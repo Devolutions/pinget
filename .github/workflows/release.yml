@@ -164,7 +164,6 @@ jobs:
     needs:
       - prepare
       - csharp-packages
-    if: secrets.NUGET_API_KEY != ''
 
     steps:
       - name: Setup .NET
@@ -179,6 +178,7 @@ jobs:
           path: dist/nuget
 
       - name: Push packages to NuGet.org
+        if: env.NUGET_API_KEY != ''
         shell: bash
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
