@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Package information
         id: info
@@ -104,60 +104,116 @@ jobs:
           Write-Host "::notice::PublishNuget: $PublishNuget"
 
   rust-artifacts:
-    name: Rust Artifacts (${{ matrix.asset_name }})
+    name: Rust Artifacts (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     needs: preflight
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            asset_name: pinget-windows-x64.zip
-            binary_path: rust/target/release/pinget.exe
-          - os: ubuntu-latest
-            asset_name: pinget-linux-x64.zip
-            binary_path: rust/target/release/pinget
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_name: pinget-linux-x64.zip
+            binary_name: pinget
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive_name: pinget-linux-arm64.zip
+            binary_name: pinget
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_name: pinget-windows-x64.zip
+            binary_name: pinget.exe
+          - name: windows-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive_name: pinget-windows-arm64.zip
+            binary_name: pinget.exe
+          - name: macos-x64
+            os: macos-14
+            target: x86_64-apple-darwin
+            archive_name: pinget-macos-x64.zip
+            binary_name: pinget
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive_name: pinget-macos-arm64.zip
+            binary_name: pinget
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Setup Rust on Linux
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Setup Rust on Windows
-        if: runner.os == 'Windows'
+      - name: Install Rust toolchain
         shell: pwsh
         run: |
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install stable --profile minimal --target "${{ matrix.target }}"
           rustup default stable
+
+      - name: Install Linux ARM64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure static MSVC runtime
+        if: contains(matrix.target, 'windows-msvc')
+        shell: pwsh
+        run: |
+          "RUSTFLAGS=-C target-feature=+crt-static" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build release binary
-        run: cargo build -p pinget-cli --manifest-path rust/Cargo.toml --release
-
-      - name: Archive Windows binary
-        if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
-          New-Item -Path dist -ItemType Directory -Force | Out-Null
-          Compress-Archive -LiteralPath '${{ matrix.binary_path }}' -DestinationPath "dist/${{ matrix.asset_name }}" -Force
+          cargo build --locked --release --package pinget-cli --bin pinget --manifest-path rust/Cargo.toml --target "${{ matrix.target }}"
 
-      - name: Archive Unix binary
-        if: runner.os != 'Windows'
-        shell: bash
+      - name: Package artifacts
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          PINGET_BIN_NAME: ${{ matrix.binary_name }}
+          PINGET_ARCHIVE_NAME: ${{ matrix.archive_name }}
         run: |
-          mkdir -p dist
-          zip -j "dist/${{ matrix.asset_name }}" "${{ matrix.binary_path }}"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $target = $env:TARGET
+          $binaryName = $env:PINGET_BIN_NAME
+          $archiveName = $env:PINGET_ARCHIVE_NAME
+          $binaryPath = [System.IO.Path]::Combine('rust', 'target', $target, 'release', $binaryName)
+
+          if (-not (Test-Path -Path $binaryPath)) {
+            throw "Binary not found: $binaryPath"
+          }
+
+          if (Test-Path -Path $archiveName) {
+            Remove-Item -Path $archiveName -Force
+          }
+
+          $archive = [System.IO.Compression.ZipFile]::Open($archiveName, [System.IO.Compression.ZipArchiveMode]::Create)
+          try {
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+              $archive,
+              $binaryPath,
+              $binaryName,
+              [System.IO.Compression.CompressionLevel]::Optimal
+            ) | Out-Null
+          }
+          finally {
+            $archive.Dispose()
+          }
+
+          Write-Host "Created $archiveName"
 
       - name: Upload Rust artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          name: ${{ matrix.archive_name }}
+          path: ${{ matrix.archive_name }}
           if-no-files-found: error
 
   csharp-packages:
@@ -167,10 +223,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
 
@@ -205,7 +261,7 @@ jobs:
           dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/Devolutions.Pinget.PowerShell.Cmdlets.csproj @packArgs
 
       - name: Upload package artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: csharp-nuget
           path: |
@@ -224,7 +280,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -256,7 +312,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist/release
           merge-multiple: true
@@ -279,12 +335,12 @@ jobs:
 
     steps:
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
 
       - name: Download package artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: csharp-nuget
           path: dist/nuget
