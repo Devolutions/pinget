@@ -2022,7 +2022,7 @@ impl Repository {
                         .headers()
                         .get("x-ms-meta-sourceversion")
                         .and_then(|value| value.to_str().ok())
-                        .map(str::to_string);
+                        .map(str::to_owned);
                     let bytes = response.bytes().context("failed to read preindexed package bytes")?;
                     let payload = bytes.to_vec();
                     let index_bytes = extract_zip_member(&payload, "Public/index.db")
@@ -2055,7 +2055,7 @@ impl Repository {
             source.identifier = info.source_identifier.clone();
         }
         source.last_update = Some(Utc::now());
-        source.source_version = choose_contract(&info.server_supported_versions).map(str::to_string);
+        source.source_version = choose_contract(&info.server_supported_versions).map(str::to_owned);
         Ok("refreshed information cache".to_owned())
     }
 
@@ -4467,7 +4467,7 @@ fn yaml_scalar_string(value: &YamlValue) -> Option<String> {
 fn yaml_string_list(root: &YamlMapping, key: &str) -> Vec<String> {
     root.get(YamlValue::from(key))
         .and_then(YamlValue::as_sequence)
-        .map(|items| items.iter().filter_map(YamlValue::as_str).map(str::to_string).collect())
+        .map(|items| items.iter().filter_map(YamlValue::as_str).map(str::to_owned).collect())
         .unwrap_or_default()
 }
 
@@ -4523,14 +4523,14 @@ fn yaml_package_dependencies(root: &YamlMapping) -> Vec<String> {
 }
 
 fn json_string(value: &JsonValue, key: &str) -> Option<String> {
-    value.get(key).and_then(JsonValue::as_str).map(str::to_string)
+    value.get(key).and_then(JsonValue::as_str).map(str::to_owned)
 }
 
 fn json_string_list(value: &JsonValue, key: &str) -> Vec<String> {
     value
         .get(key)
         .and_then(JsonValue::as_array)
-        .map(|items| items.iter().filter_map(JsonValue::as_str).map(str::to_string).collect())
+        .map(|items| items.iter().filter_map(JsonValue::as_str).map(str::to_owned).collect())
         .unwrap_or_default()
 }
 
@@ -4595,7 +4595,7 @@ fn json_installer_switches(value: &JsonValue) -> InstallerSwitches {
         switches
             .and_then(|switches| switches.get(key))
             .and_then(JsonValue::as_str)
-            .map(str::to_string)
+            .map(str::to_owned)
     };
 
     InstallerSwitches {
