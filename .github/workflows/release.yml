@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version to validate during manual runs.
+        required: true
+        type: string
+      publish_nuget:
+        description: Publish packages to NuGet.org during a manual run.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -24,7 +35,11 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            VERSION='${{ inputs.version }}'
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
           if [ -z "$VERSION" ]; then
             echo "Tag version is empty" >&2
             exit 1
@@ -141,6 +156,7 @@ jobs:
     needs:
       - rust-artifacts
       - csharp-packages
+    if: github.event_name != 'workflow_dispatch'
 
     steps:
       - name: Download all artifacts
@@ -164,6 +180,7 @@ jobs:
     needs:
       - prepare
       - csharp-packages
+    if: github.event_name != 'workflow_dispatch' || inputs.publish_nuget
 
     steps:
       - name: Setup .NET
