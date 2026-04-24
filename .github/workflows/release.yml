@@ -260,6 +260,38 @@ jobs:
           dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Engine/Devolutions.Pinget.PowerShell.Engine.csproj @packArgs
           dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/Devolutions.Pinget.PowerShell.Cmdlets.csproj @packArgs
 
+      - name: Package PowerShell module
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $moduleName = 'Pinget'
+          $moduleVersion = $env:PACKAGE_VERSION
+          $moduleOutput = Join-Path 'dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/bin/Release' 'net8.0'
+          $stagingRoot = Join-Path 'dist' 'powershell-module'
+          $moduleRoot = Join-Path $stagingRoot $moduleName
+          $archivePath = Join-Path 'dist' ("pinget-powershell-module-$moduleVersion.zip")
+
+          if (-not (Test-Path -Path (Join-Path $moduleOutput 'Pinget.psd1'))) {
+            throw "PowerShell module manifest not found in $moduleOutput"
+          }
+
+          if (Test-Path -Path $stagingRoot) {
+            Remove-Item -Path $stagingRoot -Recurse -Force
+          }
+
+          if (Test-Path -Path $archivePath) {
+            Remove-Item -Path $archivePath -Force
+          }
+
+          New-Item -Path $moduleRoot -ItemType Directory -Force | Out-Null
+          Copy-Item -Path (Join-Path $moduleOutput '*') -Destination $moduleRoot -Recurse -Force
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stagingRoot, $archivePath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+
+          Write-Host "Created $archivePath"
+
       - name: Upload package artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -267,6 +299,13 @@ jobs:
           path: |
             dist/nuget/*.nupkg
             dist/nuget/*.snupkg
+          if-no-files-found: error
+
+      - name: Upload PowerShell module artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: powershell-module
+          path: dist/pinget-powershell-module-*.zip
           if-no-files-found: error
 
   create-tag:
