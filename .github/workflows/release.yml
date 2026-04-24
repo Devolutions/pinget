@@ -2,16 +2,21 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       version:
-        description: Package version to validate during manual runs.
-        required: true
+        description: Package version to release. Defaults to the version detected from source files.
+        required: false
         type: string
+      dry_run:
+        description: Build and package only; skip tag creation, GitHub release, and NuGet publication.
+        required: false
+        default: true
+        type: boolean
       publish_nuget:
-        description: Publish packages to NuGet.org during a manual run.
+        description: Publish packages to NuGet.org during a manual release.
         required: false
         default: false
         type: boolean
@@ -29,22 +34,54 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      dry_run: ${{ steps.inputs.outputs.dry_run }}
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve inputs
+        id: inputs
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Compute package version
         id: version
         shell: bash
         run: |
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            VERSION='${{ inputs.version }}'
+          VERSION_INPUT='${{ inputs.version }}'
+          if [ -n "$VERSION_INPUT" ]; then
+            VERSION="$VERSION_INPUT"
           else
-            VERSION="${GITHUB_REF_NAME#v}"
+            CORE_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' rust/crates/pinget-core/Cargo.toml | head -n 1)
+            CLI_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' rust/crates/pinget-cli/Cargo.toml | head -n 1)
+            DOTNET_VERSION=$(sed -n 's/^const string Version = "\(.*\)";$/\1/p' dotnet/src/Devolutions.Pinget.Cli/Program.cs | head -n 1)
+            if [ -z "$CORE_VERSION" ] || [ -z "$CLI_VERSION" ] || [ -z "$DOTNET_VERSION" ]; then
+              echo "Unable to detect version from source files" >&2
+              exit 1
+            fi
+            if [ "$CORE_VERSION" != "$CLI_VERSION" ] || [ "$CORE_VERSION" != "$DOTNET_VERSION" ]; then
+              echo "Version mismatch detected: pinget-core=$CORE_VERSION pinget-cli=$CLI_VERSION dotnet=$DOTNET_VERSION" >&2
+              exit 1
+            fi
+            VERSION="$CORE_VERSION"
           fi
           if [ -z "$VERSION" ]; then
-            echo "Tag version is empty" >&2
+            echo "Package version is empty" >&2
+            exit 1
+          fi
+          if [ "${{ steps.inputs.outputs.dry_run }}" != "true" ] && [ "${GITHUB_REF_NAME}" != "master" ]; then
+            echo "Releases must run from the master branch; use dry_run=true for validation on other refs" >&2
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_name=v$VERSION" >> "$GITHUB_OUTPUT"
 
   rust-artifacts:
     name: Rust Artifacts (${{ matrix.asset_name }})
@@ -156,13 +193,46 @@ jobs:
             dist/nuget/*.snupkg
           if-no-files-found: error
 
+  create-tag:
+    name: Create Tag
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - rust-artifacts
+      - csharp-packages
+    if: needs.prepare.outputs.dry_run != 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tag does not already exist
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ needs.prepare.outputs.tag_name }}" >/dev/null 2>&1; then
+            echo "Tag ${{ needs.prepare.outputs.tag_name }} already exists on origin" >&2
+            exit 1
+          fi
+
+      - name: Create and push tag
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ needs.prepare.outputs.tag_name }}" "${GITHUB_SHA}" -m "Release ${{ needs.prepare.outputs.tag_name }}"
+          git push origin "${{ needs.prepare.outputs.tag_name }}"
+
   github-release:
     name: GitHub Release
     runs-on: ubuntu-latest
     needs:
+      - prepare
+      - create-tag
       - rust-artifacts
       - csharp-packages
-    if: github.event_name != 'workflow_dispatch'
+    if: needs.prepare.outputs.dry_run != 'true'
 
     steps:
       - name: Download all artifacts
@@ -175,7 +245,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/release/*.zip dist/release/*.nupkg dist/release/*.snupkg --generate-notes
+          gh release create "${{ needs.prepare.outputs.tag_name }}" dist/release/*.zip dist/release/*.nupkg dist/release/*.snupkg --generate-notes
 
   publish-nuget:
     name: Publish NuGet
@@ -183,7 +253,7 @@ jobs:
     needs:
       - prepare
       - csharp-packages
-    if: github.event_name != 'workflow_dispatch' || inputs.publish_nuget
+    if: needs.prepare.outputs.dry_run != 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish_nuget)
 
     steps:
       - name: Setup .NET
