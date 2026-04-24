@@ -1,0 +1,29 @@
+[package]
+name = "pinget-cli"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "pinget"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+pinget-core = { version = "0.1.0", path = "../pinget-core" }
+chrono = "0.4.44"
+dirs = "6.0"
+jsonschema = "0.30"
+reqwest = { version = "0.12", features = ["blocking"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9"
+sha2 = "0.11.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+winreg = "0.55.0"

@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Devolutions.Pinget.PowerShell.Engine\Devolutions.Pinget.PowerShell.Engine.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="PowerShellStandard.Library" Version="7.0.0-preview.1" PrivateAssets="all" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <IsPackable>true</IsPackable>
+    <AssemblyName>Devolutions.Pinget.PowerShell.Cmdlets</AssemblyName>
+    <RootNamespace>Devolutions.Pinget.PowerShell.Cmdlets</RootNamespace>
+    <PackageId>Devolutions.Pinget.PowerShell.Cmdlets</PackageId>
+    <Description>PowerShell cmdlets for Pinget.</Description>
+  </PropertyGroup>
+
+  <Target Name="CopyPowerShellModuleFiles" AfterTargets="AfterBuild">
+    <ItemGroup>
+      <ModuleFiles Include="$(ProjectDir)ModuleFiles\**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ModuleFiles)" DestinationFiles="$(OutputPath)%(RecursiveDir)%(Filename)%(Extension)" />
+  </Target>
+</Project>

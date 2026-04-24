@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Devolutions.Pinget.Core\Devolutions.Pinget.Core.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>true</IsPackable>
+    <AssemblyName>Devolutions.Pinget.PowerShell.Engine</AssemblyName>
+    <RootNamespace>Devolutions.Pinget.PowerShell.Engine</RootNamespace>
+    <PackageId>Devolutions.Pinget.PowerShell.Engine</PackageId>
+    <Description>PowerShell-facing orchestration layer for Pinget built on top of Devolutions.Pinget.Core.</Description>
+  </PropertyGroup>
+</Project>
