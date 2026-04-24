@@ -1,0 +1,15 @@
+<Project>
+  <PropertyGroup Condition="'$(IsPackable)' == 'true'">
+    <Authors>Devolutions</Authors>
+    <Company>Devolutions Inc.</Company>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Devolutions/pinget</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Devolutions/pinget.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PackageTags>pinget;winget;package-manager;powershell;dotnet</PackageTags>
+    <PackageReleaseNotes>See the repository changelog and release notes for details.</PackageReleaseNotes>
+    <Copyright>Copyright 2021-2026 Devolutions Inc.</Copyright>
+  </PropertyGroup>
+</Project>

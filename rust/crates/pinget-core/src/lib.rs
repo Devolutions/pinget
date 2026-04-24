@@ -6199,13 +6199,8 @@ Installers:
     #[test]
     fn parses_fixture_manifest() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("..")
-            .join("src")
-            .join("AppInstallerCLITests")
-            .join("TestData")
+            .join("tests")
+            .join("fixtures")
             .join("ManifestV1_28-Singleton.yaml");
         let bytes = fs::read(root).expect("fixture bytes");
         let manifest = parse_yaml_manifest(&bytes).expect("manifest");
