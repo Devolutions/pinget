@@ -170,7 +170,7 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
-          cargo build --locked --release --package pinget-cli --bin pinget --manifest-path rust/Cargo.toml --target "${{ matrix.target }}"
+          cargo build --release --package pinget-cli --bin pinget --manifest-path rust/Cargo.toml --target "${{ matrix.target }}"
 
       - name: Package artifacts
         shell: pwsh
