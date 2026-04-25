@@ -588,11 +588,18 @@ function Remove-PinIfPresent {
     )
 
     if (Test-PinVisible -Executable $Executable -PackageId $PackageId -SystemCli:$SystemCli) {
-        $removeArgs = @("pin", "remove", "--id", $PackageId, "--exact")
+        $argumentSets = @(
+            @("pin", "remove", "--id", $PackageId, "--exact", "--installed"),
+            @("pin", "remove", "--id", $PackageId, "--exact")
+        )
+
         if ($SystemCli) {
-            $removeArgs += @("--accept-source-agreements", "--disable-interactivity")
+            $argumentSets = @($argumentSets | ForEach-Object {
+                    @($_ + @("--accept-source-agreements", "--disable-interactivity"))
+                })
         }
-        Invoke-Capture -Executable $Executable -Arguments $removeArgs | Out-Null
+
+        Invoke-BestEffort -Executable $Executable -ArgumentSets $argumentSets | Out-Null
     }
 }
 
@@ -766,13 +773,22 @@ try {
     Assert-True -Condition (-not (Test-PinVisible -Executable $SystemWinget -PackageId $pinPackageId -SystemCli)) -Message "winget still reported the pin after Rust pinget removed it."
     Assert-True -Condition (-not (Test-PinVisible -Executable $DotnetWinget -PackageId $pinPackageId)) -Message "C# pinget still reported the pin after Rust pinget removed it."
 
-    Invoke-Capture -Executable $DotnetWinget -Arguments @("pin", "add", "--id", $pinPackageId, "--exact", "--installed") | Out-Null
-    Assert-True -Condition (Test-PinVisible -Executable $RustWinget -PackageId $pinPackageId) -Message "Rust pinget did not reflect the pin created by the C# CLI."
-    Assert-True -Condition (Test-PinVisible -Executable $SystemWinget -PackageId $pinPackageId -SystemCli) -Message "winget did not reflect the pin created by the C# CLI."
+    Invoke-Capture -Executable $SystemWinget -Arguments @("pin", "add", "--id", $pinPackageId, "--exact", "--installed", "--accept-source-agreements", "--disable-interactivity") | Out-Null
+    $supportsInstalledPins = Test-PinVisible -Executable $SystemWinget -PackageId $pinPackageId -SystemCli
+    Remove-PinIfPresent -Executable $SystemWinget -PackageId $pinPackageId -SystemCli
 
-    Invoke-Capture -Executable $SystemWinget -Arguments @("pin", "remove", "--id", $pinPackageId, "--exact", "--accept-source-agreements", "--disable-interactivity") | Out-Null
-    Assert-True -Condition (-not (Test-PinVisible -Executable $RustWinget -PackageId $pinPackageId)) -Message "Rust pinget still reported the pin after winget removed it."
-    Assert-True -Condition (-not (Test-PinVisible -Executable $DotnetWinget -PackageId $pinPackageId)) -Message "C# pinget still reported the pin after winget removed it."
+    if ($supportsInstalledPins) {
+        Invoke-Capture -Executable $DotnetWinget -Arguments @("pin", "add", "--id", $pinPackageId, "--exact", "--installed") | Out-Null
+        Assert-True -Condition (Test-PinVisible -Executable $RustWinget -PackageId $pinPackageId) -Message "Rust pinget did not reflect the installed pin created by the C# CLI."
+        Assert-True -Condition (Test-PinVisible -Executable $SystemWinget -PackageId $pinPackageId -SystemCli) -Message "winget did not reflect the installed pin created by the C# CLI."
+
+        Remove-PinIfPresent -Executable $SystemWinget -PackageId $pinPackageId -SystemCli
+        Assert-True -Condition (-not (Test-PinVisible -Executable $RustWinget -PackageId $pinPackageId)) -Message "Rust pinget still reported the installed pin after winget removed it."
+        Assert-True -Condition (-not (Test-PinVisible -Executable $DotnetWinget -PackageId $pinPackageId)) -Message "C# pinget still reported the installed pin after winget removed it."
+    }
+    else {
+        Write-Host ("Skipping installed pin coherence for {0} because packaged winget did not persist an installed pin for this package." -f $pinPackageId) -ForegroundColor Yellow
+    }
 
     Uninstall-WithWinget -PackageId $packageId
     $packageInstalled = $false
