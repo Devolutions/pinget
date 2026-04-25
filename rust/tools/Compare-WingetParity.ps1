@@ -177,6 +177,9 @@ function Format-WingetOutput {
         if ($trimmed -like 'warning:*REST search request failed*') {
             continue
         }
+        if ($trimmed -match '[█▒]' -and $trimmed -match '\d+(?:\.\d+)?\s*(?:KB|MB|GB)\s*/\s*\d+(?:\.\d+)?\s*(?:KB|MB|GB)') {
+            continue
+        }
         ($trimmed -replace '\s+', ' ')
     }
 }
