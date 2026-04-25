@@ -1,0 +1,13 @@
+PackageIdentifier: microsoft.msixsdk
+PackageVersion: 1.7.32
+PackageLocale: en-US
+PackageName: MSIX SDK
+Publisher: Microsoft
+ShortDescription: Test fixture manifest for pinget-core parsing.
+ManifestType: singleton
+ManifestVersion: 1.10.0
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/msixsdk-x64.exe
+    InstallerSha256: 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF

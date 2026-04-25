@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    tags-ignore:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-lint:
+    name: Rust Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add rustfmt clippy --toolchain stable
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml --all --check
+
+      - name: Run clippy
+        run: cargo clippy -q --manifest-path rust/Cargo.toml --workspace --tests -- -D warnings
+
+  rust-build:
+    name: Rust Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust on Linux
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Setup Rust on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test pinget-core
+        run: cargo test -p pinget-core --manifest-path rust/Cargo.toml
+
+      - name: Test pinget-cli
+        run: cargo test -p pinget-cli --manifest-path rust/Cargo.toml
+
+      - name: Build pinget-cli
+        run: cargo build -p pinget-cli --manifest-path rust/Cargo.toml
+
+  dotnet:
+    name: Dotnet Build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Restore solution
+        run: dotnet restore dotnet/Devolutions.Pinget.slnx
+
+      - name: Build solution
+        run: dotnet build dotnet/Devolutions.Pinget.slnx -c Release --no-restore
+
+      - name: Run core tests
+        run: dotnet test dotnet/src/Devolutions.Pinget.Core.Tests/Devolutions.Pinget.Core.Tests.csproj -c Release --no-build
+
+      - name: Run PowerShell tests
+        shell: pwsh
+        run: pwsh -NoLogo -NoProfile -File (Resolve-Path 'dotnet/tests/RunTests.ps1')
+
+      - name: Validate NuGet packing
+        shell: pwsh
+        run: |
+          New-Item -Path artifacts/ci-nuget -ItemType Directory -Force | Out-Null
+          dotnet pack dotnet/src/Devolutions.Pinget.Core/Devolutions.Pinget.Core.csproj -c Release --no-build -o artifacts/ci-nuget
+          dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Engine/Devolutions.Pinget.PowerShell.Engine.csproj -c Release --no-build -o artifacts/ci-nuget
+          dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/Devolutions.Pinget.PowerShell.Cmdlets.csproj -c Release --no-build -o artifacts/ci-nuget

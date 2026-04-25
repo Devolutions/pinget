@@ -2019,7 +2019,7 @@ public class Repository : IDisposable
     private static string Sha256Hex(byte[] data)
     {
         var hash = SHA256.HashData(data);
-        return Convert.ToHexStringLower(hash);
+        return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
     private class VersionComparer : IComparer<string>

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$ModulePath = (Join-Path $PSScriptRoot '..\src\Devolutions.Pinget.PowerShell.Cmdlets\bin\Release\net10.0\Pinget.psd1'),
+    [string]$ModulePath = (Join-Path $PSScriptRoot '..\src\Devolutions.Pinget.PowerShell.Cmdlets\bin\Release\net8.0\Pinget.psd1'),
     [string]$SourceArgument = 'https://api.winget.pro/4259fd23-6fcd-46bf-9287-be8833cfbdd5'
 )
 

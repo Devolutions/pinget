@@ -8,16 +8,25 @@
   </ItemGroup>
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <IsPackable>true</IsPackable>
+    <TargetsForTfmSpecificContentInPackage>$(TargetsForTfmSpecificContentInPackage);AddPowerShellModuleFilesToPackage</TargetsForTfmSpecificContentInPackage>
     <AssemblyName>Devolutions.Pinget.PowerShell.Cmdlets</AssemblyName>
     <RootNamespace>Devolutions.Pinget.PowerShell.Cmdlets</RootNamespace>
     <PackageId>Devolutions.Pinget.PowerShell.Cmdlets</PackageId>
     <Description>PowerShell cmdlets for Pinget.</Description>
   </PropertyGroup>
+
+  <Target Name="AddPowerShellModuleFilesToPackage">
+    <ItemGroup>
+      <TfmSpecificPackageFile Include="$(ProjectDir)ModuleFiles\**\*.*">
+        <PackagePath>lib\$(TargetFramework)\%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
+      </TfmSpecificPackageFile>
+    </ItemGroup>
+  </Target>
 
   <Target Name="CopyPowerShellModuleFiles" AfterTargets="AfterBuild">
     <ItemGroup>
