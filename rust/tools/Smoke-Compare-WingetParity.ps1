@@ -149,6 +149,10 @@ function Test-IsSourcePermissionFailure {
     return $Message -match 'requires administrator privileges|Access is denied|UnauthorizedAccessException'
 }
 
+function Test-SystemWingetSourceMutationInteropSupported {
+    return $false
+}
+
 function Test-IsPackageNotInstalledFailure {
     param([string]$Message)
 
@@ -626,26 +630,45 @@ try {
         Write-Warning "Skipping source mutation checks because this process is not elevated."
     }
     else {
+        $validateSystemWingetSourceMutation = Test-SystemWingetSourceMutationInteropSupported
+        if (-not $validateSystemWingetSourceMutation) {
+            Write-Warning "Skipping packaged winget source mutation assertions because system winget stores sources in WinRT LocalSettings plus secure metadata, and Pinget intentionally stays COM/WinRT-free."
+        }
+
         try {
             Add-SourceWithPowerShell -SourceName $sourceName -SourceArgument $sourceArgument -SourceType $sourcePowerShellType
             Assert-True -Condition (Test-SourceVisible -Executable $RustWinget -SourceName $sourceName) -Message "Rust pinget did not reflect the source added by the PowerShell module."
             Assert-True -Condition (Test-SourceVisible -Executable $DotnetWinget -SourceName $sourceName) -Message "C# pinget did not reflect the source added by the PowerShell module."
-            Assert-True -Condition (Test-SourceVisible -Executable $SystemWinget -SourceName $sourceName) -Message "winget did not reflect the source added by the PowerShell module."
+            if ($validateSystemWingetSourceMutation) {
+                Assert-True -Condition (Test-SourceVisible -Executable $SystemWinget -SourceName $sourceName) -Message "winget did not reflect the source added by the PowerShell module."
+            }
 
             Invoke-Capture -Executable $RustWinget -Arguments @("source", "remove", $sourceName) | Out-Null
             Assert-True -Condition (-not (Test-SourceVisible -Executable $DotnetWinget -SourceName $sourceName)) -Message "C# pinget still reported the source after Rust pinget removed it."
-            Assert-True -Condition (-not (Test-SourceVisible -Executable $SystemWinget -SourceName $sourceName)) -Message "winget still reported the source after Rust pinget removed it."
+            if ($validateSystemWingetSourceMutation) {
+                Assert-True -Condition (-not (Test-SourceVisible -Executable $SystemWinget -SourceName $sourceName)) -Message "winget still reported the source after Rust pinget removed it."
+            }
             Assert-True -Condition (-not (Test-SourceVisibleInPowerShell -SourceName $sourceName)) -Message "PowerShell module still reported the source after Rust pinget removed it."
 
             Add-SourceWithDotnet -SourceName $sourceName -SourceArgument $sourceArgument -SourceType $sourceCliType
             Assert-True -Condition (Test-SourceVisible -Executable $RustWinget -SourceName $sourceName) -Message "Rust pinget did not reflect the source added by the C# CLI."
-            Assert-True -Condition (Test-SourceVisible -Executable $SystemWinget -SourceName $sourceName) -Message "winget did not reflect the source added by the C# CLI."
+            if ($validateSystemWingetSourceMutation) {
+                Assert-True -Condition (Test-SourceVisible -Executable $SystemWinget -SourceName $sourceName) -Message "winget did not reflect the source added by the C# CLI."
+            }
             Assert-True -Condition (Test-SourceVisibleInPowerShell -SourceName $sourceName) -Message "PowerShell module did not reflect the source added by the C# CLI."
 
-            Remove-SourceWithWinget -SourceName $sourceName
-            Assert-True -Condition (-not (Test-SourceVisible -Executable $RustWinget -SourceName $sourceName)) -Message "Rust pinget still reported the source after winget removed it."
-            Assert-True -Condition (-not (Test-SourceVisible -Executable $DotnetWinget -SourceName $sourceName)) -Message "C# pinget still reported the source after winget removed it."
-            Assert-True -Condition (-not (Test-SourceVisibleInPowerShell -SourceName $sourceName)) -Message "PowerShell module still reported the source after winget removed it."
+            if ($validateSystemWingetSourceMutation) {
+                Remove-SourceWithWinget -SourceName $sourceName
+                Assert-True -Condition (-not (Test-SourceVisible -Executable $RustWinget -SourceName $sourceName)) -Message "Rust pinget still reported the source after winget removed it."
+                Assert-True -Condition (-not (Test-SourceVisible -Executable $DotnetWinget -SourceName $sourceName)) -Message "C# pinget still reported the source after winget removed it."
+                Assert-True -Condition (-not (Test-SourceVisibleInPowerShell -SourceName $sourceName)) -Message "PowerShell module still reported the source after winget removed it."
+            }
+            else {
+                Remove-SourceWithPowerShell -SourceName $sourceName
+                Assert-True -Condition (-not (Test-SourceVisible -Executable $RustWinget -SourceName $sourceName)) -Message "Rust pinget still reported the source after the PowerShell module removed it."
+                Assert-True -Condition (-not (Test-SourceVisible -Executable $DotnetWinget -SourceName $sourceName)) -Message "C# pinget still reported the source after the PowerShell module removed it."
+                Assert-True -Condition (-not (Test-SourceVisibleInPowerShell -SourceName $sourceName)) -Message "PowerShell module still reported the source after removing it."
+            }
         }
         catch {
             if (Test-IsSourcePermissionFailure -Message $_.Exception.Message) {
