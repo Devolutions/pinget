@@ -159,6 +159,12 @@ function Test-IsPackageNotInstalledFailure {
     return $Message -match 'No installed package found matching input criteria\.' -or $Message -match 'exit code -1978335212'
 }
 
+function Test-IsMissingSourceDataFailure {
+    param([string]$Message)
+
+    return $Message -match '0x8a15000f' -or $Message -match 'Data required by the source is missing'
+}
+
 function New-TestSettingsHashtable {
     return [ordered]@{
         experimentalFeatures = [ordered]@{
@@ -372,6 +378,26 @@ function Get-PackageDisplayName {
     }
 
     throw "Could not determine the package display name for '$PackageId'."
+}
+
+function Update-SharedSources {
+    Invoke-Capture -Executable $SystemWinget -Arguments @("source", "update") | Out-Null
+}
+
+function Ensure-HealthyReadOnlySources {
+    try {
+        Invoke-Capture -Executable $SystemWinget -Arguments @("show", "--id", "Microsoft.PowerToys", "--exact", "--source", "winget", "--accept-source-agreements", "--disable-interactivity") | Out-Null
+    }
+    catch {
+        if (-not (Test-IsMissingSourceDataFailure -Message $_.Exception.Message)) {
+            throw
+        }
+
+        Write-Warning "Resetting packaged winget sources because the runner cache is missing source data."
+        Invoke-Capture -Executable $SystemWinget -Arguments @("source", "reset", "--force") | Out-Null
+    }
+
+    Update-SharedSources
 }
 
 function Install-WithWinget {
@@ -600,6 +626,9 @@ try {
     Assert-True -Condition ($null -ne (Get-PowerShellSettingsObject)) -Message "PowerShell module could not read Pinget user settings."
 
     if (-not $SkipReadOnlyParity) {
+        Write-Section "Source baseline"
+        Ensure-HealthyReadOnlySources
+
         Write-Section "Read-only parity"
         $parityScript = Join-Path $PSScriptRoot "Compare-WingetParity.ps1"
         Assert-True -Condition (Test-Path -Path $parityScript) -Message "Parity helper not found at '$parityScript'."
