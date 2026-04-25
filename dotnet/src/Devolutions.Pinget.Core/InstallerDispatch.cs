@@ -16,6 +16,7 @@ internal static class InstallerDispatch
         {
             "msi" or "wix" => RunMsi(installerPath, request, manifest, installer),
             "msix" or "appx" => RunMsix(installerPath),
+            "zip" when ShouldDelegatePortableZipInstall(request, manifest, installer) => InstallPortableWithWinget(request, manifest),
             "zip" => ExtractZip(installerPath),
             _ => RunExe(installerPath, installerType, request, manifest, installer)
         };
@@ -157,6 +158,61 @@ internal static class InstallerDispatch
         Directory.CreateDirectory(target);
         ZipFile.ExtractToDirectory(path, target, overwriteFiles: true);
         return 0;
+    }
+
+    private static bool ShouldDelegatePortableZipInstall(InstallRequest request, Manifest manifest, Installer installer) =>
+        installer.Commands.Count > 0 &&
+        !string.IsNullOrWhiteSpace(request.Query.Id ?? manifest.Id);
+
+    internal static List<string> BuildWingetPortableInstallArguments(InstallRequest request, Manifest manifest)
+    {
+        var packageId = request.Query.Id ?? manifest.Id;
+        var args = new List<string>
+        {
+            "install",
+            "--id",
+            packageId,
+            "--exact",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        };
+
+        if (!string.IsNullOrWhiteSpace(request.Query.Source))
+        {
+            args.Add("--source");
+            args.Add(request.Query.Source!);
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.Query.Version))
+        {
+            args.Add("--version");
+            args.Add(request.Query.Version!);
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.Query.InstallScope))
+        {
+            args.Add("--scope");
+            args.Add(request.Query.InstallScope!);
+        }
+
+        if (request.AcceptPackageAgreements)
+            args.Add("--accept-package-agreements");
+
+        if (request.Mode == InstallerMode.Silent || request.Mode == InstallerMode.SilentWithProgress)
+            args.Add("--silent");
+
+        return args;
+    }
+
+    private static int InstallPortableWithWinget(InstallRequest request, Manifest manifest)
+    {
+        var psi = new ProcessStartInfo("winget") { UseShellExecute = false };
+        foreach (var arg in BuildWingetPortableInstallArguments(request, manifest))
+            psi.ArgumentList.Add(arg);
+
+        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start winget for portable install");
+        proc.WaitForExit();
+        return proc.ExitCode;
     }
 
     private static int RunExe(string path, string installerType, InstallRequest request, Manifest manifest, Installer installer)

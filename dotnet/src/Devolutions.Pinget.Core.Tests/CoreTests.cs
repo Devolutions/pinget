@@ -1093,6 +1093,47 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void BuildWingetPortableInstallArguments_PreservesWingetCoherenceFlags()
+    {
+        var manifest = new Manifest
+        {
+            Id = "JesseDuffield.lazygit",
+            Name = "lazygit",
+            Version = "0.61.1",
+        };
+
+        var request = new InstallRequest
+        {
+            Query = new PackageQuery
+            {
+                Id = "JesseDuffield.lazygit",
+                Source = "winget",
+                InstallScope = "user",
+            },
+            Mode = InstallerMode.Silent,
+            AcceptPackageAgreements = true,
+        };
+
+        Assert.Equal(
+            new[]
+            {
+                "install",
+                "--id",
+                "JesseDuffield.lazygit",
+                "--exact",
+                "--accept-source-agreements",
+                "--disable-interactivity",
+                "--source",
+                "winget",
+                "--scope",
+                "user",
+                "--accept-package-agreements",
+                "--silent",
+            },
+            InstallerDispatch.BuildWingetPortableInstallArguments(request, manifest));
+    }
+
+    [Fact]
     public void CreateRepairListQuery_IncludesInstalledSelectors()
     {
         var request = new RepairRequest
