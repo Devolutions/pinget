@@ -35,6 +35,57 @@ public class SourceStoreTests
         Assert.Contains(store.Sources, s => s.Name == "msstore");
     }
 
+        [Fact]
+        public void PackagedLayout_DefaultsToPackagedSettingsAndCachePaths()
+        {
+                if (!OperatingSystem.IsWindows())
+                        return;
+
+                var appRoot = SourceStoreManager.NormalizeAppRoot(null);
+                Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState"), appRoot, StringComparison.OrdinalIgnoreCase);
+                Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "settings.json"), SettingsStoreManager.UserSettingsPath(appRoot), StringComparison.OrdinalIgnoreCase);
+                Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "Microsoft", "Windows Package Manager"), SourceStoreManager.GetPackagedFileCacheRoot(appRoot), StringComparison.OrdinalIgnoreCase);
+        }
+
+        [Fact]
+        public void PackagedSourceYaml_OverlaysDefaultsAndMetadata()
+        {
+                const string userSourcesYaml = @"Sources:
+    - Name: winget
+        Type: Microsoft.PreIndexed.Package
+        Arg: https://cdn.winget.microsoft.com/cache
+        Data: Microsoft.Winget.Source_8wekyb3d8bbwe
+        IsTombstone: true
+    - Name: corp
+        Type: Microsoft.Rest
+        Arg: ""https://packages.contoso.test/api""
+        Data: Contoso.Rest
+        Explicit: true
+        Priority: 7
+        TrustLevel: 1
+        IsTombstone: false
+";
+
+                const string metadataYaml = @"Sources:
+    - Name: corp
+        LastUpdate: 1700000000
+        SourceVersion: 1.2.3
+";
+
+                var store = SourceStoreManager.ParsePackagedSourceStore(userSourcesYaml, metadataYaml);
+                Assert.NotNull(store);
+                Assert.DoesNotContain(store!.Sources, source => source.Name == "winget");
+
+                var corp = Assert.Single(store.Sources, source => source.Name == "corp");
+                Assert.Equal(SourceKind.Rest, corp.Kind);
+                Assert.Equal("Contoso.Rest", corp.Identifier);
+                Assert.Equal("Trusted", corp.TrustLevel);
+                Assert.True(corp.Explicit);
+                Assert.Equal(7, corp.Priority);
+                Assert.Equal("1.2.3", corp.SourceVersion);
+                Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1700000000).UtcDateTime, corp.LastUpdate);
+        }
+
     [Fact]
     public void RepositoryOpen_UsesCustomAppRoot()
     {

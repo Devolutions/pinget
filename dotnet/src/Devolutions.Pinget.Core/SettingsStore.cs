@@ -15,7 +15,9 @@ internal static class SettingsStoreManager
     ];
 
     public static string UserSettingsPath(string? appRoot = null) =>
-        Path.Combine(SourceStoreManager.NormalizeAppRoot(appRoot), "user-settings.json");
+        SourceStoreManager.UsesPackagedLayout(appRoot)
+            ? SourceStoreManager.GetPackagedUserSettingsPath(appRoot)
+            : Path.Combine(SourceStoreManager.NormalizeAppRoot(appRoot), "user-settings.json");
 
     public static string AdminSettingsPath(string? appRoot = null) =>
         Path.Combine(SourceStoreManager.NormalizeAppRoot(appRoot), "admin-settings.json");

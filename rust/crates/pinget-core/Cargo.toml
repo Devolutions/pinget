@@ -23,3 +23,4 @@ zip = "8.5.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55.0"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
