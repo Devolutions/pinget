@@ -221,6 +221,7 @@ public class ModelsTests
         var installer = new Installer();
         Assert.Null(installer.Architecture);
         Assert.Null(installer.InstallerType);
+        Assert.Null(installer.NestedInstallerType);
         Assert.Null(installer.Url);
         Assert.Null(installer.Scope);
         Assert.Null(installer.ProductCode);
@@ -560,6 +561,28 @@ public class ModelsTests
         Assert.Equal("10.0.19041.0", manifest.Installers[0].MinimumOsVersion);
         Assert.Equal(["Windows.Universal"], manifest.Installers[1].Platforms);
         Assert.Equal("10.0.22621.0", manifest.Installers[1].MinimumOsVersion);
+    }
+
+    [Fact]
+    public void ParseYamlManifest_PreservesTopLevelNestedInstallerType()
+    {
+        var yaml = """
+            PackageIdentifier: Test.Package
+            PackageVersion: 1.2.3
+            PackageName: Test Package
+            InstallerType: zip
+            NestedInstallerType: portable
+            Installers:
+              - Architecture: x64
+                InstallerUrl: https://example.test/Test.Package.zip
+                InstallerSha256: ABC123
+            """;
+
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+        var installer = Assert.Single(manifest.Installers);
+
+        Assert.Equal("zip", installer.InstallerType);
+        Assert.Equal("portable", installer.NestedInstallerType);
     }
 }
 
@@ -1131,6 +1154,34 @@ public class RepositoryParityTests
                 "--silent",
             },
             InstallerDispatch.BuildWingetPortableInstallArguments(request, manifest));
+    }
+
+    [Fact]
+    public void ShouldDelegatePortableZipInstall_ForNestedPortableZip()
+    {
+        var manifest = new Manifest
+        {
+            Id = "JesseDuffield.lazygit",
+            Name = "lazygit",
+            Version = "0.61.1",
+        };
+
+        var request = new InstallRequest
+        {
+            Query = new PackageQuery
+            {
+                Id = "JesseDuffield.lazygit",
+                Source = "winget",
+            },
+        };
+
+        var installer = new Installer
+        {
+            InstallerType = "zip",
+            NestedInstallerType = "portable",
+        };
+
+        Assert.True(InstallerDispatch.ShouldDelegatePortableZipInstall(request, manifest, installer));
     }
 
     [Fact]

@@ -311,6 +311,7 @@ internal static class RestSource
                 {
                     Architecture = GetOptStr(inst, "Architecture"),
                     InstallerType = GetOptStr(inst, "InstallerType"),
+                    NestedInstallerType = GetOptStr(inst, "NestedInstallerType") ?? GetOptStr(data, "NestedInstallerType"),
                     Url = GetOptStr(inst, "InstallerUrl"),
                     Sha256 = GetOptStr(inst, "InstallerSha256"),
                     ProductCode = GetOptStr(inst, "ProductCode"),

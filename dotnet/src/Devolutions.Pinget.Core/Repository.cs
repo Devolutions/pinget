@@ -1227,6 +1227,7 @@ public class Repository : IDisposable
 
         // Top-level installer defaults (merged manifest format)
         string? topInstallerType = GetOptStr("InstallerType");
+        string? topNestedInstallerType = GetOptStr("NestedInstallerType");
         string? topScope = GetOptStr("Scope");
         string? topProductCode = GetOptStr("ProductCode");
         string? topLocale = GetOptStr("InstallerLocale");
@@ -1263,6 +1264,7 @@ public class Repository : IDisposable
                     {
                         Architecture = InstStr("Architecture"),
                         InstallerType = InstStr("InstallerType") ?? topInstallerType,
+                        NestedInstallerType = InstStr("NestedInstallerType") ?? topNestedInstallerType,
                         Url = InstStr("InstallerUrl"),
                         Sha256 = InstStr("InstallerSha256"),
                         ProductCode = InstStr("ProductCode") ?? topProductCode,

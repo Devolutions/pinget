@@ -160,9 +160,13 @@ internal static class InstallerDispatch
         return 0;
     }
 
-    private static bool ShouldDelegatePortableZipInstall(InstallRequest request, Manifest manifest, Installer installer) =>
-        installer.Commands.Count > 0 &&
+    internal static bool ShouldDelegatePortableZipInstall(InstallRequest request, Manifest manifest, Installer installer) =>
+        IsPortableZipInstaller(installer) &&
         !string.IsNullOrWhiteSpace(request.Query.Id ?? manifest.Id);
+
+    internal static bool IsPortableZipInstaller(Installer installer) =>
+        installer.Commands.Count > 0 ||
+        string.Equals(installer.NestedInstallerType, "portable", StringComparison.OrdinalIgnoreCase);
 
     internal static List<string> BuildWingetPortableInstallArguments(InstallRequest request, Manifest manifest)
     {

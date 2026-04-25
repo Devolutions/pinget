@@ -144,6 +144,7 @@ public record Installer
 {
     public string? Architecture { get; init; }
     public string? InstallerType { get; init; }
+    public string? NestedInstallerType { get; init; }
     public string? Url { get; init; }
     public string? Sha256 { get; init; }
     public string? ProductCode { get; init; }
@@ -474,6 +475,7 @@ internal static class StructuredOutput
         var document = new Dictionary<string, object?>();
         AddString(document, "Architecture", installer.Architecture);
         AddString(document, "InstallerType", installer.InstallerType);
+        AddString(document, "NestedInstallerType", installer.NestedInstallerType);
         AddString(document, "InstallerUrl", installer.Url);
         AddString(document, "InstallerSha256", installer.Sha256);
         AddString(document, "ProductCode", installer.ProductCode);
