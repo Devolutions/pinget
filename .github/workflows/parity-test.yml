@@ -1,4 +1,4 @@
-name: Windows Smoke Tests
+name: Parity Test
 
 on:
   push:
@@ -14,8 +14,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  windows-smoke:
-    name: Windows Smoke Tests
+  parity-test:
+    name: Parity Test
     runs-on: windows-latest
     timeout-minutes: 90
 
