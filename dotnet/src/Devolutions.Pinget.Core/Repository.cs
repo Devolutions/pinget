@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+using System.Reflection;
+using System.Threading;
 using System.Security.Cryptography;
 using System.Text.Json.Nodes;
 using Microsoft.Data.Sqlite;
@@ -15,6 +17,8 @@ public class Repository : IDisposable
     internal const string UninstallUnsupportedWarning = "Uninstalling packages is not supported on this platform; no changes were made.";
     internal const string RepairUnsupportedWarning = "Repairing packages is not supported on this platform; no changes were made.";
     internal const string RepairReinstallWarning = "Pinget repair currently re-runs the package install flow for the selected package.";
+
+    private static int s_sqliteNativeLibraryInitialized;
 
     private readonly string _appRoot;
     private readonly HttpClient _client;
@@ -33,12 +37,86 @@ public class Repository : IDisposable
     public static Repository Open(RepositoryOptions? options = null)
     {
         options ??= new RepositoryOptions();
+        EnsureSqliteNativeLibraryLoaded();
         var appRoot = SourceStoreManager.NormalizeAppRoot(options.AppRoot);
         SourceStoreManager.EnsureAppDirs(appRoot);
         var store = SourceStoreManager.Load(appRoot);
         var client = new HttpClient();
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
         return new Repository(appRoot, client, store);
+    }
+
+    internal static IEnumerable<string> GetSqliteNativeLibraryCandidates(string assemblyDirectory)
+    {
+        yield return Path.Combine(assemblyDirectory, "e_sqlite3.dll");
+
+        var rid = RuntimeInformation.ProcessArchitecture switch
+        {
+            Architecture.X86 => "win-x86",
+            Architecture.Arm => "win-arm",
+            Architecture.Arm64 => "win-arm64",
+            _ => "win-x64",
+        };
+
+        yield return Path.Combine(assemblyDirectory, "runtimes", rid, "native", "e_sqlite3.dll");
+    }
+
+    private static void EnsureSqliteNativeLibraryLoaded()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            return;
+
+        if (Interlocked.Exchange(ref s_sqliteNativeLibraryInitialized, 1) != 0)
+            return;
+
+        var assemblyDirectory = Path.GetDirectoryName(typeof(Repository).Assembly.Location);
+        if (string.IsNullOrWhiteSpace(assemblyDirectory))
+            return;
+
+        var nativeLibraryPath = GetSqliteNativeLibraryCandidates(assemblyDirectory)
+            .FirstOrDefault(File.Exists);
+
+        if (string.IsNullOrWhiteSpace(nativeLibraryPath))
+            return;
+
+        RegisterSqliteDllImportResolvers(nativeLibraryPath);
+
+        try
+        {
+            NativeLibrary.Load(nativeLibraryPath);
+        }
+        catch
+        {
+            // The resolver path is the important fix for library-hosted environments.
+        }
+    }
+
+    private static void RegisterSqliteDllImportResolvers(string nativeLibraryPath)
+    {
+        RegisterSqliteDllImportResolver("SQLitePCLRaw.provider.e_sqlite3", nativeLibraryPath);
+        RegisterSqliteDllImportResolver("SQLitePCLRaw.core", nativeLibraryPath);
+    }
+
+    private static void RegisterSqliteDllImportResolver(string assemblyName, string nativeLibraryPath)
+    {
+        try
+        {
+            var assembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(candidate => string.Equals(candidate.GetName().Name, assemblyName, StringComparison.OrdinalIgnoreCase))
+                ?? Assembly.Load(new AssemblyName(assemblyName));
+
+            NativeLibrary.SetDllImportResolver(assembly, (libraryName, _, _) =>
+            {
+                if (!string.Equals(libraryName, "e_sqlite3", StringComparison.OrdinalIgnoreCase))
+                    return IntPtr.Zero;
+
+                return NativeLibrary.Load(nativeLibraryPath);
+            });
+        }
+        catch
+        {
+            // Ignore duplicate resolver registration or unavailable optional assemblies.
+        }
     }
 
     public void Dispose() => _client.Dispose();
