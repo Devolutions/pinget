@@ -180,6 +180,9 @@ function Format-WingetOutput {
         if ($trimmed -match '[█▒]' -and $trimmed -match '\d+(?:\.\d+)?\s*(?:KB|MB|GB)\s*/\s*\d+(?:\.\d+)?\s*(?:KB|MB|GB)') {
             continue
         }
+        if ($trimmed -match '[█▒]' -and $trimmed -match '\d{1,3}%$') {
+            continue
+        }
         ($trimmed -replace '\s+', ' ')
     }
 }
