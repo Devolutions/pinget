@@ -279,6 +279,10 @@ internal static class InstallerDispatch
         if (mode == InstallerMode.Interactive || hasQuietUninstallCommand)
             return command;
 
+        if (command.Contains("winget uninstall", StringComparison.OrdinalIgnoreCase) ||
+            command.Contains("winget.exe uninstall", StringComparison.OrdinalIgnoreCase))
+            return command;
+
         if (command.Contains("/quiet", StringComparison.OrdinalIgnoreCase) ||
             command.Contains("/passive", StringComparison.OrdinalIgnoreCase) ||
             command.Contains("/verysilent", StringComparison.OrdinalIgnoreCase) ||

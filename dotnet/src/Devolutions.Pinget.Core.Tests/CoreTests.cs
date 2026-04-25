@@ -976,6 +976,13 @@ public class RepositoryParityTests
             InstallerDispatch.BuildUninstallCommand("\"C:\\Program Files\\ShareX\\unins000.exe\" /VERYSILENT", silent: true, hasQuietUninstallCommand: false));
         Assert.Equal("\"C:\\Program Files\\ShareX\\unins000.exe\"",
             InstallerDispatch.BuildUninstallCommand("\"C:\\Program Files\\ShareX\\unins000.exe\"", silent: false, hasQuietUninstallCommand: false));
+
+        Assert.Equal(
+            "winget uninstall --product-code JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe",
+            InstallerDispatch.BuildUninstallCommand(
+                "winget uninstall --product-code JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe",
+                silent: true,
+                hasQuietUninstallCommand: false));
     }
 
     [Fact]

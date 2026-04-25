@@ -5939,6 +5939,9 @@ fn build_uninstall_command_with_mode(
     }
 
     let lower = uninstall_cmd.to_ascii_lowercase();
+    if lower.contains("winget uninstall") || lower.contains("winget.exe uninstall") {
+        return uninstall_cmd;
+    }
     if lower.contains("/quiet")
         || lower.contains("/passive")
         || lower.contains("/verysilent")
@@ -7919,6 +7922,14 @@ Installers:
         assert_eq!(
             r#""C:\Program Files\ShareX\unins000.exe""#,
             build_uninstall_command(r#""C:\Program Files\ShareX\unins000.exe""#, false, false)
+        );
+        assert_eq!(
+            "winget uninstall --product-code JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe",
+            build_uninstall_command(
+                "winget uninstall --product-code JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe",
+                true,
+                false,
+            )
         );
     }
 }
