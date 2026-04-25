@@ -571,11 +571,9 @@ function Test-PinVisible {
         [switch]$SystemCli
     )
 
-    $commandArgs = if ($SystemCli) {
-        @("pin", "list", "--accept-source-agreements", "--disable-interactivity")
-    }
-    else {
-        @("pin", "list", $PackageId)
+    $commandArgs = @("pin", "list", "--id", $PackageId, "--exact")
+    if ($SystemCli) {
+        $commandArgs += @("--accept-source-agreements", "--disable-interactivity")
     }
 
     $result = Invoke-Capture -Executable $Executable -Arguments $commandArgs
@@ -590,7 +588,7 @@ function Remove-PinIfPresent {
     )
 
     if (Test-PinVisible -Executable $Executable -PackageId $PackageId -SystemCli:$SystemCli) {
-        $removeArgs = @("pin", "remove", $PackageId)
+        $removeArgs = @("pin", "remove", "--id", $PackageId, "--exact")
         if ($SystemCli) {
             $removeArgs += @("--accept-source-agreements", "--disable-interactivity")
         }

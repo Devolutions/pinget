@@ -66,9 +66,9 @@ internal static class PinStore
 
         int typeInt = pinType switch
         {
-            PinType.Blocking => 1,
-            PinType.Gating => 2,
-            _ => 0
+            PinType.Blocking => 4,
+            PinType.Gating => 3,
+            _ => 2
         };
 
         using var cmd = conn.CreateCommand();
@@ -157,8 +157,8 @@ internal static class PinStore
     {
         return pinTypeValue switch
         {
-            1 => PinType.Blocking,
-            2 => PinType.Gating,
+            4 => PinType.Blocking,
+            3 => PinType.Gating,
             _ => PinType.Pinning
         };
     }

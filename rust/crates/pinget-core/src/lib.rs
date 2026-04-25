@@ -1130,9 +1130,9 @@ impl Repository {
         )?;
         let pin_type_column = resolve_pin_type_column(&conn)?.unwrap_or("type");
         let type_int: i64 = match pin_type {
-            PinType::Pinning => 0,
-            PinType::Blocking => 1,
-            PinType::Gating => 2,
+            PinType::Pinning => 2,
+            PinType::Blocking => 4,
+            PinType::Gating => 3,
         };
         conn.execute(
             &format!(
@@ -5563,8 +5563,8 @@ fn resolve_pin_type_column(conn: &Connection) -> Result<Option<&'static str>> {
 
 fn decode_pin_type(pin_type_int: i64) -> PinType {
     match pin_type_int {
-        1 => PinType::Blocking,
-        2 => PinType::Gating,
+        4 => PinType::Blocking,
+        3 => PinType::Gating,
         _ => PinType::Pinning,
     }
 }
@@ -7749,7 +7749,7 @@ Installers:
                 rusqlite::params!["Contoso.Tool", "winget"],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )?;
-            assert_eq!(stored_pin.0, 2);
+            assert_eq!(stored_pin.0, 3);
             assert_eq!(stored_pin.1, "1.2.*");
 
             Ok(())

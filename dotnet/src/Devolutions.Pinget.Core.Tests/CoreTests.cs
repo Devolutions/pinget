@@ -688,7 +688,7 @@ public class PinStoreTests
 
             using var reader = verifyCmd.ExecuteReader();
             Assert.True(reader.Read());
-            Assert.Equal(2L, reader.GetInt64(0));
+            Assert.Equal(3L, reader.GetInt64(0));
             Assert.Equal("1.2.*", reader.GetString(1));
         }
         finally
