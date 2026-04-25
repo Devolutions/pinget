@@ -1746,9 +1746,12 @@ public class Repository : IDisposable
         string? systemPlatform,
         string? currentOsVersion) =>
         MatchesOptionalCaseInsensitive(installer.InstallerType, requestedType) &&
-        MatchesOptionalCaseInsensitive(installer.Scope, requestedScope) &&
+        InstallerMatchesScope(installer.Scope, requestedScope) &&
         InstallerMatchesPlatform(installer, requestedPlatform, systemPlatform) &&
         InstallerMatchesOsVersion(installer, requestedOsVersion, currentOsVersion);
+
+    private static bool InstallerMatchesScope(string? installerScope, string? requestedScope) =>
+        requestedScope is null || installerScope is null || installerScope.Equals(requestedScope, StringComparison.OrdinalIgnoreCase);
 
     private static bool InstallerMatchesPlatform(Installer installer, string? requestedPlatform, string? systemPlatform)
     {

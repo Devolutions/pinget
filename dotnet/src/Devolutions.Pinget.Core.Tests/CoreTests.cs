@@ -1073,6 +1073,26 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void SelectInstaller_AllowsRequestedScopeWhenInstallerScopeMissing()
+    {
+        var installers = new List<Installer>
+        {
+            new() { Architecture = "x64", InstallerType = "zip", Scope = null, Switches = new InstallerSwitches() },
+            new() { Architecture = "x64", InstallerType = "exe", Scope = "machine", Switches = new InstallerSwitches() },
+        };
+
+        var selected = Repository.SelectInstaller(installers, new PackageQuery
+        {
+            InstallerType = "zip",
+            InstallScope = "user",
+        });
+
+        Assert.NotNull(selected);
+        Assert.Equal("zip", selected!.InstallerType);
+        Assert.Null(selected.Scope);
+    }
+
+    [Fact]
     public void CreateRepairListQuery_IncludesInstalledSelectors()
     {
         var request = new RepairRequest
