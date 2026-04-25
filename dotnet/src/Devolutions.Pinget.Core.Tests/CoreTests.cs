@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Nodes;
@@ -638,6 +639,57 @@ public class PinStoreTests
 
             PinStore.Reset(appRoot, "msstore");
             Assert.Empty(PinStore.List(appRoot));
+        }
+        finally
+        {
+            PinStore.Reset(appRoot);
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void AddAndList_WorkWithPackagedPinSchema()
+    {
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            var dbPath = SourceStoreManager.PinsDbPath(appRoot);
+            Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+
+            using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+                    CREATE TABLE pin (
+                        package_id TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        type INTEGER NOT NULL,
+                        version TEXT NOT NULL,
+                        PRIMARY KEY (package_id, source_id)
+                    )";
+                cmd.ExecuteNonQuery();
+            }
+
+            PinStore.Add("Test.Package.Unit", "1.2.*", "winget", PinType.Gating, appRoot);
+
+            var pin = Assert.Single(PinStore.List(appRoot));
+            Assert.Equal("Test.Package.Unit", pin.PackageId);
+            Assert.Equal("1.2.*", pin.Version);
+            Assert.Equal("winget", pin.SourceId);
+            Assert.Equal(PinType.Gating, pin.PinType);
+
+            using var verifyConn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+            verifyConn.Open();
+            using var verifyCmd = verifyConn.CreateCommand();
+            verifyCmd.CommandText = "SELECT type, version FROM pin WHERE package_id = @id AND source_id = @src";
+            verifyCmd.Parameters.AddWithValue("@id", "Test.Package.Unit");
+            verifyCmd.Parameters.AddWithValue("@src", "winget");
+
+            using var reader = verifyCmd.ExecuteReader();
+            Assert.True(reader.Read());
+            Assert.Equal(2L, reader.GetInt64(0));
+            Assert.Equal("1.2.*", reader.GetString(1));
         }
         finally
         {

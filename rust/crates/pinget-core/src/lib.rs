@@ -1078,12 +1078,16 @@ impl Repository {
             return Ok(Vec::new());
         }
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let sql = if source_id.is_some() {
-            "SELECT package_id, version, source_id, pin_type FROM pin WHERE source_id = ?1"
-        } else {
-            "SELECT package_id, version, source_id, pin_type FROM pin"
+        let pin_type_column = match resolve_pin_type_column(&conn)? {
+            Some(column) => column,
+            None => return Ok(Vec::new()),
         };
-        let mut stmt = conn.prepare(sql)?;
+        let sql = if source_id.is_some() {
+            format!("SELECT package_id, version, source_id, {pin_type_column} FROM pin WHERE source_id = ?1")
+        } else {
+            format!("SELECT package_id, version, source_id, {pin_type_column} FROM pin")
+        };
+        let mut stmt = conn.prepare(&sql)?;
         let rows = if let Some(source_id) = source_id {
             stmt.query_map([source_id], |row| {
                 let pin_type_int: i64 = row.get(3)?;
@@ -1091,11 +1095,7 @@ impl Repository {
                     package_id: row.get(0)?,
                     version: row.get(1)?,
                     source_id: row.get(2)?,
-                    pin_type: match pin_type_int {
-                        1 => PinType::Blocking,
-                        2 => PinType::Gating,
-                        _ => PinType::Pinning,
-                    },
+                    pin_type: decode_pin_type(pin_type_int),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -1107,11 +1107,7 @@ impl Repository {
                     package_id: row.get(0)?,
                     version: row.get(1)?,
                     source_id: row.get(2)?,
-                    pin_type: match pin_type_int {
-                        1 => PinType::Blocking,
-                        2 => PinType::Gating,
-                        _ => PinType::Pinning,
-                    },
+                    pin_type: decode_pin_type(pin_type_int),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -1128,17 +1124,20 @@ impl Repository {
                 package_id TEXT NOT NULL,
                 version TEXT NOT NULL DEFAULT '*',
                 source_id TEXT NOT NULL DEFAULT '',
-                pin_type INTEGER NOT NULL DEFAULT 0,
+                type INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (package_id, source_id)
             )",
         )?;
+        let pin_type_column = resolve_pin_type_column(&conn)?.unwrap_or("type");
         let type_int: i64 = match pin_type {
             PinType::Pinning => 0,
             PinType::Blocking => 1,
             PinType::Gating => 2,
         };
         conn.execute(
-            "INSERT OR REPLACE INTO pin (package_id, version, source_id, pin_type) VALUES (?1, ?2, ?3, ?4)",
+            &format!(
+                "INSERT OR REPLACE INTO pin (package_id, version, source_id, {pin_type_column}) VALUES (?1, ?2, ?3, ?4)"
+            ),
             rusqlite::params![package_id, version, source_id, type_int],
         )?;
         Ok(())
@@ -5539,6 +5538,37 @@ fn pins_db_path(app_root: &Path) -> PathBuf {
     }
 }
 
+fn resolve_pin_type_column(conn: &Connection) -> Result<Option<&'static str>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(pin)")?;
+    let mut has_current_column = false;
+    let mut has_legacy_column = false;
+
+    let column_names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column_name in column_names {
+        match column_name?.as_str() {
+            "type" => has_current_column = true,
+            "pin_type" => has_legacy_column = true,
+            _ => {}
+        }
+    }
+
+    Ok(if has_current_column {
+        Some("type")
+    } else if has_legacy_column {
+        Some("pin_type")
+    } else {
+        None
+    })
+}
+
+fn decode_pin_type(pin_type_int: i64) -> PinType {
+    match pin_type_int {
+        1 => PinType::Blocking,
+        2 => PinType::Gating,
+        _ => PinType::Pinning,
+    }
+}
+
 #[cfg(windows)]
 fn dispatch_installer(
     installer_path: &Path,
@@ -7680,6 +7710,53 @@ Installers:
 
         let _ = fs::remove_dir_all(&app_root);
         result.expect("pin round trip");
+    }
+
+    #[test]
+    fn pin_operations_work_with_packaged_pin_schema() {
+        let app_root = temp_app_root("pins_packaged_schema");
+        let result = (|| -> Result<()> {
+            let db_path = pins_db_path(&app_root);
+            if let Some(parent) = db_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let conn = Connection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE pin (
+                    package_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    type INTEGER NOT NULL,
+                    version TEXT NOT NULL,
+                    PRIMARY KEY (package_id, source_id)
+                )",
+            )?;
+            drop(conn);
+
+            let repository = Repository::open_with_options(RepositoryOptions::new(app_root.clone()))?;
+            repository.add_pin("Contoso.Tool", "1.2.*", "winget", PinType::Gating)?;
+
+            let pins = repository.list_pins(None)?;
+            assert_eq!(pins.len(), 1);
+            assert_eq!(pins[0].package_id, "Contoso.Tool");
+            assert_eq!(pins[0].version, "1.2.*");
+            assert_eq!(pins[0].source_id, "winget");
+            assert_eq!(pins[0].pin_type, PinType::Gating);
+
+            let conn = Connection::open(&db_path)?;
+            let stored_pin = conn.query_row(
+                "SELECT type, version FROM pin WHERE package_id = ?1 AND source_id = ?2",
+                rusqlite::params!["Contoso.Tool", "winget"],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            assert_eq!(stored_pin.0, 2);
+            assert_eq!(stored_pin.1, "1.2.*");
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&app_root);
+        result.expect("packaged pin schema round trip");
     }
 
     #[test]

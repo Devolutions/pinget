@@ -4,6 +4,9 @@ namespace Devolutions.Pinget.Core;
 
 internal static class PinStore
 {
+    private const string CurrentPinTypeColumn = "type";
+    private const string LegacyPinTypeColumn = "pin_type";
+
     public static List<PinRecord> List(string? appRoot = null, string? sourceId = null)
     {
         var dbPath = SourceStoreManager.PinsDbPath(appRoot);
@@ -12,14 +15,17 @@ internal static class PinStore
         using var conn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
         conn.Open();
 
+        var pinTypeColumn = ResolvePinTypeColumn(conn);
+        if (pinTypeColumn is null) return [];
+
         using var cmd = conn.CreateCommand();
         if (string.IsNullOrWhiteSpace(sourceId))
         {
-            cmd.CommandText = "SELECT package_id, version, source_id, pin_type FROM pin";
+            cmd.CommandText = $"SELECT package_id, version, source_id, {pinTypeColumn} FROM pin";
         }
         else
         {
-            cmd.CommandText = "SELECT package_id, version, source_id, pin_type FROM pin WHERE source_id = @src";
+            cmd.CommandText = $"SELECT package_id, version, source_id, {pinTypeColumn} FROM pin WHERE source_id = @src";
             cmd.Parameters.AddWithValue("@src", sourceId);
         }
 
@@ -32,12 +38,7 @@ internal static class PinStore
                 PackageId = reader.GetString(0),
                 Version = reader.GetString(1),
                 SourceId = reader.GetString(2),
-                PinType = reader.GetInt64(3) switch
-                {
-                    1 => PinType.Blocking,
-                    2 => PinType.Gating,
-                    _ => PinType.Pinning
-                }
+                PinType = ToPinType(reader.GetInt64(3))
             });
         }
         return pins;
@@ -56,10 +57,12 @@ internal static class PinStore
                 package_id TEXT NOT NULL,
                 version TEXT NOT NULL DEFAULT '*',
                 source_id TEXT NOT NULL DEFAULT '',
-                pin_type INTEGER NOT NULL DEFAULT 0,
+                type INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (package_id, source_id)
             )";
         createCmd.ExecuteNonQuery();
+
+        var pinTypeColumn = ResolvePinTypeColumn(conn) ?? CurrentPinTypeColumn;
 
         int typeInt = pinType switch
         {
@@ -69,7 +72,7 @@ internal static class PinStore
         };
 
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "INSERT OR REPLACE INTO pin (package_id, version, source_id, pin_type) VALUES (@id, @ver, @src, @type)";
+        cmd.CommandText = $"INSERT OR REPLACE INTO pin (package_id, version, source_id, {pinTypeColumn}) VALUES (@id, @ver, @src, @type)";
         cmd.Parameters.AddWithValue("@id", packageId);
         cmd.Parameters.AddWithValue("@ver", version);
         cmd.Parameters.AddWithValue("@src", sourceId);
@@ -120,5 +123,43 @@ internal static class PinStore
                 cmd.ExecuteNonQuery();
             }
         }
+    }
+
+    private static string? ResolvePinTypeColumn(SqliteConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "PRAGMA table_info(pin)";
+
+        bool hasCurrentColumn = false;
+        bool hasLegacyColumn = false;
+
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var columnName = reader.GetString(1);
+            if (string.Equals(columnName, CurrentPinTypeColumn, StringComparison.OrdinalIgnoreCase))
+            {
+                hasCurrentColumn = true;
+            }
+            else if (string.Equals(columnName, LegacyPinTypeColumn, StringComparison.OrdinalIgnoreCase))
+            {
+                hasLegacyColumn = true;
+            }
+        }
+
+        if (hasCurrentColumn) return CurrentPinTypeColumn;
+        if (hasLegacyColumn) return LegacyPinTypeColumn;
+
+        return null;
+    }
+
+    private static PinType ToPinType(long pinTypeValue)
+    {
+        return pinTypeValue switch
+        {
+            1 => PinType.Blocking,
+            2 => PinType.Gating,
+            _ => PinType.Pinning
+        };
     }
 }
