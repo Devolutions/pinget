@@ -370,7 +370,8 @@ function Get-PackageDisplayName {
 
     $showArgs = @("show", "--id", $PackageId, "--exact", "--source", "winget", "--accept-source-agreements", "--disable-interactivity")
     $showResult = Invoke-Capture -Executable $SystemWinget -Arguments $showArgs
-    foreach ($line in $showResult.Lines) {
+    $normalizedLines = $showResult.Output -split "`r|`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    foreach ($line in $normalizedLines) {
         if ($line -match '^Found\s+(.+)\s+\[(.+)\]$' -and $matches[2] -eq $PackageId) {
             $script:PackageNameCache[$PackageId] = $matches[1]
             return $matches[1]
@@ -609,7 +610,7 @@ $settingsBackup = if (Test-Path -Path $settingsPath) { Get-Content -Path $settin
 $packageId = $null
 $packageName = $null
 $packageInstalled = $false
-$pinPackageId = "Microsoft.PowerToys"
+$pinPackageId = $null
 $sourceName = "smoke-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $sourceArgument = "https://example.com/pinget-smoke/" + [Guid]::NewGuid().ToString("N")
 $sourceCliType = "rest"
@@ -752,33 +753,34 @@ try {
     Assert-True -Condition (Test-PackageVisible -Executable $SystemWinget -PackageId $packageId -SystemCli) -Message "winget did not detect the package installed by the PowerShell module."
     Assert-True -Condition (Test-PackageVisible -Executable $RustWinget -PackageId $packageId) -Message "Rust pinget did not detect the package installed by the PowerShell module."
     Assert-True -Condition (Test-PackageVisible -Executable $DotnetWinget -PackageId $packageId) -Message "C# pinget did not detect the package installed by the PowerShell module."
-
-    Uninstall-WithWinget -PackageId $packageId
-    $packageInstalled = $false
-    Assert-True -Condition (-not (Test-PackageVisible -Executable $RustWinget -PackageId $packageId)) -Message "Rust pinget still detected the package after winget uninstall."
-    Assert-True -Condition (-not (Test-PackageVisible -Executable $DotnetWinget -PackageId $packageId)) -Message "C# pinget still detected the package after winget uninstall."
-    Assert-True -Condition (-not (Test-PackageVisibleInPowerShell -PackageId $packageId -PackageName $packageName)) -Message "PowerShell module still detected the package after winget uninstall."
+    $pinPackageId = $packageId
 
     Write-Section "Pin coherence"
     Remove-PinIfPresent -Executable $RustWinget -PackageId $pinPackageId
     Remove-PinIfPresent -Executable $DotnetWinget -PackageId $pinPackageId
     Remove-PinIfPresent -Executable $SystemWinget -PackageId $pinPackageId -SystemCli
 
-    Invoke-Capture -Executable $SystemWinget -Arguments @("pin", "add", $pinPackageId, "--version", "0.70.0", "--accept-source-agreements", "--disable-interactivity") | Out-Null
+    Invoke-Capture -Executable $SystemWinget -Arguments @("pin", "add", "--id", $pinPackageId, "--exact", "--accept-source-agreements", "--disable-interactivity") | Out-Null
     Assert-True -Condition (Test-PinVisible -Executable $RustWinget -PackageId $pinPackageId) -Message "Rust pinget did not reflect the pin created by winget."
     Assert-True -Condition (Test-PinVisible -Executable $DotnetWinget -PackageId $pinPackageId) -Message "C# pinget did not reflect the pin created by winget."
 
-    Invoke-Capture -Executable $RustWinget -Arguments @("pin", "remove", $pinPackageId) | Out-Null
+    Invoke-Capture -Executable $RustWinget -Arguments @("pin", "remove", "--id", $pinPackageId, "--exact") | Out-Null
     Assert-True -Condition (-not (Test-PinVisible -Executable $SystemWinget -PackageId $pinPackageId -SystemCli)) -Message "winget still reported the pin after Rust pinget removed it."
     Assert-True -Condition (-not (Test-PinVisible -Executable $DotnetWinget -PackageId $pinPackageId)) -Message "C# pinget still reported the pin after Rust pinget removed it."
 
-    Invoke-Capture -Executable $DotnetWinget -Arguments @("pin", "add", $pinPackageId, "--version", "0.70.0") | Out-Null
+    Invoke-Capture -Executable $DotnetWinget -Arguments @("pin", "add", "--id", $pinPackageId, "--exact", "--installed") | Out-Null
     Assert-True -Condition (Test-PinVisible -Executable $RustWinget -PackageId $pinPackageId) -Message "Rust pinget did not reflect the pin created by the C# CLI."
     Assert-True -Condition (Test-PinVisible -Executable $SystemWinget -PackageId $pinPackageId -SystemCli) -Message "winget did not reflect the pin created by the C# CLI."
 
-    Invoke-Capture -Executable $SystemWinget -Arguments @("pin", "remove", $pinPackageId, "--accept-source-agreements", "--disable-interactivity") | Out-Null
+    Invoke-Capture -Executable $SystemWinget -Arguments @("pin", "remove", "--id", $pinPackageId, "--exact", "--accept-source-agreements", "--disable-interactivity") | Out-Null
     Assert-True -Condition (-not (Test-PinVisible -Executable $RustWinget -PackageId $pinPackageId)) -Message "Rust pinget still reported the pin after winget removed it."
     Assert-True -Condition (-not (Test-PinVisible -Executable $DotnetWinget -PackageId $pinPackageId)) -Message "C# pinget still reported the pin after winget removed it."
+
+    Uninstall-WithWinget -PackageId $packageId
+    $packageInstalled = $false
+    Assert-True -Condition (-not (Test-PackageVisible -Executable $RustWinget -PackageId $packageId)) -Message "Rust pinget still detected the package after winget uninstall."
+    Assert-True -Condition (-not (Test-PackageVisible -Executable $DotnetWinget -PackageId $packageId)) -Message "C# pinget still detected the package after winget uninstall."
+    Assert-True -Condition (-not (Test-PackageVisibleInPowerShell -PackageId $packageId -PackageName $packageName)) -Message "PowerShell module still detected the package after winget uninstall."
 
     Write-Section "Smoke tests completed"
     Write-Host "Windows coherence smoke tests passed for winget, Rust, C# CLI, and PowerShell."

@@ -44,6 +44,7 @@ const REPAIR_REINSTALL_WARNING: &str =
     "Pinget repair currently re-runs the package install flow for the selected package.";
 const UNINSTALL_UNSUPPORTED_WARNING: &str =
     "Uninstalling packages is not supported on this platform; no changes were made.";
+const WINGET_PACKAGE_NOT_FOUND_EXIT_CODE: i32 = -1978335212;
 const SUPPORTED_ADMIN_SETTINGS: &[&str] = &[
     "LocalManifestFiles",
     "BypassCertificatePinningForMicrosoftStore",
@@ -1484,10 +1485,7 @@ impl Repository {
             package_id: installed.id.clone(),
             version: installed.installed_version.clone(),
             installer_path: PathBuf::new(),
-            installer_type: installed
-                .installer_category
-                .clone()
-                .unwrap_or_else(|| "uninstall".to_owned()),
+            installer_type: "uninstall".to_owned(),
             exit_code,
             success: exit_code == 0,
             no_op: false,
@@ -5843,6 +5841,12 @@ fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Resul
                         }
                         .context("No uninstall command found in registry")?;
 
+                        if is_winget_uninstall_command(&uninstall_cmd)
+                            && let Some(exit_code) = try_uninstall_via_winget(installed, request)?
+                        {
+                            return Ok(Some(exit_code));
+                        }
+
                         let mut cmd = Command::new("cmd");
                         let log_path = request.log_path.as_ref().map(|value| value.display().to_string());
                         cmd.arg("/C").arg(build_uninstall_command_with_mode(
@@ -5939,7 +5943,7 @@ fn build_uninstall_command_with_mode(
     }
 
     let lower = uninstall_cmd.to_ascii_lowercase();
-    if lower.contains("winget uninstall") || lower.contains("winget.exe uninstall") {
+    if is_winget_uninstall_command_lower(&lower) {
         return uninstall_cmd;
     }
     if lower.contains("/quiet")
@@ -5952,6 +5956,85 @@ fn build_uninstall_command_with_mode(
     }
 
     format!("{uninstall_cmd} /S")
+}
+
+#[cfg(windows)]
+fn try_uninstall_via_winget(installed: &ListMatch, request: &UninstallRequest) -> Result<Option<i32>> {
+    let Some(args) = build_winget_uninstall_arguments(installed, request) else {
+        return Ok(None);
+    };
+
+    let exit_code = run_winget_uninstall(&args)?;
+    if exit_code == WINGET_PACKAGE_NOT_FOUND_EXIT_CODE && request.query.install_scope.is_some() {
+        let Some(args_without_scope) = build_winget_uninstall_arguments_with_scope(installed, request, false) else {
+            return Ok(Some(exit_code));
+        };
+
+        return Ok(Some(run_winget_uninstall(&args_without_scope)?));
+    }
+
+    Ok(Some(exit_code))
+}
+
+#[cfg(windows)]
+fn run_winget_uninstall(args: &[String]) -> Result<i32> {
+    use std::process::Command;
+
+    let status = Command::new("winget")
+        .args(args)
+        .status()
+        .context("failed to run delegated winget uninstall")?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+#[cfg(windows)]
+fn build_winget_uninstall_arguments(installed: &ListMatch, request: &UninstallRequest) -> Option<Vec<String>> {
+    build_winget_uninstall_arguments_with_scope(installed, request, true)
+}
+
+#[cfg(windows)]
+fn build_winget_uninstall_arguments_with_scope(
+    installed: &ListMatch,
+    request: &UninstallRequest,
+    include_scope: bool,
+) -> Option<Vec<String>> {
+    if installed.id.eq_ignore_ascii_case(&installed.local_id) {
+        return None;
+    }
+
+    let mut args = vec![
+        "uninstall".to_owned(),
+        "--id".to_owned(),
+        installed.id.clone(),
+        "--exact".to_owned(),
+        "--disable-interactivity".to_owned(),
+    ];
+
+    if let Some(source_name) = installed.source_name.as_deref().filter(|value| !value.is_empty()) {
+        args.push("--source".to_owned());
+        args.push(source_name.to_owned());
+    }
+
+    if include_scope
+        && let Some(scope) = request.query.install_scope.as_deref().filter(|value| !value.is_empty())
+    {
+        args.push("--scope".to_owned());
+        args.push(scope.to_owned());
+    }
+
+    if request.mode == InstallerMode::Silent {
+        args.push("--silent".to_owned());
+    }
+
+    Some(args)
+}
+
+fn is_winget_uninstall_command(command: &str) -> bool {
+    is_winget_uninstall_command_lower(&command.to_ascii_lowercase())
+}
+
+fn is_winget_uninstall_command_lower(command: &str) -> bool {
+    command.contains("winget uninstall") || command.contains("winget.exe uninstall")
 }
 
 #[cfg(windows)]
@@ -7930,6 +8013,62 @@ Installers:
                 true,
                 false,
             )
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn build_winget_uninstall_arguments_prefers_correlated_identity() {
+        let installed = ListMatch {
+            name: "lazygit".to_owned(),
+            id: "JesseDuffield.lazygit".to_owned(),
+            local_id: r"ARP\User\X64\JesseDuffield.lazygit".to_owned(),
+            installed_version: "0.61.1".to_owned(),
+            available_version: None,
+            source_name: Some("winget".to_owned()),
+            publisher: Some("Jesse Duffield".to_owned()),
+            scope: Some("User".to_owned()),
+            installer_category: Some("exe".to_owned()),
+            install_location: Some(r"C:\Users\test\AppData\Local\Microsoft\WinGet\Packages\JesseDuffield.lazygit".to_owned()),
+            package_family_names: Vec::new(),
+            product_codes: vec!["JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned()],
+            upgrade_codes: Vec::new(),
+        };
+        let mut request = UninstallRequest::new(PackageQuery {
+            id: Some("JesseDuffield.lazygit".to_owned()),
+            install_scope: Some("user".to_owned()),
+            ..PackageQuery::default()
+        });
+        request.mode = InstallerMode::Silent;
+
+        assert_eq!(
+            Some(vec![
+                "uninstall".to_owned(),
+                "--id".to_owned(),
+                "JesseDuffield.lazygit".to_owned(),
+                "--exact".to_owned(),
+                "--disable-interactivity".to_owned(),
+                "--source".to_owned(),
+                "winget".to_owned(),
+                "--scope".to_owned(),
+                "user".to_owned(),
+                "--silent".to_owned(),
+            ]),
+            build_winget_uninstall_arguments(&installed, &request)
+        );
+
+        assert_eq!(
+            Some(vec![
+                "uninstall".to_owned(),
+                "--id".to_owned(),
+                "JesseDuffield.lazygit".to_owned(),
+                "--exact".to_owned(),
+                "--disable-interactivity".to_owned(),
+                "--source".to_owned(),
+                "winget".to_owned(),
+                "--silent".to_owned(),
+            ]),
+            build_winget_uninstall_arguments_with_scope(&installed, &request, false)
         );
     }
 }
