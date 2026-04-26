@@ -33,7 +33,9 @@ const DEFAULT_MAX_RESULTS: usize = 50;
 const LIST_LOOKUP_MAX_RESULTS: usize = 500;
 const PREINDEXED_CANDIDATES: &[&str] = &["source2.msix", "source.msix"];
 const DEFAULT_USER_AGENT: &str = "pinget-rs/0.1";
+#[cfg(windows)]
 const PACKAGED_FAMILY_NAME: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
+#[cfg(windows)]
 const PACKAGED_NAME: &str = "Microsoft.DesktopAppInstaller";
 const INSTALLED_STATE_UNSUPPORTED_WARNING: &str =
     "Installed package discovery is not supported on this platform; returning no installed packages.";
@@ -44,6 +46,7 @@ const REPAIR_REINSTALL_WARNING: &str =
     "Pinget repair currently re-runs the package install flow for the selected package.";
 const UNINSTALL_UNSUPPORTED_WARNING: &str =
     "Uninstalling packages is not supported on this platform; no changes were made.";
+#[cfg(windows)]
 const WINGET_PACKAGE_NOT_FOUND_EXIT_CODE: i32 = -1978335212;
 const SUPPORTED_ADMIN_SETTINGS: &[&str] = &[
     "LocalManifestFiles",
@@ -2975,10 +2978,10 @@ fn temp_cache_path(app_root: &Path, bucket: &str, identifier: &str) -> PathBuf {
 }
 
 fn load_store(app_root: &Path) -> Result<SourceStore> {
-    if uses_packaged_layout(app_root) {
-        if let Some(store) = load_packaged_store(app_root)? {
-            return Ok(store);
-        }
+    if uses_packaged_layout(app_root)
+        && let Some(store) = load_packaged_store(app_root)?
+    {
+        return Ok(store);
     }
 
     let path = store_path(app_root);
@@ -3074,10 +3077,10 @@ fn parse_packaged_source_store(user_sources_yaml: Option<&str>, metadata_yaml: O
             source.last_update = Some(last_update);
         }
 
-        if let Some(source_version) = entry.get("SourceVersion").and_then(|value| value.clone()) {
-            if !source_version.is_empty() {
-                source.source_version = Some(source_version);
-            }
+        if let Some(source_version) = entry.get("SourceVersion").and_then(|value| value.clone())
+            && !source_version.is_empty()
+        {
+            source.source_version = Some(source_version);
         }
     }
 
@@ -6065,10 +6068,12 @@ fn build_winget_uninstall_arguments_with_scope(
     Some(args)
 }
 
+#[cfg(windows)]
 fn is_winget_uninstall_command(command: &str) -> bool {
     is_winget_uninstall_command_lower(&command.to_ascii_lowercase())
 }
 
+#[cfg(windows)]
 fn is_winget_uninstall_command_lower(command: &str) -> bool {
     command.contains("winget uninstall") || command.contains("winget.exe uninstall")
 }
