@@ -17,15 +17,15 @@ use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStringExt;
 #[cfg(windows)]
-use winreg::{RegKey, enums::*};
-#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
-#[cfg(windows)]
-use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 #[cfg(windows)]
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 #[cfg(windows)]
+use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+#[cfg(windows)]
+use winreg::{RegKey, enums::*};
 use zip::ZipArchive;
 
 const DEFAULT_MARKET: &str = "US";
@@ -2150,8 +2150,8 @@ impl Repository {
         expected_hash: Option<&str>,
     ) -> Result<CachedBytes> {
         let normalized_relative = relative_path.replace('\\', "/");
-        let cache_path = temp_cache_path(&self.app_root, bucket, &source.identifier)
-            .join(normalized_relative.replace('/', "\\"));
+        let cache_path =
+            temp_cache_path(&self.app_root, bucket, &source.identifier).join(normalized_relative.replace('/', "\\"));
 
         if cache_path.exists() {
             let cached = fs::read(&cache_path).context("failed to read cached source file")?;
@@ -3044,7 +3044,10 @@ fn parse_packaged_source_store(user_sources_yaml: Option<&str>, metadata_yaml: O
             continue;
         };
 
-        if let Some(existing) = sources.iter_mut().find(|source| source.name.eq_ignore_ascii_case(&name)) {
+        if let Some(existing) = sources
+            .iter_mut()
+            .find(|source| source.name.eq_ignore_ascii_case(&name))
+        {
             *existing = mapped;
         } else {
             sources.push(mapped);
@@ -3056,7 +3059,10 @@ fn parse_packaged_source_store(user_sources_yaml: Option<&str>, metadata_yaml: O
             continue;
         };
 
-        let Some(source) = sources.iter_mut().find(|source| source.name.eq_ignore_ascii_case(&name)) else {
+        let Some(source) = sources
+            .iter_mut()
+            .find(|source| source.name.eq_ignore_ascii_case(&name))
+        else {
             continue;
         };
 
@@ -3120,7 +3126,10 @@ fn add_packaged_yaml_key_value(entry: &mut BTreeMap<String, Option<String>>, lin
         return;
     };
 
-    entry.insert(key.trim().to_owned(), Some(unquote_yaml_scalar(value.trim()).to_owned()));
+    entry.insert(
+        key.trim().to_owned(),
+        Some(unquote_yaml_scalar(value.trim()).to_owned()),
+    );
 }
 
 fn unquote_yaml_scalar(value: &str) -> &str {
@@ -3193,7 +3202,9 @@ fn parse_packaged_datetime(value: &str) -> Option<DateTime<Utc>> {
         return DateTime::<Utc>::from_timestamp(unix_seconds, 0);
     }
 
-    DateTime::parse_from_rfc3339(value).ok().map(|value| value.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn render_packaged_sources_yaml(store: &SourceStore) -> String {
@@ -3205,7 +3216,11 @@ fn render_packaged_sources_yaml(store: &SourceStore) -> String {
         lines.push(format!("    Data: {}", yaml_scalar(&source.identifier)));
         lines.push(format!(
             "    TrustLevel: {}",
-            if source.trust_level.eq_ignore_ascii_case("Trusted") { 1 } else { 0 }
+            if source.trust_level.eq_ignore_ascii_case("Trusted") {
+                1
+            } else {
+                0
+            }
         ));
         lines.push(format!("    Explicit: {}", source.explicit));
         lines.push(format!("    Priority: {}", source.priority));
@@ -3311,14 +3326,7 @@ fn current_user_sid() -> Result<String> {
         let mut length = 0;
         GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut length);
         let mut buffer = vec![0u8; length as usize];
-        if GetTokenInformation(
-            token,
-            TokenUser,
-            buffer.as_mut_ptr() as *mut _,
-            length,
-            &mut length,
-        ) == 0
-        {
+        if GetTokenInformation(token, TokenUser, buffer.as_mut_ptr() as *mut _, length, &mut length) == 0 {
             CloseHandle(token);
             bail!("failed to get current user token information")
         }
@@ -6045,9 +6053,7 @@ fn build_winget_uninstall_arguments_with_scope(
         args.push(source_name.to_owned());
     }
 
-    if include_scope
-        && let Some(scope) = request.query.install_scope.as_deref().filter(|value| !value.is_empty())
-    {
+    if include_scope && let Some(scope) = request.query.install_scope.as_deref().filter(|value| !value.is_empty()) {
         args.push("--scope".to_owned());
         args.push(scope.to_owned());
     }
@@ -6242,7 +6248,10 @@ mod tests {
             packaged_file_cache_root(&app_root)
                 .display()
                 .to_string()
-                .ends_with(&format!(r"Packages\{}\LocalState\Microsoft\Windows Package Manager", PACKAGED_FAMILY_NAME))
+                .ends_with(&format!(
+                    r"Packages\{}\LocalState\Microsoft\Windows Package Manager",
+                    PACKAGED_FAMILY_NAME
+                ))
         );
     }
 
@@ -8106,7 +8115,9 @@ Installers:
             publisher: Some("Jesse Duffield".to_owned()),
             scope: Some("User".to_owned()),
             installer_category: Some("exe".to_owned()),
-            install_location: Some(r"C:\Users\test\AppData\Local\Microsoft\WinGet\Packages\JesseDuffield.lazygit".to_owned()),
+            install_location: Some(
+                r"C:\Users\test\AppData\Local\Microsoft\WinGet\Packages\JesseDuffield.lazygit".to_owned(),
+            ),
             package_family_names: Vec::new(),
             product_codes: vec!["JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned()],
             upgrade_codes: Vec::new(),
