@@ -6,45 +6,48 @@ param(
     [switch]$NoDotnet,
     [switch]$NoRust,
     [switch]$NoSystem,
-    [switch]$UpdateSources
+    [switch]$UpdateSources,
+    [switch]$FailOnDiff
 )
+
+$script:HadDifference = $false
 
 $defaultCases = @(
     @{
         Name = "search-powertoys"
-        Args = @("search", "PowerToys", "--count", "5")
+        Args = @("search", "PowerToys", "--count", "5", "--source", "winget")
     },
     @{
         Name = "search-tag-terminal"
-        Args = @("search", "--tag", "terminal", "--count", "5")
+        Args = @("search", "--tag", "terminal", "--count", "5", "--source", "winget")
     },
     @{
         Name = "search-exact-id"
-        Args = @("search", "--id", "Microsoft.PowerToys", "--exact")
+        Args = @("search", "--id", "Microsoft.PowerToys", "--exact", "--source", "winget")
     },
     @{
         Name = "search-by-name"
-        Args = @("search", "--name", "Remote Desktop Manager", "--count", "3")
+        Args = @("search", "--name", "Remote Desktop Manager", "--count", "3", "--source", "winget")
     },
     @{
         Name = "search-versions"
-        Args = @("search", "Microsoft.PowerToys", "--versions")
+        Args = @("search", "Microsoft.PowerToys", "--versions", "--source", "winget")
     },
     @{
         Name = "show-powertoys"
-        Args = @("show", "Microsoft.PowerToys", "--installer-type", "exe", "--architecture", "x64", "--locale", "en-US")
+        Args = @("show", "Microsoft.PowerToys", "--installer-type", "exe", "--architecture", "x64", "--locale", "en-US", "--source", "winget")
     },
     @{
         Name = "show-rdm"
-        Args = @("show", "Devolutions.RemoteDesktopManager")
+        Args = @("show", "Devolutions.RemoteDesktopManager", "--source", "winget")
     },
     @{
         Name = "show-versions"
-        Args = @("show", "Microsoft.PowerToys", "--versions")
+        Args = @("show", "Microsoft.PowerToys", "--versions", "--source", "winget")
     },
     @{
         Name = "show-exact-version"
-        Args = @("show", "Microsoft.PowerToys", "--version", "0.87.1")
+        Args = @("show", "Microsoft.PowerToys", "--version", "0.87.1", "--source", "winget")
     },
     @{
         Name = "list-count"
@@ -126,7 +129,7 @@ function Invoke-WingetCapture {
     [pscustomobject]@{
         ExitCode = $LASTEXITCODE
         RawLines = @($lines)
-        NormalizedLines = @(Normalize-WingetOutput -Lines $lines)
+        NormalizedLines = @(Format-WingetOutput -Lines $lines)
     }
 }
 
@@ -147,7 +150,7 @@ function Invoke-WingetCommand {
     }
 }
 
-function Normalize-WingetOutput {
+function Format-WingetOutput {
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
@@ -168,7 +171,16 @@ function Normalize-WingetOutput {
         if ($trimmed -like 'Failed when searching source*') {
             continue
         }
+        if ($trimmed -like 'warning: Failed when searching source*') {
+            continue
+        }
         if ($trimmed -like 'warning:*REST search request failed*') {
+            continue
+        }
+        if ($trimmed -match '[█▒]' -and $trimmed -match '\d+(?:\.\d+)?\s*(?:KB|MB|GB)\s*/\s*\d+(?:\.\d+)?\s*(?:KB|MB|GB)') {
+            continue
+        }
+        if ($trimmed -match '[█▒]' -and $trimmed -match '\d{1,3}%$') {
             continue
         }
         ($trimmed -replace '\s+', ' ')
@@ -267,6 +279,10 @@ function Write-CaseReport {
     Write-Host ("COMMAND: winget {0}" -f $commandText)
     Write-Host ("STATUS : {0}" -f $(if ($allMatch) { "MATCH" } else { "DIFF" }))
 
+    if (-not $allMatch) {
+        $script:HadDifference = $true
+    }
+
     foreach ($toolName in $results.Keys) {
         $r = $results[$toolName]
         Write-Host ("{0} EXIT: {1}" -f $toolName, $r.ExitCode)
@@ -345,4 +361,8 @@ foreach ($case in $caseSet) {
     } else {
         Write-CaseReport -Case $case -RustResult $rustResult -DotnetResult $dotnetResult -SystemResult $systemResult -CompareMode $compareMode
     }
+}
+
+if ($FailOnDiff -and $script:HadDifference) {
+    throw "One or more parity cases differed."
 }

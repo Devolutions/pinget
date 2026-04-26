@@ -285,6 +285,14 @@ internal static class PreIndexedSource
 
     private static string TempCachePath(string bucket, string sourceIdentifier)
     {
+        if (OperatingSystem.IsWindows())
+        {
+            return Path.Combine(
+                SourceStoreManager.GetPackagedFileCacheRoot(null),
+                bucket,
+                sourceIdentifier);
+        }
+
         var tempDir = Path.GetTempPath();
         return Path.Combine(tempDir, "pinget", bucket, sourceIdentifier);
     }

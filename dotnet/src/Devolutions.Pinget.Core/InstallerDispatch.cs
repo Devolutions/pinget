@@ -16,6 +16,7 @@ internal static class InstallerDispatch
         {
             "msi" or "wix" => RunMsi(installerPath, request, manifest, installer),
             "msix" or "appx" => RunMsix(installerPath),
+            "zip" when ShouldDelegatePortableZipInstall(request, manifest, installer) => InstallPortableWithWinget(request, manifest),
             "zip" => ExtractZip(installerPath),
             _ => RunExe(installerPath, installerType, request, manifest, installer)
         };
@@ -159,6 +160,65 @@ internal static class InstallerDispatch
         return 0;
     }
 
+    internal static bool ShouldDelegatePortableZipInstall(InstallRequest request, Manifest manifest, Installer installer) =>
+        IsPortableZipInstaller(installer) &&
+        !string.IsNullOrWhiteSpace(request.Query.Id ?? manifest.Id);
+
+    internal static bool IsPortableZipInstaller(Installer installer) =>
+        installer.Commands.Count > 0 ||
+        string.Equals(installer.NestedInstallerType, "portable", StringComparison.OrdinalIgnoreCase);
+
+    internal static List<string> BuildWingetPortableInstallArguments(InstallRequest request, Manifest manifest)
+    {
+        var packageId = request.Query.Id ?? manifest.Id;
+        var args = new List<string>
+        {
+            "install",
+            "--id",
+            packageId,
+            "--exact",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        };
+
+        if (!string.IsNullOrWhiteSpace(request.Query.Source))
+        {
+            args.Add("--source");
+            args.Add(request.Query.Source!);
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.Query.Version))
+        {
+            args.Add("--version");
+            args.Add(request.Query.Version!);
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.Query.InstallScope))
+        {
+            args.Add("--scope");
+            args.Add(request.Query.InstallScope!);
+        }
+
+        if (request.AcceptPackageAgreements)
+            args.Add("--accept-package-agreements");
+
+        if (request.Mode == InstallerMode.Silent || request.Mode == InstallerMode.SilentWithProgress)
+            args.Add("--silent");
+
+        return args;
+    }
+
+    private static int InstallPortableWithWinget(InstallRequest request, Manifest manifest)
+    {
+        var psi = new ProcessStartInfo("winget") { UseShellExecute = false };
+        foreach (var arg in BuildWingetPortableInstallArguments(request, manifest))
+            psi.ArgumentList.Add(arg);
+
+        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start winget for portable install");
+        proc.WaitForExit();
+        return proc.ExitCode;
+    }
+
     private static int RunExe(string path, string installerType, InstallRequest request, Manifest manifest, Installer installer)
     {
         var psi = new ProcessStartInfo(path) { UseShellExecute = false };
@@ -277,6 +337,10 @@ internal static class InstallerDispatch
         var command = PopulateTemplate(uninstallCommand, logPath, null);
 
         if (mode == InstallerMode.Interactive || hasQuietUninstallCommand)
+            return command;
+
+        if (command.Contains("winget uninstall", StringComparison.OrdinalIgnoreCase) ||
+            command.Contains("winget.exe uninstall", StringComparison.OrdinalIgnoreCase))
             return command;
 
         if (command.Contains("/quiet", StringComparison.OrdinalIgnoreCase) ||

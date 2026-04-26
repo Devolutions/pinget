@@ -15,6 +15,16 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
 #[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+#[cfg(windows)]
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+#[cfg(windows)]
+use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+#[cfg(windows)]
 use winreg::{RegKey, enums::*};
 use zip::ZipArchive;
 
@@ -23,6 +33,10 @@ const DEFAULT_MAX_RESULTS: usize = 50;
 const LIST_LOOKUP_MAX_RESULTS: usize = 500;
 const PREINDEXED_CANDIDATES: &[&str] = &["source2.msix", "source.msix"];
 const DEFAULT_USER_AGENT: &str = "pinget-rs/0.1";
+#[cfg(windows)]
+const PACKAGED_FAMILY_NAME: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
+#[cfg(windows)]
+const PACKAGED_NAME: &str = "Microsoft.DesktopAppInstaller";
 const INSTALLED_STATE_UNSUPPORTED_WARNING: &str =
     "Installed package discovery is not supported on this platform; returning no installed packages.";
 const INSTALL_UNSUPPORTED_WARNING: &str =
@@ -32,6 +46,8 @@ const REPAIR_REINSTALL_WARNING: &str =
     "Pinget repair currently re-runs the package install flow for the selected package.";
 const UNINSTALL_UNSUPPORTED_WARNING: &str =
     "Uninstalling packages is not supported on this platform; no changes were made.";
+#[cfg(windows)]
+const WINGET_PACKAGE_NOT_FOUND_EXIT_CODE: i32 = -1978335212;
 const SUPPORTED_ADMIN_SETTINGS: &[&str] = &[
     "LocalManifestFiles",
     "BypassCertificatePinningForMicrosoftStore",
@@ -1065,12 +1081,16 @@ impl Repository {
             return Ok(Vec::new());
         }
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let sql = if source_id.is_some() {
-            "SELECT package_id, version, source_id, pin_type FROM pin WHERE source_id = ?1"
-        } else {
-            "SELECT package_id, version, source_id, pin_type FROM pin"
+        let pin_type_column = match resolve_pin_type_column(&conn)? {
+            Some(column) => column,
+            None => return Ok(Vec::new()),
         };
-        let mut stmt = conn.prepare(sql)?;
+        let sql = if source_id.is_some() {
+            format!("SELECT package_id, version, source_id, {pin_type_column} FROM pin WHERE source_id = ?1")
+        } else {
+            format!("SELECT package_id, version, source_id, {pin_type_column} FROM pin")
+        };
+        let mut stmt = conn.prepare(&sql)?;
         let rows = if let Some(source_id) = source_id {
             stmt.query_map([source_id], |row| {
                 let pin_type_int: i64 = row.get(3)?;
@@ -1078,11 +1098,7 @@ impl Repository {
                     package_id: row.get(0)?,
                     version: row.get(1)?,
                     source_id: row.get(2)?,
-                    pin_type: match pin_type_int {
-                        1 => PinType::Blocking,
-                        2 => PinType::Gating,
-                        _ => PinType::Pinning,
-                    },
+                    pin_type: decode_pin_type(pin_type_int),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -1094,11 +1110,7 @@ impl Repository {
                     package_id: row.get(0)?,
                     version: row.get(1)?,
                     source_id: row.get(2)?,
-                    pin_type: match pin_type_int {
-                        1 => PinType::Blocking,
-                        2 => PinType::Gating,
-                        _ => PinType::Pinning,
-                    },
+                    pin_type: decode_pin_type(pin_type_int),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -1115,17 +1127,20 @@ impl Repository {
                 package_id TEXT NOT NULL,
                 version TEXT NOT NULL DEFAULT '*',
                 source_id TEXT NOT NULL DEFAULT '',
-                pin_type INTEGER NOT NULL DEFAULT 0,
+                type INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (package_id, source_id)
             )",
         )?;
+        let pin_type_column = resolve_pin_type_column(&conn)?.unwrap_or("type");
         let type_int: i64 = match pin_type {
-            PinType::Pinning => 0,
-            PinType::Blocking => 1,
-            PinType::Gating => 2,
+            PinType::Pinning => 2,
+            PinType::Blocking => 4,
+            PinType::Gating => 3,
         };
         conn.execute(
-            "INSERT OR REPLACE INTO pin (package_id, version, source_id, pin_type) VALUES (?1, ?2, ?3, ?4)",
+            &format!(
+                "INSERT OR REPLACE INTO pin (package_id, version, source_id, {pin_type_column}) VALUES (?1, ?2, ?3, ?4)"
+            ),
             rusqlite::params![package_id, version, source_id, type_int],
         )?;
         Ok(())
@@ -1472,10 +1487,7 @@ impl Repository {
             package_id: installed.id.clone(),
             version: installed.installed_version.clone(),
             installer_path: PathBuf::new(),
-            installer_type: installed
-                .installer_category
-                .clone()
-                .unwrap_or_else(|| "uninstall".to_owned()),
+            installer_type: "uninstall".to_owned(),
             exit_code,
             success: exit_code == 0,
             no_op: false,
@@ -2141,7 +2153,8 @@ impl Repository {
         expected_hash: Option<&str>,
     ) -> Result<CachedBytes> {
         let normalized_relative = relative_path.replace('\\', "/");
-        let cache_path = temp_cache_path(bucket, &source.identifier).join(normalized_relative.replace('/', "\\"));
+        let cache_path =
+            temp_cache_path(&self.app_root, bucket, &source.identifier).join(normalized_relative.replace('/', "\\"));
 
         if cache_path.exists() {
             let cached = fs::read(&cache_path).context("failed to read cached source file")?;
@@ -2189,7 +2202,7 @@ impl Repository {
         version: &str,
         channel: &str,
     ) -> Result<(Vec<u8>, PathBuf)> {
-        let cache_path = rest_manifest_cache_path(source, package_id, version, channel);
+        let cache_path = rest_manifest_cache_path_with_root(&self.app_root, source, package_id, version, channel);
         if cache_path.exists() {
             return Ok((
                 fs::read(&cache_path).context("failed to read cached REST manifest")?,
@@ -2875,14 +2888,34 @@ fn looks_like_product_code(value: &str) -> bool {
 }
 
 fn ensure_app_dirs(app_root: &Path) -> Result<()> {
-    fs::create_dir_all(app_root.join("sources")).context("failed to create app source directory")?;
+    fs::create_dir_all(app_root).context("failed to create app root directory")?;
+    if uses_packaged_layout(app_root) {
+        fs::create_dir_all(packaged_file_cache_root(app_root)).context("failed to create packaged file cache root")?;
+        let user_sources_path = packaged_user_sources_path(app_root)?;
+        if let Some(parent) = user_sources_path.parent() {
+            fs::create_dir_all(parent).context("failed to create packaged secure settings directory")?;
+        }
+    } else {
+        fs::create_dir_all(app_root.join("sources")).context("failed to create app source directory")?;
+    }
     Ok(())
 }
 
 fn default_app_root() -> Result<PathBuf> {
-    dirs::data_local_dir()
-        .map(|path| path.join("pinget"))
-        .ok_or_else(|| anyhow!("unable to determine LocalAppData path"))
+    let local_app_data = dirs::data_local_dir().ok_or_else(|| anyhow!("unable to determine LocalAppData path"))?;
+
+    #[cfg(windows)]
+    {
+        Ok(local_app_data
+            .join("Packages")
+            .join(PACKAGED_FAMILY_NAME)
+            .join("LocalState"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(local_app_data.join("pinget"))
+    }
 }
 
 fn store_path(app_root: &Path) -> PathBuf {
@@ -2890,7 +2923,11 @@ fn store_path(app_root: &Path) -> PathBuf {
 }
 
 fn user_settings_path(app_root: &Path) -> PathBuf {
-    app_root.join("user-settings.json")
+    if uses_packaged_layout(app_root) {
+        app_root.join("settings.json")
+    } else {
+        app_root.join("user-settings.json")
+    }
 }
 
 fn admin_settings_path(app_root: &Path) -> PathBuf {
@@ -2898,9 +2935,13 @@ fn admin_settings_path(app_root: &Path) -> PathBuf {
 }
 
 fn source_state_dir(app_root: &Path, source: &SourceRecord) -> PathBuf {
-    app_root
-        .join("sources")
-        .join(source.name.replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_"))
+    if uses_packaged_layout(app_root) {
+        return app_root
+            .join(packaged_source_type(source.kind))
+            .join(sanitize_path_segment(&source.identifier));
+    }
+
+    app_root.join("sources").join(sanitize_path_segment(&source.name))
 }
 
 fn preindexed_package_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
@@ -2915,24 +2956,34 @@ fn rest_information_cache_path(app_root: &Path, source: &SourceRecord) -> PathBu
     source_state_dir(app_root, source).join("rest-information.json")
 }
 
-fn rest_manifest_cache_path(source: &SourceRecord, package_id: &str, version: &str, channel: &str) -> PathBuf {
+fn rest_manifest_cache_path_with_root(
+    app_root: &Path,
+    source: &SourceRecord,
+    package_id: &str,
+    version: &str,
+    channel: &str,
+) -> PathBuf {
     let key = format!("{}|{}|{}|{}", source.identifier, package_id, version, channel);
     let digest = sha256_hex(key.as_bytes());
-    std::env::temp_dir()
-        .join("cache")
+    cache_root(app_root)
         .join("REST_M")
-        .join(source.identifier.replace(':', "_"))
+        .join(sanitize_path_segment(&source.identifier))
         .join(format!("{digest}.json"))
 }
 
-fn temp_cache_path(bucket: &str, identifier: &str) -> PathBuf {
-    std::env::temp_dir()
-        .join("cache")
+fn temp_cache_path(app_root: &Path, bucket: &str, identifier: &str) -> PathBuf {
+    cache_root(app_root)
         .join(bucket)
-        .join(identifier.replace(':', "_"))
+        .join(sanitize_path_segment(identifier))
 }
 
 fn load_store(app_root: &Path) -> Result<SourceStore> {
+    if uses_packaged_layout(app_root)
+        && let Some(store) = load_packaged_store(app_root)?
+    {
+        return Ok(store);
+    }
+
     let path = store_path(app_root);
     if !path.exists() {
         let store = SourceStore::default();
@@ -2945,7 +2996,396 @@ fn load_store(app_root: &Path) -> Result<SourceStore> {
 }
 
 fn save_store(app_root: &Path, store: &SourceStore) -> Result<()> {
+    if uses_packaged_layout(app_root) {
+        return save_packaged_store(app_root, store);
+    }
+
     write_json(store_path(app_root), store)
+}
+
+fn load_packaged_store(app_root: &Path) -> Result<Option<SourceStore>> {
+    let user_sources_path = packaged_user_sources_path(app_root)?;
+    let metadata_path = app_root.join("sources_metadata");
+    let user_sources_yaml = fs::read_to_string(&user_sources_path).ok();
+    let metadata_yaml = fs::read_to_string(&metadata_path).ok();
+    Ok(parse_packaged_source_store(
+        user_sources_yaml.as_deref(),
+        metadata_yaml.as_deref(),
+    ))
+}
+
+fn save_packaged_store(app_root: &Path, store: &SourceStore) -> Result<()> {
+    let user_sources_path = packaged_user_sources_path(app_root)?;
+    if let Some(parent) = user_sources_path.parent() {
+        fs::create_dir_all(parent).context("failed to create packaged source stream directory")?;
+    }
+
+    fs::write(&user_sources_path, render_packaged_sources_yaml(store))
+        .context("failed to write packaged user_sources stream")?;
+    fs::write(app_root.join("sources_metadata"), render_packaged_metadata_yaml(store))
+        .context("failed to write packaged source metadata")?;
+    Ok(())
+}
+
+fn parse_packaged_source_store(user_sources_yaml: Option<&str>, metadata_yaml: Option<&str>) -> Option<SourceStore> {
+    if user_sources_yaml.is_none() && metadata_yaml.is_none() {
+        return None;
+    }
+
+    let mut sources = SourceStore::default().sources;
+    for entry in parse_packaged_yaml_entries(user_sources_yaml) {
+        let Some(name) = entry.get("Name").and_then(|value| value.clone()) else {
+            continue;
+        };
+
+        if yaml_bool(entry.get("IsTombstone")) {
+            sources.retain(|source| !source.name.eq_ignore_ascii_case(&name));
+            continue;
+        }
+
+        let Some(mapped) = map_packaged_source_entry(&entry) else {
+            continue;
+        };
+
+        if let Some(existing) = sources
+            .iter_mut()
+            .find(|source| source.name.eq_ignore_ascii_case(&name))
+        {
+            *existing = mapped;
+        } else {
+            sources.push(mapped);
+        }
+    }
+
+    for entry in parse_packaged_yaml_entries(metadata_yaml) {
+        let Some(name) = entry.get("Name").and_then(|value| value.clone()) else {
+            continue;
+        };
+
+        let Some(source) = sources
+            .iter_mut()
+            .find(|source| source.name.eq_ignore_ascii_case(&name))
+        else {
+            continue;
+        };
+
+        if let Some(last_update) = entry
+            .get("LastUpdate")
+            .and_then(|value| value.as_deref())
+            .and_then(parse_packaged_datetime)
+        {
+            source.last_update = Some(last_update);
+        }
+
+        if let Some(source_version) = entry.get("SourceVersion").and_then(|value| value.clone())
+            && !source_version.is_empty()
+        {
+            source.source_version = Some(source_version);
+        }
+    }
+
+    Some(SourceStore { sources })
+}
+
+fn parse_packaged_yaml_entries(yaml: Option<&str>) -> Vec<BTreeMap<String, Option<String>>> {
+    let Some(yaml) = yaml else {
+        return Vec::new();
+    };
+
+    let mut entries = Vec::new();
+    let mut current: Option<BTreeMap<String, Option<String>>> = None;
+    for raw_line in yaml.replace("\r\n", "\n").split('\n') {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.eq_ignore_ascii_case("Sources:") {
+            continue;
+        }
+
+        if let Some(remainder) = trimmed.strip_prefix("- ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+
+            let mut entry = BTreeMap::new();
+            add_packaged_yaml_key_value(&mut entry, remainder);
+            current = Some(entry);
+            continue;
+        }
+
+        if let Some(entry) = current.as_mut() {
+            add_packaged_yaml_key_value(entry, trimmed);
+        }
+    }
+
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+
+    entries
+}
+
+fn add_packaged_yaml_key_value(entry: &mut BTreeMap<String, Option<String>>, line: &str) {
+    let Some((key, value)) = line.split_once(':') else {
+        return;
+    };
+
+    entry.insert(
+        key.trim().to_owned(),
+        Some(unquote_yaml_scalar(value.trim()).to_owned()),
+    );
+}
+
+fn unquote_yaml_scalar(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let first = bytes[0] as char;
+        let last = bytes[value.len() - 1] as char;
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return &value[1..value.len() - 1];
+        }
+    }
+
+    value
+}
+
+fn map_packaged_source_entry(entry: &BTreeMap<String, Option<String>>) -> Option<SourceRecord> {
+    let name = entry.get("Name").and_then(|value| value.clone())?;
+    let source_type = entry.get("Type").and_then(|value| value.clone())?;
+    let arg = entry.get("Arg").and_then(|value| value.clone())?;
+    let kind = parse_packaged_source_kind(&source_type)?;
+
+    Some(SourceRecord {
+        name: name.clone(),
+        kind,
+        arg,
+        identifier: entry
+            .get("Identifier")
+            .and_then(|value| value.clone())
+            .or_else(|| entry.get("Data").and_then(|value| value.clone()))
+            .unwrap_or(name),
+        trust_level: parse_packaged_trust_level(entry.get("TrustLevel").and_then(|value| value.as_deref())),
+        explicit: yaml_bool(entry.get("Explicit")),
+        priority: entry
+            .get("Priority")
+            .and_then(|value| value.as_deref())
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or_default(),
+        last_update: None,
+        source_version: None,
+    })
+}
+
+fn parse_packaged_source_kind(value: &str) -> Option<SourceKind> {
+    if value.eq_ignore_ascii_case("Microsoft.PreIndexed.Package") {
+        Some(SourceKind::PreIndexed)
+    } else if value.eq_ignore_ascii_case("Microsoft.Rest") {
+        Some(SourceKind::Rest)
+    } else {
+        None
+    }
+}
+
+fn parse_packaged_trust_level(value: Option<&str>) -> String {
+    match value {
+        Some(raw) if raw.eq_ignore_ascii_case("Trusted") => "Trusted".to_owned(),
+        Some(raw) if raw.parse::<i64>().ok().unwrap_or_default() > 0 => "Trusted".to_owned(),
+        _ => "None".to_owned(),
+    }
+}
+
+fn yaml_bool(value: Option<&Option<String>>) -> bool {
+    value
+        .and_then(|raw| raw.as_deref())
+        .and_then(|raw| raw.parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn parse_packaged_datetime(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(unix_seconds) = value.parse::<i64>() {
+        return DateTime::<Utc>::from_timestamp(unix_seconds, 0);
+    }
+
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn render_packaged_sources_yaml(store: &SourceStore) -> String {
+    let mut lines = vec!["Sources:".to_owned()];
+    for source in &store.sources {
+        lines.push(format!("  - Name: {}", source.name));
+        lines.push(format!("    Type: {}", packaged_source_type(source.kind)));
+        lines.push(format!("    Arg: {}", yaml_scalar(&source.arg)));
+        lines.push(format!("    Data: {}", yaml_scalar(&source.identifier)));
+        lines.push(format!(
+            "    TrustLevel: {}",
+            if source.trust_level.eq_ignore_ascii_case("Trusted") {
+                1
+            } else {
+                0
+            }
+        ));
+        lines.push(format!("    Explicit: {}", source.explicit));
+        lines.push(format!("    Priority: {}", source.priority));
+        lines.push("    IsTombstone: false".to_owned());
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn render_packaged_metadata_yaml(store: &SourceStore) -> String {
+    let mut lines = vec!["Sources:".to_owned()];
+    for source in &store.sources {
+        if source.last_update.is_none() && source.source_version.is_none() {
+            continue;
+        }
+
+        lines.push(format!("  - Name: {}", source.name));
+        if let Some(last_update) = source.last_update {
+            lines.push(format!("    LastUpdate: {}", last_update.timestamp()));
+        }
+        if let Some(source_version) = &source.source_version {
+            lines.push(format!("    SourceVersion: {}", yaml_scalar(source_version)));
+        }
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn yaml_scalar(value: &str) -> String {
+    if value.chars().any(|ch| ch.is_whitespace() || ch == ':') {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn uses_packaged_layout(app_root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        try_get_packaged_local_state_root(app_root).is_some()
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = app_root;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn try_get_packaged_local_state_root(app_root: &Path) -> Option<PathBuf> {
+    let local_state = app_root.file_name()?.to_string_lossy();
+    if !local_state.eq_ignore_ascii_case("LocalState") {
+        return None;
+    }
+
+    let family = app_root.parent()?.file_name()?.to_string_lossy();
+    if !family.eq_ignore_ascii_case(PACKAGED_FAMILY_NAME) {
+        return None;
+    }
+
+    let packages = app_root.parent()?.parent()?.file_name()?.to_string_lossy();
+    if !packages.eq_ignore_ascii_case("Packages") {
+        return None;
+    }
+
+    Some(app_root.to_path_buf())
+}
+
+#[cfg(windows)]
+fn packaged_user_sources_path(app_root: &Path) -> Result<PathBuf> {
+    let _ = try_get_packaged_local_state_root(app_root).ok_or_else(|| anyhow!("not a packaged WinGet app root"))?;
+    Ok(packaged_secure_settings_root()?.join("user_sources"))
+}
+
+#[cfg(not(windows))]
+fn packaged_user_sources_path(_app_root: &Path) -> Result<PathBuf> {
+    bail!("packaged WinGet source streams are only available on Windows")
+}
+
+#[cfg(windows)]
+fn packaged_secure_settings_root() -> Result<PathBuf> {
+    let program_data = std::env::var_os("PROGRAMDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("unable to determine ProgramData path"))?;
+    Ok(program_data
+        .join("Microsoft")
+        .join("WinGet")
+        .join(current_user_sid()?)
+        .join("settings")
+        .join("pkg")
+        .join(PACKAGED_NAME))
+}
+
+#[cfg(windows)]
+fn current_user_sid() -> Result<String> {
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            bail!("failed to open current process token")
+        }
+
+        let mut length = 0;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut length);
+        let mut buffer = vec![0u8; length as usize];
+        if GetTokenInformation(token, TokenUser, buffer.as_mut_ptr() as *mut _, length, &mut length) == 0 {
+            CloseHandle(token);
+            bail!("failed to get current user token information")
+        }
+
+        let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut sid_ptr: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(token_user.User.Sid, &mut sid_ptr) == 0 {
+            CloseHandle(token);
+            bail!("failed to convert current user SID")
+        }
+
+        let mut len = 0usize;
+        while *sid_ptr.add(len) != 0 {
+            len += 1;
+        }
+
+        let sid = std::ffi::OsString::from_wide(std::slice::from_raw_parts(sid_ptr, len))
+            .to_string_lossy()
+            .into_owned();
+        LocalFree(sid_ptr.cast());
+        CloseHandle(token);
+        Ok(sid)
+    }
+}
+
+fn packaged_file_cache_root(app_root: &Path) -> PathBuf {
+    app_root.join("Microsoft").join("Windows Package Manager")
+}
+
+fn cache_root(app_root: &Path) -> PathBuf {
+    if uses_packaged_layout(app_root) {
+        packaged_file_cache_root(app_root)
+    } else {
+        default_cache_root_fallback()
+    }
+}
+
+fn default_cache_root_fallback() -> PathBuf {
+    std::env::temp_dir().join("cache")
+}
+
+fn packaged_source_type(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::PreIndexed => "Microsoft.PreIndexed.Package",
+        SourceKind::Rest => "Microsoft.Rest",
+    }
+}
+
+fn sanitize_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => ch,
+        })
+        .collect()
 }
 
 fn load_json_object(path: &Path) -> Result<JsonMap<String, JsonValue>> {
@@ -5102,9 +5542,42 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn pins_db_path(app_root: &Path) -> PathBuf {
-    // WinGet pins DB: %LOCALAPPDATA%\Microsoft\WinGet\pins.db
-    // Our own pins: %LOCALAPPDATA%\pinget\pins.db
-    app_root.join("pins.db")
+    if uses_packaged_layout(app_root) {
+        app_root.join("pinning.db")
+    } else {
+        app_root.join("pins.db")
+    }
+}
+
+fn resolve_pin_type_column(conn: &Connection) -> Result<Option<&'static str>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(pin)")?;
+    let mut has_current_column = false;
+    let mut has_legacy_column = false;
+
+    let column_names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column_name in column_names {
+        match column_name?.as_str() {
+            "type" => has_current_column = true,
+            "pin_type" => has_legacy_column = true,
+            _ => {}
+        }
+    }
+
+    Ok(if has_current_column {
+        Some("type")
+    } else if has_legacy_column {
+        Some("pin_type")
+    } else {
+        None
+    })
+}
+
+fn decode_pin_type(pin_type_int: i64) -> PinType {
+    match pin_type_int {
+        4 => PinType::Blocking,
+        3 => PinType::Gating,
+        _ => PinType::Pinning,
+    }
 }
 
 #[cfg(windows)]
@@ -5409,6 +5882,12 @@ fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Resul
                         }
                         .context("No uninstall command found in registry")?;
 
+                        if is_winget_uninstall_command(&uninstall_cmd)
+                            && let Some(exit_code) = try_uninstall_via_winget(installed, request)?
+                        {
+                            return Ok(Some(exit_code));
+                        }
+
                         let mut cmd = Command::new("cmd");
                         let log_path = request.log_path.as_ref().map(|value| value.display().to_string());
                         cmd.arg("/C").arg(build_uninstall_command_with_mode(
@@ -5505,6 +5984,9 @@ fn build_uninstall_command_with_mode(
     }
 
     let lower = uninstall_cmd.to_ascii_lowercase();
+    if is_winget_uninstall_command_lower(&lower) {
+        return uninstall_cmd;
+    }
     if lower.contains("/quiet")
         || lower.contains("/passive")
         || lower.contains("/verysilent")
@@ -5515,6 +5997,85 @@ fn build_uninstall_command_with_mode(
     }
 
     format!("{uninstall_cmd} /S")
+}
+
+#[cfg(windows)]
+fn try_uninstall_via_winget(installed: &ListMatch, request: &UninstallRequest) -> Result<Option<i32>> {
+    let Some(args) = build_winget_uninstall_arguments(installed, request) else {
+        return Ok(None);
+    };
+
+    let exit_code = run_winget_uninstall(&args)?;
+    if exit_code == WINGET_PACKAGE_NOT_FOUND_EXIT_CODE && request.query.install_scope.is_some() {
+        let Some(args_without_scope) = build_winget_uninstall_arguments_with_scope(installed, request, false) else {
+            return Ok(Some(exit_code));
+        };
+
+        return Ok(Some(run_winget_uninstall(&args_without_scope)?));
+    }
+
+    Ok(Some(exit_code))
+}
+
+#[cfg(windows)]
+fn run_winget_uninstall(args: &[String]) -> Result<i32> {
+    use std::process::Command;
+
+    let status = Command::new("winget")
+        .args(args)
+        .status()
+        .context("failed to run delegated winget uninstall")?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+#[cfg(windows)]
+fn build_winget_uninstall_arguments(installed: &ListMatch, request: &UninstallRequest) -> Option<Vec<String>> {
+    build_winget_uninstall_arguments_with_scope(installed, request, true)
+}
+
+#[cfg(windows)]
+fn build_winget_uninstall_arguments_with_scope(
+    installed: &ListMatch,
+    request: &UninstallRequest,
+    include_scope: bool,
+) -> Option<Vec<String>> {
+    if installed.id.eq_ignore_ascii_case(&installed.local_id) {
+        return None;
+    }
+
+    let mut args = vec![
+        "uninstall".to_owned(),
+        "--id".to_owned(),
+        installed.id.clone(),
+        "--exact".to_owned(),
+        "--disable-interactivity".to_owned(),
+    ];
+
+    if let Some(source_name) = installed.source_name.as_deref().filter(|value| !value.is_empty()) {
+        args.push("--source".to_owned());
+        args.push(source_name.to_owned());
+    }
+
+    if include_scope && let Some(scope) = request.query.install_scope.as_deref().filter(|value| !value.is_empty()) {
+        args.push("--scope".to_owned());
+        args.push(scope.to_owned());
+    }
+
+    if request.mode == InstallerMode::Silent {
+        args.push("--silent".to_owned());
+    }
+
+    Some(args)
+}
+
+#[cfg(windows)]
+fn is_winget_uninstall_command(command: &str) -> bool {
+    is_winget_uninstall_command_lower(&command.to_ascii_lowercase())
+}
+
+#[cfg(windows)]
+fn is_winget_uninstall_command_lower(command: &str) -> bool {
+    command.contains("winget uninstall") || command.contains("winget.exe uninstall")
 }
 
 #[cfg(windows)]
@@ -5675,6 +6236,55 @@ mod tests {
             app_root.join("sources").join("winget_test")
         );
         assert_eq!(pins_db_path(&app_root), app_root.join("pins.db"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packaged_layout_defaults_to_packaged_paths() {
+        let app_root = default_app_root().expect("default app root");
+        assert!(uses_packaged_layout(&app_root));
+        assert!(
+            user_settings_path(&app_root)
+                .display()
+                .to_string()
+                .ends_with(&format!(r"Packages\{}\LocalState\settings.json", PACKAGED_FAMILY_NAME))
+        );
+        assert!(
+            packaged_file_cache_root(&app_root)
+                .display()
+                .to_string()
+                .ends_with(&format!(
+                    r"Packages\{}\LocalState\Microsoft\Windows Package Manager",
+                    PACKAGED_FAMILY_NAME
+                ))
+        );
+    }
+
+    #[test]
+    fn packaged_source_stream_overlays_defaults_and_metadata() {
+        let store = parse_packaged_source_store(
+            Some(
+                "Sources:\n  - Name: winget\n    Type: Microsoft.PreIndexed.Package\n    Arg: https://cdn.winget.microsoft.com/cache\n    Data: Microsoft.Winget.Source_8wekyb3d8bbwe\n    IsTombstone: true\n  - Name: corp\n    Type: Microsoft.Rest\n    Arg: https://packages.contoso.test/api\n    Data: Contoso.Rest\n    Explicit: true\n    Priority: 7\n    TrustLevel: 1\n    IsTombstone: false\n",
+            ),
+            Some(
+                "Sources:\n  - Name: corp\n    LastUpdate: 1700000000\n    SourceVersion: 1.2.3\n",
+            ),
+        )
+        .expect("packaged store");
+
+        assert!(!store.sources.iter().any(|source| source.name == "winget"));
+        let corp = store
+            .sources
+            .iter()
+            .find(|source| source.name == "corp")
+            .expect("corp source");
+        assert_eq!(corp.kind, SourceKind::Rest);
+        assert_eq!(corp.identifier, "Contoso.Rest");
+        assert_eq!(corp.trust_level, "Trusted");
+        assert!(corp.explicit);
+        assert_eq!(corp.priority, 7);
+        assert_eq!(corp.source_version.as_deref(), Some("1.2.3"));
+        assert_eq!(corp.last_update, DateTime::<Utc>::from_timestamp(1_700_000_000, 0));
     }
 
     #[test]
@@ -7117,6 +7727,53 @@ Installers:
     }
 
     #[test]
+    fn pin_operations_work_with_packaged_pin_schema() {
+        let app_root = temp_app_root("pins_packaged_schema");
+        let result = (|| -> Result<()> {
+            let db_path = pins_db_path(&app_root);
+            if let Some(parent) = db_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let conn = Connection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE pin (
+                    package_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    type INTEGER NOT NULL,
+                    version TEXT NOT NULL,
+                    PRIMARY KEY (package_id, source_id)
+                )",
+            )?;
+            drop(conn);
+
+            let repository = Repository::open_with_options(RepositoryOptions::new(app_root.clone()))?;
+            repository.add_pin("Contoso.Tool", "1.2.*", "winget", PinType::Gating)?;
+
+            let pins = repository.list_pins(None)?;
+            assert_eq!(pins.len(), 1);
+            assert_eq!(pins[0].package_id, "Contoso.Tool");
+            assert_eq!(pins[0].version, "1.2.*");
+            assert_eq!(pins[0].source_id, "winget");
+            assert_eq!(pins[0].pin_type, PinType::Gating);
+
+            let conn = Connection::open(&db_path)?;
+            let stored_pin = conn.query_row(
+                "SELECT type, version FROM pin WHERE package_id = ?1 AND source_id = ?2",
+                rusqlite::params!["Contoso.Tool", "winget"],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            assert_eq!(stored_pin.0, 3);
+            assert_eq!(stored_pin.1, "1.2.*");
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&app_root);
+        result.expect("packaged pin schema round trip");
+    }
+
+    #[test]
     fn version_pin_patterns_match_exact_and_prefix_values() {
         assert!(version_matches_pin_pattern("1.2.3", "*"));
         assert!(version_matches_pin_pattern("1.2.3", "1.2.3"));
@@ -7439,6 +8096,72 @@ Installers:
         assert_eq!(
             r#""C:\Program Files\ShareX\unins000.exe""#,
             build_uninstall_command(r#""C:\Program Files\ShareX\unins000.exe""#, false, false)
+        );
+        assert_eq!(
+            "winget uninstall --product-code JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe",
+            build_uninstall_command(
+                "winget uninstall --product-code JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe",
+                true,
+                false,
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn build_winget_uninstall_arguments_prefers_correlated_identity() {
+        let installed = ListMatch {
+            name: "lazygit".to_owned(),
+            id: "JesseDuffield.lazygit".to_owned(),
+            local_id: r"ARP\User\X64\JesseDuffield.lazygit".to_owned(),
+            installed_version: "0.61.1".to_owned(),
+            available_version: None,
+            source_name: Some("winget".to_owned()),
+            publisher: Some("Jesse Duffield".to_owned()),
+            scope: Some("User".to_owned()),
+            installer_category: Some("exe".to_owned()),
+            install_location: Some(
+                r"C:\Users\test\AppData\Local\Microsoft\WinGet\Packages\JesseDuffield.lazygit".to_owned(),
+            ),
+            package_family_names: Vec::new(),
+            product_codes: vec!["JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned()],
+            upgrade_codes: Vec::new(),
+        };
+        let mut request = UninstallRequest::new(PackageQuery {
+            id: Some("JesseDuffield.lazygit".to_owned()),
+            install_scope: Some("user".to_owned()),
+            ..PackageQuery::default()
+        });
+        request.mode = InstallerMode::Silent;
+
+        assert_eq!(
+            Some(vec![
+                "uninstall".to_owned(),
+                "--id".to_owned(),
+                "JesseDuffield.lazygit".to_owned(),
+                "--exact".to_owned(),
+                "--disable-interactivity".to_owned(),
+                "--source".to_owned(),
+                "winget".to_owned(),
+                "--scope".to_owned(),
+                "user".to_owned(),
+                "--silent".to_owned(),
+            ]),
+            build_winget_uninstall_arguments(&installed, &request)
+        );
+
+        assert_eq!(
+            Some(vec![
+                "uninstall".to_owned(),
+                "--id".to_owned(),
+                "JesseDuffield.lazygit".to_owned(),
+                "--exact".to_owned(),
+                "--disable-interactivity".to_owned(),
+                "--source".to_owned(),
+                "winget".to_owned(),
+                "--silent".to_owned(),
+            ]),
+            build_winget_uninstall_arguments_with_scope(&installed, &request, false)
         );
     }
 }

@@ -1,0 +1,53 @@
+name: Parity Test
+
+on:
+  push:
+    branches:
+      - master
+      - settings
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  parity-test:
+    name: Parity Test
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build pinget-cli
+        shell: pwsh
+        run: |
+          cargo build -p pinget-cli --manifest-path rust/Cargo.toml
+
+      - name: Build C# CLI and PowerShell module
+        shell: pwsh
+        run: |
+          dotnet build dotnet/Devolutions.Pinget.slnx -c Release
+
+      - name: Run Windows parity coherence tests
+        shell: pwsh
+        run: |
+          $rustPinget = Resolve-Path 'rust/target/debug/pinget.exe'
+          $dotnetPinget = Resolve-Path 'dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.exe'
+          $pingetModule = Resolve-Path 'dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/bin/Release/net8.0/Pinget.psd1'
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts/Parity-Compare-WingetParity.ps1') -RustWinget $rustPinget -DotnetWinget $dotnetPinget -PowerShellModulePath $pingetModule

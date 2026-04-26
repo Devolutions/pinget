@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Nodes;
@@ -34,6 +35,57 @@ public class SourceStoreTests
         Assert.Contains(store.Sources, s => s.Name == "winget");
         Assert.Contains(store.Sources, s => s.Name == "msstore");
     }
+
+        [Fact]
+        public void PackagedLayout_DefaultsToPackagedSettingsAndCachePaths()
+        {
+                if (!OperatingSystem.IsWindows())
+                        return;
+
+                var appRoot = SourceStoreManager.NormalizeAppRoot(null);
+                Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState"), appRoot, StringComparison.OrdinalIgnoreCase);
+                Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "settings.json"), SettingsStoreManager.UserSettingsPath(appRoot), StringComparison.OrdinalIgnoreCase);
+                Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "Microsoft", "Windows Package Manager"), SourceStoreManager.GetPackagedFileCacheRoot(appRoot), StringComparison.OrdinalIgnoreCase);
+        }
+
+        [Fact]
+        public void PackagedSourceYaml_OverlaysDefaultsAndMetadata()
+        {
+                const string userSourcesYaml = @"Sources:
+    - Name: winget
+        Type: Microsoft.PreIndexed.Package
+        Arg: https://cdn.winget.microsoft.com/cache
+        Data: Microsoft.Winget.Source_8wekyb3d8bbwe
+        IsTombstone: true
+    - Name: corp
+        Type: Microsoft.Rest
+        Arg: ""https://packages.contoso.test/api""
+        Data: Contoso.Rest
+        Explicit: true
+        Priority: 7
+        TrustLevel: 1
+        IsTombstone: false
+";
+
+                const string metadataYaml = @"Sources:
+    - Name: corp
+        LastUpdate: 1700000000
+        SourceVersion: 1.2.3
+";
+
+                var store = SourceStoreManager.ParsePackagedSourceStore(userSourcesYaml, metadataYaml);
+                Assert.NotNull(store);
+                Assert.DoesNotContain(store!.Sources, source => source.Name == "winget");
+
+                var corp = Assert.Single(store.Sources, source => source.Name == "corp");
+                Assert.Equal(SourceKind.Rest, corp.Kind);
+                Assert.Equal("Contoso.Rest", corp.Identifier);
+                Assert.Equal("Trusted", corp.TrustLevel);
+                Assert.True(corp.Explicit);
+                Assert.Equal(7, corp.Priority);
+                Assert.Equal("1.2.3", corp.SourceVersion);
+                Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1700000000).UtcDateTime, corp.LastUpdate);
+        }
 
     [Fact]
     public void RepositoryOpen_UsesCustomAppRoot()
@@ -170,6 +222,7 @@ public class ModelsTests
         var installer = new Installer();
         Assert.Null(installer.Architecture);
         Assert.Null(installer.InstallerType);
+        Assert.Null(installer.NestedInstallerType);
         Assert.Null(installer.Url);
         Assert.Null(installer.Scope);
         Assert.Null(installer.ProductCode);
@@ -510,6 +563,38 @@ public class ModelsTests
         Assert.Equal(["Windows.Universal"], manifest.Installers[1].Platforms);
         Assert.Equal("10.0.22621.0", manifest.Installers[1].MinimumOsVersion);
     }
+
+    [Fact]
+    public void ParseYamlManifest_PreservesTopLevelNestedInstallerType()
+    {
+        var yaml = """
+            PackageIdentifier: Test.Package
+            PackageVersion: 1.2.3
+            PackageName: Test Package
+            InstallerType: zip
+            NestedInstallerType: portable
+            Installers:
+              - Architecture: x64
+                InstallerUrl: https://example.test/Test.Package.zip
+                InstallerSha256: ABC123
+            """;
+
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+        var installer = Assert.Single(manifest.Installers);
+
+        Assert.Equal("zip", installer.InstallerType);
+        Assert.Equal("portable", installer.NestedInstallerType);
+    }
+
+    [Fact]
+    public void GetSqliteNativeLibraryCandidates_ProbesRootAndRidFolder()
+    {
+        var candidates = Repository.GetSqliteNativeLibraryCandidates(@"C:\module").ToList();
+
+        Assert.Equal(@"C:\module\e_sqlite3.dll", candidates[0]);
+        Assert.Contains(Path.Combine(@"C:\module", "runtimes"), candidates[1]);
+        Assert.EndsWith(Path.Combine("native", "e_sqlite3.dll"), candidates[1], StringComparison.OrdinalIgnoreCase);
+    }
 }
 
 public class PinStoreTests
@@ -554,6 +639,57 @@ public class PinStoreTests
 
             PinStore.Reset(appRoot, "msstore");
             Assert.Empty(PinStore.List(appRoot));
+        }
+        finally
+        {
+            PinStore.Reset(appRoot);
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void AddAndList_WorkWithPackagedPinSchema()
+    {
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            var dbPath = SourceStoreManager.PinsDbPath(appRoot);
+            Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+
+            using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+                    CREATE TABLE pin (
+                        package_id TEXT NOT NULL,
+                        source_id TEXT NOT NULL,
+                        type INTEGER NOT NULL,
+                        version TEXT NOT NULL,
+                        PRIMARY KEY (package_id, source_id)
+                    )";
+                cmd.ExecuteNonQuery();
+            }
+
+            PinStore.Add("Test.Package.Unit", "1.2.*", "winget", PinType.Gating, appRoot);
+
+            var pin = Assert.Single(PinStore.List(appRoot));
+            Assert.Equal("Test.Package.Unit", pin.PackageId);
+            Assert.Equal("1.2.*", pin.Version);
+            Assert.Equal("winget", pin.SourceId);
+            Assert.Equal(PinType.Gating, pin.PinType);
+
+            using var verifyConn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+            verifyConn.Open();
+            using var verifyCmd = verifyConn.CreateCommand();
+            verifyCmd.CommandText = "SELECT type, version FROM pin WHERE package_id = @id AND source_id = @src";
+            verifyCmd.Parameters.AddWithValue("@id", "Test.Package.Unit");
+            verifyCmd.Parameters.AddWithValue("@src", "winget");
+
+            using var reader = verifyCmd.ExecuteReader();
+            Assert.True(reader.Read());
+            Assert.Equal(3L, reader.GetInt64(0));
+            Assert.Equal("1.2.*", reader.GetString(1));
         }
         finally
         {
@@ -925,6 +1061,13 @@ public class RepositoryParityTests
             InstallerDispatch.BuildUninstallCommand("\"C:\\Program Files\\ShareX\\unins000.exe\" /VERYSILENT", silent: true, hasQuietUninstallCommand: false));
         Assert.Equal("\"C:\\Program Files\\ShareX\\unins000.exe\"",
             InstallerDispatch.BuildUninstallCommand("\"C:\\Program Files\\ShareX\\unins000.exe\"", silent: false, hasQuietUninstallCommand: false));
+
+        Assert.Equal(
+            "winget uninstall --product-code JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe",
+            InstallerDispatch.BuildUninstallCommand(
+                "winget uninstall --product-code JesseDuffield.lazygit_Microsoft.Winget.Source_8wekyb3d8bbwe",
+                silent: true,
+                hasQuietUninstallCommand: false));
     }
 
     [Fact]
@@ -1012,6 +1155,95 @@ public class RepositoryParityTests
 
         Assert.NotNull(selected);
         Assert.Equal("10.0.19041.0", selected!.MinimumOsVersion);
+    }
+
+    [Fact]
+    public void SelectInstaller_AllowsRequestedScopeWhenInstallerScopeMissing()
+    {
+        var installers = new List<Installer>
+        {
+            new() { Architecture = "x64", InstallerType = "zip", Scope = null, Switches = new InstallerSwitches() },
+            new() { Architecture = "x64", InstallerType = "exe", Scope = "machine", Switches = new InstallerSwitches() },
+        };
+
+        var selected = Repository.SelectInstaller(installers, new PackageQuery
+        {
+            InstallerType = "zip",
+            InstallScope = "user",
+        });
+
+        Assert.NotNull(selected);
+        Assert.Equal("zip", selected!.InstallerType);
+        Assert.Null(selected.Scope);
+    }
+
+    [Fact]
+    public void BuildWingetPortableInstallArguments_PreservesWingetCoherenceFlags()
+    {
+        var manifest = new Manifest
+        {
+            Id = "JesseDuffield.lazygit",
+            Name = "lazygit",
+            Version = "0.61.1",
+        };
+
+        var request = new InstallRequest
+        {
+            Query = new PackageQuery
+            {
+                Id = "JesseDuffield.lazygit",
+                Source = "winget",
+                InstallScope = "user",
+            },
+            Mode = InstallerMode.Silent,
+            AcceptPackageAgreements = true,
+        };
+
+        Assert.Equal(
+            new[]
+            {
+                "install",
+                "--id",
+                "JesseDuffield.lazygit",
+                "--exact",
+                "--accept-source-agreements",
+                "--disable-interactivity",
+                "--source",
+                "winget",
+                "--scope",
+                "user",
+                "--accept-package-agreements",
+                "--silent",
+            },
+            InstallerDispatch.BuildWingetPortableInstallArguments(request, manifest));
+    }
+
+    [Fact]
+    public void ShouldDelegatePortableZipInstall_ForNestedPortableZip()
+    {
+        var manifest = new Manifest
+        {
+            Id = "JesseDuffield.lazygit",
+            Name = "lazygit",
+            Version = "0.61.1",
+        };
+
+        var request = new InstallRequest
+        {
+            Query = new PackageQuery
+            {
+                Id = "JesseDuffield.lazygit",
+                Source = "winget",
+            },
+        };
+
+        var installer = new Installer
+        {
+            InstallerType = "zip",
+            NestedInstallerType = "portable",
+        };
+
+        Assert.True(InstallerDispatch.ShouldDelegatePortableZipInstall(request, manifest, installer));
     }
 
     [Fact]
