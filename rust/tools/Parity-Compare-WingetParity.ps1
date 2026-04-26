@@ -796,8 +796,8 @@ try {
     Assert-True -Condition (-not (Test-PackageVisible -Executable $DotnetWinget -PackageId $packageId)) -Message "C# pinget still detected the package after winget uninstall."
     Assert-True -Condition (-not (Test-PackageVisibleInPowerShell -PackageId $packageId -PackageName $packageName)) -Message "PowerShell module still detected the package after winget uninstall."
 
-    Write-Section "Smoke tests completed"
-    Write-Host "Windows coherence smoke tests passed for winget, Rust, C# CLI, and PowerShell."
+    Write-Section "Parity tests completed"
+    Write-Host "Windows coherence parity tests passed for winget, Rust, C# CLI, and PowerShell."
 }
 finally {
     Write-Section "Cleanup"

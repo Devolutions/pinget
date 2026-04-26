@@ -44,10 +44,10 @@ jobs:
         run: |
           dotnet build dotnet/Devolutions.Pinget.slnx -c Release
 
-      - name: Run Windows smoke coherence tests
+      - name: Run Windows parity coherence tests
         shell: pwsh
         run: |
           $rustPinget = Resolve-Path 'rust/target/debug/pinget.exe'
           $dotnetPinget = Resolve-Path 'dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.exe'
           $pingetModule = Resolve-Path 'dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/bin/Release/net8.0/Pinget.psd1'
-          pwsh -NoLogo -NoProfile -File (Resolve-Path 'rust/tools/Smoke-Compare-WingetParity.ps1') -RustWinget $rustPinget -DotnetWinget $dotnetPinget -PowerShellModulePath $pingetModule
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'rust/tools/Parity-Compare-WingetParity.ps1') -RustWinget $rustPinget -DotnetWinget $dotnetPinget -PowerShellModulePath $pingetModule
