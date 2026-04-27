@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine.PSObjects;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsCommon.Add, Constants.PingetNouns.Source)]
-[Alias("apgs")]
 public sealed class AddSourceCmdlet : PSCmdlet
 {
     [Parameter(Mandatory = true, ValueFromPipeline = true, ValueFromPipelineByPropertyName = true)]

@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine.PSObjects;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsData.Export, Constants.PingetNouns.Package, DefaultParameterSetName = Constants.FoundSet, SupportsShouldProcess = true)]
-[Alias("epgp")]
 [OutputType(typeof(PSDownloadResult))]
 public sealed class ExportPackageCmdlet : InstallerSelectionCmdlet
 {

@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine.PSObjects;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsCommon.Get, Constants.PingetNouns.Package)]
-[Alias("gpgp")]
 [OutputType(typeof(PSInstalledCatalogPackage))]
 public sealed class GetPackageCmdlet : FinderExtendedCmdlet
 {

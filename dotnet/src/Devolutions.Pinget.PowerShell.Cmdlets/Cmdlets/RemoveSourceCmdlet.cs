@@ -5,7 +5,6 @@ using Devolutions.Pinget.PowerShell.Engine;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsCommon.Remove, Constants.PingetNouns.Source)]
-[Alias("rpgs")]
 public sealed class RemoveSourceCmdlet : PSCmdlet
 {
     [Parameter(Position = 0, Mandatory = true, ValueFromPipeline = true, ValueFromPipelineByPropertyName = true)]

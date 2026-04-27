@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine.PSObjects;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsLifecycle.Install, Constants.PingetNouns.Package, DefaultParameterSetName = Constants.FoundSet, SupportsShouldProcess = true)]
-[Alias("ispgp")]
 [OutputType(typeof(PSInstallResult))]
 public sealed class InstallPackageCmdlet : InstallCmdlet
 {

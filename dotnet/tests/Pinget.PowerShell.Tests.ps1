@@ -6,12 +6,15 @@ param(
 
 BeforeAll {
     $script:previousLocalAppData = $env:LOCALAPPDATA
+    $script:previousPingetAppRoot = $env:PINGET_APPROOT
     $script:testRoot = Join-Path $env:TEMP "PingetPwshTests-$([guid]::NewGuid())"
+    $script:appRoot = Join-Path $script:testRoot 'app-root'
     $script:sourceName = 'PingetParitySource'
     $script:downloadDirectory = Join-Path $script:testRoot 'downloads'
 
-    New-Item -ItemType Directory -Force -Path $script:testRoot, $script:downloadDirectory | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:testRoot, $script:appRoot, $script:downloadDirectory | Out-Null
     $env:LOCALAPPDATA = $script:testRoot
+    $env:PINGET_APPROOT = $script:appRoot
 
     Import-Module $ModulePath -Force
 
@@ -36,8 +39,9 @@ AfterAll {
     {
     }
 
-    Remove-Module Pinget -Force -ErrorAction SilentlyContinue
+    Remove-Module Devolutions.Pinget.Client -Force -ErrorAction SilentlyContinue
     $env:LOCALAPPDATA = $script:previousLocalAppData
+    $env:PINGET_APPROOT = $script:previousPingetAppRoot
 
     if (Test-Path $script:testRoot)
     {
@@ -47,7 +51,7 @@ AfterAll {
 
 Describe 'Pinget module exports' {
     It 'exports the renamed client cmdlets' {
-        $commands = Get-Command -Module Pinget | Select-Object -ExpandProperty Name
+        $commands = Get-Command -Module Devolutions.Pinget.Client | Select-Object -ExpandProperty Name
 
         @(
             'Get-PingetVersion'
@@ -75,38 +79,35 @@ Describe 'Pinget module exports' {
         }
     }
 
-    It 'exports the upstream-style plural aliases' {
-        $aliases = (Get-Module Pinget).ExportedAliases.Keys
+    It 'does not export aliases' {
+        $aliases = (Get-Module Devolutions.Pinget.Client).ExportedAliases.Keys
 
-        $aliases | Should -Contain 'Get-PingetSettings'
-        $aliases | Should -Contain 'Get-PingetUserSettings'
-        $aliases | Should -Contain 'Set-PingetUserSettings'
-        $aliases | Should -Contain 'Test-PingetUserSettings'
+        $aliases | Should -BeNullOrEmpty
     }
 }
 
 Describe 'Pinget command metadata' {
     It 'keeps Add-PingetSource compatibility parameters' {
-        $command = Get-Command Add-PingetSource -Module Pinget
+        $command = Get-Command Add-PingetSource -Module Devolutions.Pinget.Client
         $command.Parameters.Keys | Should -Contain 'TrustLevel'
         $command.Parameters.Keys | Should -Contain 'Explicit'
         $command.Parameters.Keys | Should -Contain 'Priority'
     }
 
     It 'keeps export installer selection parameters' {
-        $command = Get-Command Export-PingetPackage -Module Pinget
+        $command = Get-Command Export-PingetPackage -Module Devolutions.Pinget.Client
         $command.Parameters.Keys | Should -Contain 'AllowHashMismatch'
         $command.Parameters.Keys | Should -Contain 'Platform'
         $command.Parameters.Keys | Should -Contain 'TargetOSVersion'
     }
 
     It 'keeps install compatibility headers as a hashtable' {
-        $command = Get-Command Install-PingetPackage -Module Pinget
+        $command = Get-Command Install-PingetPackage -Module Devolutions.Pinget.Client
         $command.Parameters['Header'].ParameterType.FullName | Should -Be 'System.Collections.Hashtable'
     }
 
     It 'keeps Reset-PingetSource parameter sets' {
-        $command = Get-Command Reset-PingetSource -Module Pinget
+        $command = Get-Command Reset-PingetSource -Module Devolutions.Pinget.Client
 
         $command.DefaultParameterSet | Should -Be 'DefaultSet'
         ($command.ParameterSets | Select-Object -ExpandProperty Name) | Should -Contain 'DefaultSet'
@@ -114,9 +115,9 @@ Describe 'Pinget command metadata' {
     }
 
     It 'declares upstream-like output types for key commands' {
-        (Get-Command Get-PingetSource -Module Pinget).OutputType.Type.FullName | Should -Contain 'Devolutions.Pinget.PowerShell.Engine.PSObjects.PSSourceResult'
-        (Get-Command Find-PingetPackage -Module Pinget).OutputType.Type.FullName | Should -Contain 'Devolutions.Pinget.PowerShell.Engine.PSObjects.PSFoundCatalogPackage'
-        (Get-Command Export-PingetPackage -Module Pinget).OutputType.Type.FullName | Should -Contain 'Devolutions.Pinget.PowerShell.Engine.PSObjects.PSDownloadResult'
+        (Get-Command Get-PingetSource -Module Devolutions.Pinget.Client).OutputType.Type.FullName | Should -Contain 'Devolutions.Pinget.PowerShell.Engine.PSObjects.PSSourceResult'
+        (Get-Command Find-PingetPackage -Module Devolutions.Pinget.Client).OutputType.Type.FullName | Should -Contain 'Devolutions.Pinget.PowerShell.Engine.PSObjects.PSFoundCatalogPackage'
+        (Get-Command Export-PingetPackage -Module Devolutions.Pinget.Client).OutputType.Type.FullName | Should -Contain 'Devolutions.Pinget.PowerShell.Engine.PSObjects.PSDownloadResult'
     }
 }
 

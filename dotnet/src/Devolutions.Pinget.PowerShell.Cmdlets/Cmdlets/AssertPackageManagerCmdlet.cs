@@ -5,7 +5,6 @@ using Devolutions.Pinget.PowerShell.Engine;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsLifecycle.Assert, Constants.PingetNouns.PingetPackageManager, DefaultParameterSetName = Constants.IntegrityVersionSet)]
-[Alias("apgpm")]
 public sealed class AssertPackageManagerCmdlet : PingetPackageManagerCmdlet
 {
     protected override void ProcessRecord()

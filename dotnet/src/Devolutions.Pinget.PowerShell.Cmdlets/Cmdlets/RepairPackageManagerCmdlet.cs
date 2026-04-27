@@ -5,7 +5,6 @@ using Devolutions.Pinget.PowerShell.Engine;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsDiagnostic.Repair, Constants.PingetNouns.PingetPackageManager, DefaultParameterSetName = Constants.IntegrityVersionSet)]
-[Alias("rppgpm")]
 [OutputType(typeof(int))]
 public sealed class RepairPackageManagerCmdlet : PingetPackageManagerCmdlet
 {

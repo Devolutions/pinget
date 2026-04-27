@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine.PSObjects;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsCommon.Find, Constants.PingetNouns.Package)]
-[Alias("fdpgp")]
 [OutputType(typeof(PSFoundCatalogPackage))]
 public sealed class FindPackageCmdlet : FinderExtendedCmdlet
 {

@@ -5,7 +5,6 @@ using Devolutions.Pinget.PowerShell.Engine;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsCommon.Get, Constants.PingetNouns.Setting)]
-[Alias("gpgse", "Get-PingetSettings")]
 public sealed class GetSettingCmdlet : PSCmdlet
 {
     [Parameter(ValueFromPipelineByPropertyName = true)]

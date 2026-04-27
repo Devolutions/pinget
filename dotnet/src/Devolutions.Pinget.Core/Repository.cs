@@ -1,8 +1,8 @@
-using System.Runtime.InteropServices;
 using System.Reflection;
-using System.Threading;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json.Nodes;
+using System.Threading;
 using Microsoft.Data.Sqlite;
 using YamlDotNet.Core;
 using YamlDotNet.Serialization;
@@ -12,6 +12,8 @@ namespace Devolutions.Pinget.Core;
 
 public class Repository : IDisposable
 {
+    private const string AppRootEnvironmentVariable = "PINGET_APPROOT";
+
     internal const string InstalledStateUnsupportedWarning = "Installed package discovery is not supported on this platform; returning no installed packages.";
     internal const string InstallUnsupportedWarning = "Installing packages is not supported on this platform; no changes were made.";
     internal const string UninstallUnsupportedWarning = "Uninstalling packages is not supported on this platform; no changes were made.";
@@ -38,7 +40,7 @@ public class Repository : IDisposable
     {
         options ??= new RepositoryOptions();
         EnsureSqliteNativeLibraryLoaded();
-        var appRoot = SourceStoreManager.NormalizeAppRoot(options.AppRoot);
+        var appRoot = SourceStoreManager.NormalizeAppRoot(options.AppRoot ?? Environment.GetEnvironmentVariable(AppRootEnvironmentVariable));
         SourceStoreManager.EnsureAppDirs(appRoot);
         var store = SourceStoreManager.Load(appRoot);
         var client = new HttpClient();
