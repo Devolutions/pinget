@@ -111,4 +111,7 @@ jobs:
           New-Item -Path artifacts/ci-nuget -ItemType Directory -Force | Out-Null
           dotnet pack dotnet/src/Devolutions.Pinget.Core/Devolutions.Pinget.Core.csproj -c Release --no-build -o artifacts/ci-nuget
           dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Engine/Devolutions.Pinget.PowerShell.Engine.csproj -c Release --no-build -o artifacts/ci-nuget
-          dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/Devolutions.Pinget.PowerShell.Cmdlets.csproj -c Release --no-build -o artifacts/ci-nuget
+
+      - name: Validate PowerShell module packaging
+        shell: pwsh
+        run: pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts/Build-PowerShellModule.ps1') -NoBuild -OutputRoot artifacts/ci-powershell -Clean

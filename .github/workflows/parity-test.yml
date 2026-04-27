@@ -43,11 +43,12 @@ jobs:
         shell: pwsh
         run: |
           dotnet build dotnet/Devolutions.Pinget.slnx -c Release
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts/Build-PowerShellModule.ps1') -NoBuild -OutputRoot dist/powershell-module -Clean
 
       - name: Run Windows parity coherence tests
         shell: pwsh
         run: |
           $rustPinget = Resolve-Path 'rust/target/debug/pinget.exe'
           $dotnetPinget = Resolve-Path 'dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.exe'
-          $pingetModule = Resolve-Path 'dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/bin/Release/net8.0/Pinget.psd1'
+          $pingetModule = Resolve-Path 'dist/powershell-module/Devolutions.Pinget.Client/Devolutions.Pinget.Client.psd1'
           pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts/Parity-Compare-WingetParity.ps1') -RustWinget $rustPinget -DotnetWinget $dotnetPinget -PowerShellModulePath $pingetModule

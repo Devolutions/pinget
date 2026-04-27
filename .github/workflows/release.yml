@@ -20,6 +20,11 @@ on:
         required: false
         default: false
         type: boolean
+      publish-powershell-gallery:
+        description: Publish Devolutions.Pinget.Client to PowerShell Gallery during a manual release.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -37,6 +42,7 @@ jobs:
       tag-name: ${{ steps.info.outputs.tag-name }}
       dry-run: ${{ steps.info.outputs.dry-run }}
       publish-nuget: ${{ steps.info.outputs.publish-nuget }}
+      publish-powershell-gallery: ${{ steps.info.outputs.publish-powershell-gallery }}
 
     steps:
       - name: Checkout
@@ -51,19 +57,23 @@ jobs:
 
           $DryRun = $false
           $PublishNuget = $true
+          $PublishPowerShellGallery = $true
 
           if ($IsWorkflowDispatch) {
             try { $DryRun = [System.Boolean]::Parse('${{ inputs['dry-run'] }}') } catch { $DryRun = $true }
             try { $PublishNuget = [System.Boolean]::Parse('${{ inputs['publish-nuget'] }}') } catch { $PublishNuget = $false }
+            try { $PublishPowerShellGallery = [System.Boolean]::Parse('${{ inputs['publish-powershell-gallery'] }}') } catch { $PublishPowerShellGallery = $false }
           }
 
           if (-not $IsMasterBranch) {
             $DryRun = $true
             $PublishNuget = $false
+            $PublishPowerShellGallery = $false
           }
 
           if ($DryRun) {
             $PublishNuget = $false
+            $PublishPowerShellGallery = $false
           }
 
           $Version = '${{ inputs.version }}'
@@ -97,11 +107,13 @@ jobs:
           "tag-name=$TagName" >> $Env:GITHUB_OUTPUT
           "dry-run=$($DryRun.ToString().ToLower())" >> $Env:GITHUB_OUTPUT
           "publish-nuget=$($PublishNuget.ToString().ToLower())" >> $Env:GITHUB_OUTPUT
+          "publish-powershell-gallery=$($PublishPowerShellGallery.ToString().ToLower())" >> $Env:GITHUB_OUTPUT
 
           Write-Host "::notice::Version: $Version"
           Write-Host "::notice::Tag: $TagName"
           Write-Host "::notice::DryRun: $DryRun"
           Write-Host "::notice::PublishNuget: $PublishNuget"
+          Write-Host "::notice::PublishPowerShellGallery: $PublishPowerShellGallery"
 
   rust-artifacts:
     name: Rust Artifacts (${{ matrix.name }})
@@ -258,39 +270,14 @@ jobs:
           $packArgs = @('-c', 'Release', '--no-build', '-p:ContinuousIntegrationBuild=true', "-p:Version=$env:PACKAGE_VERSION", '-p:IncludeSymbols=true', '-p:SymbolPackageFormat=snupkg', '-o', 'dist/nuget')
           dotnet pack dotnet/src/Devolutions.Pinget.Core/Devolutions.Pinget.Core.csproj @packArgs
           dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Engine/Devolutions.Pinget.PowerShell.Engine.csproj @packArgs
-          dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/Devolutions.Pinget.PowerShell.Cmdlets.csproj @packArgs
 
       - name: Package PowerShell module
         shell: pwsh
         env:
           PACKAGE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-          $moduleName = 'Pinget'
-          $moduleVersion = $env:PACKAGE_VERSION
-          $moduleOutput = Join-Path 'dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/bin/Release' 'net8.0'
-          $stagingRoot = Join-Path 'dist' 'powershell-module'
-          $moduleRoot = Join-Path $stagingRoot $moduleName
-          $archivePath = Join-Path 'dist' ("pinget-powershell-module-$moduleVersion.zip")
-
-          if (-not (Test-Path -Path (Join-Path $moduleOutput 'Pinget.psd1'))) {
-            throw "PowerShell module manifest not found in $moduleOutput"
-          }
-
-          if (Test-Path -Path $stagingRoot) {
-            Remove-Item -Path $stagingRoot -Recurse -Force
-          }
-
-          if (Test-Path -Path $archivePath) {
-            Remove-Item -Path $archivePath -Force
-          }
-
-          New-Item -Path $moduleRoot -ItemType Directory -Force | Out-Null
-          Copy-Item -Path (Join-Path $moduleOutput '*') -Destination $moduleRoot -Recurse -Force
-          [System.IO.Compression.ZipFile]::CreateFromDirectory($stagingRoot, $archivePath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
-
-          Write-Host "Created $archivePath"
+          $archivePath = Join-Path 'dist' "Devolutions.Pinget.Client.$env:PACKAGE_VERSION.zip"
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts/Build-PowerShellModule.ps1') -NoBuild -Version $env:PACKAGE_VERSION -OutputRoot dist/powershell-module -ArchivePath $archivePath -Clean
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v7
@@ -305,7 +292,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: powershell-module
-          path: dist/pinget-powershell-module-*.zip
+          path: dist/Devolutions.Pinget.Client.*.zip
           if-no-files-found: error
 
   create-tag:
@@ -365,6 +352,8 @@ jobs:
   publish-nuget:
     name: Publish NuGet
     runs-on: ubuntu-latest
+    env:
+      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
     needs:
       - preflight
       - csharp-packages
@@ -387,8 +376,41 @@ jobs:
       - name: Push packages to NuGet.org
         if: env.NUGET_API_KEY != ''
         shell: bash
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
           dotnet nuget push dist/nuget/*.nupkg --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
           dotnet nuget push dist/nuget/*.snupkg --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+  publish-powershell-gallery:
+    name: Publish PowerShell Gallery
+    runs-on: ubuntu-latest
+    env:
+      PS_GALLERY_API_KEY: ${{ secrets.PS_GALLERY_API_KEY }}
+    needs:
+      - preflight
+      - csharp-packages
+      - create-tag
+      - github-release
+    if: ${{ fromJSON(needs.preflight.outputs.dry-run) == false && fromJSON(needs.preflight.outputs.publish-powershell-gallery) == true }}
+
+    steps:
+      - name: Download PowerShell module artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: powershell-module
+          path: dist/powershell-module
+
+      - name: Publish Devolutions.Pinget.Client to PowerShell Gallery
+        if: env.PS_GALLERY_API_KEY != ''
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem -Path dist/powershell-module -Filter 'Devolutions.Pinget.Client.*.zip' | Select-Object -First 1
+          if ($null -eq $archive) {
+            throw 'PowerShell module archive was not downloaded.'
+          }
+
+          $expandedRoot = Join-Path 'dist' 'powershell-gallery'
+          Expand-Archive -Path $archive.FullName -DestinationPath $expandedRoot -Force
+          $modulePath = (Resolve-Path (Join-Path $expandedRoot 'Devolutions.Pinget.Client')).Path
+
+          Test-ModuleManifest -Path (Join-Path $modulePath 'Devolutions.Pinget.Client.psd1') | Out-Null
+          Publish-Module -Path $modulePath -NuGetApiKey $env:PS_GALLERY_API_KEY -Verbose

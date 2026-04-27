@@ -6,7 +6,7 @@
     Author = 'Devolutions'
     CompanyName = 'Devolutions'
     Copyright = '(c) Devolutions. All rights reserved.'
-    Description = 'PowerShell module for Pinget.'
+    Description = 'PowerShell 7 client module for Pinget, a COM-free WinGet-compatible package manager.'
     PowerShellVersion = '7.4.0'
 
     FunctionsToExport = @()
@@ -68,10 +68,14 @@
             Tags = @(
                 'PSEdition_Core'
                 'WindowsPackageManager'
+                'WinGet'
                 'Pinget'
                 'PortableWinget'
+                'PackageManagement'
             )
-            ProjectUri = 'https://github.com/microsoft/winget-cli'
+            LicenseUri = 'https://github.com/Devolutions/pinget/blob/master/LICENSE'
+            ProjectUri = 'https://github.com/Devolutions/pinget'
+            ReleaseNotes = 'See the repository changelog and release notes for details.'
         }
     }
 }

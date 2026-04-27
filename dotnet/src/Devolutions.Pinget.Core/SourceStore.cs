@@ -1,6 +1,6 @@
+using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Security.Principal;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -452,4 +452,4 @@ internal static class SourceStoreManager
 
     private static string SanitizePathSegment(string value) => string.Concat(value.Select(c =>
         @"\/:*?""<>|".Contains(c) ? '_' : c));
-    }
+}

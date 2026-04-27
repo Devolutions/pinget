@@ -1,7 +1,7 @@
 param(
     [string]$RustWinget = (Join-Path $PSScriptRoot "..\target\debug\pinget.exe"),
     [string]$DotnetWinget = (Join-Path $PSScriptRoot "..\..\dotnet\src\Devolutions.Pinget.Cli\bin\Release\net10.0\pinget.exe"),
-    [string]$PowerShellModulePath = (Join-Path $PSScriptRoot "..\..\dotnet\src\Devolutions.Pinget.PowerShell.Cmdlets\bin\Release\net10.0\Pinget.psd1"),
+    [string]$PowerShellModulePath = (Join-Path $PSScriptRoot "..\dist\powershell-module\Devolutions.Pinget.Client\Devolutions.Pinget.Client.psd1"),
     [string]$SystemWinget = "winget",
     [string[]]$ReadOnlyCases = @(
         "show-versions",
