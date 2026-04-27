@@ -434,7 +434,7 @@ jobs:
             'dotnet/src/Devolutions.Pinget.PowerShell.Engine/bin/Release',
             'dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/bin/Release'
           )
-          $Binaries = @(Get-ChildItem -Path $BinaryRoots -Recurse -File -Include 'Devolutions.Pinget*.dll' | Where-Object {
+          $Binaries = @(Get-ChildItem -Path $BinaryRoots -Recurse -File -Include '*.dll','*.exe' | Where-Object {
             $_.FullName -like '*\bin\Release\*' -and $_.FullName -notmatch '\\ref\\'
           })
 
@@ -443,6 +443,12 @@ jobs:
           }
 
           foreach ($Binary in $Binaries) {
+            $Signature = Get-AuthenticodeSignature -FilePath $Binary.FullName
+            if ($Signature.Status -eq 'Valid') {
+              Write-Host "Code signing skipped for already-signed binary: $($Binary.FullName)"
+              continue
+            }
+
             AzureSignTool @SignParams $Binary.FullName
             if ($LASTEXITCODE -ne 0) {
               throw "Code signing failed for $($Binary.FullName)."
