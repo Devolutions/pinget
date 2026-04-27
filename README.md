@@ -27,13 +27,63 @@ Structured manifest output is also supported:
 - `show --output json|yaml`
 - `search --manifests --output json|yaml`
 
-The C# implementation also ships the **`Devolutions.Pinget.Client` PowerShell 7 module** that mirrors the upstream `Microsoft.WinGet.Client` cmdlet family with renamed `Pinget` nouns, backed entirely by `Devolutions.Pinget.Core` rather than COM / WinRT APIs.
+The C# implementation also ships the **`Devolutions.Pinget.Client` PowerShell 7 module** that mirrors the upstream `Microsoft.WinGet.Client` cmdlet family with renamed `Pinget` nouns, backed by `Devolutions.Pinget.Core`.
+
+## PowerShell module
+
+The **`Devolutions.Pinget.Client`** module is available from the PowerShell Gallery:
+
+```powershell
+# Recommended for current PowerShellGet/PSResourceGet environments.
+Install-PSResource -Name Devolutions.Pinget.Client -Repository PSGallery
+
+# PowerShellGet v2 alternative.
+Install-Module -Name Devolutions.Pinget.Client -Scope CurrentUser
+```
+
+The module requires PowerShell 7.4 or later and exposes WinGet-style cmdlets with `Pinget` nouns instead of `WinGet` nouns. It is implemented over `Devolutions.Pinget.Core`.
+
+```powershell
+Import-Module Devolutions.Pinget.Client
+
+Get-PingetVersion
+Get-Command -Module Devolutions.Pinget.Client
+Get-PingetSource
+```
+
+Examples below use Devolutions packages from the community WinGet manifests:
+
+```powershell
+# Discover Devolutions packages.
+Find-PingetPackage -Query Devolutions
+Find-PingetPackage -Id Devolutions.RemoteDesktopManager
+Find-PingetPackage -Id Devolutions.MsRdpEx
+
+# Inspect package metadata and available versions.
+$rdm = Find-PingetPackage -Id Devolutions.RemoteDesktopManager | Select-Object -First 1
+$rdm.AvailableVersions | Select-Object -First 5
+$rdm.GetPackageVersionInfo($rdm.AvailableVersions[0]) |
+    Format-List Id, DisplayName, Version, Publisher, InstallerType, InstallerUrl
+
+# Query installed packages.
+Get-PingetPackage -Name Devolutions
+Get-PingetPackage -Id Devolutions.RemoteDesktopManager
+
+# Preview package operations. Remove -WhatIf to execute them.
+Install-PingetPackage -Id Devolutions.MsRdpEx -Scope User -WhatIf
+Update-PingetPackage -Id Devolutions.RemoteDesktopManager -WhatIf
+Uninstall-PingetPackage -Id Devolutions.MsRdpEx -WhatIf
+
+# Download installers without installing them.
+Export-PingetPackage -Id Devolutions.RemoteDesktopManager -DownloadDirectory .\downloads
+```
+
+Useful exported cmdlets include `Find-PingetPackage`, `Get-PingetPackage`, `Install-PingetPackage`, `Update-PingetPackage`, `Uninstall-PingetPackage`, `Repair-PingetPackage`, `Export-PingetPackage`, `Get-PingetSource`, `Add-PingetSource`, `Remove-PingetSource`, `Reset-PingetSource`, and the user-setting cmdlets.
 
 ## Non-goals
 
 Pinget intentionally excludes:
 
-- COM / WinRT / `Microsoft.Management.Deployment`
 - DSC-backed configuration flows (`configure`, `dscv3`, `Microsoft.WinGet.Configuration`)
 - `mcp`
 
@@ -126,7 +176,7 @@ Pinget is maintained with WinGet compatibility in mind. Current prep rules:
 
 1. Prefer subtree-relative paths in docs and scripts.
 2. Keep Pinget-specific documentation under this directory instead of the parent repo when practical.
-3. Avoid introducing dependencies on the native WinGet COM stack, DSC/configuration stack, or MCP.
+3. Avoid introducing dependencies on the native WinGet DSC/configuration stack or MCP.
 4. Keep Rust and C# toolchain instructions runnable from this directory as a future repository root.
 
 ## Status
@@ -137,6 +187,6 @@ Pinget is best treated as an **experimental portable winget implementation** foc
 - manifest retrieval and shaping
 - custom REST source support
 - reusable library surfaces in Rust and C#
-- a COM-free PowerShell automation surface over the C# implementation
+- a PowerShell automation surface over the C# implementation
 
 It is not intended to be a drop-in, fully complete replacement for the native Windows Package Manager client.

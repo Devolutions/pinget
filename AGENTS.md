@@ -8,13 +8,11 @@ This directory is being prepared to become its own `pinget` repository. Treat `p
 - Maintain the C# CLI + core + PowerShell module in `dotnet\`
 - Keep **both** `rust\` and `dotnet\` directories in the standalone-repo prep
 - Keep behavior aligned with WinGet where practical
-- Keep the implementation **COM-free**
 
 ## Hard exclusions
 
 Do not add or depend on:
 
-- COM / WinRT / `Microsoft.Management.Deployment`
 - DSC / `configure` / `dscv3` / `Microsoft.WinGet.Configuration`
 - `mcp`
 
