@@ -246,7 +246,7 @@ function Get-DotnetSettingsObject {
 
 function Get-PowerShellSettingsObject {
     Import-PingetPowerShellModule
-    return Get-PingetUserSettings -ErrorAction Stop
+    return Get-PingetUserSetting -ErrorAction Stop
 }
 
 function Assert-TestSettingsVisible {
@@ -649,7 +649,7 @@ try {
 
     Write-Section "Settings roundtrip"
     $testSettings = New-TestSettingsHashtable
-    Set-PingetUserSettings -UserSettings $testSettings -ErrorAction Stop | Out-Null
+    Set-PingetUserSetting -UserSettings $testSettings -ErrorAction Stop | Out-Null
     Assert-True -Condition (Test-Path -Path $settingsPath) -Message "PowerShell settings write did not create the packaged settings file."
     Assert-TestSettingsVisible -SettingsObject (Get-RustSettingsObject) -Label "Rust pinget settings export"
     Assert-TestSettingsVisible -SettingsObject (Get-DotnetSettingsObject) -Label "C# pinget settings export"
