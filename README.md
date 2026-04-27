@@ -29,6 +29,45 @@ Structured manifest output is also supported:
 
 The C# implementation also ships the **`Devolutions.Pinget.Client` PowerShell 7 module** that mirrors the upstream `Microsoft.WinGet.Client` cmdlet family with renamed `Pinget` nouns, backed by `Devolutions.Pinget.Core`.
 
+## Pinget CLI
+
+The prebuilt `pinget` CLI published in [GitHub Releases](https://github.com/Devolutions/pinget/releases) is the Rust build. Download the archive for your platform, extract it, and put the `pinget` executable on your `PATH`.
+
+```powershell
+pinget --help
+pinget --info
+pinget source list
+pinget source update
+```
+
+Examples below use Devolutions packages from the community WinGet manifests:
+
+```powershell
+# Discover packages.
+pinget search Devolutions
+pinget search --id Devolutions.RemoteDesktopManager --exact
+pinget search --id Devolutions.MsRdpEx --exact --versions
+
+# Inspect package metadata.
+pinget show --id Devolutions.RemoteDesktopManager --exact
+pinget show --id Devolutions.MsRdpEx --exact --versions
+
+# Produce structured manifest output for automation.
+pinget show --id Devolutions.RemoteDesktopManager --exact --output json
+pinget search Devolutions --manifests --output yaml
+
+# Download installers without installing them.
+pinget download --id Devolutions.RemoteDesktopManager --download-directory .\downloads
+
+# Query installed packages and available upgrades.
+pinget list Devolutions
+pinget upgrade
+
+# Package action commands execute installers on supported platforms.
+pinget install --id Devolutions.MsRdpEx --scope user --silent
+pinget uninstall --id Devolutions.MsRdpEx --silent
+```
+
 ## PowerShell module
 
 The **`Devolutions.Pinget.Client`** module is available from the PowerShell Gallery:
@@ -79,6 +118,60 @@ Export-PingetPackage -Id Devolutions.RemoteDesktopManager -DownloadDirectory .\d
 ```
 
 Useful exported cmdlets include `Find-PingetPackage`, `Get-PingetPackage`, `Install-PingetPackage`, `Update-PingetPackage`, `Uninstall-PingetPackage`, `Repair-PingetPackage`, `Export-PingetPackage`, `Get-PingetSource`, `Add-PingetSource`, `Remove-PingetSource`, `Reset-PingetSource`, and the user-setting cmdlets.
+
+## NuGet package
+
+The **`Devolutions.Pinget.Core`** library is available on [nuget.org](https://www.nuget.org/packages/Devolutions.Pinget.Core) for .NET applications that want to use Pinget package discovery, source caches, manifest metadata, downloads, and installed package state programmatically.
+
+```powershell
+dotnet add package Devolutions.Pinget.Core
+```
+
+The package targets .NET 8 and .NET 10. `Repository.Open()` is the main entry point; pass `RepositoryOptions` when you want an isolated app root or a custom user agent.
+
+```csharp
+using Devolutions.Pinget.Core;
+
+using var repository = Repository.Open(new RepositoryOptions
+{
+    AppRoot = Path.Combine(Path.GetTempPath(), "pinget-sample"),
+    UserAgent = "my-app/1.0",
+});
+
+foreach (var update in repository.UpdateSources())
+{
+    Console.WriteLine($"{update.Name}: {update.Detail}");
+}
+
+var search = repository.Search(new PackageQuery
+{
+    Query = "Devolutions",
+    Count = 10,
+});
+
+foreach (var package in search.Matches)
+{
+    Console.WriteLine($"{package.Id} {package.Version}");
+}
+
+var rdm = repository.Show(new PackageQuery
+{
+    Id = "Devolutions.RemoteDesktopManager",
+    Exact = true,
+});
+
+Console.WriteLine($"{rdm.Manifest.Name} {rdm.Manifest.Version}");
+
+var (_, installerPath) = repository.DownloadInstaller(
+    new PackageQuery
+    {
+        Id = "Devolutions.MsRdpEx",
+        Exact = true,
+    },
+    Path.Combine(Environment.CurrentDirectory, "downloads"));
+
+Console.WriteLine(installerPath);
+```
 
 ## Non-goals
 
