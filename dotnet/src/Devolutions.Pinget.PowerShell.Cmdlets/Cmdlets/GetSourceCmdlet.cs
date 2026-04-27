@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine.PSObjects;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsCommon.Get, Constants.PingetNouns.Source)]
-[Alias("gpgso")]
 [OutputType(typeof(PSSourceResult))]
 public sealed class GetSourceCmdlet : PSCmdlet
 {

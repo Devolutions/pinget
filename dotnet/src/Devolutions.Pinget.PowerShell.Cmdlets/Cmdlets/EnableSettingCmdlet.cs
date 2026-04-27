@@ -5,7 +5,6 @@ using Devolutions.Pinget.PowerShell.Engine;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsLifecycle.Enable, Constants.PingetNouns.Setting)]
-[Alias("epgs")]
 public sealed class EnableSettingCmdlet : PSCmdlet
 {
     [Parameter(Position = 0, Mandatory = true, ValueFromPipeline = true, ValueFromPipelineByPropertyName = true)]

@@ -6,7 +6,7 @@
     Author = 'Devolutions'
     CompanyName = 'Devolutions'
     Copyright = '(c) Devolutions. All rights reserved.'
-    Description = 'PowerShell 7 client module for Pinget, a COM-free WinGet-compatible package manager.'
+    Description = 'PowerShell 7 winget-compatible pinget module.'
     PowerShellVersion = '7.4.0'
 
     FunctionsToExport = @()
@@ -34,32 +34,7 @@
         'Export-PingetPackage'
     )
 
-    AliasesToExport = @(
-        'apgs'
-        'apgpm'
-        'dpgs'
-        'epgp'
-        'epgs'
-        'fdpgp'
-        'gpgp'
-        'gpgse'
-        'gpgso'
-        'gpgus'
-        'gpgv'
-        'ispgp'
-        'rpgp'
-        'rpgs'
-        'rppgpm'
-        'rspgs'
-        'spgus'
-        'tpgus'
-        'udpgp'
-        'uspgp'
-        'Get-PingetSettings'
-        'Get-PingetUserSettings'
-        'Set-PingetUserSettings'
-        'Test-PingetUserSettings'
-    )
+    AliasesToExport = @()
 
     FormatsToProcess = @('Format.ps1xml')
 

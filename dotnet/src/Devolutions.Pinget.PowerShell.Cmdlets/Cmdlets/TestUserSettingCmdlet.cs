@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsDiagnostic.Test, Constants.PingetNouns.UserSetting)]
-[Alias("tpgus", "Test-PingetUserSettings")]
 [OutputType(typeof(bool))]
 public sealed class TestUserSettingCmdlet : PSCmdlet
 {

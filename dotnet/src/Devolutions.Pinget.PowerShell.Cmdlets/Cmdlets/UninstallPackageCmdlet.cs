@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine.PSObjects;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsLifecycle.Uninstall, Constants.PingetNouns.Package, DefaultParameterSetName = Constants.FoundSet, SupportsShouldProcess = true)]
-[Alias("uspgp")]
 [OutputType(typeof(PSUninstallResult))]
 public sealed class UninstallPackageCmdlet : PackageCmdlet
 {

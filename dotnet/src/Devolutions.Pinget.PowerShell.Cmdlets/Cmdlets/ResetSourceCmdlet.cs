@@ -5,7 +5,6 @@ using Devolutions.Pinget.PowerShell.Engine;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsCommon.Reset, Constants.PingetNouns.Source, DefaultParameterSetName = Constants.DefaultSet)]
-[Alias("rspgs")]
 public sealed class ResetSourceCmdlet : PSCmdlet
 {
     [Parameter(

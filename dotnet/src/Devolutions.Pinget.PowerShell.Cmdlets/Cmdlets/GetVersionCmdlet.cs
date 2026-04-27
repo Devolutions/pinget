@@ -5,7 +5,6 @@ using Devolutions.Pinget.PowerShell.Engine;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsCommon.Get, Constants.PingetNouns.Version)]
-[Alias("gpgv")]
 [OutputType(typeof(string))]
 public sealed class GetVersionCmdlet : PSCmdlet
 {

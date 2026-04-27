@@ -79,13 +79,10 @@ Describe 'Pinget module exports' {
         }
     }
 
-    It 'exports the upstream-style plural aliases' {
+    It 'does not export aliases' {
         $aliases = (Get-Module Devolutions.Pinget.Client).ExportedAliases.Keys
 
-        $aliases | Should -Contain 'Get-PingetSettings'
-        $aliases | Should -Contain 'Get-PingetUserSettings'
-        $aliases | Should -Contain 'Set-PingetUserSettings'
-        $aliases | Should -Contain 'Test-PingetUserSettings'
+        $aliases | Should -BeNullOrEmpty
     }
 }
 

@@ -1,8 +1,8 @@
 # Pinget
 
-This directory contains **Pinget**: portable, COM-free WinGet-compatible implementations intended to become a standalone repository later.
+This directory contains **Pinget**: portable implementations intended to remain compatible with WinGet behavior where practical.
 
-The current goal is to keep the subtree self-contained enough that it can be split out with minimal rewriting. Within this directory, treat paths as if `pinget\` were the repository root.
+The current goal is to keep the Rust, C#, and PowerShell surfaces aligned while preserving WinGet-compatible behavior. Within this directory, treat paths as if `pinget\` were the repository root.
 
 ## Layout
 
@@ -120,9 +120,9 @@ dotnet run --project dotnet\src\Devolutions.Pinget.Cli\Devolutions.Pinget.Cli.cs
 - `dotnet\src\Devolutions.Pinget.PowerShell.Cmdlets` - PowerShell cmdlet implementation for the `Devolutions.Pinget.Client` module
 - `dotnet\tests` - Pinget PowerShell Pester coverage
 
-## Extraction prep
+## Compatibility guidance
 
-This subtree is being prepared for later promotion into its own GitHub repository. Current prep rules:
+Pinget is maintained with WinGet compatibility in mind. Current prep rules:
 
 1. Prefer subtree-relative paths in docs and scripts.
 2. Keep Pinget-specific documentation under this directory instead of the parent repo when practical.

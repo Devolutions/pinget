@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine.PSObjects;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsData.Update, Constants.PingetNouns.Package, DefaultParameterSetName = Constants.FoundSet, SupportsShouldProcess = true)]
-[Alias("udpgp")]
 [OutputType(typeof(PSInstallResult))]
 public sealed class UpdatePackageCmdlet : InstallCmdlet
 {

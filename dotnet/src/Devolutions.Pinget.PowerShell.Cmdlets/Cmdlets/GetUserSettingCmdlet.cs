@@ -5,7 +5,6 @@ using Devolutions.Pinget.PowerShell.Engine;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsCommon.Get, Constants.PingetNouns.UserSetting)]
-[Alias("gpgus", "Get-PingetUserSettings")]
 [OutputType(typeof(System.Collections.Hashtable))]
 public sealed class GetUserSettingCmdlet : PSCmdlet
 {

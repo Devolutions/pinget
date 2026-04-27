@@ -6,7 +6,6 @@ using Devolutions.Pinget.PowerShell.Engine.PSObjects;
 namespace Devolutions.Pinget.PowerShell.Cmdlets.Cmdlets;
 
 [Cmdlet(VerbsDiagnostic.Repair, Constants.PingetNouns.Package, DefaultParameterSetName = Constants.FoundSet, SupportsShouldProcess = true)]
-[Alias("rpgp")]
 [OutputType(typeof(PSRepairResult))]
 public sealed class RepairPackageCmdlet : PackageCmdlet
 {
