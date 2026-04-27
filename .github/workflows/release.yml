@@ -539,7 +539,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ needs.preflight.outputs.tag-name }}" dist/release/*.zip dist/release/*.nupkg dist/release/*.snupkg --generate-notes
+          gh release create "${{ needs.preflight.outputs.tag-name }}" dist/release/*.zip dist/release/*.nupkg dist/release/*.snupkg --generate-notes --repo "${{ github.repository }}"
 
   publish-nuget:
     name: Publish NuGet
