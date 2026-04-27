@@ -164,6 +164,7 @@ jobs:
     name: Rust Artifacts (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     needs: preflight
+    environment: ${{ needs.preflight.outputs.package-env }}
     strategy:
       fail-fast: false
       matrix:
@@ -228,6 +229,72 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           cargo build --release --package pinget-cli --bin pinget --manifest-path rust/Cargo.toml --target "${{ matrix.target }}"
+
+      - name: Install code signing tools
+        if: contains(matrix.target, 'windows-msvc')
+        shell: pwsh
+        run: |
+          dotnet tool install --global AzureSignTool
+
+          $TestCertsUrl = "https://raw.githubusercontent.com/Devolutions/devolutions-authenticode/master/data/certs"
+          Invoke-WebRequest -Uri "$TestCertsUrl/authenticode-test-ca.crt" -OutFile ".\authenticode-test-ca.crt"
+          Import-Certificate -FilePath ".\authenticode-test-ca.crt" -CertStoreLocation "cert:\LocalMachine\Root"
+          Remove-Item ".\authenticode-test-ca.crt" -ErrorAction SilentlyContinue | Out-Null
+
+      - name: Code sign Rust binary
+        if: contains(matrix.target, 'windows-msvc')
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          CODE_SIGNING_CERTIFICATE_NAME: ${{ secrets.CODE_SIGNING_CERTIFICATE_NAME }}
+          CODE_SIGNING_CLIENT_ID: ${{ secrets.CODE_SIGNING_CLIENT_ID }}
+          CODE_SIGNING_CLIENT_SECRET: ${{ secrets.CODE_SIGNING_CLIENT_SECRET }}
+          CODE_SIGNING_KEYVAULT_URL: ${{ secrets.CODE_SIGNING_KEYVAULT_URL }}
+          CODE_SIGNING_TIMESTAMP_SERVER: ${{ vars.CODE_SIGNING_TIMESTAMP_SERVER }}
+          TARGET: ${{ matrix.target }}
+          PINGET_BIN_NAME: ${{ matrix.binary_name }}
+        run: |
+          $PackageEnv = '${{ needs.preflight.outputs.package-env }}'
+          $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
+          $RequiredVariables = @(
+            'AZURE_TENANT_ID',
+            'CODE_SIGNING_CERTIFICATE_NAME',
+            'CODE_SIGNING_CLIENT_ID',
+            'CODE_SIGNING_CLIENT_SECRET',
+            'CODE_SIGNING_KEYVAULT_URL',
+            'CODE_SIGNING_TIMESTAMP_SERVER'
+          )
+          $MissingVariables = @($RequiredVariables | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          })
+
+          if ($MissingVariables.Count -gt 0) {
+            $Message = "Code signing configuration missing: $($MissingVariables -join ', ')"
+            if ($PackageEnv -eq 'publish-prod' -and -not $DryRun) {
+              throw $Message
+            }
+
+            Write-Host "$Message; skipping code signing."
+            return
+          }
+
+          $BinaryPath = [System.IO.Path]::Combine('rust', 'target', $env:TARGET, 'release', $env:PINGET_BIN_NAME)
+          if (-not (Test-Path -Path $BinaryPath)) {
+            throw "Binary not found: $BinaryPath"
+          }
+
+          AzureSignTool sign `
+            -kvt $env:AZURE_TENANT_ID `
+            -kvu $env:CODE_SIGNING_KEYVAULT_URL `
+            -kvi $env:CODE_SIGNING_CLIENT_ID `
+            -kvs $env:CODE_SIGNING_CLIENT_SECRET `
+            -kvc $env:CODE_SIGNING_CERTIFICATE_NAME `
+            -tr $env:CODE_SIGNING_TIMESTAMP_SERVER `
+            -v `
+            $BinaryPath
+          if ($LASTEXITCODE -ne 0) {
+            throw "Code signing failed for $BinaryPath."
+          }
 
       - name: Package artifacts
         shell: pwsh
