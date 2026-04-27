@@ -15,12 +15,21 @@ on:
         required: false
         default: true
         type: boolean
+      github-env:
+        description: GitHub environment selection.
+        required: true
+        type: choice
+        options:
+          - auto
+          - test
+          - prod
+        default: auto
       publish-nuget:
         description: Publish packages to NuGet.org during a manual release.
         required: false
         default: false
         type: boolean
-      publish-powershell-gallery:
+      publish-psgallery:
         description: Publish Devolutions.Pinget.Client to PowerShell Gallery during a manual release.
         required: false
         default: false
@@ -41,8 +50,9 @@ jobs:
       version: ${{ steps.info.outputs.version }}
       tag-name: ${{ steps.info.outputs.tag-name }}
       dry-run: ${{ steps.info.outputs.dry-run }}
+      package-env: ${{ steps.info.outputs.package-env }}
       publish-nuget: ${{ steps.info.outputs.publish-nuget }}
-      publish-powershell-gallery: ${{ steps.info.outputs.publish-powershell-gallery }}
+      publish-psgallery: ${{ steps.info.outputs.publish-psgallery }}
 
     steps:
       - name: Checkout
@@ -58,17 +68,49 @@ jobs:
           $DryRun = $false
           $PublishNuget = $true
           $PublishPowerShellGallery = $true
+          $RequestedEnvironment = 'auto'
 
           if ($IsWorkflowDispatch) {
             try { $DryRun = [System.Boolean]::Parse('${{ inputs['dry-run'] }}') } catch { $DryRun = $true }
             try { $PublishNuget = [System.Boolean]::Parse('${{ inputs['publish-nuget'] }}') } catch { $PublishNuget = $false }
-            try { $PublishPowerShellGallery = [System.Boolean]::Parse('${{ inputs['publish-powershell-gallery'] }}') } catch { $PublishPowerShellGallery = $false }
+            try { $PublishPowerShellGallery = [System.Boolean]::Parse('${{ inputs['publish-psgallery'] }}') } catch { $PublishPowerShellGallery = $false }
+
+            $RequestedEnvironment = '${{ inputs['github-env'] }}'.Trim().ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($RequestedEnvironment)) {
+              $RequestedEnvironment = 'auto'
+            }
+          }
+
+          switch ($RequestedEnvironment) {
+            'auto' {
+              $PackageEnv = if ($IsMasterBranch) {
+                'publish-prod'
+              } else {
+                'publish-test'
+              }
+            }
+            'test' {
+              $PackageEnv = 'publish-test'
+            }
+            'prod' {
+              $PackageEnv = 'publish-prod'
+            }
+            default {
+              throw "Unsupported github-env value: $RequestedEnvironment (expected auto, test, or prod)"
+            }
+          }
+
+          if ($RequestedEnvironment -eq 'test' -and ($IsMasterBranch -or (-not $DryRun -and ($PublishNuget -or $PublishPowerShellGallery)))) {
+            $PackageEnv = 'publish-prod'
+            Write-Host '::notice::github-env=test was promoted to publish-prod'
           }
 
           if (-not $IsMasterBranch) {
-            $DryRun = $true
-            $PublishNuget = $false
-            $PublishPowerShellGallery = $false
+            if ($PackageEnv -ne 'publish-prod') {
+              $DryRun = $true
+              $PublishNuget = $false
+              $PublishPowerShellGallery = $false
+            }
           }
 
           if ($DryRun) {
@@ -106,12 +148,15 @@ jobs:
           "version=$Version" >> $Env:GITHUB_OUTPUT
           "tag-name=$TagName" >> $Env:GITHUB_OUTPUT
           "dry-run=$($DryRun.ToString().ToLower())" >> $Env:GITHUB_OUTPUT
+          "package-env=$PackageEnv" >> $Env:GITHUB_OUTPUT
           "publish-nuget=$($PublishNuget.ToString().ToLower())" >> $Env:GITHUB_OUTPUT
-          "publish-powershell-gallery=$($PublishPowerShellGallery.ToString().ToLower())" >> $Env:GITHUB_OUTPUT
+          "publish-psgallery=$($PublishPowerShellGallery.ToString().ToLower())" >> $Env:GITHUB_OUTPUT
 
           Write-Host "::notice::Version: $Version"
           Write-Host "::notice::Tag: $TagName"
           Write-Host "::notice::DryRun: $DryRun"
+          Write-Host "::notice::Environment: $PackageEnv"
+          Write-Host "::notice::GitHubEnvMode: $RequestedEnvironment"
           Write-Host "::notice::PublishNuget: $PublishNuget"
           Write-Host "::notice::PublishPowerShellGallery: $PublishPowerShellGallery"
 
@@ -232,6 +277,7 @@ jobs:
     name: C# Packages
     runs-on: windows-latest
     needs: preflight
+    environment: ${{ needs.preflight.outputs.package-env }}
 
     steps:
       - name: Checkout
@@ -260,6 +306,81 @@ jobs:
       - name: Run PowerShell tests
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -File (Resolve-Path 'dotnet/tests/RunTests.ps1')
+
+      - name: Install code signing tools
+        shell: pwsh
+        run: |
+          dotnet tool install --global AzureSignTool
+
+          $TestCertsUrl = "https://raw.githubusercontent.com/Devolutions/devolutions-authenticode/master/data/certs"
+          Invoke-WebRequest -Uri "$TestCertsUrl/authenticode-test-ca.crt" -OutFile ".\authenticode-test-ca.crt"
+          Import-Certificate -FilePath ".\authenticode-test-ca.crt" -CertStoreLocation "cert:\LocalMachine\Root"
+          Remove-Item ".\authenticode-test-ca.crt" -ErrorAction SilentlyContinue | Out-Null
+
+      - name: Code sign C# binaries
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          CODE_SIGNING_CERTIFICATE_NAME: ${{ secrets.CODE_SIGNING_CERTIFICATE_NAME }}
+          CODE_SIGNING_CLIENT_ID: ${{ secrets.CODE_SIGNING_CLIENT_ID }}
+          CODE_SIGNING_CLIENT_SECRET: ${{ secrets.CODE_SIGNING_CLIENT_SECRET }}
+          CODE_SIGNING_KEYVAULT_URL: ${{ secrets.CODE_SIGNING_KEYVAULT_URL }}
+          CODE_SIGNING_TIMESTAMP_SERVER: ${{ vars.CODE_SIGNING_TIMESTAMP_SERVER }}
+        run: |
+          $PackageEnv = '${{ needs.preflight.outputs.package-env }}'
+          $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
+          $RequiredVariables = @(
+            'AZURE_TENANT_ID',
+            'CODE_SIGNING_CERTIFICATE_NAME',
+            'CODE_SIGNING_CLIENT_ID',
+            'CODE_SIGNING_CLIENT_SECRET',
+            'CODE_SIGNING_KEYVAULT_URL',
+            'CODE_SIGNING_TIMESTAMP_SERVER'
+          )
+          $MissingVariables = @($RequiredVariables | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          })
+
+          if ($MissingVariables.Count -gt 0) {
+            $Message = "Code signing configuration missing: $($MissingVariables -join ', ')"
+            if ($PackageEnv -eq 'publish-prod' -and -not $DryRun) {
+              throw $Message
+            }
+
+            Write-Host "$Message; skipping code signing."
+            return
+          }
+
+          $SignParams = @(
+            'sign',
+            '-kvt', $env:AZURE_TENANT_ID,
+            '-kvu', $env:CODE_SIGNING_KEYVAULT_URL,
+            '-kvi', $env:CODE_SIGNING_CLIENT_ID,
+            '-kvs', $env:CODE_SIGNING_CLIENT_SECRET,
+            '-kvc', $env:CODE_SIGNING_CERTIFICATE_NAME,
+            '-tr', $env:CODE_SIGNING_TIMESTAMP_SERVER,
+            '-v'
+          )
+
+          $BinaryRoots = @(
+            'dotnet/src/Devolutions.Pinget.Core/bin/Release',
+            'dotnet/src/Devolutions.Pinget.PowerShell.Engine/bin/Release',
+            'dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/bin/Release'
+          )
+          $Binaries = @(Get-ChildItem -Path $BinaryRoots -Recurse -File -Include 'Devolutions.Pinget*.dll' | Where-Object {
+            $_.FullName -like '*\bin\Release\*' -and $_.FullName -notmatch '\\ref\\'
+          })
+
+          if ($Binaries.Count -eq 0) {
+            throw 'No C# binaries were found for code signing.'
+          }
+
+          foreach ($Binary in $Binaries) {
+            AzureSignTool @SignParams $Binary.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Code signing failed for $($Binary.FullName)."
+            }
+          }
 
       - name: Pack NuGet packages
         shell: pwsh
@@ -352,8 +473,10 @@ jobs:
   publish-nuget:
     name: Publish NuGet
     runs-on: ubuntu-latest
-    env:
-      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+    environment: ${{ needs.preflight.outputs.package-env }}
+    permissions:
+      contents: read
+      id-token: write
     needs:
       - preflight
       - csharp-packages
@@ -367,6 +490,12 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: NuGet login (OIDC)
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_BOT_USERNAME }}
+
       - name: Download package artifacts
         uses: actions/download-artifact@v8
         with:
@@ -374,23 +503,40 @@ jobs:
           path: dist/nuget
 
       - name: Push packages to NuGet.org
-        if: env.NUGET_API_KEY != ''
-        shell: bash
+        shell: pwsh
         run: |
-          dotnet nuget push dist/nuget/*.nupkg --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
-          dotnet nuget push dist/nuget/*.snupkg --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          $Packages = @(Get-ChildItem -Path dist/nuget -Filter '*.nupkg')
+          if ($Packages.Count -eq 0) {
+            throw 'No NuGet packages were downloaded.'
+          }
 
-  publish-powershell-gallery:
+          foreach ($Package in $Packages) {
+            dotnet nuget push $Package.FullName --api-key '${{ steps.nuget-login.outputs.NUGET_API_KEY }}' --source https://api.nuget.org/v3/index.json --skip-duplicate
+            if ($LASTEXITCODE -ne 0) {
+              throw "NuGet package publishing failed for $($Package.FullName)."
+            }
+          }
+
+          $SymbolPackages = @(Get-ChildItem -Path dist/nuget -Filter '*.snupkg')
+          foreach ($SymbolPackage in $SymbolPackages) {
+            dotnet nuget push $SymbolPackage.FullName --api-key '${{ steps.nuget-login.outputs.NUGET_API_KEY }}' --source https://api.nuget.org/v3/index.json --skip-duplicate
+            if ($LASTEXITCODE -ne 0) {
+              throw "NuGet symbol package publishing failed for $($SymbolPackage.FullName)."
+            }
+          }
+
+  publish-psgallery:
     name: Publish PowerShell Gallery
     runs-on: ubuntu-latest
+    environment: ${{ needs.preflight.outputs.package-env }}
     env:
-      PS_GALLERY_API_KEY: ${{ secrets.PS_GALLERY_API_KEY }}
+      PSGALLERY_NUGET_API_KEY: ${{ secrets.PSGALLERY_NUGET_API_KEY }}
     needs:
       - preflight
       - csharp-packages
       - create-tag
       - github-release
-    if: ${{ fromJSON(needs.preflight.outputs.dry-run) == false && fromJSON(needs.preflight.outputs.publish-powershell-gallery) == true }}
+    if: ${{ fromJSON(needs.preflight.outputs.dry-run) == false && fromJSON(needs.preflight.outputs.publish-psgallery) == true }}
 
     steps:
       - name: Download PowerShell module artifact
@@ -400,9 +546,12 @@ jobs:
           path: dist/powershell-module
 
       - name: Publish Devolutions.Pinget.Client to PowerShell Gallery
-        if: env.PS_GALLERY_API_KEY != ''
         shell: pwsh
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:PSGALLERY_NUGET_API_KEY)) {
+            throw 'PSGALLERY_NUGET_API_KEY is not configured.'
+          }
+
           $archive = Get-ChildItem -Path dist/powershell-module -Filter 'Devolutions.Pinget.Client.*.zip' | Select-Object -First 1
           if ($null -eq $archive) {
             throw 'PowerShell module archive was not downloaded.'
@@ -413,4 +562,4 @@ jobs:
           $modulePath = (Resolve-Path (Join-Path $expandedRoot 'Devolutions.Pinget.Client')).Path
 
           Test-ModuleManifest -Path (Join-Path $modulePath 'Devolutions.Pinget.Client.psd1') | Out-Null
-          Publish-Module -Path $modulePath -NuGetApiKey $env:PS_GALLERY_API_KEY -Verbose
+          Publish-Module -Path $modulePath -NuGetApiKey $env:PSGALLERY_NUGET_API_KEY -Verbose
