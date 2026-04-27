@@ -1,9 +1,7 @@
 name: Release
 
 on:
-  push:
-    branches:
-      - master
+  # Keep releases manual-only so default-branch merges do not request approval.
   workflow_dispatch:
     inputs:
       version:
