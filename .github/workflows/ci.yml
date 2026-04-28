@@ -107,10 +107,6 @@ jobs:
       - name: Run core tests
         run: dotnet test dotnet/src/Devolutions.Pinget.Core.Tests/Devolutions.Pinget.Core.Tests.csproj -c Release --no-build
 
-      - name: Run PowerShell tests
-        shell: pwsh
-        run: pwsh -NoLogo -NoProfile -File (Resolve-Path 'dotnet/tests/RunTests.ps1')
-
       - name: Build native COM DLLs
         shell: pwsh
         env:
@@ -118,6 +114,10 @@ jobs:
         run: |
           cargo build -p pinget-com --manifest-path rust/Cargo.toml --release --target x86_64-pc-windows-msvc
           cargo build -p pinget-com --manifest-path rust/Cargo.toml --release --target aarch64-pc-windows-msvc
+
+      - name: Run PowerShell tests
+        shell: pwsh
+        run: pwsh -NoLogo -NoProfile -File (Resolve-Path 'dotnet/tests/RunTests.ps1')
 
       - name: Validate NuGet packing
         shell: pwsh
