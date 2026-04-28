@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>true</IsPackable>
+    <AssemblyName>Devolutions.Pinget.ComInterop.Net48</AssemblyName>
+    <RootNamespace>Devolutions.Pinget.ComInterop</RootNamespace>
+    <PackageId>Devolutions.Pinget.ComInterop.Net48</PackageId>
+    <Description>.NET Framework bridge for loading and consuming the registration-free native Pinget COM DLL.</Description>
+  </PropertyGroup>
+</Project>

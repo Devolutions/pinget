@@ -20,7 +20,7 @@ public sealed class UninstallPackageCmdlet : PackageCmdlet
 
     protected override void ProcessRecord()
     {
-        var target = PSCatalogPackage?.Id ?? Id ?? Name ?? string.Join(' ', Query ?? []);
+        var target = PSCatalogPackage?.Id ?? Id ?? Name ?? string.Join(" ", Query ?? []);
         if (!ShouldProcess(target, "Uninstall package"))
             return;
 

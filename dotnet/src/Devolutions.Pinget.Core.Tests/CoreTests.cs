@@ -933,6 +933,31 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void CreateDependencyInstallRequest_IsSilentAndNotForced()
+    {
+        var result = Repository.CreateDependencyInstallRequest(
+            "Microsoft.VCRedist.2015+.x64",
+            new InstallRequest
+            {
+                Query = new PackageQuery { Source = "winget" },
+                Mode = InstallerMode.SilentWithProgress,
+                Force = true,
+                AcceptPackageAgreements = true,
+                IgnoreSecurityHash = true,
+                DependencySource = "dependencies",
+            });
+
+        Assert.Equal("Microsoft.VCRedist.2015+.x64", result.Query.Id);
+        Assert.Equal("dependencies", result.Query.Source);
+        Assert.True(result.Query.Exact);
+        Assert.Equal(InstallerMode.Silent, result.Mode);
+        Assert.False(result.Force);
+        Assert.True(result.NoUpgrade);
+        Assert.True(result.AcceptPackageAgreements);
+        Assert.True(result.IgnoreSecurityHash);
+    }
+
+    [Fact]
     public void CreateInstallNoOpResult_SkipsReinstallWhenAlreadyCurrent()
     {
         var result = Repository.CreateInstallNoOpResult(

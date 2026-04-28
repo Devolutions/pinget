@@ -2,6 +2,7 @@
 members = [
     "crates/pinget-core",
     "crates/pinget-cli",
+    "crates/pinget-com",
 ]
 resolver = "3"
 

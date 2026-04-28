@@ -1,10 +1,48 @@
 [CmdletBinding()]
 param(
-    [string]$ModulePath = (Join-Path $PSScriptRoot '..\..\dist\powershell-module\Devolutions.Pinget.Client\Devolutions.Pinget.Client.psd1'),
+    [string]$ModulePath,
     [string]$SourceArgument = 'https://api.winget.pro/4259fd23-6fcd-46bf-9287-be8833cfbdd5'
 )
 
-Import-Module Pester -MinimumVersion 5.0.0
+try
+{
+    Import-Module Pester -MinimumVersion 5.0.0 -ErrorAction Stop
+}
+catch
+{
+    $powerShellModuleRoots = @(
+        (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules\Pester')
+        (Join-Path $env:ProgramFiles 'PowerShell\Modules\Pester')
+    )
+    $pesterManifest = $null
+    foreach ($powerShellModuleRoot in $powerShellModuleRoots)
+    {
+        if (Test-Path -Path $powerShellModuleRoot)
+        {
+            $pesterManifest = Get-ChildItem -Path $powerShellModuleRoot -Filter Pester.psd1 -Recurse |
+                Where-Object { [version]$_.Directory.Name -ge [version]'5.0.0' } |
+                Sort-Object { [version]$_.Directory.Name } -Descending |
+                Select-Object -First 1 -ExpandProperty FullName
+
+            if (-not [string]::IsNullOrWhiteSpace($pesterManifest))
+            {
+                break
+            }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($pesterManifest))
+    {
+        throw
+    }
+
+    Import-Module $pesterManifest -MinimumVersion 5.0.0 -ErrorAction Stop
+}
+
+if ([string]::IsNullOrWhiteSpace($ModulePath))
+{
+    $ModulePath = Join-Path $PSScriptRoot '..\..\dist\powershell-module\Devolutions.Pinget.Client\Devolutions.Pinget.Client.psd1'
+}
 
 if (-not (Test-Path -Path $ModulePath))
 {
