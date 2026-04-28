@@ -61,6 +61,11 @@ Set-VersionInFile `
     -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
 
 Set-VersionInFile `
+    -RelativePath 'rust\crates\pinget-com\Cargo.toml' `
+    -Pattern '^(version\s*=\s*")[^"]+(")' `
+    -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
+
+Set-VersionInFile `
     -RelativePath 'dotnet\src\Devolutions.Pinget.Cli\Program.cs' `
     -Pattern '^(const string Version\s*=\s*")[^"]+(";)' `
     -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
