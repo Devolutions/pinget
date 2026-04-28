@@ -737,24 +737,26 @@ public class Repository : IDisposable
 
         foreach (var dependencyId in dependencies)
         {
-            Install(new InstallRequest
-            {
-                Query = new PackageQuery
-                {
-                    Id = dependencyId,
-                    Source = request.DependencySource ?? request.Query.Source,
-                    Exact = true,
-                },
-                Mode = request.Mode,
-                SkipDependencies = false,
-                DependenciesOnly = false,
-                AcceptPackageAgreements = request.AcceptPackageAgreements,
-                Force = request.Force,
-                IgnoreSecurityHash = request.IgnoreSecurityHash,
-                DependencySource = request.DependencySource,
-            });
+            Install(CreateDependencyInstallRequest(dependencyId, request));
         }
     }
+
+    internal static InstallRequest CreateDependencyInstallRequest(string dependencyId, InstallRequest request) => new()
+    {
+        Query = new PackageQuery
+        {
+            Id = dependencyId,
+            Source = request.DependencySource ?? request.Query.Source,
+            Exact = true,
+        },
+        Mode = request.Mode == InstallerMode.Interactive ? InstallerMode.Interactive : InstallerMode.Silent,
+        SkipDependencies = false,
+        DependenciesOnly = false,
+        AcceptPackageAgreements = request.AcceptPackageAgreements,
+        NoUpgrade = true,
+        IgnoreSecurityHash = request.IgnoreSecurityHash,
+        DependencySource = request.DependencySource,
+    };
 
     internal static ListQuery CreateRepairListQuery(RepairRequest request) => new()
     {

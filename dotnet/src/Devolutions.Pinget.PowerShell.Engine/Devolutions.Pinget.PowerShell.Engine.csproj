@@ -1,12 +1,22 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' != 'net48'">
     <ProjectReference Include="..\Devolutions.Pinget.Core\Devolutions.Pinget.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
+    <ProjectReference Include="..\Devolutions.Pinget.ComInterop.Net48\Devolutions.Pinget.ComInterop.Net48.csproj" />
+    <PackageReference Include="System.Text.Json" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
+    <Compile Remove="PingetClient.cs" />
+  </ItemGroup>
+
   <PropertyGroup>
-    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <TargetFrameworks>net48;net8.0;net10.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
     <IsPackable>true</IsPackable>
     <AssemblyName>Devolutions.Pinget.PowerShell.Engine</AssemblyName>
     <RootNamespace>Devolutions.Pinget.PowerShell.Engine</RootNamespace>

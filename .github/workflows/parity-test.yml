@@ -31,13 +31,21 @@ jobs:
       - name: Setup Rust
         shell: pwsh
         run: |
-          rustup toolchain install stable --profile minimal
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc --target aarch64-pc-windows-msvc
           rustup default stable
 
       - name: Build pinget-cli
         shell: pwsh
         run: |
           cargo build -p pinget-cli --manifest-path rust/Cargo.toml
+
+      - name: Build native COM DLLs
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build -p pinget-com --manifest-path rust/Cargo.toml --release --target x86_64-pc-windows-msvc
+          cargo build -p pinget-com --manifest-path rust/Cargo.toml --release --target aarch64-pc-windows-msvc
 
       - name: Build C# CLI and PowerShell module
         shell: pwsh

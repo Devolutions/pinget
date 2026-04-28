@@ -4,6 +4,8 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{Cursor, Read};
 #[cfg(windows)]
+use std::mem::{MaybeUninit, size_of};
+#[cfg(windows)]
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -1576,24 +1578,32 @@ impl Repository {
                 continue;
             }
 
-            let mut dependency_request = InstallRequest::new(PackageQuery {
-                id: Some(dependency_id),
-                source: request
-                    .dependency_source
-                    .clone()
-                    .or_else(|| request.query.source.clone()),
-                exact: true,
-                ..PackageQuery::default()
-            });
-            dependency_request.mode = request.mode;
-            dependency_request.accept_package_agreements = request.accept_package_agreements;
-            dependency_request.force = request.force;
-            dependency_request.ignore_security_hash = request.ignore_security_hash;
-            dependency_request.dependency_source = request.dependency_source.clone();
+            let dependency_request = Self::create_dependency_install_request(dependency_id, request);
             self.install_request(&dependency_request)?;
         }
 
         Ok(())
+    }
+
+    fn create_dependency_install_request(dependency_id: String, request: &InstallRequest) -> InstallRequest {
+        let mut dependency_request = InstallRequest::new(PackageQuery {
+            id: Some(dependency_id),
+            source: request
+                .dependency_source
+                .clone()
+                .or_else(|| request.query.source.clone()),
+            exact: true,
+            ..PackageQuery::default()
+        });
+        dependency_request.mode = match request.mode {
+            InstallerMode::Interactive => InstallerMode::Interactive,
+            InstallerMode::SilentWithProgress | InstallerMode::Silent => InstallerMode::Silent,
+        };
+        dependency_request.accept_package_agreements = request.accept_package_agreements;
+        dependency_request.no_upgrade = true;
+        dependency_request.ignore_security_hash = request.ignore_security_hash;
+        dependency_request.dependency_source = request.dependency_source.clone();
+        dependency_request
     }
 
     fn create_repair_list_query(request: &RepairRequest) -> ListQuery {
@@ -2977,6 +2987,10 @@ fn ensure_app_dirs(app_root: &Path) -> Result<()> {
 }
 
 fn default_app_root() -> Result<PathBuf> {
+    if let Some(app_root) = std::env::var_os("PINGET_APPROOT") {
+        return Ok(PathBuf::from(app_root));
+    }
+
     let local_app_data = dirs::data_local_dir().ok_or_else(|| anyhow!("unable to determine LocalAppData path"))?;
 
     #[cfg(windows)]
@@ -3760,50 +3774,61 @@ fn packaged_secure_settings_root() -> Result<PathBuf> {
 #[cfg(windows)]
 #[allow(clippy::multiple_unsafe_ops_per_block)]
 fn current_user_sid() -> Result<String> {
+    fn close_token(token: HANDLE) {
+        if !token.is_null() {
+            // SAFETY: token is a HANDLE returned by OpenProcessToken and may be closed once here.
+            unsafe {
+                CloseHandle(token);
+            }
+        }
+    }
+
     let mut token: HANDLE = std::ptr::null_mut();
-    // SAFETY: GetCurrentProcess returns a pseudo-handle for the current process and does not require ownership.
+    // SAFETY: GetCurrentProcess returns a pseudo-handle valid for OpenProcessToken in this process.
     let current_process = unsafe { GetCurrentProcess() };
-    // SAFETY: token points to writable storage for the handle returned by OpenProcessToken.
+    // SAFETY: token points to valid storage for the process token handle on success.
     if unsafe { OpenProcessToken(current_process, TOKEN_QUERY, &mut token) } == 0 {
         bail!("failed to open current process token")
     }
 
     let mut length = 0;
-    // SAFETY: This size probe intentionally passes a null buffer with zero length.
-    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut length) };
-    let word_count = (length as usize).div_ceil(size_of::<usize>());
-    let mut buffer = vec![0usize; word_count];
-    // SAFETY: buffer is writable, sufficiently large according to the prior size probe, and suitably aligned.
-    if unsafe { GetTokenInformation(token, TokenUser, buffer.as_mut_ptr() as *mut _, length, &mut length) } == 0 {
-        // SAFETY: token was returned by OpenProcessToken and is still owned by this function.
-        unsafe { CloseHandle(token) };
+    // SAFETY: The null buffer call asks Windows for the required buffer length.
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut length);
+    }
+
+    let element_size = size_of::<TOKEN_USER>();
+    let element_count = (length as usize).div_ceil(element_size);
+    let mut buffer = vec![MaybeUninit::<TOKEN_USER>::uninit(); element_count];
+    // SAFETY: buffer is aligned for TOKEN_USER and has at least length bytes of storage.
+    if unsafe { GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), length, &mut length) } == 0 {
+        close_token(token);
         bail!("failed to get current user token information")
     }
 
-    // SAFETY: GetTokenInformation wrote a TOKEN_USER structure at the start of the aligned buffer.
-    let token_user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+    // SAFETY: GetTokenInformation initialized the buffer as a TOKEN_USER structure.
+    let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
     let mut sid_ptr: *mut u16 = std::ptr::null_mut();
-    // SAFETY: token_user.User.Sid is provided by the OS, and sid_ptr receives a LocalAlloc buffer.
+    // SAFETY: token_user.User.Sid is supplied by Windows and sid_ptr receives a LocalAlloc buffer on success.
     if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_ptr) } == 0 {
-        // SAFETY: token was returned by OpenProcessToken and is still owned by this function.
-        unsafe { CloseHandle(token) };
+        close_token(token);
         bail!("failed to convert current user SID")
     }
 
     let mut len = 0usize;
-    // SAFETY: ConvertSidToStringSidW returns a null-terminated UTF-16 string.
-    while unsafe { *sid_ptr.add(len) } != 0 {
+    // SAFETY: sid_ptr is a null-terminated UTF-16 string returned by ConvertSidToStringSidW.
+    while unsafe { *sid_ptr.wrapping_add(len) } != 0 {
         len += 1;
     }
 
-    // SAFETY: sid_ptr is valid for len UTF-16 code units as measured above.
-    let sid = std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(sid_ptr, len) })
-        .to_string_lossy()
-        .into_owned();
+    // SAFETY: sid_ptr points to len initialized UTF-16 code units.
+    let sid_slice = unsafe { std::slice::from_raw_parts(sid_ptr, len) };
+    let sid = std::ffi::OsString::from_wide(sid_slice).to_string_lossy().into_owned();
     // SAFETY: sid_ptr was allocated by ConvertSidToStringSidW and must be released with LocalFree.
-    unsafe { LocalFree(sid_ptr.cast()) };
-    // SAFETY: token was returned by OpenProcessToken and has not yet been closed.
-    unsafe { CloseHandle(token) };
+    unsafe {
+        LocalFree(sid_ptr.cast());
+    }
+    close_token(token);
     Ok(sid)
 }
 
@@ -6665,6 +6690,30 @@ mod tests {
 
         assert_eq!(options.app_root, PathBuf::from(r"C:\temp\pinget-test"));
         assert_eq!(options.user_agent, "pinget-rs-tests/1.0");
+    }
+
+    #[test]
+    fn dependency_install_requests_are_silent_and_not_forced() {
+        let mut parent = InstallRequest::new(PackageQuery {
+            source: Some("winget".to_owned()),
+            ..PackageQuery::default()
+        });
+        parent.mode = InstallerMode::SilentWithProgress;
+        parent.force = true;
+        parent.accept_package_agreements = true;
+        parent.ignore_security_hash = true;
+        parent.dependency_source = Some("dependencies".to_owned());
+
+        let dependency =
+            Repository::create_dependency_install_request("Microsoft.VCRedist.2015+.x64".to_owned(), &parent);
+
+        assert_eq!(dependency.query.id.as_deref(), Some("Microsoft.VCRedist.2015+.x64"));
+        assert_eq!(dependency.query.source.as_deref(), Some("dependencies"));
+        assert_eq!(dependency.mode, InstallerMode::Silent);
+        assert!(!dependency.force);
+        assert!(dependency.no_upgrade);
+        assert!(dependency.accept_package_agreements);
+        assert!(dependency.ignore_security_hash);
     }
 
     #[test]

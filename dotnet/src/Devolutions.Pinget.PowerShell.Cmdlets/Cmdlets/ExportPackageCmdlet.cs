@@ -23,7 +23,7 @@ public sealed class ExportPackageCmdlet : InstallerSelectionCmdlet
 
     protected override void ProcessRecord()
     {
-        var target = PSCatalogPackage?.Id ?? Id ?? Name ?? string.Join(' ', Query ?? []);
+        var target = PSCatalogPackage?.Id ?? Id ?? Name ?? string.Join(" ", Query ?? []);
         if (!ShouldProcess(target, "Export package"))
             return;
 

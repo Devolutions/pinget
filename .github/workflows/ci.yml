@@ -86,6 +86,12 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Setup Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc --target aarch64-pc-windows-msvc
+          rustup default stable
+
       - name: Install Pester
         shell: pwsh
         run: |
@@ -100,6 +106,14 @@ jobs:
 
       - name: Run core tests
         run: dotnet test dotnet/src/Devolutions.Pinget.Core.Tests/Devolutions.Pinget.Core.Tests.csproj -c Release --no-build
+
+      - name: Build native COM DLLs
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build -p pinget-com --manifest-path rust/Cargo.toml --release --target x86_64-pc-windows-msvc
+          cargo build -p pinget-com --manifest-path rust/Cargo.toml --release --target aarch64-pc-windows-msvc
 
       - name: Run PowerShell tests
         shell: pwsh

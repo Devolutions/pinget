@@ -1,13 +1,13 @@
 @{
-    RootModule = 'Devolutions.Pinget.PowerShell.Cmdlets.dll'
-    ModuleVersion = '0.1.0'
-    CompatiblePSEditions = @('Core')
+    RootModule = 'Devolutions.Pinget.Client.psm1'
+    ModuleVersion = '0.2.0'
+    CompatiblePSEditions = @('Desktop', 'Core')
     GUID = 'c6d1b5f2-5ccd-4771-9480-25caad7c58bd'
     Author = 'Devolutions'
     CompanyName = 'Devolutions'
     Copyright = '(c) Devolutions. All rights reserved.'
-    Description = 'PowerShell 7 winget-compatible pinget module.'
-    PowerShellVersion = '7.4.0'
+    Description = 'WinGet-compatible Pinget module for Windows PowerShell and PowerShell 7.'
+    PowerShellVersion = '5.1'
 
     FunctionsToExport = @()
 
@@ -42,6 +42,7 @@
         PSData = @{
             Tags = @(
                 'PSEdition_Core'
+                'PSEdition_Desktop'
                 'WindowsPackageManager'
                 'WinGet'
                 'Pinget'
