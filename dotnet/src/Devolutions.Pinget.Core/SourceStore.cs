@@ -117,9 +117,26 @@ internal static class SourceStoreManager
         return JsonSerializer.Deserialize(json, SourceStoreContext.Default.SourceStore) ?? SourceStore.Default();
     }
 
+    internal static bool UsesSystemWingetSourceCommands(string? appRoot)
+    {
+        if (!OperatingSystem.IsWindows())
+            return false;
+
+        var root = NormalizeAppRoot(appRoot);
+        if (!UsesPackagedLayout(root))
+            return false;
+
+        var userSourcesPath = GetPackagedUserSourcesPath(root);
+        var userSourcesYaml = File.Exists(userSourcesPath) ? File.ReadAllText(userSourcesPath) : null;
+        return SystemWingetSourceStore.IsSecureSettingsStub(userSourcesYaml);
+    }
+
     public static void Save(SourceStore store, string? appRoot = null)
     {
         var root = NormalizeAppRoot(appRoot);
+        if (UsesSystemWingetSourceCommands(root))
+            throw new InvalidOperationException("System WinGet source settings must be modified through winget.");
+
         if (UsesPackagedLayout(root))
         {
             SavePackagedStore(root, store);
@@ -203,6 +220,14 @@ internal static class SourceStoreManager
         return store;
     }
 
+    internal static SourceStore? LoadPackagedStoreFromStreams(string? userSourcesYaml, string? metadataYaml)
+    {
+        if (SystemWingetSourceStore.IsSecureSettingsStub(userSourcesYaml))
+            return SystemWingetSourceStore.Load();
+
+        return ParsePackagedSourceStore(userSourcesYaml, metadataYaml);
+    }
+
     private static SourceStore? LoadPackagedStore(string root)
     {
         var userSourcesPath = GetPackagedUserSourcesPath(root);
@@ -210,7 +235,7 @@ internal static class SourceStoreManager
 
         var userSourcesYaml = File.Exists(userSourcesPath) ? File.ReadAllText(userSourcesPath) : null;
         var metadataYaml = File.Exists(metadataPath) ? File.ReadAllText(metadataPath) : null;
-        return ParsePackagedSourceStore(userSourcesYaml, metadataYaml);
+        return LoadPackagedStoreFromStreams(userSourcesYaml, metadataYaml);
     }
 
     private static void SavePackagedStore(string root, SourceStore store)

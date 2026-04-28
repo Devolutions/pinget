@@ -87,6 +87,153 @@ public class SourceStoreTests
                 Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1700000000).UtcDateTime, corp.LastUpdate);
         }
 
+        [Fact]
+        public void SystemWingetExport_ParsesJsonLines()
+        {
+                const string output = """
+{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+{"Arg":"https://cdn.contoso.test/cache","Data":"Contoso.Source_8wekyb3d8bbwe","Explicit":true,"Identifier":"Contoso.Source_8wekyb3d8bbwe","Name":"contoso-cache","TrustLevel":["Trusted","StoreOrigin"],"Type":"Microsoft.PreIndexed.Package"}
+""";
+
+                var sources = SystemWingetSourceStore.ParseExport(output);
+
+                Assert.Equal(["contoso", "contoso-cache"], sources.Select(source => source.Name).ToArray());
+                var rest = sources[0];
+                Assert.Equal(SourceKind.Rest, rest.Kind);
+                Assert.Equal("https://api.contoso.test/feed", rest.Arg);
+                Assert.Equal("api.contoso.test", rest.Identifier);
+                Assert.Equal("Trusted", rest.TrustLevel);
+                Assert.False(rest.Explicit);
+
+                var preIndexed = sources[1];
+                Assert.Equal(SourceKind.PreIndexed, preIndexed.Kind);
+                Assert.Equal("Contoso.Source_8wekyb3d8bbwe", preIndexed.Identifier);
+                Assert.True(preIndexed.Explicit);
+        }
+
+        [Fact]
+        public void SystemWingetExport_ParsesWrappedSources()
+        {
+                const string output = """
+{
+  "Sources": [
+    {
+      "Name": "corp",
+      "Type": "Microsoft.Rest",
+      "Arg": "https://packages.contoso.test/api",
+      "Identifier": "Contoso.Rest",
+      "TrustLevel": "Trusted",
+      "Explicit": true,
+      "Priority": 9
+    }
+  ]
+}
+""";
+
+                var source = Assert.Single(SystemWingetSourceStore.ParseExport(output));
+                Assert.Equal("corp", source.Name);
+                Assert.Equal(SourceKind.Rest, source.Kind);
+                Assert.Equal("Contoso.Rest", source.Identifier);
+                Assert.Equal("Trusted", source.TrustLevel);
+                Assert.True(source.Explicit);
+                Assert.Equal(9, source.Priority);
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_DetectsSecureSettingsStub()
+        {
+                Assert.True(SystemWingetSourceStore.IsSecureSettingsStub("SHA256: d52f7aa273206e81585b714fc627ecb6f6e17b6aeba7b28025124da0d25db334"));
+                Assert.False(SystemWingetSourceStore.IsSecureSettingsStub("Sources:\n  - Name: winget\n"));
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_BuildsAddArguments()
+        {
+                var args = SystemWingetSourceStore.BuildAddArguments(
+                        "corp",
+                        "https://packages.contoso.test/api",
+                        SourceKind.Rest,
+                        "Trusted",
+                        explicitSource: true);
+
+                Assert.Equal(
+                [
+                        "source",
+                        "add",
+                        "--name",
+                        "corp",
+                        "--arg",
+                        "https://packages.contoso.test/api",
+                        "--type",
+                        "Microsoft.Rest",
+                        "--disable-interactivity",
+                        "--trust-level",
+                        "trusted",
+                        "--explicit"
+                ], args);
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_LoadUsesExportCommand()
+        {
+                var originalRunner = SystemWingetSourceStore.CommandRunner;
+                try
+                {
+                        IReadOnlyList<string>? capturedArgs = null;
+                        SystemWingetSourceStore.CommandRunner = args =>
+                        {
+                                capturedArgs = args.ToArray();
+                                return new WingetCommandResult(
+                                        0,
+                                        """
+{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+""",
+                                        "");
+                        };
+
+                        var store = SystemWingetSourceStore.Load();
+
+                        Assert.Equal(SystemWingetSourceStore.BuildExportArguments(), capturedArgs);
+                        Assert.Equal("contoso", Assert.Single(store.Sources).Name);
+                }
+                finally
+                {
+                        SystemWingetSourceStore.CommandRunner = originalRunner;
+                }
+        }
+
+        [Fact]
+        public void PackagedSecureSettingsStub_DelegatesToSystemWingetExport()
+        {
+                var originalRunner = SystemWingetSourceStore.CommandRunner;
+                try
+                {
+                        IReadOnlyList<string>? capturedArgs = null;
+                        SystemWingetSourceStore.CommandRunner = args =>
+                        {
+                                capturedArgs = args.ToArray();
+                                return new WingetCommandResult(
+                                        0,
+                                        """
+{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+""",
+                                        "");
+                        };
+
+                        var store = SourceStoreManager.LoadPackagedStoreFromStreams(
+                                "SHA256: d52f7aa273206e81585b714fc627ecb6f6e17b6aeba7b28025124da0d25db334",
+                                null);
+
+                        Assert.NotNull(store);
+                        Assert.Equal(SystemWingetSourceStore.BuildExportArguments(), capturedArgs);
+                        Assert.Equal("contoso", Assert.Single(store!.Sources).Name);
+                }
+                finally
+                {
+                        SystemWingetSourceStore.CommandRunner = originalRunner;
+                }
+        }
+
     [Fact]
     public void RepositoryOpen_UsesCustomAppRoot()
     {
