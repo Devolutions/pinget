@@ -24,13 +24,15 @@ public class Repository : IDisposable
 
     private readonly string _appRoot;
     private readonly HttpClient _client;
+    private readonly bool _useSystemWingetSources;
     private SourceStore _store;
 
-    private Repository(string appRoot, HttpClient client, SourceStore store)
+    private Repository(string appRoot, HttpClient client, SourceStore store, bool useSystemWingetSources)
     {
         _appRoot = appRoot;
         _client = client;
         _store = store;
+        _useSystemWingetSources = useSystemWingetSources;
     }
 
     /// <summary>
@@ -42,10 +44,11 @@ public class Repository : IDisposable
         EnsureSqliteNativeLibraryLoaded();
         var appRoot = SourceStoreManager.NormalizeAppRoot(options.AppRoot ?? Environment.GetEnvironmentVariable(AppRootEnvironmentVariable));
         SourceStoreManager.EnsureAppDirs(appRoot);
+        var useSystemWingetSources = SourceStoreManager.UsesSystemWingetSourceCommands(appRoot);
         var store = SourceStoreManager.Load(appRoot);
         var client = new HttpClient();
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
-        return new Repository(appRoot, client, store);
+        return new Repository(appRoot, client, store, useSystemWingetSources);
     }
 
     internal static IEnumerable<string> GetSqliteNativeLibraryCandidates(string assemblyDirectory)
@@ -137,10 +140,21 @@ public class Repository : IDisposable
 
     // ── Source management ──
 
-    public List<SourceRecord> ListSources() => _store.Sources.ToList();
+    public List<SourceRecord> ListSources()
+    {
+        RefreshSystemWingetSources();
+        return _store.Sources.ToList();
+    }
 
     public void AddSource(string name, string arg, SourceKind kind, string trustLevel = "None", bool explicitSource = false, int priority = 0)
     {
+        if (_useSystemWingetSources)
+        {
+            SystemWingetSourceStore.AddSource(name, arg, kind, NormalizeSourceTrustLevel(trustLevel), explicitSource);
+            RefreshSystemWingetSources();
+            return;
+        }
+
         if (_store.Sources.Any(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase)))
             throw new InvalidOperationException($"A source with name '{name}' already exists.");
         if (_store.Sources.Any(s => s.Arg == arg))
@@ -161,6 +175,9 @@ public class Repository : IDisposable
 
     public void EditSource(string name, bool? explicitSource = null, string? trustLevel = null)
     {
+        if (_useSystemWingetSources)
+            throw new InvalidOperationException("Editing system WinGet sources is not supported by winget source commands.");
+
         var source = _store.Sources.FirstOrDefault(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidOperationException($"Source '{name}' not found.");
 
@@ -175,6 +192,13 @@ public class Repository : IDisposable
 
     public void RemoveSource(string name)
     {
+        if (_useSystemWingetSources)
+        {
+            SystemWingetSourceStore.RemoveSource(name);
+            RefreshSystemWingetSources();
+            return;
+        }
+
         var source = _store.Sources.FirstOrDefault(s => s.Name == name)
             ?? throw new InvalidOperationException($"Source '{name}' not found.");
 
@@ -187,6 +211,13 @@ public class Repository : IDisposable
 
     public void ResetSource(string name)
     {
+        if (_useSystemWingetSources)
+        {
+            SystemWingetSourceStore.ResetSource(name);
+            RefreshSystemWingetSources();
+            return;
+        }
+
         var index = _store.Sources.FindIndex(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase));
         if (index < 0)
             throw new InvalidOperationException($"Source '{name}' not found.");
@@ -214,6 +245,13 @@ public class Repository : IDisposable
 
     public void ResetSources()
     {
+        if (_useSystemWingetSources)
+        {
+            SystemWingetSourceStore.ResetSources();
+            RefreshSystemWingetSources();
+            return;
+        }
+
         foreach (var source in _store.Sources)
         {
             var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot);
@@ -297,6 +335,9 @@ public class Repository : IDisposable
 
     public List<SourceUpdateResult> UpdateSources(string? sourceName = null)
     {
+        if (_useSystemWingetSources)
+            return UpdateSystemWingetSources(sourceName);
+
         var indexes = ResolveSourceIndexes(sourceName);
         var results = new List<SourceUpdateResult>();
 
@@ -1022,7 +1063,8 @@ public class Repository : IDisposable
         {
             PreIndexedSource.Update(_client, source, _appRoot);
             source.LastUpdate = DateTime.UtcNow;
-            SourceStoreManager.Save(_store, _appRoot);
+            if (!_useSystemWingetSources)
+                SourceStoreManager.Save(_store, _appRoot);
         }
 
         var conn = new SqliteConnection($"Data Source={indexPath};Mode=ReadOnly");
@@ -2011,6 +2053,32 @@ public class Repository : IDisposable
                 return [i];
         }
         throw new InvalidOperationException($"Source '{sourceName}' not found.");
+    }
+
+    private void RefreshSystemWingetSources()
+    {
+        if (_useSystemWingetSources)
+            _store = SystemWingetSourceStore.Load();
+    }
+
+    private List<SourceUpdateResult> UpdateSystemWingetSources(string? sourceName)
+    {
+        RefreshSystemWingetSources();
+        var indexes = ResolveSourceIndexes(sourceName);
+        var selectedNames = indexes.Select(index => _store.Sources[index].Name).ToList();
+        var detail = SystemWingetSourceStore.UpdateSources(sourceName);
+        RefreshSystemWingetSources();
+
+        return selectedNames
+            .Select(name => _store.Sources.FirstOrDefault(source => source.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            .Where(source => source is not null)
+            .Select(source => new SourceUpdateResult
+            {
+                Name = source!.Name,
+                Kind = source.Kind,
+                Detail = detail,
+            })
+            .ToList();
     }
 
     // ── Scoring ──

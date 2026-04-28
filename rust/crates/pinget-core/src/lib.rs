@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{Cursor, Read};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -14,8 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
-#[cfg(windows)]
-use std::os::windows::ffi::OsStringExt;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
 #[cfg(windows)]
@@ -635,6 +636,7 @@ pub struct Repository {
     app_root: PathBuf,
     client: Client,
     store: SourceStore,
+    use_system_winget_sources: bool,
 }
 
 impl Repository {
@@ -646,6 +648,7 @@ impl Repository {
     /// Opens the repository with explicit hosting options for library consumers.
     pub fn open_with_options(options: RepositoryOptions) -> Result<Self> {
         ensure_app_dirs(&options.app_root)?;
+        let use_system_winget_sources = uses_system_winget_source_commands(&options.app_root);
         let store = load_store(&options.app_root)?;
         let client = Client::builder()
             .user_agent(&options.user_agent)
@@ -655,6 +658,7 @@ impl Repository {
             app_root: options.app_root,
             client,
             store,
+            use_system_winget_sources,
         })
     }
 
@@ -679,6 +683,12 @@ impl Repository {
         explicit: bool,
         priority: i32,
     ) -> Result<()> {
+        if self.use_system_winget_sources {
+            system_winget_add_source(name, arg, kind, &normalize_source_trust_level(trust_level)?, explicit)?;
+            self.refresh_system_winget_sources()?;
+            return Ok(());
+        }
+
         if self.store.sources.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
             bail!("A source with name '{name}' already exists.");
         }
@@ -702,6 +712,10 @@ impl Repository {
     }
 
     pub fn edit_source(&mut self, name: &str, explicit: Option<bool>, trust_level: Option<&str>) -> Result<()> {
+        if self.use_system_winget_sources {
+            bail!("Editing system WinGet sources is not supported by winget source commands.");
+        }
+
         let source = self
             .store
             .sources
@@ -722,6 +736,12 @@ impl Repository {
     }
 
     pub fn remove_source(&mut self, name: &str) -> Result<()> {
+        if self.use_system_winget_sources {
+            system_winget_remove_source(name)?;
+            self.refresh_system_winget_sources()?;
+            return Ok(());
+        }
+
         let idx = self
             .store
             .sources
@@ -739,6 +759,12 @@ impl Repository {
     }
 
     pub fn reset_source(&mut self, name: &str) -> Result<()> {
+        if self.use_system_winget_sources {
+            system_winget_reset_source(name)?;
+            self.refresh_system_winget_sources()?;
+            return Ok(());
+        }
+
         let idx = self
             .store
             .sources
@@ -768,6 +794,12 @@ impl Repository {
     }
 
     pub fn reset_sources(&mut self) -> Result<()> {
+        if self.use_system_winget_sources {
+            system_winget_reset_sources()?;
+            self.refresh_system_winget_sources()?;
+            return Ok(());
+        }
+
         // Remove cached state for all current sources
         for source in &self.store.sources {
             let state_dir = self.source_state_dir(source);
@@ -876,6 +908,10 @@ impl Repository {
     }
 
     pub fn update_sources(&mut self, source_name: Option<&str>) -> Result<Vec<SourceUpdateResult>> {
+        if self.use_system_winget_sources {
+            return self.update_system_winget_sources(source_name);
+        }
+
         let indexes = self.resolve_source_indexes(source_name)?;
         let mut results = Vec::new();
 
@@ -2008,7 +2044,9 @@ impl Repository {
         let index_path = preindexed_index_path(&self.app_root, &source);
         if !index_path.exists() {
             let _ = self.update_preindexed(source_index)?;
-            self.save_store()?;
+            if !self.use_system_winget_sources {
+                self.save_store()?;
+            }
         }
 
         Self::open_sqlite_connection(index_path).context("failed to open preindexed index")
@@ -2288,6 +2326,43 @@ impl Repository {
 
     fn source_clone(&self, index: usize) -> SourceRecord {
         self.store.sources[index].clone()
+    }
+
+    fn refresh_system_winget_sources(&mut self) -> Result<()> {
+        if self.use_system_winget_sources {
+            self.store = load_system_winget_source_store()?;
+        }
+        Ok(())
+    }
+
+    fn update_system_winget_sources(&mut self, source_name: Option<&str>) -> Result<Vec<SourceUpdateResult>> {
+        self.refresh_system_winget_sources()?;
+        let selected_names: Vec<_> = if source_name.is_none() {
+            self.store.sources.iter().map(|source| source.name.clone()).collect()
+        } else {
+            self.resolve_source_indexes(source_name)?
+                .into_iter()
+                .map(|index| self.store.sources[index].name.clone())
+                .collect()
+        };
+
+        let detail = system_winget_update_sources(source_name)?;
+        self.refresh_system_winget_sources()?;
+
+        Ok(selected_names
+            .into_iter()
+            .filter_map(|name| {
+                self.store
+                    .sources
+                    .iter()
+                    .find(|source| source.name.eq_ignore_ascii_case(&name))
+                    .map(|source| SourceUpdateResult {
+                        name: source.name.clone(),
+                        kind: source.kind,
+                        detail: detail.clone(),
+                    })
+            })
+            .collect())
     }
 }
 
@@ -2996,6 +3071,10 @@ fn load_store(app_root: &Path) -> Result<SourceStore> {
 }
 
 fn save_store(app_root: &Path, store: &SourceStore) -> Result<()> {
+    if uses_system_winget_source_commands(app_root) {
+        bail!("System WinGet source settings must be modified through winget.");
+    }
+
     if uses_packaged_layout(app_root) {
         return save_packaged_store(app_root, store);
     }
@@ -3008,10 +3087,18 @@ fn load_packaged_store(app_root: &Path) -> Result<Option<SourceStore>> {
     let metadata_path = app_root.join("sources_metadata");
     let user_sources_yaml = fs::read_to_string(&user_sources_path).ok();
     let metadata_yaml = fs::read_to_string(&metadata_path).ok();
-    Ok(parse_packaged_source_store(
-        user_sources_yaml.as_deref(),
-        metadata_yaml.as_deref(),
-    ))
+    load_packaged_store_from_streams(user_sources_yaml.as_deref(), metadata_yaml.as_deref())
+}
+
+fn load_packaged_store_from_streams(
+    user_sources_yaml: Option<&str>,
+    metadata_yaml: Option<&str>,
+) -> Result<Option<SourceStore>> {
+    if is_secure_settings_stub(user_sources_yaml) {
+        return load_system_winget_source_store().map(Some);
+    }
+
+    Ok(parse_packaged_source_store(user_sources_yaml, metadata_yaml))
 }
 
 fn save_packaged_store(app_root: &Path, store: &SourceStore) -> Result<()> {
@@ -3025,6 +3112,358 @@ fn save_packaged_store(app_root: &Path, store: &SourceStore) -> Result<()> {
     fs::write(app_root.join("sources_metadata"), render_packaged_metadata_yaml(store))
         .context("failed to write packaged source metadata")?;
     Ok(())
+}
+
+fn uses_system_winget_source_commands(app_root: &Path) -> bool {
+    if !uses_packaged_layout(app_root) {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        let Ok(user_sources_path) = packaged_user_sources_path(app_root) else {
+            return false;
+        };
+
+        let user_sources_yaml = fs::read_to_string(user_sources_path).ok();
+        is_secure_settings_stub(user_sources_yaml.as_deref())
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn is_secure_settings_stub(value: Option<&str>) -> bool {
+    value
+        .map(str::trim_start)
+        .is_some_and(|value| value.starts_with("SHA256:") || value.starts_with("sha256:"))
+}
+
+fn load_system_winget_source_store() -> Result<SourceStore> {
+    let result = run_checked_winget_source_command(build_winget_source_export_arguments(), "export WinGet sources")?;
+    Ok(SourceStore {
+        sources: parse_system_winget_source_export(&result.stdout)?,
+    })
+}
+
+fn system_winget_add_source(name: &str, arg: &str, kind: SourceKind, trust_level: &str, explicit: bool) -> Result<()> {
+    run_checked_winget_source_command(
+        build_winget_source_add_arguments(name, arg, kind, trust_level, explicit),
+        &format!("add WinGet source '{name}'"),
+    )?;
+    Ok(())
+}
+
+fn system_winget_remove_source(name: &str) -> Result<()> {
+    run_checked_winget_source_command(
+        vec![
+            "source".to_owned(),
+            "remove".to_owned(),
+            "--name".to_owned(),
+            name.to_owned(),
+            "--disable-interactivity".to_owned(),
+        ],
+        &format!("remove WinGet source '{name}'"),
+    )?;
+    Ok(())
+}
+
+fn system_winget_reset_source(name: &str) -> Result<()> {
+    run_checked_winget_source_command(
+        vec![
+            "source".to_owned(),
+            "reset".to_owned(),
+            "--name".to_owned(),
+            name.to_owned(),
+            "--force".to_owned(),
+            "--disable-interactivity".to_owned(),
+        ],
+        &format!("reset WinGet source '{name}'"),
+    )?;
+    Ok(())
+}
+
+fn system_winget_reset_sources() -> Result<()> {
+    run_checked_winget_source_command(
+        vec![
+            "source".to_owned(),
+            "reset".to_owned(),
+            "--force".to_owned(),
+            "--disable-interactivity".to_owned(),
+        ],
+        "reset WinGet sources",
+    )?;
+    Ok(())
+}
+
+fn system_winget_update_sources(name: Option<&str>) -> Result<String> {
+    let mut args = vec!["source".to_owned(), "update".to_owned()];
+    if let Some(name) = name {
+        args.push("--name".to_owned());
+        args.push(name.to_owned());
+    }
+
+    args.push("--disable-interactivity".to_owned());
+    let result = run_checked_winget_source_command(
+        args,
+        if name.is_some() {
+            "update WinGet source"
+        } else {
+            "update WinGet sources"
+        },
+    )?;
+    let detail = result.stdout.trim();
+    Ok(if detail.is_empty() {
+        "Done".to_owned()
+    } else {
+        detail.to_owned()
+    })
+}
+
+fn build_winget_source_export_arguments() -> Vec<String> {
+    vec![
+        "source".to_owned(),
+        "export".to_owned(),
+        "--disable-interactivity".to_owned(),
+    ]
+}
+
+fn build_winget_source_add_arguments(
+    name: &str,
+    arg: &str,
+    kind: SourceKind,
+    trust_level: &str,
+    explicit: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "source".to_owned(),
+        "add".to_owned(),
+        "--name".to_owned(),
+        name.to_owned(),
+        "--arg".to_owned(),
+        arg.to_owned(),
+        "--type".to_owned(),
+        packaged_source_type(kind).to_owned(),
+        "--disable-interactivity".to_owned(),
+    ];
+
+    if !trust_level.trim().is_empty() {
+        args.push("--trust-level".to_owned());
+        args.push(if trust_level.eq_ignore_ascii_case("Trusted") {
+            "trusted".to_owned()
+        } else {
+            "none".to_owned()
+        });
+    }
+
+    if explicit {
+        args.push("--explicit".to_owned());
+    }
+
+    args
+}
+
+#[derive(Debug)]
+struct WingetSourceCommandResult {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+type WingetSourceCommandRunner = fn(&[String]) -> Result<WingetSourceCommandResult>;
+
+static SYSTEM_WINGET_SOURCE_COMMAND_RUNNER: RwLock<WingetSourceCommandRunner> =
+    RwLock::new(run_winget_source_command_process);
+
+fn run_checked_winget_source_command(args: Vec<String>, action: &str) -> Result<WingetSourceCommandResult> {
+    let result = run_winget_source_command(&args)?;
+    if result.exit_code == 0 {
+        return Ok(result);
+    }
+
+    let detail = [result.stderr.trim(), result.stdout.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if detail.is_empty() {
+        bail!("Failed to {action}; winget exited with code {}.", result.exit_code);
+    }
+
+    bail!(
+        "Failed to {action}; winget exited with code {}:\n{}",
+        result.exit_code,
+        detail
+    );
+}
+
+fn run_winget_source_command(args: &[String]) -> Result<WingetSourceCommandResult> {
+    let runner = *SYSTEM_WINGET_SOURCE_COMMAND_RUNNER
+        .read()
+        .map_err(|_| anyhow!("failed to read WinGet source command runner"))?;
+    runner(args)
+}
+
+fn run_winget_source_command_process(args: &[String]) -> Result<WingetSourceCommandResult> {
+    use std::process::Command;
+
+    let output = Command::new("winget")
+        .args(args)
+        .output()
+        .context("failed to run winget source command")?;
+
+    Ok(WingetSourceCommandResult {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+fn parse_system_winget_source_export(output: &str) -> Result<Vec<SourceRecord>> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Ok(value) = serde_json::from_str::<JsonValue>(trimmed)
+        && let Some(sources) = parse_system_winget_source_export_value(&value)?
+    {
+        return Ok(order_sources(sources));
+    }
+
+    let mut sources = Vec::new();
+    for line in output.replace("\r\n", "\n").lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+
+        let value: JsonValue = serde_json::from_str(line)
+            .with_context(|| format!("WinGet source export returned a non-source line: {line}"))?;
+        let Some(mut parsed) = parse_system_winget_source_export_value(&value)? else {
+            bail!("WinGet source export returned a non-source line: {line}");
+        };
+        sources.append(&mut parsed);
+    }
+
+    Ok(order_sources(sources))
+}
+
+fn parse_system_winget_source_export_value(value: &JsonValue) -> Result<Option<Vec<SourceRecord>>> {
+    match value {
+        JsonValue::Array(items) => items
+            .iter()
+            .map(parse_system_winget_source_record)
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        JsonValue::Object(object) => {
+            if let Some(JsonValue::Array(items)) = object.get("Sources") {
+                items
+                    .iter()
+                    .map(parse_system_winget_source_record)
+                    .collect::<Result<Vec<_>>>()
+                    .map(Some)
+            } else if object.contains_key("Name") {
+                Ok(Some(vec![parse_system_winget_source_record(value)?]))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_system_winget_source_record(value: &JsonValue) -> Result<SourceRecord> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("WinGet source export entry was not an object"))?;
+    let name = required_json_string(object, "Name")?;
+    let source_type = required_json_string(object, "Type")?;
+    let arg = required_json_string(object, "Arg")?;
+    let kind = parse_system_winget_source_kind(&source_type)?;
+    let identifier = optional_json_string(object, "Identifier")
+        .or_else(|| optional_json_string(object, "Data"))
+        .unwrap_or_else(|| name.clone());
+
+    Ok(SourceRecord {
+        name,
+        kind,
+        arg,
+        identifier,
+        trust_level: parse_system_winget_trust_level(object),
+        explicit: optional_json_bool(object, "Explicit").unwrap_or(false),
+        priority: optional_json_i32(object, "Priority").unwrap_or_default(),
+        last_update: None,
+        source_version: None,
+    })
+}
+
+fn required_json_string(object: &JsonMap<String, JsonValue>, key: &str) -> Result<String> {
+    optional_json_string(object, key).ok_or_else(|| anyhow!("WinGet source export did not include '{key}'."))
+}
+
+fn optional_json_string(object: &JsonMap<String, JsonValue>, key: &str) -> Option<String> {
+    match object.get(key)? {
+        JsonValue::String(value) => Some(value.clone()),
+        JsonValue::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn optional_json_bool(object: &JsonMap<String, JsonValue>, key: &str) -> Option<bool> {
+    match object.get(key)? {
+        JsonValue::Bool(value) => Some(*value),
+        JsonValue::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn optional_json_i32(object: &JsonMap<String, JsonValue>, key: &str) -> Option<i32> {
+    match object.get(key)? {
+        JsonValue::Number(value) => value.as_i64().and_then(|value| i32::try_from(value).ok()),
+        JsonValue::String(value) => value.parse().ok(),
+        _ => None,
+    }
+}
+
+fn parse_system_winget_source_kind(value: &str) -> Result<SourceKind> {
+    if value.eq_ignore_ascii_case("Microsoft.PreIndexed.Package") {
+        Ok(SourceKind::PreIndexed)
+    } else if value.eq_ignore_ascii_case("Microsoft.Rest") {
+        Ok(SourceKind::Rest)
+    } else {
+        bail!("Unsupported WinGet source type '{value}'.")
+    }
+}
+
+fn parse_system_winget_trust_level(object: &JsonMap<String, JsonValue>) -> String {
+    let Some(value) = object.get("TrustLevel") else {
+        return "None".to_owned();
+    };
+
+    match value {
+        JsonValue::Array(items) if items.iter().any(json_trust_value_is_trusted) => "Trusted".to_owned(),
+        JsonValue::String(_) if json_trust_value_is_trusted(value) => "Trusted".to_owned(),
+        JsonValue::Number(value) if value.as_i64().unwrap_or_default() > 0 => "Trusted".to_owned(),
+        _ => "None".to_owned(),
+    }
+}
+
+fn json_trust_value_is_trusted(value: &JsonValue) -> bool {
+    value
+        .as_str()
+        .is_some_and(|value| value.eq_ignore_ascii_case("Trusted"))
+}
+
+fn order_sources(mut sources: Vec<SourceRecord>) -> Vec<SourceRecord> {
+    sources.sort_by(|left, right| {
+        left.explicit
+            .cmp(&right.explicit)
+            .then_with(|| right.priority.cmp(&left.priority))
+            .then_with(|| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()))
+    });
+    sources
 }
 
 fn parse_packaged_source_store(user_sources_yaml: Option<&str>, metadata_yaml: Option<&str>) -> Option<SourceStore> {
@@ -3319,40 +3758,53 @@ fn packaged_secure_settings_root() -> Result<PathBuf> {
 }
 
 #[cfg(windows)]
+#[allow(clippy::multiple_unsafe_ops_per_block)]
 fn current_user_sid() -> Result<String> {
-    unsafe {
-        let mut token: HANDLE = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            bail!("failed to open current process token")
-        }
-
-        let mut length = 0;
-        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut length);
-        let mut buffer = vec![0u8; length as usize];
-        if GetTokenInformation(token, TokenUser, buffer.as_mut_ptr() as *mut _, length, &mut length) == 0 {
-            CloseHandle(token);
-            bail!("failed to get current user token information")
-        }
-
-        let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
-        let mut sid_ptr: *mut u16 = std::ptr::null_mut();
-        if ConvertSidToStringSidW(token_user.User.Sid, &mut sid_ptr) == 0 {
-            CloseHandle(token);
-            bail!("failed to convert current user SID")
-        }
-
-        let mut len = 0usize;
-        while *sid_ptr.add(len) != 0 {
-            len += 1;
-        }
-
-        let sid = std::ffi::OsString::from_wide(std::slice::from_raw_parts(sid_ptr, len))
-            .to_string_lossy()
-            .into_owned();
-        LocalFree(sid_ptr.cast());
-        CloseHandle(token);
-        Ok(sid)
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess returns a pseudo-handle for the current process and does not require ownership.
+    let current_process = unsafe { GetCurrentProcess() };
+    // SAFETY: token points to writable storage for the handle returned by OpenProcessToken.
+    if unsafe { OpenProcessToken(current_process, TOKEN_QUERY, &mut token) } == 0 {
+        bail!("failed to open current process token")
     }
+
+    let mut length = 0;
+    // SAFETY: This size probe intentionally passes a null buffer with zero length.
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut length) };
+    let word_count = (length as usize).div_ceil(size_of::<usize>());
+    let mut buffer = vec![0usize; word_count];
+    // SAFETY: buffer is writable, sufficiently large according to the prior size probe, and suitably aligned.
+    if unsafe { GetTokenInformation(token, TokenUser, buffer.as_mut_ptr() as *mut _, length, &mut length) } == 0 {
+        // SAFETY: token was returned by OpenProcessToken and is still owned by this function.
+        unsafe { CloseHandle(token) };
+        bail!("failed to get current user token information")
+    }
+
+    // SAFETY: GetTokenInformation wrote a TOKEN_USER structure at the start of the aligned buffer.
+    let token_user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+    let mut sid_ptr: *mut u16 = std::ptr::null_mut();
+    // SAFETY: token_user.User.Sid is provided by the OS, and sid_ptr receives a LocalAlloc buffer.
+    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_ptr) } == 0 {
+        // SAFETY: token was returned by OpenProcessToken and is still owned by this function.
+        unsafe { CloseHandle(token) };
+        bail!("failed to convert current user SID")
+    }
+
+    let mut len = 0usize;
+    // SAFETY: ConvertSidToStringSidW returns a null-terminated UTF-16 string.
+    while unsafe { *sid_ptr.add(len) } != 0 {
+        len += 1;
+    }
+
+    // SAFETY: sid_ptr is valid for len UTF-16 code units as measured above.
+    let sid = std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(sid_ptr, len) })
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: sid_ptr was allocated by ConvertSidToStringSidW and must be released with LocalFree.
+    unsafe { LocalFree(sid_ptr.cast()) };
+    // SAFETY: token was returned by OpenProcessToken and has not yet been closed.
+    unsafe { CloseHandle(token) };
+    Ok(sid)
 }
 
 fn packaged_file_cache_root(app_root: &Path) -> PathBuf {
@@ -6285,6 +6737,128 @@ mod tests {
         assert_eq!(corp.priority, 7);
         assert_eq!(corp.source_version.as_deref(), Some("1.2.3"));
         assert_eq!(corp.last_update, DateTime::<Utc>::from_timestamp(1_700_000_000, 0));
+    }
+
+    #[test]
+    fn system_winget_export_parses_json_lines() {
+        let output = r#"{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+{"Arg":"https://cdn.contoso.test/cache","Data":"Contoso.Source_8wekyb3d8bbwe","Explicit":true,"Identifier":"Contoso.Source_8wekyb3d8bbwe","Name":"contoso-cache","TrustLevel":["Trusted","StoreOrigin"],"Type":"Microsoft.PreIndexed.Package"}
+"#;
+
+        let sources = parse_system_winget_source_export(output).expect("source export");
+
+        assert_eq!(
+            sources.iter().map(|source| source.name.as_str()).collect::<Vec<_>>(),
+            vec!["contoso", "contoso-cache"]
+        );
+        assert_eq!(sources[0].kind, SourceKind::Rest);
+        assert_eq!(sources[0].arg, "https://api.contoso.test/feed");
+        assert_eq!(sources[0].identifier, "api.contoso.test");
+        assert_eq!(sources[0].trust_level, "Trusted");
+        assert!(!sources[0].explicit);
+        assert_eq!(sources[1].kind, SourceKind::PreIndexed);
+        assert_eq!(sources[1].identifier, "Contoso.Source_8wekyb3d8bbwe");
+        assert!(sources[1].explicit);
+    }
+
+    #[test]
+    fn system_winget_export_parses_wrapped_sources() {
+        let output = r#"{
+  "Sources": [
+    {
+      "Name": "corp",
+      "Type": "Microsoft.Rest",
+      "Arg": "https://packages.contoso.test/api",
+      "Identifier": "Contoso.Rest",
+      "TrustLevel": "Trusted",
+      "Explicit": true,
+      "Priority": 9
+    }
+  ]
+}"#;
+
+        let sources = parse_system_winget_source_export(output).expect("source export");
+        let source = sources.first().expect("source");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(source.name, "corp");
+        assert_eq!(source.kind, SourceKind::Rest);
+        assert_eq!(source.identifier, "Contoso.Rest");
+        assert_eq!(source.trust_level, "Trusted");
+        assert!(source.explicit);
+        assert_eq!(source.priority, 9);
+    }
+
+    #[test]
+    fn system_winget_source_store_detects_secure_settings_stub() {
+        assert!(is_secure_settings_stub(Some(
+            "SHA256: d52f7aa273206e81585b714fc627ecb6f6e17b6aeba7b28025124da0d25db334"
+        )));
+        assert!(!is_secure_settings_stub(Some("Sources:\n  - Name: winget\n")));
+    }
+
+    #[test]
+    fn system_winget_source_store_builds_add_arguments() {
+        let args = build_winget_source_add_arguments(
+            "corp",
+            "https://packages.contoso.test/api",
+            SourceKind::Rest,
+            "Trusted",
+            true,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "source",
+                "add",
+                "--name",
+                "corp",
+                "--arg",
+                "https://packages.contoso.test/api",
+                "--type",
+                "Microsoft.Rest",
+                "--disable-interactivity",
+                "--trust-level",
+                "trusted",
+                "--explicit",
+            ]
+        );
+    }
+
+    fn fake_system_winget_source_export(_args: &[String]) -> Result<WingetSourceCommandResult> {
+        Ok(WingetSourceCommandResult {
+            exit_code: 0,
+            stdout: r#"{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+"#
+            .to_owned(),
+            stderr: String::new(),
+        })
+    }
+
+    #[test]
+    fn packaged_secure_settings_stub_delegates_to_system_winget_export() {
+        let original_runner = {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            let original = *runner;
+            *runner = fake_system_winget_source_export;
+            original
+        };
+
+        let result = load_packaged_store_from_streams(
+            Some("SHA256: d52f7aa273206e81585b714fc627ecb6f6e17b6aeba7b28025124da0d25db334"),
+            None,
+        );
+
+        {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            *runner = original_runner;
+        }
+
+        let store = result.expect("packaged store").expect("packaged store");
+        let source = store.sources.first().expect("source");
+        assert_eq!(store.sources.len(), 1);
+        assert_eq!(source.name, "contoso");
+        assert_eq!(source.kind, SourceKind::Rest);
     }
 
     #[test]
