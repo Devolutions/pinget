@@ -736,6 +736,16 @@ public class ModelsTests
     }
 
     [Fact]
+    public void GetSqliteNativeLibraryCandidates_ProbesRootAndRidFolder()
+    {
+        var candidates = Repository.GetSqliteNativeLibraryCandidates(@"C:\module").ToList();
+
+        Assert.Equal(@"C:\module\e_sqlite3.dll", candidates[0]);
+        Assert.Contains(Path.Combine(@"C:\module", "runtimes"), candidates[1]);
+        Assert.EndsWith(Path.Combine("native", "e_sqlite3.dll"), candidates[1], StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void TryGetWinGetPackageIdentityFromLocalId_UsesSourceIdentifierSuffix()
     {
         SourceRecord source = new()
