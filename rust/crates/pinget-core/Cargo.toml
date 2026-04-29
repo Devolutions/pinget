@@ -1,6 +1,6 @@
 [package]
 name = "pinget-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Pure Rust Pinget core library that works directly with source caches, REST endpoints, and installed package state without COM."
 license = "MIT"
