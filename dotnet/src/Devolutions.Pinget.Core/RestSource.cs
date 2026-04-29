@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 
 namespace Devolutions.Pinget.Core;
 
@@ -34,7 +35,7 @@ internal static class RestSource
             try
             {
                 var cacheJson = File.ReadAllText(cachePath);
-                var cache = JsonSerializer.Deserialize<RestInfoCache>(cacheJson);
+                var cache = JsonSerializer.Deserialize(cacheJson, RestSourceJsonContext.Default.RestInfoCache);
                 if (cache is not null && cache.ExpiresAt > DateTime.UtcNow)
                     return cache.Value;
             }
@@ -66,7 +67,7 @@ internal static class RestSource
 
         // Cache for 1 hour
         var cacheEntry = new RestInfoCache { ExpiresAt = DateTime.UtcNow.AddHours(1), Value = info };
-        File.WriteAllText(cachePath, JsonSerializer.Serialize(cacheEntry));
+        File.WriteAllText(cachePath, JsonSerializer.Serialize(cacheEntry, RestSourceJsonContext.Default.RestInfoCache));
 
         return info;
     }
@@ -277,6 +278,33 @@ internal static class RestSource
             return v.EnumerateArray().Select(x => x.GetString() ?? "").Where(s => s != "").ToList();
         }
 
+        List<string> GetPackageDependencies(JsonElement el)
+        {
+            var direct = GetStrArray(el, "PackageDependencies");
+            if (direct.Count > 0)
+                return direct;
+
+            if (!el.TryGetProperty("Dependencies", out var dependencies) ||
+                dependencies.ValueKind != JsonValueKind.Object ||
+                !dependencies.TryGetProperty("PackageDependencies", out var packageDependencies) ||
+                packageDependencies.ValueKind != JsonValueKind.Array)
+            {
+                return [];
+            }
+
+            var result = new List<string>();
+            foreach (var dependency in packageDependencies.EnumerateArray())
+            {
+                if (dependency.ValueKind == JsonValueKind.String)
+                    result.Add(dependency.GetString() ?? "");
+                else if (dependency.ValueKind == JsonValueKind.Object &&
+                         dependency.TryGetProperty("PackageIdentifier", out var packageIdentifier))
+                    result.Add(packageIdentifier.GetString() ?? "");
+            }
+
+            return result.Where(item => !string.IsNullOrWhiteSpace(item)).ToList();
+        }
+
         InstallerSwitches GetSwitches(JsonElement el)
         {
             if (!el.TryGetProperty("InstallerSwitches", out var switches) && !el.TryGetProperty("Switches", out switches))
@@ -322,7 +350,7 @@ internal static class RestSource
                     UpgradeCode = GetOptStr(inst, "UpgradeCode"),
                     Switches = GetSwitches(inst).MergeWith(defaultSwitches),
                     Commands = GetStrArray(inst, "Commands"),
-                    PackageDependencies = GetStrArray(inst, "PackageDependencies"),
+                    PackageDependencies = GetPackageDependencies(inst),
                 });
             }
         }
@@ -374,6 +402,7 @@ internal static class RestSource
             ReleaseNotesUrl = GetOptStr(defaultLocale, "ReleaseNotesUrl"),
             Tags = GetStrArray(defaultLocale, "Tags"),
             Agreements = agreements,
+            PackageDependencies = GetPackageDependencies(installersSource),
             Documentation = docs,
             Installers = installers,
         };
@@ -514,3 +543,6 @@ internal static class RestSource
         public string? MatchCriteria { get; init; }
     }
 }
+
+[JsonSerializable(typeof(RestSource.RestInfoCache))]
+internal partial class RestSourceJsonContext : JsonSerializerContext;

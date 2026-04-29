@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using Microsoft.Data.Sqlite;
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Xunit;
 using Devolutions.Pinget.Core;
@@ -1497,6 +1499,289 @@ public class RepositoryParityTests
     }
 }
 
+public class RepositoryEmbeddingTests
+{
+    private const string TesslPackageId = "tessl.tessl";
+
+    [Fact]
+    public void ShowManifest_RestExactId_ReturnsSerializableManifestAndSelectedInstaller()
+    {
+        using var server = new TestRestSourceServer();
+        var diagnostics = new List<RepositoryWarning>();
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                Diagnostics = diagnostics.Add,
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.Rest));
+
+            var result = repo.ShowManifest(new PackageQuery
+            {
+                Id = TesslPackageId,
+                Exact = true,
+                Source = "test",
+                InstallerArchitecture = "x64",
+            });
+
+            Assert.Equal(TesslPackageId, result.PackageIdentifier);
+            Assert.Equal("Tessl", result.PackageName);
+            Assert.Equal("1.2.3", result.PackageVersion);
+            Assert.Equal("test", result.SourceName);
+            Assert.Equal(SourceKind.Rest, result.SourceKind);
+            Assert.Equal("Tessl Publisher", result.Publisher);
+            Assert.Equal("Tessl Author", result.Author);
+            Assert.Equal("Tessl short description", result.ShortDescription);
+            Assert.Equal("https://example.test/tessl", result.PackageUrl);
+            Assert.Equal("MIT", result.License);
+            Assert.Equal("https://example.test/license", result.LicenseUrl);
+            Assert.Equal("Release notes", result.ReleaseNotes);
+            Assert.Equal("https://example.test/release-notes", result.ReleaseNotesUrl);
+            Assert.Equal(["ai", "cli"], result.Tags);
+            Assert.Equal(["Contoso.Dependency"], result.PackageDependencies);
+            var installer = Assert.Single(result.Installers);
+            Assert.Equal("https://example.test/tessl.exe", installer.InstallerUrl);
+            Assert.Equal(new string('A', 64), installer.InstallerSha256);
+            Assert.Equal("exe", installer.InstallerType);
+            Assert.Equal("2026-01-02", installer.ReleaseDate);
+            Assert.NotNull(result.SelectedInstaller);
+            Assert.Equal(installer.InstallerUrl, result.SelectedInstaller!.InstallerUrl);
+            Assert.Equal(["Installer.Dependency"], installer.PackageDependencies);
+            Assert.Empty(result.SourceWarnings);
+            Assert.Empty(diagnostics);
+
+            var json = JsonSerializer.Serialize(result, PingetJsonContext.Default.SerializableShowManifest);
+            using var document = JsonDocument.Parse(json);
+            Assert.Equal(TesslPackageId, document.RootElement.GetProperty(nameof(SerializableShowManifest.PackageIdentifier)).GetString());
+            Assert.Equal("https://example.test/tessl.exe",
+                document.RootElement.GetProperty(nameof(SerializableShowManifest.SelectedInstaller)).GetProperty(nameof(SerializableInstaller.InstallerUrl)).GetString());
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_SingleRestSourceFailure_ThrowsSourceSearchExceptionWithDiagnostics()
+    {
+        using var server = new TestRestSourceServer(request =>
+            request.Url?.AbsolutePath == "/manifestSearch"
+                ? new TestRestResponse(503, """{"error":"source unavailable"}""")
+                : TestRestSourceServer.DefaultResponse(request));
+
+        var diagnostics = new List<RepositoryWarning>();
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                Diagnostics = diagnostics.Add,
+            });
+            ReplaceSources(repo, ("winget.pro", server.Url, SourceKind.Rest));
+
+            var ex = Assert.Throws<SourceSearchException>(() => repo.Show(new PackageQuery
+            {
+                Id = TesslPackageId,
+                Exact = true,
+                Source = "winget.pro",
+            }));
+
+            Assert.Equal("winget.pro", ex.Warning.SourceName);
+            Assert.Equal(SourceKind.Rest, ex.Warning.SourceKind);
+            Assert.Equal(503, ex.Warning.HttpStatusCode);
+            Assert.Contains("/manifestSearch", ex.Warning.RequestUri);
+            Assert.Contains("503", ex.Warning.Message);
+            var diagnostic = Assert.Single(diagnostics);
+            Assert.Equal(ex.Warning.SourceName, diagnostic.SourceName);
+            Assert.Equal(ex.Warning.HttpStatusCode, diagnostic.HttpStatusCode);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_MultipleSourcesExposeStructuredMatches()
+    {
+        using var firstServer = new TestRestSourceServer();
+        using var secondServer = new TestRestSourceServer();
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            ReplaceSources(
+                repo,
+                ("first", firstServer.Url, SourceKind.Rest),
+                ("second", secondServer.Url, SourceKind.Rest));
+
+            var ex = Assert.Throws<MultiplePackageMatchesException>(() => repo.Show(new PackageQuery
+            {
+                Id = TesslPackageId,
+                Exact = true,
+            }));
+
+            Assert.Equal(["first", "second"], ex.Matches.Select(match => match.SourceName).ToArray());
+            Assert.All(ex.Matches, match =>
+            {
+                Assert.Equal(TesslPackageId, match.Id);
+                Assert.Equal(SourceKind.Rest, match.SourceKind);
+            });
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void CliShowJson_MatchesCoreSerializableManifestForRestSource()
+    {
+        using var server = new TestRestSourceServer();
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using (var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot }))
+            {
+                ReplaceSources(repo, ("test", server.Url, SourceKind.Rest));
+                var core = repo.ShowManifest(new PackageQuery
+                {
+                    Id = TesslPackageId,
+                    Exact = true,
+                    Source = "test",
+                    InstallerArchitecture = "x64",
+                });
+
+                var cli = RunCliShowJson(appRoot);
+
+                Assert.Equal(core.PackageIdentifier, cli.RootElement.GetProperty(nameof(SerializableShowManifest.PackageIdentifier)).GetString());
+                Assert.Equal(core.SourceName, cli.RootElement.GetProperty(nameof(SerializableShowManifest.SourceName)).GetString());
+                Assert.Equal(core.SelectedInstaller!.InstallerUrl,
+                    cli.RootElement.GetProperty(nameof(SerializableShowManifest.SelectedInstaller)).GetProperty(nameof(SerializableInstaller.InstallerUrl)).GetString());
+                Assert.Equal(core.PackageDependencies,
+                    cli.RootElement.GetProperty(nameof(SerializableShowManifest.PackageDependencies)).EnumerateArray().Select(item => item.GetString() ?? "").ToList());
+            }
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [SkippableFact]
+    public void LiveWingetPro_TesslExactLookup_ReturnsManifestWhenAvailable()
+    {
+        const string liveSourceUrl = "https://api.winget.pro/4259fd23-6fcd-46bf-9287-be8833cfbdd5";
+        Skip.IfNot(string.Equals(Environment.GetEnvironmentVariable("PINGET_LIVE_WINGETPRO_TESTS"), "1", StringComparison.Ordinal),
+            "Set PINGET_LIVE_WINGETPRO_TESTS=1 to run the optional winget.pro live smoke test.");
+
+        using var probe = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        try
+        {
+            using var response = probe.GetAsync($"{liveSourceUrl}/information").GetAwaiter().GetResult();
+            Skip.If(!response.IsSuccessStatusCode, $"winget.pro information endpoint returned {(int)response.StatusCode}.");
+        }
+        catch (Exception ex)
+        {
+            Skip.If(true, $"winget.pro is unavailable: {ex.Message}");
+        }
+
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            ReplaceSources(repo, ("winget.pro", liveSourceUrl, SourceKind.Rest));
+
+            var result = repo.ShowManifest(new PackageQuery
+            {
+                Id = TesslPackageId,
+                Exact = true,
+                Source = "winget.pro",
+            });
+
+            Assert.Equal(TesslPackageId, result.PackageIdentifier, ignoreCase: true);
+            Assert.Equal("winget.pro", result.SourceName);
+            Assert.NotEmpty(result.Installers);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    private static void ReplaceSources(Repository repo, params (string Name, string Arg, SourceKind Kind)[] sources)
+    {
+        foreach (var source in repo.ListSources())
+            repo.RemoveSource(source.Name);
+
+        foreach (var source in sources)
+            repo.AddSource(source.Name, source.Arg, source.Kind, trustLevel: "trusted");
+    }
+
+    private static JsonDocument RunCliShowJson(string appRoot)
+    {
+        var root = FindRepositoryRoot();
+        var cliProject = Path.Combine(root, "dotnet", "src", "Devolutions.Pinget.Cli", "Devolutions.Pinget.Cli.csproj");
+        var cliDll = Path.Combine(root, "dotnet", "src", "Devolutions.Pinget.Cli", "bin", "Release", "net10.0", "pinget.dll");
+
+        var build = RunProcess("dotnet", ["build", cliProject, "-c", "Release", "-v:q"], appRoot);
+        Assert.Equal(0, build.ExitCode);
+        Assert.True(File.Exists(cliDll));
+
+        var run = RunProcess("dotnet",
+        [
+            cliDll,
+            "show",
+            "--id", TesslPackageId,
+            "--exact",
+            "--source", "test",
+            "--architecture", "x64",
+            "--output", "json",
+        ], appRoot);
+
+        Assert.Equal(0, run.ExitCode);
+        return JsonDocument.Parse(run.Stdout);
+    }
+
+    private static (int ExitCode, string Stdout, string Stderr) RunProcess(string fileName, IReadOnlyList<string> arguments, string appRoot)
+    {
+        var psi = new ProcessStartInfo(fileName)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        psi.Environment["PINGET_APPROOT"] = appRoot;
+
+        foreach (var argument in arguments)
+            psi.ArgumentList.Add(argument);
+
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException($"Failed to start {fileName}.");
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        process.WaitForExit();
+        return (process.ExitCode, stdout.GetAwaiter().GetResult(), stderr.GetAwaiter().GetResult());
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "dotnet", "Devolutions.Pinget.slnx")))
+                return directory.FullName;
+
+            directory = directory.Parent;
+        }
+
+        throw new InvalidOperationException("Could not locate repository root.");
+    }
+}
+
 file static class TestPaths
 {
     public static string CreateTempAppRoot() =>
@@ -1514,6 +1799,170 @@ file static class TestPaths
     {
         if (Directory.Exists(appRoot))
             Directory.Delete(appRoot, recursive: true);
+    }
+}
+
+file sealed record TestRestResponse(int StatusCode, string Body, string ContentType = "application/json");
+
+file sealed class TestRestSourceServer : IDisposable
+{
+    private readonly HttpListener _listener;
+    private readonly Task _loopTask;
+    private readonly CancellationTokenSource _cts = new();
+    private readonly Func<HttpListenerRequest, TestRestResponse> _handler;
+
+    public TestRestSourceServer(Func<HttpListenerRequest, TestRestResponse>? handler = null)
+    {
+        _handler = handler ?? DefaultResponse;
+        var port = GetFreePort();
+        Url = $"http://127.0.0.1:{port}";
+        _listener = new HttpListener();
+        _listener.Prefixes.Add($"{Url}/");
+        _listener.Start();
+        _loopTask = Task.Run(async () =>
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                HttpListenerContext? context = null;
+                try
+                {
+                    context = await _listener.GetContextAsync();
+                    var response = _handler(context.Request);
+                    var bytes = System.Text.Encoding.UTF8.GetBytes(response.Body);
+                    context.Response.StatusCode = response.StatusCode;
+                    context.Response.ContentType = response.ContentType;
+                    context.Response.ContentLength64 = bytes.Length;
+                    await context.Response.OutputStream.WriteAsync(bytes, _cts.Token);
+                }
+                catch (ObjectDisposedException) when (_cts.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (HttpListenerException) when (_cts.IsCancellationRequested)
+                {
+                    break;
+                }
+                finally
+                {
+                    context?.Response.OutputStream.Dispose();
+                    context?.Response.Close();
+                }
+            }
+        }, _cts.Token);
+    }
+
+    public string Url { get; }
+
+    public static TestRestResponse DefaultResponse(HttpListenerRequest request)
+    {
+        return request.Url?.AbsolutePath switch
+        {
+            "/information" => new TestRestResponse(200, """
+                {
+                  "Data": {
+                    "SourceIdentifier": "Test.Rest",
+                    "ServerSupportedVersions": [ "1.10.0" ],
+                    "RequiredPackageMatchFields": [],
+                    "UnsupportedPackageMatchFields": []
+                  }
+                }
+                """),
+            "/manifestSearch" => new TestRestResponse(200, """
+                {
+                  "Data": [
+                    {
+                      "PackageIdentifier": "tessl.tessl",
+                      "PackageName": "Tessl",
+                      "Versions": [
+                        { "PackageVersion": "1.2.3", "Channel": "" }
+                      ]
+                    }
+                  ]
+                }
+                """),
+            "/packageManifests/tessl.tessl" => new TestRestResponse(200, $$"""
+                {
+                  "Data": {
+                    "PackageIdentifier": "tessl.tessl",
+                    "PackageName": "Tessl",
+                    "DefaultLocale": {
+                      "PackageName": "Tessl",
+                      "Publisher": "Tessl Publisher",
+                      "Author": "Tessl Author",
+                      "ShortDescription": "Tessl short description",
+                      "Description": "Tessl long description",
+                      "PackageUrl": "https://example.test/tessl",
+                      "License": "MIT",
+                      "LicenseUrl": "https://example.test/license",
+                      "ReleaseNotes": "Release notes",
+                      "ReleaseNotesUrl": "https://example.test/release-notes",
+                      "Tags": [ "ai", "cli" ]
+                    },
+                    "Versions": [
+                      {
+                        "PackageVersion": "1.2.3",
+                        "DefaultLocale": {
+                          "PackageName": "Tessl",
+                          "Publisher": "Tessl Publisher",
+                          "Author": "Tessl Author",
+                          "ShortDescription": "Tessl short description",
+                          "Description": "Tessl long description",
+                          "PackageUrl": "https://example.test/tessl",
+                          "License": "MIT",
+                          "LicenseUrl": "https://example.test/license",
+                          "ReleaseNotes": "Release notes",
+                          "ReleaseNotesUrl": "https://example.test/release-notes",
+                          "Tags": [ "ai", "cli" ]
+                        },
+                        "Dependencies": {
+                          "PackageDependencies": [
+                            { "PackageIdentifier": "Contoso.Dependency" }
+                          ]
+                        },
+                        "Installers": [
+                          {
+                            "Architecture": "x64",
+                            "InstallerType": "exe",
+                            "InstallerUrl": "https://example.test/tessl.exe",
+                            "InstallerSha256": "{{new string('A', 64)}}",
+                            "ReleaseDate": "2026-01-02",
+                            "Dependencies": {
+                              "PackageDependencies": [
+                                { "PackageIdentifier": "Installer.Dependency" }
+                              ]
+                            }
+                          }
+                        ],
+                        "ManifestVersion": "1.10.0"
+                      }
+                    ],
+                    "ManifestVersion": "1.10.0"
+                  }
+                }
+                """),
+            _ => new TestRestResponse(404, """{"error":"not found"}"""),
+        };
+    }
+
+    public void Dispose()
+    {
+        _cts.Cancel();
+        _listener.Stop();
+        _listener.Close();
+        try
+        {
+            _loopTask.GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private static int GetFreePort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
     }
 }
 

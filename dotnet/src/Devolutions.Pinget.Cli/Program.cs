@@ -136,7 +136,7 @@ showCommand.SetHandler((ctx) =>
     else
     {
         var result = repo.Show(query);
-        if (output != OutputFormat.Text) WriteManifestStructuredOutput(result.ToStructuredDocument(), output);
+        if (output != OutputFormat.Text) WriteManifestStructuredOutput(result.ToSerializableManifest(), output);
         else PrintShow(result);
     }
 });
@@ -1266,7 +1266,10 @@ void WriteStructuredOutput(object value, OutputFormat output)
     switch (output)
     {
         case OutputFormat.Json:
-            Console.WriteLine(JsonSerializer.Serialize(value, JsonOpts));
+            if (value is SerializableShowManifest showManifest)
+                Console.WriteLine(JsonSerializer.Serialize(showManifest, PingetJsonContext.Default.SerializableShowManifest));
+            else
+                Console.WriteLine(JsonSerializer.Serialize(value, JsonOpts));
             break;
         case OutputFormat.Yaml:
             Console.Write(new SerializerBuilder().Build().Serialize(value));

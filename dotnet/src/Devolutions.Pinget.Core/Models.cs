@@ -34,8 +34,51 @@ public record SourceRecord
 /// </summary>
 public record RepositoryOptions
 {
+    /// <summary>
+    /// Storage root for source state and caches. A null value uses the real Desktop App Installer / WinGet state on Windows.
+    /// </summary>
     public string? AppRoot { get; init; }
     public string UserAgent { get; init; } = "pinget-dotnet/0.1";
+    public Action<RepositoryWarning>? Diagnostics { get; init; }
+}
+
+public record RepositoryWarning
+{
+    public required string Operation { get; init; }
+    public required string SourceName { get; init; }
+    public required SourceKind SourceKind { get; init; }
+    public required string SourceArg { get; init; }
+    public string? SourceIdentifier { get; init; }
+    public string? RequestUri { get; init; }
+    public string? CachePath { get; init; }
+    public required string Message { get; init; }
+    public string? ExceptionType { get; init; }
+    public int? HttpStatusCode { get; init; }
+}
+
+public class SourceSearchException : InvalidOperationException
+{
+    public SourceSearchException(RepositoryWarning warning, Exception innerException)
+        : base($"Failed during source operation '{warning.Operation}' for '{warning.SourceName}': {warning.Message}", innerException)
+    {
+        Warning = warning;
+    }
+
+    public RepositoryWarning Warning { get; }
+}
+
+public class MultiplePackageMatchesException : InvalidOperationException
+{
+    public MultiplePackageMatchesException(IEnumerable<SearchMatch> matches)
+        : base($"multiple packages matched: {FormatChoices(matches)}")
+    {
+        Matches = matches.ToList();
+    }
+
+    public IReadOnlyList<SearchMatch> Matches { get; }
+
+    private static string FormatChoices(IEnumerable<SearchMatch> matches) =>
+        string.Join(", ", matches.Take(10).Select(m => $"{m.Name} [{m.Id}] ({m.SourceName})"));
 }
 
 public record PackageQuery
@@ -94,6 +137,7 @@ public record SearchResponse
 {
     public required List<SearchMatch> Matches { get; init; }
     public required List<string> Warnings { get; init; }
+    public List<RepositoryWarning> SourceWarnings { get; init; } = [];
     public bool Truncated { get; init; }
 }
 
@@ -274,16 +318,142 @@ public record ShowResult
     public Installer? SelectedInstaller { get; init; }
     public List<string> CachedFiles { get; init; } = [];
     public List<string> Warnings { get; init; } = [];
+    public List<RepositoryWarning> SourceWarnings { get; init; } = [];
     public required object StructuredDocument { private get; init; }
 
     public object ToStructuredDocument() => StructuredOutput.CollapseManifestDocuments(StructuredDocument);
+
+    public SerializableShowManifest ToSerializableManifest()
+    {
+        var document = ToStructuredDocument() as Dictionary<string, object?> ??
+            new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+        string? GetString(string key) =>
+            document.TryGetValue(key, out var value) && value is not null ? value.ToString() : null;
+
+        return new SerializableShowManifest
+        {
+            PackageIdentifier = Manifest.Id,
+            PackageName = Manifest.Name,
+            PackageVersion = Manifest.Version,
+            Channel = string.IsNullOrWhiteSpace(Manifest.Channel) ? null : Manifest.Channel,
+            SourceName = Package.SourceName,
+            SourceKind = Package.SourceKind,
+            Publisher = Manifest.Publisher,
+            Author = Manifest.Author,
+            Moniker = Manifest.Moniker,
+            Description = Manifest.Description,
+            ShortDescription = GetString("ShortDescription"),
+            PackageUrl = Manifest.PackageUrl,
+            PublisherUrl = Manifest.PublisherUrl,
+            PublisherSupportUrl = Manifest.PublisherSupportUrl,
+            License = Manifest.License,
+            LicenseUrl = Manifest.LicenseUrl,
+            PrivacyUrl = Manifest.PrivacyUrl,
+            Copyright = Manifest.Copyright,
+            CopyrightUrl = Manifest.CopyrightUrl,
+            ReleaseNotes = Manifest.ReleaseNotes,
+            ReleaseNotesUrl = Manifest.ReleaseNotesUrl,
+            Tags = Manifest.Tags,
+            PackageDependencies = Manifest.PackageDependencies,
+            Documentation = Manifest.Documentation,
+            Agreements = Manifest.Agreements,
+            Installers = Manifest.Installers.Select(SerializableInstaller.FromInstaller).ToList(),
+            SelectedInstaller = SelectedInstaller is null ? null : SerializableInstaller.FromInstaller(SelectedInstaller),
+            CachedFiles = CachedFiles,
+            Warnings = Warnings,
+            SourceWarnings = SourceWarnings,
+        };
+    }
 }
+
+public record SerializableShowManifest
+{
+    public required string PackageIdentifier { get; init; }
+    public required string PackageName { get; init; }
+    public required string PackageVersion { get; init; }
+    public string? Channel { get; init; }
+    public required string SourceName { get; init; }
+    public required SourceKind SourceKind { get; init; }
+    public string? Publisher { get; init; }
+    public string? Author { get; init; }
+    public string? Moniker { get; init; }
+    public string? Description { get; init; }
+    public string? ShortDescription { get; init; }
+    public string? PackageUrl { get; init; }
+    public string? PublisherUrl { get; init; }
+    public string? PublisherSupportUrl { get; init; }
+    public string? License { get; init; }
+    public string? LicenseUrl { get; init; }
+    public string? PrivacyUrl { get; init; }
+    public string? Copyright { get; init; }
+    public string? CopyrightUrl { get; init; }
+    public string? ReleaseNotes { get; init; }
+    public string? ReleaseNotesUrl { get; init; }
+    public List<string> Tags { get; init; } = [];
+    public List<string> PackageDependencies { get; init; } = [];
+    public List<Documentation> Documentation { get; init; } = [];
+    public List<PackageAgreement> Agreements { get; init; } = [];
+    public List<SerializableInstaller> Installers { get; init; } = [];
+    public SerializableInstaller? SelectedInstaller { get; init; }
+    public List<string> CachedFiles { get; init; } = [];
+    public List<string> Warnings { get; init; } = [];
+    public List<RepositoryWarning> SourceWarnings { get; init; } = [];
+}
+
+public record SerializableInstaller
+{
+    public string? Architecture { get; init; }
+    public string? InstallerType { get; init; }
+    public string? NestedInstallerType { get; init; }
+    public string? InstallerUrl { get; init; }
+    public string? InstallerSha256 { get; init; }
+    public string? ProductCode { get; init; }
+    public string? InstallerLocale { get; init; }
+    public string? Scope { get; init; }
+    public string? ReleaseDate { get; init; }
+    public string? PackageFamilyName { get; init; }
+    public string? UpgradeCode { get; init; }
+    public List<string> Platforms { get; init; } = [];
+    public string? MinimumOsVersion { get; init; }
+    public InstallerSwitches Switches { get; init; } = new();
+    public List<string> Commands { get; init; } = [];
+    public List<string> PackageDependencies { get; init; } = [];
+
+    public static SerializableInstaller FromInstaller(Installer installer) => new()
+    {
+        Architecture = installer.Architecture,
+        InstallerType = installer.InstallerType,
+        NestedInstallerType = installer.NestedInstallerType,
+        InstallerUrl = installer.Url,
+        InstallerSha256 = installer.Sha256,
+        ProductCode = installer.ProductCode,
+        InstallerLocale = installer.Locale,
+        Scope = installer.Scope,
+        ReleaseDate = installer.ReleaseDate,
+        PackageFamilyName = installer.PackageFamilyName,
+        UpgradeCode = installer.UpgradeCode,
+        Platforms = installer.Platforms,
+        MinimumOsVersion = installer.MinimumOsVersion,
+        Switches = installer.Switches,
+        Commands = installer.Commands,
+        PackageDependencies = installer.PackageDependencies,
+    };
+}
+
+[JsonSerializable(typeof(SerializableShowManifest))]
+[JsonSerializable(typeof(List<SerializableShowManifest>))]
+[JsonSerializable(typeof(RepositoryWarning))]
+[JsonSerializable(typeof(List<RepositoryWarning>))]
+[JsonSourceGenerationOptions(WriteIndented = true)]
+public partial class PingetJsonContext : JsonSerializerContext;
 
 public record VersionsResult
 {
     public required SearchMatch Package { get; init; }
     public required List<VersionKey> Versions { get; init; }
     public List<string> Warnings { get; init; } = [];
+    public List<RepositoryWarning> SourceWarnings { get; init; } = [];
 }
 
 public record CacheWarmResult
@@ -291,6 +461,7 @@ public record CacheWarmResult
     public required SearchMatch Package { get; init; }
     public List<string> CachedFiles { get; init; } = [];
     public List<string> Warnings { get; init; } = [];
+    public List<RepositoryWarning> SourceWarnings { get; init; } = [];
 }
 
 public record SourceUpdateResult

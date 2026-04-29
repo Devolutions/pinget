@@ -25,14 +25,21 @@ public class Repository : IDisposable
     private readonly string _appRoot;
     private readonly HttpClient _client;
     private readonly bool _useSystemWingetSources;
+    private readonly Action<RepositoryWarning>? _diagnostics;
     private SourceStore _store;
 
-    private Repository(string appRoot, HttpClient client, SourceStore store, bool useSystemWingetSources)
+    private Repository(
+        string appRoot,
+        HttpClient client,
+        SourceStore store,
+        bool useSystemWingetSources,
+        Action<RepositoryWarning>? diagnostics)
     {
         _appRoot = appRoot;
         _client = client;
         _store = store;
         _useSystemWingetSources = useSystemWingetSources;
+        _diagnostics = diagnostics;
     }
 
     /// <summary>
@@ -48,7 +55,7 @@ public class Repository : IDisposable
         var store = SourceStoreManager.Load(appRoot);
         var client = new HttpClient();
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
-        return new Repository(appRoot, client, store, useSystemWingetSources);
+        return new Repository(appRoot, client, store, useSystemWingetSources, options.Diagnostics);
     }
 
     internal static IEnumerable<string> GetSqliteNativeLibraryCandidates(string assemblyDirectory)
@@ -362,18 +369,19 @@ public class Repository : IDisposable
 
     public SearchResponse Search(PackageQuery query)
     {
-        var (matches, warnings, truncated) = SearchLocated(query, SearchSemantics.Many);
+        var (matches, warnings, failures, truncated) = SearchLocated(query, SearchSemantics.Many);
         return new SearchResponse
         {
             Matches = matches.Select(m => m.Display).ToList(),
             Warnings = warnings,
+            SourceWarnings = failures.Select(f => f.Warning).ToList(),
             Truncated = truncated
         };
     }
 
     public List<Dictionary<string, object?>> SearchManifests(PackageQuery query)
     {
-        var (matches, _, _) = SearchLocated(query, SearchSemantics.Many);
+        var (matches, _, _, _) = SearchLocated(query, SearchSemantics.Many);
         return StructuredOutput.CollapseManifestResults(matches.Select(located =>
         {
             var (_, structuredDocument, _) = ManifestForMatch(located, query);
@@ -385,42 +393,91 @@ public class Repository : IDisposable
 
     public ShowResult Show(PackageQuery query)
     {
-        var (located, warnings) = FindSingleMatch(query);
-        var (manifest, structuredDocument, cachedFiles) = ManifestForMatch(located, query);
-        var selectedInstaller = SelectInstaller(manifest.Installers, query);
+        var (located, warnings, sourceWarnings) = FindSingleMatch(query);
+        return CreateShowResult(located, query, warnings, sourceWarnings);
+    }
 
-        return new ShowResult
+    public SerializableShowManifest ShowManifest(PackageQuery query) => Show(query).ToSerializableManifest();
+
+    public ShowResult ShowFirstMatchAcrossSources(PackageQuery query)
+    {
+        if (query.Source is not null)
+            return Show(query);
+
+        var allWarnings = new List<string>();
+        var allFailures = new List<SourceSearchFailure>();
+
+        foreach (var sourceIndex in ResolveSearchSourceIndexes(null))
         {
-            Package = located.Display,
-            Manifest = manifest,
-            SelectedInstaller = selectedInstaller,
-            CachedFiles = cachedFiles,
-            Warnings = warnings,
-            StructuredDocument = structuredDocument,
-        };
+            var sourceQuery = query with { Source = _store.Sources[sourceIndex].Name };
+            var (matches, warnings, failures, _) = SearchLocated(sourceQuery, SearchSemantics.Single);
+            allWarnings.AddRange(warnings);
+            allFailures.AddRange(failures);
+
+            if (matches.Count == 0)
+                continue;
+
+            if (matches.Count > 1)
+                throw new MultiplePackageMatchesException(matches.Select(m => m.Display));
+
+            return CreateShowResult(matches[0], query, allWarnings, allFailures.Select(f => f.Warning).ToList());
+        }
+
+        if (allFailures.Count > 0)
+            throw new SourceSearchException(allFailures[0].Warning, allFailures[0].Exception);
+
+        throw new InvalidOperationException("no package matched the supplied query");
+    }
+
+    private ShowResult CreateShowResult(
+        LocatedMatch located,
+        PackageQuery query,
+        List<string> warnings,
+        List<RepositoryWarning> sourceWarnings)
+    {
+        try
+        {
+            var (manifest, structuredDocument, cachedFiles) = ManifestForMatch(located, query);
+            return new ShowResult
+            {
+                Package = located.Display,
+                Manifest = manifest,
+                SelectedInstaller = SelectInstaller(manifest.Installers, query),
+                CachedFiles = cachedFiles,
+                Warnings = warnings,
+                SourceWarnings = sourceWarnings,
+                StructuredDocument = structuredDocument,
+            };
+        }
+        catch (Exception ex)
+        {
+            var warning = CreateSourceWarning(located.SourceIndex, "manifest", ex);
+            EmitDiagnostic(warning);
+            throw new SourceSearchException(warning, UnwrapSourceOperationException(ex));
+        }
     }
 
     public VersionsResult ShowVersions(PackageQuery query)
     {
-        var (located, warnings) = FindSingleMatch(query);
+        var (located, warnings, sourceWarnings) = FindSingleMatch(query);
         var versions = VersionsForMatch(located, query);
-        return new VersionsResult { Package = located.Display, Versions = versions, Warnings = warnings };
+        return new VersionsResult { Package = located.Display, Versions = versions, Warnings = warnings, SourceWarnings = sourceWarnings };
     }
 
     public VersionsResult SearchVersions(PackageQuery query)
     {
-        var (located, warnings) = FindSingleMatchWithSemantics(query, SearchSemantics.Many);
+        var (located, warnings, sourceWarnings) = FindSingleMatchWithSemantics(query, SearchSemantics.Many);
         var versions = VersionsForMatch(located, query);
-        return new VersionsResult { Package = located.Display, Versions = versions, Warnings = warnings };
+        return new VersionsResult { Package = located.Display, Versions = versions, Warnings = warnings, SourceWarnings = sourceWarnings };
     }
 
     // ── Cache warm ──
 
     public CacheWarmResult WarmCache(PackageQuery query)
     {
-        var (located, warnings) = FindSingleMatch(query);
+        var (located, warnings, sourceWarnings) = FindSingleMatch(query);
         var (_, _, cachedFiles) = ManifestForMatch(located, query);
-        return new CacheWarmResult { Package = located.Display, CachedFiles = cachedFiles, Warnings = warnings };
+        return new CacheWarmResult { Package = located.Display, CachedFiles = cachedFiles, Warnings = warnings, SourceWarnings = sourceWarnings };
     }
 
     // ── List ──
@@ -444,7 +501,7 @@ public class Repository : IDisposable
         if (needsAvailable && hasFilter)
         {
             var availableQuery = PackageQueryFromListQuery(query);
-            var (matches, srcWarnings, _) = SearchLocated(availableQuery, SearchSemantics.Many);
+            var (matches, srcWarnings, _, _) = SearchLocated(availableQuery, SearchSemantics.Many);
             warnings.AddRange(srcWarnings);
             var candidates = matches.Select(m => m.Display).ToList();
             foreach (var pkg in installed)
@@ -694,7 +751,7 @@ public class Repository : IDisposable
         if (!string.IsNullOrWhiteSpace(request.ManifestPath))
             return LoadManifestFromPath(request.ManifestPath!);
 
-        var (located, _) = FindSingleMatch(request.Query);
+        var (located, _, _) = FindSingleMatch(request.Query);
         var (manifest, _, _) = ManifestForMatch(located, request.Query);
         return manifest;
     }
@@ -933,12 +990,15 @@ public class Repository : IDisposable
 
     // ── Internal search machinery ──
 
-    private (List<LocatedMatch> Matches, List<string> Warnings, bool Truncated) SearchLocated(
+    private record SourceSearchFailure(RepositoryWarning Warning, Exception Exception);
+
+    private (List<LocatedMatch> Matches, List<string> Warnings, List<SourceSearchFailure> Failures, bool Truncated) SearchLocated(
         PackageQuery query, SearchSemantics semantics)
     {
         var indexes = ResolveSearchSourceIndexes(query.Source);
         var matches = new List<LocatedMatch>();
         var warnings = new List<string>();
+        var failures = new List<SourceSearchFailure>();
         bool truncated = false;
 
         foreach (var index in indexes)
@@ -949,9 +1009,14 @@ public class Repository : IDisposable
                 truncated |= srcTruncated;
                 matches.AddRange(sourceMatches);
             }
-            catch
+            catch (Exception ex)
             {
-                warnings.Add($"Failed when searching source; results will not be included: {_store.Sources[index].Name}");
+                var operation = ex is SourceOperationException sourceOperation ? sourceOperation.Operation : "search";
+                var exception = UnwrapSourceOperationException(ex);
+                var warning = CreateSourceWarning(index, operation, exception);
+                failures.Add(new SourceSearchFailure(warning, exception));
+                warnings.Add($"Failed when searching source '{warning.SourceName}'; results will not be included: {warning.Message}");
+                EmitDiagnostic(warning);
             }
         }
 
@@ -968,7 +1033,7 @@ public class Repository : IDisposable
             }
         }
 
-        return (matches, warnings, truncated);
+        return (matches, warnings, failures, truncated);
     }
 
     private (List<LocatedMatch> Matches, bool Truncated) SearchSource(
@@ -1036,9 +1101,27 @@ public class Repository : IDisposable
         int sourceIndex, PackageQuery query, SearchSemantics semantics)
     {
         var source = _store.Sources[sourceIndex];
-        var info = RestSource.LoadInformation(_client, source, _appRoot);
+        RestSource.RestInformation info;
+        try
+        {
+            info = RestSource.LoadInformation(_client, source, _appRoot);
+        }
+        catch (Exception ex)
+        {
+            throw new SourceOperationException("information", ex);
+        }
 
-        var (results, truncated) = RestSource.Search(_client, source, query, info, semantics);
+        (List<RestSource.RestMatchResult> Results, bool Truncated) search;
+        try
+        {
+            search = RestSource.Search(_client, source, query, info, semantics);
+        }
+        catch (Exception ex)
+        {
+            throw new SourceOperationException("search", ex);
+        }
+
+        var (results, truncated) = search;
         return (results.Select(r => new LocatedMatch
         {
             Display = new SearchMatch
@@ -1057,6 +1140,56 @@ public class Repository : IDisposable
         }).ToList(), truncated);
     }
 
+    private RepositoryWarning CreateSourceWarning(int sourceIndex, string operation, Exception exception)
+    {
+        var source = _store.Sources[sourceIndex];
+        return new RepositoryWarning
+        {
+            Operation = operation,
+            SourceName = source.Name,
+            SourceKind = source.Kind,
+            SourceArg = source.Arg,
+            SourceIdentifier = source.Identifier,
+            RequestUri = SourceRequestUri(source, operation),
+            CachePath = SourceDiagnosticCachePath(source),
+            Message = exception.Message,
+            ExceptionType = exception.GetType().FullName,
+            HttpStatusCode = exception is HttpRequestException httpException && httpException.StatusCode.HasValue
+                ? (int)httpException.StatusCode.Value
+                : null,
+        };
+    }
+
+    private static string SourceRequestUri(SourceRecord source, string operation) =>
+        source.Kind == SourceKind.Rest
+            ? operation switch
+            {
+                "search" => $"{source.Arg.TrimEnd('/')}/manifestSearch",
+                "manifest" => $"{source.Arg.TrimEnd('/')}/packageManifests",
+                "information" => $"{source.Arg.TrimEnd('/')}/information",
+                _ => source.Arg,
+            }
+            : source.Arg;
+
+    private string? SourceDiagnosticCachePath(SourceRecord source) =>
+        source.Kind switch
+        {
+            SourceKind.PreIndexed => PreIndexedSource.IndexPath(source, _appRoot),
+            SourceKind.Rest => Path.Combine(SourceStoreManager.SourceStateDir(source, _appRoot), "rest_info.json"),
+            _ => null,
+        };
+
+    private void EmitDiagnostic(RepositoryWarning warning) => _diagnostics?.Invoke(warning);
+
+    private sealed class SourceOperationException(string operation, Exception innerException)
+        : Exception(innerException.Message, innerException)
+    {
+        public string Operation { get; } = operation;
+    }
+
+    private static Exception UnwrapSourceOperationException(Exception exception) =>
+        exception is SourceOperationException { InnerException: { } innerException } ? innerException : exception;
+
     private SqliteConnection OpenPreindexedConnection(int sourceIndex)
     {
         var source = _store.Sources[sourceIndex];
@@ -1074,25 +1207,26 @@ public class Repository : IDisposable
         return conn;
     }
 
-    private (LocatedMatch Match, List<string> Warnings) FindSingleMatch(PackageQuery query)
+    private (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) FindSingleMatch(PackageQuery query)
         => FindSingleMatchWithSemantics(query, SearchSemantics.Single);
 
-    private (LocatedMatch Match, List<string> Warnings) FindSingleMatchWithSemantics(
+    private (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) FindSingleMatchWithSemantics(
         PackageQuery query, SearchSemantics semantics)
     {
-        var (matches, warnings, _) = SearchLocated(query, semantics);
+        var (matches, warnings, failures, _) = SearchLocated(query, semantics);
 
         if (matches.Count == 0)
-            throw new InvalidOperationException("no package matched the supplied query");
-
-        if (matches.Count > 1)
         {
-            var choices = string.Join(", ", matches.Take(10)
-                .Select(m => $"{m.Display.Name} [{m.Display.Id}] ({m.Display.SourceName})"));
-            throw new InvalidOperationException($"multiple packages matched: {choices}");
+            if (query.Source is not null && failures.Count > 0)
+                throw new SourceSearchException(failures[0].Warning, failures[0].Exception);
+
+            throw new InvalidOperationException("no package matched the supplied query");
         }
 
-        return (matches[0], warnings);
+        if (matches.Count > 1)
+            throw new MultiplePackageMatchesException(matches.Select(m => m.Display));
+
+        return (matches[0], warnings, failures.Select(f => f.Warning).ToList());
     }
 
     private List<VersionKey> VersionsForMatch(LocatedMatch located, PackageQuery query)
@@ -1636,7 +1770,7 @@ public class Repository : IDisposable
     private List<string> CorrelateAllInstalled(List<InstalledPackage> installed)
     {
         var allQuery = new PackageQuery { Count = 100_000 };
-        var (matches, warnings, _) = SearchLocated(allQuery, SearchSemantics.Many);
+        var (matches, warnings, _, _) = SearchLocated(allQuery, SearchSemantics.Many);
         var candidates = matches.Select(m => m.Display).ToList();
         foreach (var pkg in installed)
             pkg.Correlated = CorrelateInstalledPackage(pkg, candidates, true);

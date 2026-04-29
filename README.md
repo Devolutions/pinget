@@ -127,15 +127,19 @@ The **`Devolutions.Pinget.Core`** library is available on [nuget.org](https://ww
 dotnet add package Devolutions.Pinget.Core
 ```
 
-The package targets .NET 8 and .NET 10. `Repository.Open()` is the main entry point; pass `RepositoryOptions` when you want an isolated app root or a custom user agent.
+The package targets .NET 8 and .NET 10. `Repository.Open()` is the main entry point; pass `RepositoryOptions` when you want source diagnostics, an isolated app root, or a custom user agent.
+
+`RepositoryOptions.AppRoot = null` is the system WinGet mode on Windows. It uses the real Desktop App Installer / WinGet source state and is intended for embedded apps that need to align with `winget.exe source list` and `winget source export`. Use a custom app root when you want isolated sources and caches for tests, probes, or app-private package catalogs.
 
 ```csharp
 using Devolutions.Pinget.Core;
 
+var diagnostics = new List<RepositoryWarning>();
 using var repository = Repository.Open(new RepositoryOptions
 {
-    AppRoot = Path.Combine(Path.GetTempPath(), "pinget-sample"),
+    AppRoot = null,
     UserAgent = "my-app/1.0",
+    Diagnostics = diagnostics.Add,
 });
 
 foreach (var update in repository.UpdateSources())
@@ -162,6 +166,11 @@ var rdm = repository.Show(new PackageQuery
 
 Console.WriteLine($"{rdm.Manifest.Name} {rdm.Manifest.Version}");
 
+var serializable = rdm.ToSerializableManifest();
+var json = System.Text.Json.JsonSerializer.Serialize(
+    serializable,
+    PingetJsonContext.Default.SerializableShowManifest);
+
 var (_, installerPath) = repository.DownloadInstaller(
     new PackageQuery
     {
@@ -172,6 +181,10 @@ var (_, installerPath) = repository.DownloadInstaller(
 
 Console.WriteLine(installerPath);
 ```
+
+For embedded `show` and exact package resolution, Core exposes structured diagnostics in result `SourceWarnings`, in `SourceSearchException.Warning`, and through `RepositoryOptions.Diagnostics`. Single-source search failures surface the source name, source kind, source URL, cache path, HTTP status when available, and the original exception message instead of looking like a clean no-match. Multiple-source ambiguity is exposed as `MultiplePackageMatchesException.Matches`, so callers do not need to parse source names out of exception text.
+
+`Repository.ShowManifest(query)` and `ShowResult.ToSerializableManifest()` return the same serializable manifest model used by the C# CLI `show --output json|yaml` path, including all installers and the Core-selected installer. Use `PingetJsonContext` for reflection-free `System.Text.Json` serialization in hosts that set `JsonSerializer.IsReflectionEnabledByDefault` to `false`.
 
 ## Non-goals
 
