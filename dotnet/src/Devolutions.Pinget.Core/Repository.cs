@@ -1562,6 +1562,7 @@ public class Repository : IDisposable
             Version = GetStr("PackageVersion"),
             Publisher = GetOptStr("Publisher"),
             Description = GetOptStr("Description") ?? GetOptStr("ShortDescription"),
+            ShortDescription = GetOptStr("ShortDescription"),
             Moniker = GetOptStr("Moniker"),
             PackageUrl = GetOptStr("PackageUrl"),
             PublisherUrl = GetOptStr("PublisherUrl"),
@@ -1952,7 +1953,7 @@ public class Repository : IDisposable
         return 2;
     }
 
-    private static ListMatch ListMatchFromInstalled(InstalledPackage pkg)
+    private ListMatch ListMatchFromInstalled(InstalledPackage pkg)
     {
         string? availableVersion = null;
         if (pkg.Correlated?.Version is string av)
@@ -1961,14 +1962,27 @@ public class Repository : IDisposable
                 RestSource.CompareVersionStrings(av, pkg.InstalledVersion) > 0)
                 availableVersion = av;
         }
+
+        string packageId = pkg.Correlated?.Id ?? pkg.LocalId;
+        string? sourceName = pkg.Correlated?.SourceName;
+        if (sourceName is null && TryGetWinGetPackageIdentityFromLocalId(
+            pkg.LocalId,
+            _store.Sources,
+            out string? localPackageId,
+            out string? localSourceName))
+        {
+            packageId = localPackageId;
+            sourceName = localSourceName;
+        }
+
         return new()
         {
             Name = pkg.Name,
-            Id = pkg.Correlated?.Id ?? pkg.LocalId,
+            Id = packageId,
             LocalId = pkg.LocalId,
             InstalledVersion = pkg.InstalledVersion,
             AvailableVersion = availableVersion,
-            SourceName = pkg.Correlated?.SourceName,
+            SourceName = sourceName,
             Publisher = pkg.Publisher,
             Scope = pkg.Scope,
             InstallerCategory = pkg.InstallerCategory,
@@ -1977,6 +1991,40 @@ public class Repository : IDisposable
             ProductCodes = pkg.ProductCodes,
             UpgradeCodes = pkg.UpgradeCodes,
         };
+    }
+
+    internal static bool TryGetWinGetPackageIdentityFromLocalId(
+        string localId,
+        IReadOnlyList<SourceRecord> sources,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? packageId,
+        out string? sourceName)
+    {
+        packageId = null;
+        sourceName = null;
+
+        int packageIdStartIndex = localId.LastIndexOf('\\') + 1;
+        SourceRecord? source = null;
+        int sourceIdentifierStartIndex = -1;
+        foreach (SourceRecord candidate in sources)
+        {
+            string sourceSuffix = "_" + candidate.Identifier;
+            if (!localId.EndsWith(sourceSuffix, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            source = candidate;
+            sourceIdentifierStartIndex = localId.Length - sourceSuffix.Length;
+            break;
+        }
+
+        if (source is null)
+            return false;
+
+        if (sourceIdentifierStartIndex <= packageIdStartIndex)
+            return false;
+
+        packageId = localId[packageIdStartIndex..sourceIdentifierStartIndex];
+        sourceName = source.Name;
+        return !string.IsNullOrWhiteSpace(packageId);
     }
 
     private static bool ListQueryNeedsAvailableLookup(ListQuery query)

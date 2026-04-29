@@ -247,6 +247,7 @@ public record Manifest
     public string Channel { get; init; } = "";
     public string? Publisher { get; init; }
     public string? Description { get; init; }
+    public string? ShortDescription { get; init; }
     public string? Moniker { get; init; }
     public string? PackageUrl { get; init; }
     public string? PublisherUrl { get; init; }
@@ -343,7 +344,7 @@ public record ShowResult
             Author = Manifest.Author,
             Moniker = Manifest.Moniker,
             Description = Manifest.Description,
-            ShortDescription = GetString("ShortDescription"),
+            ShortDescription = Manifest.ShortDescription ?? GetString("ShortDescription"),
             PackageUrl = Manifest.PackageUrl,
             PublisherUrl = Manifest.PublisherUrl,
             PublisherSupportUrl = Manifest.PublisherSupportUrl,
