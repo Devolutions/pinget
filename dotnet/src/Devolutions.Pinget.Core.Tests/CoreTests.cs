@@ -736,14 +736,51 @@ public class ModelsTests
     }
 
     [Fact]
-    public void GetSqliteNativeLibraryCandidates_ProbesRootAndRidFolder()
+    public void TryGetWinGetPackageIdentityFromLocalId_UsesSourceIdentifierSuffix()
     {
-        var candidates = Repository.GetSqliteNativeLibraryCandidates(@"C:\module").ToList();
+        SourceRecord source = new()
+        {
+            Name = "winget",
+            Kind = SourceKind.PreIndexed,
+            Arg = "https://cdn.winget.microsoft.com/cache",
+            Identifier = "Microsoft.Winget.Source_8wekyb3d8bbwe",
+        };
 
-        Assert.Equal(@"C:\module\e_sqlite3.dll", candidates[0]);
-        Assert.Contains(Path.Combine(@"C:\module", "runtimes"), candidates[1]);
-        Assert.EndsWith(Path.Combine("native", "e_sqlite3.dll"), candidates[1], StringComparison.OrdinalIgnoreCase);
+        bool result = Repository.TryGetWinGetPackageIdentityFromLocalId(
+            @"ARP\User\X64\Atlassian.AtlassianCLI_Microsoft.Winget.Source_8wekyb3d8bbwe",
+            [source],
+            out string? packageId,
+            out string? sourceName
+        );
+
+        Assert.True(result);
+        Assert.Equal("Atlassian.AtlassianCLI", packageId);
+        Assert.Equal("winget", sourceName);
     }
+
+    [Fact]
+    public void TryGetWinGetPackageIdentityFromLocalId_IgnoresUnknownSourceIdentifier()
+    {
+        SourceRecord source = new()
+        {
+            Name = "winget",
+            Kind = SourceKind.PreIndexed,
+            Arg = "https://cdn.winget.microsoft.com/cache",
+            Identifier = "Microsoft.Winget.Source_8wekyb3d8bbwe",
+        };
+
+        bool result = Repository.TryGetWinGetPackageIdentityFromLocalId(
+            @"ARP\Machine\X64\Contoso.Tool_Unknown.Source_1234",
+            [source],
+            out string? packageId,
+            out string? sourceName
+        );
+
+        Assert.False(result);
+        Assert.Null(packageId);
+        Assert.Null(sourceName);
+    }
+
 }
 
 public class PinStoreTests
@@ -1551,6 +1588,16 @@ public class RepositoryEmbeddingTests
             Assert.Equal(["Installer.Dependency"], installer.PackageDependencies);
             Assert.Empty(result.SourceWarnings);
             Assert.Empty(diagnostics);
+
+            var typedResult = repo.Show(new PackageQuery
+            {
+                Id = TesslPackageId,
+                Exact = true,
+                Source = "test",
+                InstallerArchitecture = "x64",
+            });
+
+            Assert.Equal("Tessl short description", typedResult.Manifest.ShortDescription);
 
             var json = JsonSerializer.Serialize(result, PingetJsonContext.Default.SerializableShowManifest);
             using var document = JsonDocument.Parse(json);

@@ -46,7 +46,8 @@ internal static class RestSource
         using var response = client.GetAsync(url).GetAwaiter().GetResult();
         response.EnsureSuccessStatusCode();
         var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        var json = JsonSerializer.Deserialize<JsonElement>(body);
+        using var document = JsonDocument.Parse(body);
+        var json = document.RootElement;
 
         // The REST response wraps data in a "Data" property
         var data = json.TryGetProperty("Data", out var d) ? d : json;
@@ -96,7 +97,8 @@ internal static class RestSource
         response.EnsureSuccessStatusCode();
 
         var responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        var json = JsonSerializer.Deserialize<JsonElement>(responseBody);
+        using var document = JsonDocument.Parse(responseBody);
+        var json = document.RootElement;
 
         var data = json.TryGetProperty("Data", out var d) && d.ValueKind == JsonValueKind.Array
             ? d.EnumerateArray().ToList()
@@ -140,7 +142,8 @@ internal static class RestSource
         response.EnsureSuccessStatusCode();
 
         var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        var json = JsonSerializer.Deserialize<JsonElement>(body);
+        using var document = JsonDocument.Parse(body);
+        var json = document.RootElement;
 
         return ParseRestManifest(json, packageId, version, channel);
     }
@@ -388,6 +391,7 @@ internal static class RestSource
             Channel = channel,
             Publisher = GetOptStr(defaultLocale, "Publisher"),
             Description = GetOptStr(defaultLocale, "Description") ?? GetOptStr(defaultLocale, "ShortDescription"),
+            ShortDescription = GetOptStr(defaultLocale, "ShortDescription"),
             Moniker = GetOptStr(data, "Moniker"),
             PackageUrl = GetOptStr(defaultLocale, "PackageUrl"),
             PublisherUrl = GetOptStr(defaultLocale, "PublisherUrl"),

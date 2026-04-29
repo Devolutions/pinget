@@ -1,5 +1,5 @@
 <Project>
-  <PropertyGroup Condition="'$(IsPackable)' == 'true'">
+  <PropertyGroup>
     <Authors>Devolutions</Authors>
     <Company>Devolutions Inc.</Company>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

@@ -301,7 +301,9 @@ internal static class SourceStoreManager
     private static string GetPackagedSecureSettingsRoot()
     {
         var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-        var sid = WindowsIdentity.GetCurrent().User?.Value ?? "UnknownSid";
+        var sid = OperatingSystem.IsWindows()
+            ? WindowsIdentity.GetCurrent().User?.Value ?? "UnknownSid"
+            : "UnknownSid";
         return Path.Combine(programData, "Microsoft", "WinGet", sid, "settings", "pkg", PackagedName);
     }
 

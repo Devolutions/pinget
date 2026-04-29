@@ -1,8 +1,6 @@
-using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json.Nodes;
-using System.Threading;
 using Microsoft.Data.Sqlite;
 using YamlDotNet.Core;
 using YamlDotNet.Serialization;
@@ -19,8 +17,6 @@ public class Repository : IDisposable
     internal const string UninstallUnsupportedWarning = "Uninstalling packages is not supported on this platform; no changes were made.";
     internal const string RepairUnsupportedWarning = "Repairing packages is not supported on this platform; no changes were made.";
     internal const string RepairReinstallWarning = "Pinget repair currently re-runs the package install flow for the selected package.";
-
-    private static int s_sqliteNativeLibraryInitialized;
 
     private readonly string _appRoot;
     private readonly HttpClient _client;
@@ -48,7 +44,7 @@ public class Repository : IDisposable
     public static Repository Open(RepositoryOptions? options = null)
     {
         options ??= new RepositoryOptions();
-        EnsureSqliteNativeLibraryLoaded();
+        SQLitePCL.Batteries_V2.Init();
         var appRoot = SourceStoreManager.NormalizeAppRoot(options.AppRoot ?? Environment.GetEnvironmentVariable(AppRootEnvironmentVariable));
         SourceStoreManager.EnsureAppDirs(appRoot);
         var useSystemWingetSources = SourceStoreManager.UsesSystemWingetSourceCommands(appRoot);
@@ -56,79 +52,6 @@ public class Repository : IDisposable
         var client = new HttpClient();
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
         return new Repository(appRoot, client, store, useSystemWingetSources, options.Diagnostics);
-    }
-
-    internal static IEnumerable<string> GetSqliteNativeLibraryCandidates(string assemblyDirectory)
-    {
-        yield return Path.Combine(assemblyDirectory, "e_sqlite3.dll");
-
-        var rid = RuntimeInformation.ProcessArchitecture switch
-        {
-            Architecture.X86 => "win-x86",
-            Architecture.Arm => "win-arm",
-            Architecture.Arm64 => "win-arm64",
-            _ => "win-x64",
-        };
-
-        yield return Path.Combine(assemblyDirectory, "runtimes", rid, "native", "e_sqlite3.dll");
-    }
-
-    private static void EnsureSqliteNativeLibraryLoaded()
-    {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            return;
-
-        if (Interlocked.Exchange(ref s_sqliteNativeLibraryInitialized, 1) != 0)
-            return;
-
-        var assemblyDirectory = Path.GetDirectoryName(typeof(Repository).Assembly.Location);
-        if (string.IsNullOrWhiteSpace(assemblyDirectory))
-            return;
-
-        var nativeLibraryPath = GetSqliteNativeLibraryCandidates(assemblyDirectory)
-            .FirstOrDefault(File.Exists);
-
-        if (string.IsNullOrWhiteSpace(nativeLibraryPath))
-            return;
-
-        RegisterSqliteDllImportResolvers(nativeLibraryPath);
-
-        try
-        {
-            NativeLibrary.Load(nativeLibraryPath);
-        }
-        catch
-        {
-            // The resolver path is the important fix for library-hosted environments.
-        }
-    }
-
-    private static void RegisterSqliteDllImportResolvers(string nativeLibraryPath)
-    {
-        RegisterSqliteDllImportResolver("SQLitePCLRaw.provider.e_sqlite3", nativeLibraryPath);
-        RegisterSqliteDllImportResolver("SQLitePCLRaw.core", nativeLibraryPath);
-    }
-
-    private static void RegisterSqliteDllImportResolver(string assemblyName, string nativeLibraryPath)
-    {
-        try
-        {
-            var assembly = AppDomain.CurrentDomain.GetAssemblies()
-                .FirstOrDefault(candidate => string.Equals(candidate.GetName().Name, assemblyName, StringComparison.OrdinalIgnoreCase))
-                ?? Assembly.Load(new AssemblyName(assemblyName));
-
-            NativeLibrary.SetDllImportResolver(assembly, (libraryName, _, _) =>
-            {
-                if (!string.Equals(libraryName, "e_sqlite3", StringComparison.OrdinalIgnoreCase))
-                    return IntPtr.Zero;
-
-                return NativeLibrary.Load(nativeLibraryPath);
-            });
-        }
-        catch
-        {
-            // Ignore duplicate resolver registration or unavailable optional assemblies.
-        }
     }
 
     public void Dispose() => _client.Dispose();
@@ -1562,6 +1485,7 @@ public class Repository : IDisposable
             Version = GetStr("PackageVersion"),
             Publisher = GetOptStr("Publisher"),
             Description = GetOptStr("Description") ?? GetOptStr("ShortDescription"),
+            ShortDescription = GetOptStr("ShortDescription"),
             Moniker = GetOptStr("Moniker"),
             PackageUrl = GetOptStr("PackageUrl"),
             PublisherUrl = GetOptStr("PublisherUrl"),
@@ -1952,7 +1876,7 @@ public class Repository : IDisposable
         return 2;
     }
 
-    private static ListMatch ListMatchFromInstalled(InstalledPackage pkg)
+    private ListMatch ListMatchFromInstalled(InstalledPackage pkg)
     {
         string? availableVersion = null;
         if (pkg.Correlated?.Version is string av)
@@ -1961,14 +1885,27 @@ public class Repository : IDisposable
                 RestSource.CompareVersionStrings(av, pkg.InstalledVersion) > 0)
                 availableVersion = av;
         }
+
+        string packageId = pkg.Correlated?.Id ?? pkg.LocalId;
+        string? sourceName = pkg.Correlated?.SourceName;
+        if (sourceName is null && TryGetWinGetPackageIdentityFromLocalId(
+            pkg.LocalId,
+            _store.Sources,
+            out string? localPackageId,
+            out string? localSourceName))
+        {
+            packageId = localPackageId;
+            sourceName = localSourceName;
+        }
+
         return new()
         {
             Name = pkg.Name,
-            Id = pkg.Correlated?.Id ?? pkg.LocalId,
+            Id = packageId,
             LocalId = pkg.LocalId,
             InstalledVersion = pkg.InstalledVersion,
             AvailableVersion = availableVersion,
-            SourceName = pkg.Correlated?.SourceName,
+            SourceName = sourceName,
             Publisher = pkg.Publisher,
             Scope = pkg.Scope,
             InstallerCategory = pkg.InstallerCategory,
@@ -1977,6 +1914,40 @@ public class Repository : IDisposable
             ProductCodes = pkg.ProductCodes,
             UpgradeCodes = pkg.UpgradeCodes,
         };
+    }
+
+    internal static bool TryGetWinGetPackageIdentityFromLocalId(
+        string localId,
+        IReadOnlyList<SourceRecord> sources,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? packageId,
+        out string? sourceName)
+    {
+        packageId = null;
+        sourceName = null;
+
+        int packageIdStartIndex = localId.LastIndexOf('\\') + 1;
+        SourceRecord? source = null;
+        int sourceIdentifierStartIndex = -1;
+        foreach (SourceRecord candidate in sources)
+        {
+            string sourceSuffix = "_" + candidate.Identifier;
+            if (!localId.EndsWith(sourceSuffix, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            source = candidate;
+            sourceIdentifierStartIndex = localId.Length - sourceSuffix.Length;
+            break;
+        }
+
+        if (source is null)
+            return false;
+
+        if (sourceIdentifierStartIndex <= packageIdStartIndex)
+            return false;
+
+        packageId = localId[packageIdStartIndex..sourceIdentifierStartIndex];
+        sourceName = source.Name;
+        return !string.IsNullOrWhiteSpace(packageId);
     }
 
     private static bool ListQueryNeedsAvailableLookup(ListQuery query)
