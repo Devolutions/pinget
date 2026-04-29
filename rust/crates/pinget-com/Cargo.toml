@@ -1,6 +1,6 @@
 [package]
 name = "pinget-com"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Windows-only native COM bridge for Pinget backed by pinget-core."
 license = "MIT"
