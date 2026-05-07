@@ -4,6 +4,8 @@ version = "0.3.0"
 edition = "2024"
 description = "Pure Rust Pinget core library that works directly with source caches, REST endpoints, and installed package state without COM."
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Devolutions/pinget"
 
 [lints]
 workspace = true
