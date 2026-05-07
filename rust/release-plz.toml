@@ -1,0 +1,18 @@
+[workspace]
+dependencies_update = true
+git_release_enable = false
+semver_check = true
+pr_branch_prefix = "release-plz/"
+pr_name = "chore(release): prepare for publishing"
+release_commits = "^(feat|docs|fix|build|perf)"
+
+# Only publish pinget-core to crates.io.
+[[package]]
+name = "pinget-cli"
+publish = false
+release = false
+
+[[package]]
+name = "pinget-com"
+publish = false
+release = false
