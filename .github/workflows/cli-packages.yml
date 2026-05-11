@@ -195,29 +195,29 @@ jobs:
           $projectPath = Join-Path $smokeRoot 'pinget-cli-package-smoke.csproj'
           $project = Get-Content -Path $projectPath -Raw
           $project = $project -replace '</Project>', @"
-  <PropertyGroup>
-    <DevolutionsPingetRustCliWindowsOutputName>pinget-rust.exe</DevolutionsPingetRustCliWindowsOutputName>
-    <DevolutionsPingetDotNetCliWindowsOutputName>pinget-dotnet.exe</DevolutionsPingetDotNetCliWindowsOutputName>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="Devolutions.Pinget.Cli.Rust" Version="$rustVersion" />
-    <PackageReference Include="Devolutions.Pinget.Cli.DotNet" Version="$dotNetVersion" />
-  </ItemGroup>
-</Project>
-"@
+            <PropertyGroup>
+              <DevolutionsPingetRustCliWindowsOutputName>pinget-rust.exe</DevolutionsPingetRustCliWindowsOutputName>
+              <DevolutionsPingetDotNetCliWindowsOutputName>pinget-dotnet.exe</DevolutionsPingetDotNetCliWindowsOutputName>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="Devolutions.Pinget.Cli.Rust" Version="$rustVersion" />
+              <PackageReference Include="Devolutions.Pinget.Cli.DotNet" Version="$dotNetVersion" />
+            </ItemGroup>
+          </Project>
+          "@
           Set-Content -Path $projectPath -Value $project -Encoding utf8
 
           $nugetConfig = Join-Path $smokeRoot 'NuGet.Config'
           @"
-<?xml version="1.0" encoding="utf-8"?>
-<configuration>
-  <packageSources>
-    <clear />
-    <add key="local" value="$packageSource" />
-    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
-  </packageSources>
-</configuration>
-"@ | Set-Content -Path $nugetConfig -Encoding utf8
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$packageSource" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+          </configuration>
+          "@ | Set-Content -Path $nugetConfig -Encoding utf8
 
           dotnet build $projectPath --configfile $nugetConfig
           if ($LASTEXITCODE -ne 0) { throw 'Smoke project build failed.' }
