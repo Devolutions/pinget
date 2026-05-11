@@ -237,9 +237,60 @@ jobs:
             }
           }
 
+      - name: Smoke test dotnet tool package
+        shell: pwsh
+        run: |
+          $packageSource = (Resolve-Path 'artifacts/cli-nuget').Path
+          $toolPackage = Get-ChildItem -Path $packageSource -Filter 'Devolutions.Pinget.Tool.*.nupkg' | Select-Object -First 1
+          if ($null -eq $toolPackage) {
+            throw 'Devolutions.Pinget.Tool package was not found.'
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($toolPackage.FullName)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName })
+            $nuspecEntry = $archive.Entries | Where-Object { $_.FullName -match '\.nuspec$' } | Select-Object -First 1
+            if ($null -eq $nuspecEntry) {
+              throw "Unable to find nuspec entry in $($toolPackage.Name)."
+            }
+
+            $reader = [System.IO.StreamReader]::new($nuspecEntry.Open())
+            try {
+              $nuspec = $reader.ReadToEnd()
+            }
+            finally {
+              $reader.Dispose()
+            }
+
+            if ($nuspec -notmatch '<packageType name="DotnetTool"') {
+              throw "Expected DotnetTool package type in $($toolPackage.Name)."
+            }
+
+            $ridSpecificEntries = @($entries | Where-Object { $_ -match '^runtimes/' -or $_ -match '^tools/[^/]+/(win|linux|osx)-' })
+            if ($ridSpecificEntries.Count -gt 0) {
+              throw "Framework-dependent tool package contains RID-specific entries: $($ridSpecificEntries -join ', ')"
+            }
+          }
+          finally {
+            $archive.Dispose()
+          }
+
+          $toolVersion = $toolPackage.BaseName.Substring('Devolutions.Pinget.Tool.'.Length)
+          $toolPath = Join-Path $env:RUNNER_TEMP 'pinget-dotnet-tool'
+          Remove-Item -Path $toolPath -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -Path $toolPath -ItemType Directory -Force | Out-Null
+
+          dotnet tool install --tool-path $toolPath Devolutions.Pinget.Tool --add-source $packageSource --version $toolVersion
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet tool install failed.' }
+
+          $toolCommand = Join-Path $toolPath 'pinget'
+          & $toolCommand --help
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet tool smoke test failed.' }
+
       - name: Upload CLI NuGet packages
         uses: actions/upload-artifact@v7
         with:
-          name: cli-native-nuget
+          name: cli-nuget
           path: artifacts/cli-nuget/*.nupkg
           if-no-files-found: error

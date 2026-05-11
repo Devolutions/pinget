@@ -19,8 +19,17 @@
     <Product>Pinget</Product>
     <Description>Pinget CLI</Description>
     <Copyright>Copyright 2021-2026 Devolutions Inc.</Copyright>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>pinget</ToolCommandName>
+    <PackageId>Devolutions.Pinget.Tool</PackageId>
+    <PackageTags>pinget;winget;package-manager;cli;dotnet-tool</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <PingetUseStaticWindowsRuntime Condition="'$(PingetUseStaticWindowsRuntime)' == ''">true</PingetUseStaticWindowsRuntime>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <Target Name="UseStaticWindowsRuntimeForNativeAot"
           AfterTargets="SetupOSSpecificProps"

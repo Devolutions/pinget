@@ -650,7 +650,7 @@ jobs:
       - name: Upload CLI NuGet package artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: cli-native-nuget
+          name: cli-nuget
           path: artifacts/cli-nuget/*.nupkg
           if-no-files-found: error
 
@@ -746,7 +746,7 @@ jobs:
       - name: Download CLI package artifacts
         uses: actions/download-artifact@v8
         with:
-          name: cli-native-nuget
+          name: cli-nuget
           path: dist/nuget
 
       - name: Push packages to NuGet.org

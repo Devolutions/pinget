@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('All', 'Rust', 'DotNet')]
+    [ValidateSet('All', 'Rust', 'DotNet', 'Tool')]
     [string]$Package = 'All',
 
     [string]$Version,
@@ -369,6 +369,45 @@ function Set-NupkgUnixExecutablePermissions {
     }
 }
 
+function Assert-DotNetToolPackage {
+    param([Parameter(Mandatory)][string]$PackagePath)
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($PackagePath)
+    try {
+        $entryNames = @($archive.Entries | ForEach-Object { $_.FullName })
+        $nuspecEntry = $archive.Entries | Where-Object { $_.FullName -match '\.nuspec$' } | Select-Object -First 1
+        if ($null -eq $nuspecEntry) {
+            throw "Unable to find nuspec entry in $PackagePath."
+        }
+
+        $reader = New-Object System.IO.StreamReader($nuspecEntry.Open())
+        try {
+            $nuspec = $reader.ReadToEnd()
+        }
+        finally {
+            $reader.Dispose()
+        }
+
+        if ($nuspec -notmatch '<packageType name="DotnetTool"') {
+            throw "Expected DotnetTool package type in $PackagePath."
+        }
+
+        if (-not ($entryNames | Where-Object { $_ -match '^tools/[^/]+/any/DotnetToolSettings\.xml$' })) {
+            throw "Expected DotnetToolSettings.xml in the framework-dependent tool package: $PackagePath."
+        }
+
+        $ridSpecificEntries = @($entryNames | Where-Object { $_ -match '^runtimes/' -or $_ -match '^tools/[^/]+/(win|linux|osx)-' })
+        if ($ridSpecificEntries.Count -gt 0) {
+            throw "Framework-dependent tool package should not contain RID-specific native payload entries: $($ridSpecificEntries -join ', ')"
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = Get-SourceVersion
 }
@@ -379,6 +418,7 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 
 $buildRust = $Package -in @('All', 'Rust')
 $buildDotNet = $Package -in @('All', 'DotNet')
+$buildTool = $Package -in @('All', 'Tool')
 
 if ($Clean) {
     if ($buildRust) {
@@ -495,5 +535,14 @@ if (-not $NoPack) {
         Invoke-NativeCommand -FilePath dotnet -ArgumentList @('pack', $dotNetPackageProject, '-c', $Configuration, '-o', $OutputRoot, "/p:Version=$Version", '/p:ContinuousIntegrationBuild=true')
 
         Assert-FileExists -Path (Join-Path $OutputRoot "Devolutions.Pinget.Cli.DotNet.$Version.nupkg")
+    }
+
+    if ($buildTool) {
+        $toolPackageProject = Join-Path $repoRoot 'dotnet\src\Devolutions.Pinget.Cli\Devolutions.Pinget.Cli.csproj'
+        Invoke-NativeCommand -FilePath dotnet -ArgumentList @('pack', $toolPackageProject, '-c', $Configuration, '-o', $OutputRoot, "/p:Version=$Version", '/p:ContinuousIntegrationBuild=true')
+
+        $toolPackage = Join-Path $OutputRoot "Devolutions.Pinget.Tool.$Version.nupkg"
+        Assert-FileExists -Path $toolPackage
+        Assert-DotNetToolPackage -PackagePath $toolPackage
     }
 }
