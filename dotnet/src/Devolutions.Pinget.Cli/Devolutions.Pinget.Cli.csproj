@@ -15,6 +15,10 @@
     <Nullable>enable</Nullable>
     <AssemblyName>pinget</AssemblyName>
     <RootNamespace>Devolutions.Pinget.Cli</RootNamespace>
+    <AssemblyTitle>Pinget CLI</AssemblyTitle>
+    <Product>Pinget</Product>
+    <Description>Pinget CLI</Description>
+    <Copyright>Copyright 2021-2026 Devolutions Inc.</Copyright>
   </PropertyGroup>
 
 </Project>

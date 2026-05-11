@@ -1,0 +1,250 @@
+name: CLI NuGet Packages
+
+on:
+  push:
+    tags-ignore:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build and package only; skip publish/release actions.
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-cli:
+    name: Rust CLI (${{ matrix.rid }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: linux-x64
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+          - rid: linux-arm64
+            os: ubuntu-latest
+            rust-target: aarch64-unknown-linux-gnu
+          - rid: win-x64
+            os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+          - rid: win-arm64
+            os: windows-latest
+            rust-target: aarch64-pc-windows-msvc
+          - rid: macos-x64
+            os: macos-14
+            rust-target: x86_64-apple-darwin
+          - rid: macos-arm64
+            os: macos-14
+            rust-target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Dry-run mode
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          Write-Host "::notice::DryRun=${{ inputs['dry-run'] }}"
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --target "${{ matrix.rust-target }}"
+          rustup default stable
+
+      - name: Install Linux ARM64 linker
+        if: matrix.rid == 'linux-arm64'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure static MSVC runtime
+        if: contains(matrix.rust-target, 'windows-msvc')
+        shell: pwsh
+        run: |
+          "RUSTFLAGS=-C target-feature=+crt-static" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build and stage Rust CLI
+        shell: pwsh
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts\Build-CliNativeNuGetPackages.ps1') `
+            -Package Rust `
+            -RustRuntimeIdentifiers '${{ matrix.rid }}' `
+            -NoPack `
+            -Clean
+
+      - name: Upload Rust CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-cli-${{ matrix.rid }}
+          path: artifacts/cli/rust/${{ matrix.rid }}/*
+          if-no-files-found: error
+
+  dotnet-cli:
+    name: .NET NativeAOT CLI (${{ matrix.rid }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid:
+          - win-x64
+          - win-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build and stage .NET NativeAOT CLI
+        shell: pwsh
+        run: |
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts\Build-CliNativeNuGetPackages.ps1') `
+            -Package DotNet `
+            -DotNetRuntimeIdentifiers '${{ matrix.rid }}' `
+            -NoPack `
+            -Clean
+
+      - name: Upload .NET CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dotnet-cli-${{ matrix.rid }}
+          path: artifacts/cli/dotnet-nativeaot/${{ matrix.rid }}/*
+          if-no-files-found: error
+
+  package:
+    name: Pack and smoke test
+    runs-on: ubuntu-latest
+    needs:
+      - rust-cli
+      - dotnet-cli
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/download
+
+      - name: Arrange staged artifacts
+        shell: pwsh
+        run: |
+          $Mappings = @{
+            'rust-cli-linux-x64' = 'artifacts/cli/rust/linux-x64'
+            'rust-cli-linux-arm64' = 'artifacts/cli/rust/linux-arm64'
+            'rust-cli-win-x64' = 'artifacts/cli/rust/win-x64'
+            'rust-cli-win-arm64' = 'artifacts/cli/rust/win-arm64'
+            'rust-cli-macos-x64' = 'artifacts/cli/rust/osx-x64'
+            'rust-cli-macos-arm64' = 'artifacts/cli/rust/osx-arm64'
+            'dotnet-cli-win-x64' = 'artifacts/cli/dotnet-nativeaot/win-x64'
+            'dotnet-cli-win-arm64' = 'artifacts/cli/dotnet-nativeaot/win-arm64'
+          }
+
+          foreach ($mapping in $Mappings.GetEnumerator()) {
+            $source = Join-Path 'artifacts/download' $mapping.Key
+            if (-not (Test-Path -Path $source)) {
+              throw "Downloaded artifact directory not found: $source"
+            }
+
+            New-Item -Path $mapping.Value -ItemType Directory -Force | Out-Null
+            Copy-Item -Path (Join-Path $source '*') -Destination $mapping.Value -Recurse -Force
+          }
+
+      - name: Pack CLI NuGet packages
+        shell: pwsh
+        run: |
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts\Build-CliNativeNuGetPackages.ps1') -NoBuild -Clean:$false
+
+      - name: Smoke test PackageReference copy targets
+        shell: pwsh
+        run: |
+          $packageSource = (Resolve-Path 'artifacts/cli-nuget').Path
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'pinget-cli-package-smoke'
+          $env:NUGET_PACKAGES = Join-Path $env:RUNNER_TEMP 'pinget-cli-package-smoke-nuget-cache'
+          New-Item -Path $smokeRoot -ItemType Directory -Force | Out-Null
+          New-Item -Path $env:NUGET_PACKAGES -ItemType Directory -Force | Out-Null
+          $rustPackage = Get-ChildItem -Path $packageSource -Filter 'Devolutions.Pinget.Cli.Rust.*.nupkg' | Select-Object -First 1
+          $dotNetPackage = Get-ChildItem -Path $packageSource -Filter 'Devolutions.Pinget.Cli.DotNet.*.nupkg' | Select-Object -First 1
+          if (($null -eq $rustPackage) -or ($null -eq $dotNetPackage)) {
+            throw 'Smoke test packages were not found.'
+          }
+          $rustVersion = $rustPackage.BaseName.Substring('Devolutions.Pinget.Cli.Rust.'.Length)
+          $dotNetVersion = $dotNetPackage.BaseName.Substring('Devolutions.Pinget.Cli.DotNet.'.Length)
+
+          dotnet new console --framework net10.0 --output $smokeRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Smoke project creation failed.' }
+
+          $projectPath = Join-Path $smokeRoot 'pinget-cli-package-smoke.csproj'
+          $project = Get-Content -Path $projectPath -Raw
+          $project = $project -replace '</Project>', @"
+  <PropertyGroup>
+    <DevolutionsPingetRustCliWindowsOutputName>pinget-rust.exe</DevolutionsPingetRustCliWindowsOutputName>
+    <DevolutionsPingetDotNetCliWindowsOutputName>pinget-dotnet.exe</DevolutionsPingetDotNetCliWindowsOutputName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Devolutions.Pinget.Cli.Rust" Version="$rustVersion" />
+    <PackageReference Include="Devolutions.Pinget.Cli.DotNet" Version="$dotNetVersion" />
+  </ItemGroup>
+</Project>
+"@
+          Set-Content -Path $projectPath -Value $project -Encoding utf8
+
+          $nugetConfig = Join-Path $smokeRoot 'NuGet.Config'
+          @"
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="local" value="$packageSource" />
+    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+  </packageSources>
+</configuration>
+"@ | Set-Content -Path $nugetConfig -Encoding utf8
+
+          dotnet build $projectPath --configfile $nugetConfig
+          if ($LASTEXITCODE -ne 0) { throw 'Smoke project build failed.' }
+
+          $expectedFiles = @(
+            'bin/Debug/net10.0/runtimes/win-x64/native/pinget.exe',
+            'bin/Debug/net10.0/runtimes/win-x64/native/pinget-rust.exe',
+            'bin/Debug/net10.0/runtimes/win-x64/native/pinget-dotnet.exe',
+            'bin/Debug/net10.0/runtimes/linux-x64/native/pinget'
+          )
+
+          foreach ($relativePath in $expectedFiles) {
+            $path = Join-Path $smokeRoot $relativePath
+            if (-not (Test-Path -Path $path -PathType Leaf)) {
+              throw "Expected smoke output file was not found: $path"
+            }
+          }
+
+      - name: Upload CLI NuGet packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-native-nuget
+          path: artifacts/cli-nuget/*.nupkg
+          if-no-files-found: error

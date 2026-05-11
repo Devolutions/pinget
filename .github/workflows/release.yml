@@ -503,6 +503,157 @@ jobs:
           path: dist/Devolutions.Pinget.Client.*.zip
           if-no-files-found: error
 
+  cli-native-packages:
+    name: CLI Native NuGet Packages
+    runs-on: windows-latest
+    needs:
+      - preflight
+      - rust-artifacts
+    environment: ${{ needs.preflight.outputs.package-env }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download Rust release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: pinget-*.zip
+          path: artifacts/release-rust
+
+      - name: Stage Rust CLI artifacts
+        shell: pwsh
+        run: |
+          $Artifacts = @(
+            @{ Archive = 'pinget-windows-x64.zip'; Rid = 'win-x64'; SourceBinary = 'pinget.exe'; PackageBinary = 'pinget.exe' },
+            @{ Archive = 'pinget-windows-arm64.zip'; Rid = 'win-arm64'; SourceBinary = 'pinget.exe'; PackageBinary = 'pinget.exe' },
+            @{ Archive = 'pinget-linux-x64.zip'; Rid = 'linux-x64'; SourceBinary = 'pinget'; PackageBinary = 'pinget' },
+            @{ Archive = 'pinget-linux-arm64.zip'; Rid = 'linux-arm64'; SourceBinary = 'pinget'; PackageBinary = 'pinget' },
+            @{ Archive = 'pinget-macos-x64.zip'; Rid = 'osx-x64'; SourceBinary = 'pinget'; PackageBinary = 'pinget' },
+            @{ Archive = 'pinget-macos-arm64.zip'; Rid = 'osx-arm64'; SourceBinary = 'pinget'; PackageBinary = 'pinget' }
+          )
+
+          foreach ($Artifact in $Artifacts) {
+            $archive = Get-ChildItem -Path artifacts/release-rust -Recurse -File -Filter $Artifact.Archive | Select-Object -First 1
+            if ($null -eq $archive) {
+              throw "Rust release archive not found: $($Artifact.Archive)"
+            }
+
+            $extractRoot = Join-Path $env:RUNNER_TEMP "pinget-$($Artifact.Rid)"
+            Remove-Item -Path $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -Path $extractRoot -ItemType Directory -Force | Out-Null
+            Expand-Archive -Path $archive.FullName -DestinationPath $extractRoot -Force
+
+            $binary = Join-Path $extractRoot $Artifact.SourceBinary
+            if (-not (Test-Path -Path $binary -PathType Leaf)) {
+              throw "Rust release binary not found after extracting $($Artifact.Archive): $binary"
+            }
+
+            $stageDir = Join-Path 'artifacts/cli/rust' $Artifact.Rid
+            New-Item -Path $stageDir -ItemType Directory -Force | Out-Null
+            Copy-Item -Path $binary -Destination (Join-Path $stageDir $Artifact.PackageBinary) -Force
+          }
+
+      - name: Build .NET NativeAOT CLI artifacts
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts\Build-CliNativeNuGetPackages.ps1') `
+            -Package DotNet `
+            -Version $env:PACKAGE_VERSION `
+            -NoPack `
+            -Clean
+
+      - name: Install code signing tools
+        shell: pwsh
+        run: |
+          dotnet tool install --global AzureSignTool
+
+          $TestCertsUrl = "https://raw.githubusercontent.com/Devolutions/devolutions-authenticode/master/data/certs"
+          Invoke-WebRequest -Uri "$TestCertsUrl/authenticode-test-ca.crt" -OutFile ".\authenticode-test-ca.crt"
+          Import-Certificate -FilePath ".\authenticode-test-ca.crt" -CertStoreLocation "cert:\LocalMachine\Root"
+          Remove-Item ".\authenticode-test-ca.crt" -ErrorAction SilentlyContinue | Out-Null
+
+      - name: Code sign .NET NativeAOT CLI artifacts
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          CODE_SIGNING_CERTIFICATE_NAME: ${{ secrets.CODE_SIGNING_CERTIFICATE_NAME }}
+          CODE_SIGNING_CLIENT_ID: ${{ secrets.CODE_SIGNING_CLIENT_ID }}
+          CODE_SIGNING_CLIENT_SECRET: ${{ secrets.CODE_SIGNING_CLIENT_SECRET }}
+          CODE_SIGNING_KEYVAULT_URL: ${{ secrets.CODE_SIGNING_KEYVAULT_URL }}
+          CODE_SIGNING_TIMESTAMP_SERVER: ${{ vars.CODE_SIGNING_TIMESTAMP_SERVER }}
+        run: |
+          $PackageEnv = '${{ needs.preflight.outputs.package-env }}'
+          $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
+          $RequiredVariables = @(
+            'AZURE_TENANT_ID',
+            'CODE_SIGNING_CERTIFICATE_NAME',
+            'CODE_SIGNING_CLIENT_ID',
+            'CODE_SIGNING_CLIENT_SECRET',
+            'CODE_SIGNING_KEYVAULT_URL',
+            'CODE_SIGNING_TIMESTAMP_SERVER'
+          )
+          $MissingVariables = @($RequiredVariables | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          })
+
+          if ($MissingVariables.Count -gt 0) {
+            $Message = "Code signing configuration missing: $($MissingVariables -join ', ')"
+            if ($PackageEnv -eq 'publish-prod' -and -not $DryRun) {
+              throw $Message
+            }
+
+            Write-Host "$Message; skipping code signing."
+            return
+          }
+
+          $SignParams = @(
+            'sign',
+            '-kvt', $env:AZURE_TENANT_ID,
+            '-kvu', $env:CODE_SIGNING_KEYVAULT_URL,
+            '-kvi', $env:CODE_SIGNING_CLIENT_ID,
+            '-kvs', $env:CODE_SIGNING_CLIENT_SECRET,
+            '-kvc', $env:CODE_SIGNING_CERTIFICATE_NAME,
+            '-tr', $env:CODE_SIGNING_TIMESTAMP_SERVER,
+            '-v'
+          )
+
+          $Binaries = @(Get-ChildItem -Path 'artifacts/cli/dotnet-nativeaot' -Recurse -File -Include '*.exe')
+          if ($Binaries.Count -eq 0) {
+            throw 'No .NET NativeAOT CLI executables were found for code signing.'
+          }
+
+          foreach ($Binary in $Binaries) {
+            AzureSignTool @SignParams $Binary.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "Code signing failed for $($Binary.FullName)."
+            }
+          }
+
+      - name: Pack CLI NuGet packages
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts\Build-CliNativeNuGetPackages.ps1') `
+            -Version $env:PACKAGE_VERSION `
+            -NoBuild `
+            -Clean:$false
+
+      - name: Upload CLI NuGet package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-native-nuget
+          path: artifacts/cli-nuget/*.nupkg
+          if-no-files-found: error
+
   create-tag:
     name: Create Tag
     runs-on: ubuntu-latest
@@ -510,6 +661,7 @@ jobs:
       - preflight
       - rust-artifacts
       - csharp-packages
+      - cli-native-packages
     if: ${{ fromJSON(needs.preflight.outputs.dry-run) == false }}
 
     steps:
@@ -542,6 +694,7 @@ jobs:
       - create-tag
       - rust-artifacts
       - csharp-packages
+      - cli-native-packages
     if: ${{ fromJSON(needs.preflight.outputs.dry-run) == false }}
 
     steps:
@@ -567,6 +720,7 @@ jobs:
     needs:
       - preflight
       - csharp-packages
+      - cli-native-packages
       - create-tag
       - github-release
     if: ${{ fromJSON(needs.preflight.outputs.dry-run) == false && fromJSON(needs.preflight.outputs.publish-nuget) == true }}
@@ -587,6 +741,12 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: csharp-nuget
+          path: dist/nuget
+
+      - name: Download CLI package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: cli-native-nuget
           path: dist/nuget
 
       - name: Push packages to NuGet.org

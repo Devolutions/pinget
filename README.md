@@ -186,6 +186,31 @@ For embedded `show` and exact package resolution, Core exposes structured diagno
 
 `Repository.ShowManifest(query)` and `ShowResult.ToSerializableManifest()` return the same serializable manifest model used by the C# CLI `show --output json|yaml` path, including all installers and the Core-selected installer. Use `PingetJsonContext` for reflection-free `System.Text.Json` serialization in hosts that set `JsonSerializer.IsReflectionEnabledByDefault` to `false`.
 
+### CLI executable packages
+
+Pinget also publishes build-output packages for .NET projects that need a prebuilt `pinget` executable alongside their own application:
+
+| Package | Executable implementation | Notes |
+| --- | --- | --- |
+| `Devolutions.Pinget.Cli.Rust` | Rust CLI | Cross-platform native executable assets named `pinget[.exe]` under `runtimes\<rid>\native` |
+| `Devolutions.Pinget.Cli.DotNet` | C# CLI | Trimmed NativeAOT executable assets named `pinget.exe`, starting with Windows x64 and arm64 |
+
+These packages are intended for `PackageReference` consumption and copy the executable assets into the consuming project's output/publish output through MSBuild targets. They are not the future install-facing `dotnet tool` package; reserve `Devolutions.Pinget.Tool` for that scenario.
+
+```powershell
+dotnet add package Devolutions.Pinget.Cli.Rust
+dotnet add package Devolutions.Pinget.Cli.DotNet
+```
+
+Both packages use `pinget[.exe]` inside the NuGet package. If a project intentionally references both implementations, set package-specific output names to add distinguishable copies in the build output:
+
+```xml
+<PropertyGroup>
+  <DevolutionsPingetRustCliWindowsOutputName>pinget.exe</DevolutionsPingetRustCliWindowsOutputName>
+  <DevolutionsPingetDotNetCliWindowsOutputName>pinget-managed.exe</DevolutionsPingetDotNetCliWindowsOutputName>
+</PropertyGroup>
+```
+
 ## Non-goals
 
 Pinget intentionally excludes:
