@@ -40,10 +40,10 @@ jobs:
           - rid: win-arm64
             os: windows-latest
             rust-target: aarch64-pc-windows-msvc
-          - rid: macos-x64
+          - rid: osx-x64
             os: macos-14
             rust-target: x86_64-apple-darwin
-          - rid: macos-arm64
+          - rid: osx-arm64
             os: macos-14
             rust-target: aarch64-apple-darwin
 
@@ -152,8 +152,8 @@ jobs:
             'rust-cli-linux-arm64' = 'artifacts/cli/rust/linux-arm64'
             'rust-cli-win-x64' = 'artifacts/cli/rust/win-x64'
             'rust-cli-win-arm64' = 'artifacts/cli/rust/win-arm64'
-            'rust-cli-macos-x64' = 'artifacts/cli/rust/osx-x64'
-            'rust-cli-macos-arm64' = 'artifacts/cli/rust/osx-arm64'
+            'rust-cli-osx-x64' = 'artifacts/cli/rust/osx-x64'
+            'rust-cli-osx-arm64' = 'artifacts/cli/rust/osx-arm64'
             'dotnet-cli-win-x64' = 'artifacts/cli/dotnet-nativeaot/win-x64'
             'dotnet-cli-win-arm64' = 'artifacts/cli/dotnet-nativeaot/win-arm64'
           }
