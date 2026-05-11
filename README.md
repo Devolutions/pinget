@@ -193,7 +193,7 @@ Pinget also publishes build-output packages for .NET projects that need a prebui
 | Package | Executable implementation | Notes |
 | --- | --- | --- |
 | `Devolutions.Pinget.Cli.Rust` | Rust CLI | Cross-platform native executable assets named `pinget[.exe]` under `runtimes\<rid>\native` |
-| `Devolutions.Pinget.Cli.DotNet` | C# CLI | Trimmed NativeAOT executable assets named `pinget.exe`, starting with Windows x64 and arm64 |
+| `Devolutions.Pinget.Cli.DotNet` | C# CLI | Trimmed NativeAOT executable assets named `pinget.exe`, plus required native sidecars, starting with Windows x64 and arm64 |
 
 These packages are intended for `PackageReference` consumption and copy the executable assets into the consuming project's output/publish output through MSBuild targets. They are not the future install-facing `dotnet tool` package; reserve `Devolutions.Pinget.Tool` for that scenario.
 

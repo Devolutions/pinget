@@ -23,10 +23,16 @@
 
   <ItemGroup>
     <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\dotnet-nativeaot\win-x64\pinget.exe" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\dotnet-nativeaot\win-x64\pinget.exe')">
-      <PackagePath>runtimes\win-x64\native\</PackagePath>
+      <PackagePath>runtimes\win-x64\native\pinget.exe</PackagePath>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\dotnet-nativeaot\win-x64\e_sqlite3.dll" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\dotnet-nativeaot\win-x64\e_sqlite3.dll')">
+      <PackagePath>runtimes\win-x64\native\e_sqlite3.dll</PackagePath>
     </Content>
     <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\dotnet-nativeaot\win-arm64\pinget.exe" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\dotnet-nativeaot\win-arm64\pinget.exe')">
-      <PackagePath>runtimes\win-arm64\native\</PackagePath>
+      <PackagePath>runtimes\win-arm64\native\pinget.exe</PackagePath>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\dotnet-nativeaot\win-arm64\e_sqlite3.dll" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\dotnet-nativeaot\win-arm64\e_sqlite3.dll')">
+      <PackagePath>runtimes\win-arm64\native\e_sqlite3.dll</PackagePath>
     </Content>
     <Content Include="Devolutions.Pinget.Cli.DotNet.targets" PackagePath="build\Devolutions.Pinget.Cli.DotNet.targets" Pack="true" />
   </ItemGroup>

@@ -23,22 +23,22 @@
 
   <ItemGroup>
     <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\win-x64\pinget.exe" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\win-x64\pinget.exe')">
-      <PackagePath>runtimes\win-x64\native\</PackagePath>
+      <PackagePath>runtimes\win-x64\native\pinget.exe</PackagePath>
     </Content>
     <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\win-arm64\pinget.exe" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\win-arm64\pinget.exe')">
-      <PackagePath>runtimes\win-arm64\native\</PackagePath>
+      <PackagePath>runtimes\win-arm64\native\pinget.exe</PackagePath>
     </Content>
     <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\linux-x64\pinget" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\linux-x64\pinget')">
-      <PackagePath>runtimes\linux-x64\native\</PackagePath>
+      <PackagePath>runtimes\linux-x64\native</PackagePath>
     </Content>
     <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\linux-arm64\pinget" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\linux-arm64\pinget')">
-      <PackagePath>runtimes\linux-arm64\native\</PackagePath>
+      <PackagePath>runtimes\linux-arm64\native</PackagePath>
     </Content>
     <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\osx-x64\pinget" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\osx-x64\pinget')">
-      <PackagePath>runtimes\osx-x64\native\</PackagePath>
+      <PackagePath>runtimes\osx-x64\native</PackagePath>
     </Content>
     <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\osx-arm64\pinget" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\osx-arm64\pinget')">
-      <PackagePath>runtimes\osx-arm64\native\</PackagePath>
+      <PackagePath>runtimes\osx-arm64\native</PackagePath>
     </Content>
     <Content Include="Devolutions.Pinget.Cli.Rust.targets" PackagePath="build\Devolutions.Pinget.Cli.Rust.targets" Pack="true" />
   </ItemGroup>

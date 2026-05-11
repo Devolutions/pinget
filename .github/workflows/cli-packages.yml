@@ -226,6 +226,7 @@ jobs:
             'bin/Debug/net10.0/runtimes/win-x64/native/pinget.exe',
             'bin/Debug/net10.0/runtimes/win-x64/native/pinget-rust.exe',
             'bin/Debug/net10.0/runtimes/win-x64/native/pinget-dotnet.exe',
+            'bin/Debug/net10.0/runtimes/win-x64/native/e_sqlite3.dll',
             'bin/Debug/net10.0/runtimes/linux-x64/native/pinget'
           )
 
