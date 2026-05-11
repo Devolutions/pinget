@@ -65,6 +65,13 @@ Set-VersionInFile `
     -Pattern '^(version\s*=\s*")[^"]+(")' `
     -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
 
+foreach ($crateName in @('pinget-core', 'pinget-cli', 'pinget-com')) {
+    Set-VersionInFile `
+        -RelativePath 'rust\Cargo.lock' `
+        -Pattern "(\[\[package\]\]\r?\nname = `"$crateName`"\r?\nversion = `")[^`"]+(`")" `
+        -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
+}
+
 Set-VersionInFile `
     -RelativePath 'dotnet\src\Devolutions.Pinget.Cli\Program.cs' `
     -Pattern '^(const string Version\s*=\s*")[^"]+(";)' `
@@ -80,3 +87,13 @@ Set-VersionInFile `
     -RelativePath 'dotnet\src\Devolutions.Pinget.PowerShell.Cmdlets\ModuleFiles\Devolutions.Pinget.Client.psd1' `
     -Pattern "^(    ModuleVersion\s*=\s*')[^']+(')" `
     -Replacement { param($match) "$($match.Groups[1].Value)$moduleVersion$($match.Groups[2].Value)" }
+
+Set-VersionInFile `
+    -RelativePath 'nuget\Devolutions.Pinget.Cli.Rust\Devolutions.Pinget.Cli.Rust.csproj' `
+    -Pattern '^(    <Version>)[^<]+(</Version>)' `
+    -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
+
+Set-VersionInFile `
+    -RelativePath 'nuget\Devolutions.Pinget.Cli.DotNet\Devolutions.Pinget.Cli.DotNet.csproj' `
+    -Pattern '^(    <Version>)[^<]+(</Version>)' `
+    -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }

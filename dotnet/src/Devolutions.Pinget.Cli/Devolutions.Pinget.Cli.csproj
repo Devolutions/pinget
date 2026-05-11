@@ -15,6 +15,33 @@
     <Nullable>enable</Nullable>
     <AssemblyName>pinget</AssemblyName>
     <RootNamespace>Devolutions.Pinget.Cli</RootNamespace>
+    <AssemblyTitle>Pinget CLI</AssemblyTitle>
+    <Product>Pinget</Product>
+    <Description>Pinget CLI</Description>
+    <Copyright>Copyright 2021-2026 Devolutions Inc.</Copyright>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>pinget</ToolCommandName>
+    <PackageId>Devolutions.Pinget.Tool</PackageId>
+    <PackageTags>pinget;winget;package-manager;cli;dotnet-tool</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PingetUseStaticWindowsRuntime Condition="'$(PingetUseStaticWindowsRuntime)' == ''">true</PingetUseStaticWindowsRuntime>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <Target Name="UseStaticWindowsRuntimeForNativeAot"
+          AfterTargets="SetupOSSpecificProps"
+          Condition="'$(PublishAot)' == 'true'
+                     and '$(PingetUseStaticWindowsRuntime)' == 'true'
+                     and $([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win-'))">
+    <ItemGroup>
+      <LinkerArg Remove="/NODEFAULTLIB:libucrt.lib" />
+      <LinkerArg Remove="/DEFAULTLIB:ucrt.lib" />
+      <LinkerArg Include="/NODEFAULTLIB:ucrt.lib" />
+      <LinkerArg Include="/DEFAULTLIB:libucrt.lib" />
+    </ItemGroup>
+  </Target>
 
 </Project>

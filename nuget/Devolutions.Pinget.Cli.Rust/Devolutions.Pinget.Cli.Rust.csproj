@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk" DefaultTargets="Pack">
+
+  <PropertyGroup>
+    <Version>0.4.0</Version>
+    <Company>Devolutions Inc.</Company>
+    <Authors>Devolutions</Authors>
+    <PackageId>Devolutions.Pinget.Cli.Rust</PackageId>
+    <PackageTags>pinget;winget;package-manager;cli;rust;native</PackageTags>
+    <Description>Prebuilt Rust Pinget CLI executable for use from .NET projects.</Description>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <NoBuild>true</NoBuild>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <IncludeSymbols>false</IncludeSymbols>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackFrameworkReferences>false</PackFrameworkReferences>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Devolutions/pinget</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Devolutions/pinget.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\win-x64\pinget.exe" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\win-x64\pinget.exe')">
+      <PackagePath>runtimes\win-x64\native\pinget.exe</PackagePath>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\win-arm64\pinget.exe" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\win-arm64\pinget.exe')">
+      <PackagePath>runtimes\win-arm64\native\pinget.exe</PackagePath>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\linux-x64\pinget" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\linux-x64\pinget')">
+      <PackagePath>runtimes\linux-x64\native</PackagePath>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\linux-arm64\pinget" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\linux-arm64\pinget')">
+      <PackagePath>runtimes\linux-arm64\native</PackagePath>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\osx-x64\pinget" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\osx-x64\pinget')">
+      <PackagePath>runtimes\osx-x64\native</PackagePath>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\osx-arm64\pinget" Pack="true" Condition="Exists('$(MSBuildThisFileDirectory)..\..\artifacts\cli\rust\osx-arm64\pinget')">
+      <PackagePath>runtimes\osx-arm64\native</PackagePath>
+    </Content>
+    <Content Include="Devolutions.Pinget.Cli.Rust.targets" PackagePath="build\Devolutions.Pinget.Cli.Rust.targets" Pack="true" />
+  </ItemGroup>
+
+</Project>

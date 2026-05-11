@@ -186,6 +186,50 @@ For embedded `show` and exact package resolution, Core exposes structured diagno
 
 `Repository.ShowManifest(query)` and `ShowResult.ToSerializableManifest()` return the same serializable manifest model used by the C# CLI `show --output json|yaml` path, including all installers and the Core-selected installer. Use `PingetJsonContext` for reflection-free `System.Text.Json` serialization in hosts that set `JsonSerializer.IsReflectionEnabledByDefault` to `false`.
 
+### .NET tool package
+
+The **`Devolutions.Pinget.Tool`** package installs the C# Pinget CLI as a framework-dependent .NET tool:
+
+```powershell
+dotnet tool install -g Devolutions.Pinget.Tool
+pinget --help
+```
+
+For local tool manifests:
+
+```powershell
+dotnet new tool-manifest
+dotnet tool install Devolutions.Pinget.Tool
+dotnet tool run pinget -- --help
+```
+
+This package is install-facing and requires a compatible .NET runtime on the target machine. It is separate from the build-output packages below.
+
+### CLI executable packages
+
+Pinget also publishes build-output packages for .NET projects that need a prebuilt `pinget` executable alongside their own application:
+
+| Package | Executable implementation | Notes |
+| --- | --- | --- |
+| `Devolutions.Pinget.Cli.Rust` | Rust CLI | Cross-platform native executable assets named `pinget[.exe]` under `runtimes\<rid>\native` |
+| `Devolutions.Pinget.Cli.DotNet` | C# CLI | Trimmed NativeAOT executable assets named `pinget.exe`, plus required native sidecars, starting with Windows x64 and arm64 |
+
+These packages are intended for `PackageReference` consumption and copy the executable assets into the consuming project's output/publish output through MSBuild targets. They are not `dotnet tool` packages; use `Devolutions.Pinget.Tool` when you want to install the CLI with `dotnet tool install`.
+
+```powershell
+dotnet add package Devolutions.Pinget.Cli.Rust
+dotnet add package Devolutions.Pinget.Cli.DotNet
+```
+
+Both packages use `pinget[.exe]` inside the NuGet package. If a project intentionally references both implementations, set package-specific output names to add distinguishable copies in the build output:
+
+```xml
+<PropertyGroup>
+  <DevolutionsPingetRustCliWindowsOutputName>pinget.exe</DevolutionsPingetRustCliWindowsOutputName>
+  <DevolutionsPingetDotNetCliWindowsOutputName>pinget-managed.exe</DevolutionsPingetDotNetCliWindowsOutputName>
+</PropertyGroup>
+```
+
 ## Non-goals
 
 Pinget intentionally excludes:

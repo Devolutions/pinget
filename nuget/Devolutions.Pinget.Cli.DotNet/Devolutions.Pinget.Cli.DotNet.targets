@@ -1,0 +1,43 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <DevolutionsPingetDotNetCliWindowsOutputName Condition="'$(DevolutionsPingetDotNetCliWindowsOutputName)' == ''">pinget.exe</DevolutionsPingetDotNetCliWindowsOutputName>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == '' Or '$(RuntimeIdentifier)' == 'win-x64'">
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\pinget.exe" Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\pinget.exe')">
+      <Link>runtimes\win-x64\native\$(DevolutionsPingetDotNetCliWindowsOutputName)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <PublishState>Included</PublishState>
+      <Visible>false</Visible>
+      <Pack>false</Pack>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\e_sqlite3.dll" Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-x64\native\e_sqlite3.dll')">
+      <Link>runtimes\win-x64\native\e_sqlite3.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <PublishState>Included</PublishState>
+      <Visible>false</Visible>
+      <Pack>false</Pack>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == '' Or '$(RuntimeIdentifier)' == 'win-arm64'">
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-arm64\native\pinget.exe" Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-arm64\native\pinget.exe')">
+      <Link>runtimes\win-arm64\native\$(DevolutionsPingetDotNetCliWindowsOutputName)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <PublishState>Included</PublishState>
+      <Visible>false</Visible>
+      <Pack>false</Pack>
+    </Content>
+    <Content Include="$(MSBuildThisFileDirectory)..\runtimes\win-arm64\native\e_sqlite3.dll" Condition="Exists('$(MSBuildThisFileDirectory)..\runtimes\win-arm64\native\e_sqlite3.dll')">
+      <Link>runtimes\win-arm64\native\e_sqlite3.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <PublishState>Included</PublishState>
+      <Visible>false</Visible>
+      <Pack>false</Pack>
+    </Content>
+  </ItemGroup>
+</Project>
