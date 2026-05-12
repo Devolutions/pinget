@@ -1,6 +1,7 @@
 [workspace]
 dependencies_update = true
 git_release_enable = false
+git_tag_name = "{{ package }}-v{{ version }}"
 semver_check = true
 pr_branch_prefix = "release-plz/"
 pr_name = "chore(release): prepare for publishing"
