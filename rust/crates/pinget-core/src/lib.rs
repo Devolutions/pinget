@@ -26,6 +26,8 @@ use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 #[cfg(windows)]
 use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 #[cfg(windows)]
+use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 #[cfg(windows)]
 use winreg::{RegKey, enums::*};
@@ -2995,16 +2997,32 @@ fn default_app_root() -> Result<PathBuf> {
 
     #[cfg(windows)]
     {
-        Ok(local_app_data
-            .join("Packages")
-            .join(PACKAGED_FAMILY_NAME)
-            .join("LocalState"))
+        if has_current_package_identity() {
+            return Ok(local_app_data
+                .join("Packages")
+                .join(PACKAGED_FAMILY_NAME)
+                .join("LocalState"));
+        }
+        Ok(local_app_data.join("Devolutions").join("Pinget"))
     }
 
     #[cfg(not(windows))]
     {
         Ok(local_app_data.join("pinget"))
     }
+}
+
+#[cfg(windows)]
+fn has_current_package_identity() -> bool {
+    // APPMODEL_ERROR_NO_PACKAGE; documented Win32 error returned when the calling
+    // process has no AppX package identity.
+    const APPMODEL_ERROR_NO_PACKAGE: u32 = 15700;
+
+    let mut length: u32 = 0;
+    // SAFETY: GetCurrentPackageFullName accepts a null name buffer when length is 0; it returns
+    // ERROR_INSUFFICIENT_BUFFER for packaged callers and APPMODEL_ERROR_NO_PACKAGE otherwise.
+    let rc = unsafe { GetCurrentPackageFullName(&mut length, std::ptr::null_mut()) };
+    rc != APPMODEL_ERROR_NO_PACKAGE
 }
 
 fn store_path(app_root: &Path) -> PathBuf {
@@ -6741,8 +6759,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn packaged_layout_defaults_to_packaged_paths() {
-        let app_root = default_app_root().expect("default app root");
+    fn packaged_layout_paths_resolve_from_packaged_app_root() {
+        let local_app_data = dirs::data_local_dir().expect("LocalAppData");
+        let app_root = local_app_data
+            .join("Packages")
+            .join(PACKAGED_FAMILY_NAME)
+            .join("LocalState");
         assert!(uses_packaged_layout(&app_root));
         assert!(
             user_settings_path(&app_root)
@@ -6758,6 +6780,31 @@ mod tests {
                     r"Packages\{}\LocalState\Microsoft\Windows Package Manager",
                     PACKAGED_FAMILY_NAME
                 ))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_app_root_outside_package_avoids_packaged_layout() {
+        // Tests run without AppX package identity, so the default app root must not
+        // resolve to the WinGet packaged LocalState — that location requires a
+        // brokered/elevated writer for its secure-settings stream.
+        let prior = std::env::var_os("PINGET_APPROOT");
+        // SAFETY: tests in this module are not run concurrently with other env mutators.
+        unsafe { std::env::remove_var("PINGET_APPROOT") };
+
+        let result = default_app_root();
+
+        if let Some(prior) = prior {
+            // SAFETY: restoring the prior value before assertions panic, single-threaded test.
+            unsafe { std::env::set_var("PINGET_APPROOT", prior) };
+        }
+
+        let app_root = result.expect("default app root");
+        assert!(!uses_packaged_layout(&app_root), "got packaged layout for {app_root:?}");
+        assert!(
+            app_root.ends_with(Path::new("Devolutions").join("Pinget")),
+            "unexpected fallback app root: {app_root:?}"
         );
     }
 
