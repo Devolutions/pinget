@@ -39,15 +39,30 @@ public class SourceStoreTests
     }
 
         [Fact]
-        public void PackagedLayout_DefaultsToPackagedSettingsAndCachePaths()
+        public void PackagedLayout_PathsResolveFromPackagedAppRoot()
         {
                 if (!OperatingSystem.IsWindows())
                         return;
 
-                var appRoot = SourceStoreManager.NormalizeAppRoot(null);
+                var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                var appRoot = Path.Combine(localAppData, "Packages", SourceStoreManager.PackagedFamilyName, "LocalState");
                 Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState"), appRoot, StringComparison.OrdinalIgnoreCase);
                 Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "settings.json"), SettingsStoreManager.UserSettingsPath(appRoot), StringComparison.OrdinalIgnoreCase);
                 Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "Microsoft", "Windows Package Manager"), SourceStoreManager.GetPackagedFileCacheRoot(appRoot), StringComparison.OrdinalIgnoreCase);
+        }
+
+        [Fact]
+        public void DefaultAppRootOutsidePackage_AvoidsPackagedLayout()
+        {
+                // Tests run without AppX package identity, so the default app root must
+                // not resolve to the WinGet packaged LocalState — that location requires
+                // a brokered/elevated writer for its secure-settings stream.
+                if (!OperatingSystem.IsWindows())
+                        return;
+
+                var appRoot = SourceStoreManager.NormalizeAppRoot(null);
+                Assert.EndsWith(Path.Combine("Devolutions", "Pinget"), appRoot, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName), appRoot, StringComparison.OrdinalIgnoreCase);
         }
 
         [Fact]

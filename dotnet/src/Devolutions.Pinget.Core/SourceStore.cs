@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -55,9 +56,30 @@ internal static class SourceStoreManager
             return Path.GetFullPath(appRoot);
 
         var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        return OperatingSystem.IsWindows()
-            ? Path.Combine(localAppData, "Packages", PackagedFamilyName, "LocalState")
-            : Path.Combine(localAppData, "pinget");
+        if (!OperatingSystem.IsWindows())
+            return Path.Combine(localAppData, "pinget");
+
+        if (HasCurrentPackageIdentity())
+            return Path.Combine(localAppData, "Packages", PackagedFamilyName, "LocalState");
+
+        return Path.Combine(localAppData, "Devolutions", "Pinget");
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = false)]
+    private static extern int GetCurrentPackageFullName(ref uint packageFullNameLength, IntPtr packageFullName);
+
+    private static bool HasCurrentPackageIdentity()
+    {
+        if (!OperatingSystem.IsWindows())
+            return false;
+
+        // APPMODEL_ERROR_NO_PACKAGE; documented Win32 error returned when the
+        // calling process has no AppX package identity.
+        const int AppModelErrorNoPackage = 15700;
+
+        uint length = 0;
+        var rc = GetCurrentPackageFullName(ref length, IntPtr.Zero);
+        return rc != AppModelErrorNoPackage;
     }
 
     public static void EnsureAppDirs(string? appRoot = null)
