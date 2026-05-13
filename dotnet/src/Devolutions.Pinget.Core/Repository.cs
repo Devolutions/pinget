@@ -1778,12 +1778,16 @@ public class Repository : IDisposable
         return warnings;
     }
 
-    private static SearchMatch? CorrelateInstalledPackage(InstalledPackage pkg, List<SearchMatch> candidates, bool loose)
+    internal static SearchMatch? CorrelateInstalledPackage(InstalledPackage pkg, List<SearchMatch> candidates, bool loose)
     {
-        if (pkg.LocalId.StartsWith(@"MSIX\", StringComparison.OrdinalIgnoreCase))
-            return null;
+        // Note: MSIX packages used to be hard-skipped here, but that prevented obvious
+        // correlations like `Microsoft Teams` (MSIX) → `Microsoft.Teams` (catalog).
+        // Name-based correlation now applies uniformly; MSIX entries whose installed
+        // name is an unresolved resource string (e.g. `ms-resource:appDisplayName`)
+        // simply fail to match and return null, same as before.
 
         var installedName = NormalizeCorrelationName(pkg.Name);
+        var installedNameLower = pkg.Name.ToLowerInvariant();
         var candidateNames = CorrelationNameCandidates(pkg.Name);
 
         SearchMatch? best = null;
@@ -1791,16 +1795,40 @@ public class Repository : IDisposable
         foreach (var candidate in candidates)
         {
             var candidateNorm = NormalizeCorrelationName(candidate.Name);
-            int score;
+            int baseScore;
             if (candidate.Id.Equals(pkg.LocalId, StringComparison.OrdinalIgnoreCase))
-                score = 1000;
+                baseScore = 1000;
             else if (candidateNames.Any(n => NormalizeCorrelationName(n).Equals(candidateNorm, StringComparison.OrdinalIgnoreCase)))
-                score = 900;
+                baseScore = 900;
             else if (loose && candidateNorm.Length >= 6 && installedName.Contains(candidateNorm, StringComparison.OrdinalIgnoreCase))
-                score = 700;
+                baseScore = 700;
             else
-                score = 0;
+                baseScore = 0;
 
+            if (baseScore == 0) continue;
+
+            // Tiebreaker so we pick the *right* candidate when multiple catalog
+            // entries collapse to the same normalized name or all loose-match a
+            // long installed name. Two failure modes this addresses:
+            //   • `Notepad++` and `Notepad--` both normalize to `notepad` (the
+            //     alphanumeric filter strips `+`/`-`), so both score 900 and
+            //     iteration order picked an arbitrary one.
+            //   • Loose substring match picks up `Studio` inside
+            //     `...from Visual Studio` and lets `ZeroBrane.Studio` outrank
+            //     `Microsoft.DotNet.SDK.10` when both score 700.
+            // The bonus rewards catalog names that appear verbatim in the
+            // installed display name — strongly when they anchor the start,
+            // weaker when they're embedded.
+            var candidateLower = candidate.Name.ToLowerInvariant();
+            int prefixBonus;
+            if (installedNameLower.StartsWith(candidateLower, StringComparison.Ordinal))
+                prefixBonus = 100;
+            else if (installedNameLower.Contains(candidateLower, StringComparison.Ordinal))
+                prefixBonus = 50;
+            else
+                prefixBonus = 0;
+
+            var score = baseScore + prefixBonus;
             if (score > bestScore) { bestScore = score; best = candidate; }
         }
         return best;

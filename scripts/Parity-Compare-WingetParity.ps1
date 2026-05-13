@@ -137,6 +137,35 @@ function Get-PackagedSettingsPath {
     return Join-Path $env:LOCALAPPDATA "Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\settings.json"
 }
 
+function Test-IsPackagedProcess {
+    # GetCurrentPackageFullName returns APPMODEL_ERROR_NO_PACKAGE (15700) when the
+    # calling process has no AppX package identity. Pinget mirrors this check to
+    # decide whether to default its app root to the packaged WinGet LocalState
+    # (writeable only by packaged callers in practice) or to a non-packaged
+    # %LOCALAPPDATA%\Devolutions\Pinget fallback.
+    if (-not ('Pinget.AppModel' -as [type])) {
+        Add-Type -Namespace 'Pinget' -Name 'AppModel' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode, ExactSpelling=true, SetLastError=false)]
+public static extern int GetCurrentPackageFullName(ref uint packageFullNameLength, System.IntPtr packageFullName);
+'@
+    }
+
+    [uint32]$length = 0
+    $rc = [Pinget.AppModel]::GetCurrentPackageFullName([ref]$length, [System.IntPtr]::Zero)
+    return $rc -ne 15700
+}
+
+function Get-ExpectedUserSettingsPath {
+    # Matches default_app_root + user_settings_path in pinget-core: packaged
+    # callers write to %LOCALAPPDATA%\Packages\...\LocalState\settings.json;
+    # non-packaged callers write to %LOCALAPPDATA%\Devolutions\Pinget\user-settings.json.
+    if (Test-IsPackagedProcess) {
+        return Get-PackagedSettingsPath
+    }
+
+    return Join-Path $env:LOCALAPPDATA "Devolutions\Pinget\user-settings.json"
+}
+
 function Test-IsProcessElevated {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -609,7 +638,8 @@ Assert-True -Condition (Test-Path -Path $PowerShellModulePath) -Message "Pinget 
 Import-PingetPowerShellModule
 Invoke-Capture -Executable $SystemWinget -Arguments @("--version") | Out-Null
 
-$settingsPath = Get-PackagedSettingsPath
+$packagedSettingsPath = Get-PackagedSettingsPath
+$settingsPath = Get-ExpectedUserSettingsPath
 $packagedLocalStateSegment = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState"
 $settingsBackup = if (Test-Path -Path $settingsPath) { Get-Content -Path $settingsPath -Raw } else { $null }
 $packageId = $null
@@ -626,7 +656,10 @@ try {
     $rustInfo = Invoke-Capture -Executable $RustWinget -Arguments @("--info")
     $dotnetInfo = Invoke-Capture -Executable $DotnetWinget -Arguments @("--info")
     $wingetInfo = Invoke-Capture -Executable $SystemWinget -Arguments @("--info")
-    Assert-Contains -Text $rustInfo.Output -Needle $settingsPath -Message "Rust pinget --info did not report the packaged settings path."
+    # `pinget --info` is winget-parity output and always reports the packaged
+    # LocalState path regardless of where pinget actually writes — assert against
+    # that fixed path, not the runtime-selected $settingsPath.
+    Assert-Contains -Text $rustInfo.Output -Needle $packagedSettingsPath -Message "Rust pinget --info did not report the packaged settings path."
     Assert-Contains -Text $dotnetInfo.Output -Needle "Pure C# subset of Pinget" -Message "C# pinget --info did not report the expected runtime banner."
     Assert-Contains -Text $wingetInfo.Output -Needle $packagedLocalStateSegment -Message "winget --info did not report the packaged LocalState path."
     Assert-True -Condition ($null -ne (Get-PowerShellSettingsObject)) -Message "PowerShell module could not read Pinget user settings."
@@ -650,7 +683,7 @@ try {
     Write-Section "Settings roundtrip"
     $testSettings = New-TestSettingsHashtable
     Set-PingetUserSetting -UserSettings $testSettings -ErrorAction Stop | Out-Null
-    Assert-True -Condition (Test-Path -Path $settingsPath) -Message "PowerShell settings write did not create the packaged settings file."
+    Assert-True -Condition (Test-Path -Path $settingsPath) -Message "PowerShell settings write did not create the user settings file at '$settingsPath'."
     Assert-TestSettingsVisible -SettingsObject (Get-RustSettingsObject) -Label "Rust pinget settings export"
     Assert-TestSettingsVisible -SettingsObject (Get-DotnetSettingsObject) -Label "C# pinget settings export"
     Assert-TestSettingsVisible -SettingsObject (Get-PowerShellSettingsObject) -Label "Pinget PowerShell settings"

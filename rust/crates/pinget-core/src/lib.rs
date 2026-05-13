@@ -2642,18 +2642,21 @@ fn correlate_installed_package(
     candidates: &[SearchMatch],
     allow_loose_name_match: bool,
 ) -> Option<SearchMatch> {
-    if package.local_id.starts_with("MSIX\\") {
-        return None;
-    }
+    // Note: MSIX packages used to be hard-skipped here, but that prevented obvious
+    // correlations like `Microsoft Teams` (MSIX) → `Microsoft.Teams` (catalog).
+    // Name-based correlation now applies uniformly; MSIX entries whose installed
+    // name is an unresolved resource string (e.g. `ms-resource:appDisplayName`)
+    // simply fail to match and return None, same as before.
 
     let installed_name = normalize_correlation_name(&package.name);
+    let installed_name_lower = package.name.to_ascii_lowercase();
     let candidate_names = correlation_name_candidates(&package.name);
 
     candidates
         .iter()
         .filter_map(|candidate| {
             let candidate_name = normalize_correlation_name(&candidate.name);
-            let score = if candidate.id.eq_ignore_ascii_case(&package.local_id) {
+            let base_score = if candidate.id.eq_ignore_ascii_case(&package.local_id) {
                 1000
             } else if candidate_names.iter().any(|name| {
                 let normalized = normalize_correlation_name(name);
@@ -2666,7 +2669,32 @@ fn correlate_installed_package(
                 0
             };
 
-            (score > 0).then_some((score, candidate.clone()))
+            if base_score == 0 {
+                return None;
+            }
+
+            // Tiebreaker so we pick the *right* candidate when multiple catalog
+            // entries collapse to the same normalized name or all loose-match a
+            // long installed name. Two failure modes this addresses:
+            //   • `Notepad++` and `Notepad--` both normalize to `notepad` (the
+            //     alphanumeric filter strips `+`/`-`), so both score 900 and
+            //     `max_by_key` arbitrarily picked the latter.
+            //   • Loose substring match picks up `Studio` inside
+            //     `...from Visual Studio` and lets `ZeroBrane.Studio` outrank
+            //     `Microsoft.DotNet.SDK.10` when both score 700.
+            // The bonus rewards catalog names that appear verbatim in the
+            // installed display name — strongly when they anchor the start,
+            // weaker when they're embedded.
+            let candidate_lower = candidate.name.to_ascii_lowercase();
+            let prefix_bonus = if installed_name_lower.starts_with(&candidate_lower) {
+                100
+            } else if installed_name_lower.contains(&candidate_lower) {
+                50
+            } else {
+                0
+            };
+
+            Some((base_score + prefix_bonus, candidate.clone()))
         })
         .max_by_key(|(score, _)| *score)
         .map(|(_, candidate)| candidate)
@@ -6335,6 +6363,7 @@ fn uninstall_package(installed: &ListMatch, request: &UninstallRequest) -> Resul
 
 #[cfg(windows)]
 fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Result<Option<i32>> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
@@ -6383,14 +6412,24 @@ fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Resul
                             return Ok(Some(exit_code));
                         }
 
-                        let mut cmd = Command::new("cmd");
                         let log_path = request.log_path.as_ref().map(|value| value.display().to_string());
-                        cmd.arg("/C").arg(build_uninstall_command_with_mode(
+                        let uninstall_line = build_uninstall_command_with_mode(
                             &uninstall_cmd,
                             request.mode,
                             quiet_uninstall_cmd.is_some(),
                             log_path.as_deref(),
-                        ));
+                        );
+                        // `UninstallString` is a complete command line and may already contain
+                        // its own quotes (e.g. `"C:\path with spaces\unins.exe"`). Passing it
+                        // through Command::arg causes Rust's CRT-style quoting to backslash-escape
+                        // those embedded quotes (`\"...\"`), which cmd.exe does not understand and
+                        // rejects with "is not recognized as an internal or external command".
+                        // Use `cmd /S /C "<line>"`: `/S` makes cmd strip only the outermost pair
+                        // of quotes, leaving the embedded quotes intact. `raw_arg` bypasses Rust's
+                        // automatic quoting so we can feed cmd the literal command line.
+                        let mut cmd = Command::new("cmd");
+                        cmd.raw_arg("/S /C");
+                        cmd.raw_arg(format!("\"{uninstall_line}\""));
                         let status = cmd.status().context("failed to run uninstaller")?;
                         return Ok(Some(status.code().unwrap_or(-1)));
                     }
@@ -8180,6 +8219,173 @@ Installers:
 
         let package_query = package_query_from_list_query(&query);
         assert_eq!(package_query.count, Some(LIST_LOOKUP_MAX_RESULTS));
+    }
+
+    #[test]
+    fn correlation_tiebreaks_on_unnormalized_name_prefix() {
+        // `Notepad++` and `Notepad--` both normalize to `notepad` (alphanumeric filter
+        // strips the trailing punctuation). Without a tiebreaker, max_by_key returned
+        // whichever candidate happened to come last in iteration order. The installed
+        // display name's prefix decides the correct one.
+        let installed = InstalledPackage {
+            name: "Notepad++ (ARM 64-bit)".to_owned(),
+            local_id: r"ARP\Machine\X64\Notepad++".to_owned(),
+            installed_version: "8.8.9".to_owned(),
+            publisher: None,
+            scope: Some("Machine".to_owned()),
+            installer_category: Some("exe".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+        };
+        let candidates = vec![
+            SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "ndd.Notepad--".to_owned(),
+                name: "Notepad--".to_owned(),
+                moniker: None,
+                version: Some("1.0.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+            SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Notepad++.Notepad++".to_owned(),
+                name: "Notepad++".to_owned(),
+                moniker: None,
+                version: Some("8.9.5".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+        ];
+
+        let correlated = correlate_installed_package(&installed, &candidates, true).expect("correlated");
+        assert_eq!(correlated.id, "Notepad++.Notepad++");
+    }
+
+    #[test]
+    fn loose_correlation_prefers_anchored_candidate_over_word_fragment() {
+        // Without the prefix bonus, the loose substring match picked up `Studio`
+        // anywhere in the installed name — so `ZeroBrane.Studio` would outrank the
+        // genuinely-related `Microsoft.DotNet.SDK.10` because both scored 700 and
+        // sort order favored the alphabetically-later candidate.
+        let installed = InstalledPackage {
+            name: "Microsoft .NET SDK 10.0.101 (arm64) from Visual Studio".to_owned(),
+            local_id: r"ARP\Machine\X64\{7E9F8584-06E7-445E-9165-7486CC1B56C3}".to_owned(),
+            installed_version: "40.10.18029".to_owned(),
+            publisher: None,
+            scope: Some("Machine".to_owned()),
+            installer_category: Some("msi".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+        };
+        let candidates = vec![
+            SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "ZeroBrane.Studio".to_owned(),
+                name: "Studio".to_owned(),
+                moniker: None,
+                version: Some("1.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+            SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "BrickLink.Studio".to_owned(),
+                name: "Studio".to_owned(),
+                moniker: None,
+                version: Some("1.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+            SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Microsoft.DotNet.SDK.10".to_owned(),
+                name: "Microsoft .NET SDK 10.0".to_owned(),
+                moniker: None,
+                version: Some("10.0.204".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+        ];
+
+        let correlated = correlate_installed_package(&installed, &candidates, true).expect("correlated");
+        assert_eq!(correlated.id, "Microsoft.DotNet.SDK.10");
+    }
+
+    #[test]
+    fn msix_packages_correlate_by_name() {
+        // Previously hard-skipped via `package.local_id.starts_with("MSIX\\")` →
+        // None, which prevented obvious MSIX updates (Microsoft.Teams etc.) from
+        // ever surfacing. Name-based correlation now runs uniformly.
+        let installed = InstalledPackage {
+            name: "Microsoft Teams".to_owned(),
+            local_id: r"MSIX\MSTeams_25290.205.4069.4894_arm64__8wekyb3d8bbwe".to_owned(),
+            installed_version: "25290.205.4069.4894".to_owned(),
+            publisher: None,
+            scope: Some("User".to_owned()),
+            installer_category: Some("msix".to_owned()),
+            install_location: None,
+            package_family_names: vec!["MSTeams_8wekyb3d8bbwe".to_owned()],
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+        };
+        let candidates = vec![SearchMatch {
+            source_name: "winget".to_owned(),
+            source_kind: SourceKind::PreIndexed,
+            id: "Microsoft.Teams".to_owned(),
+            name: "Microsoft Teams".to_owned(),
+            moniker: None,
+            version: Some("26106.1906.4665.7308".to_owned()),
+            channel: None,
+            match_criteria: None,
+        }];
+
+        let correlated = correlate_installed_package(&installed, &candidates, true).expect("correlated");
+        assert_eq!(correlated.id, "Microsoft.Teams");
+    }
+
+    #[test]
+    fn msix_with_resource_string_name_does_not_correlate() {
+        // Some MSIX entries have unresolved resource-string display names
+        // (e.g. `ms-resource:appDisplayName`). Those shouldn't latch onto an
+        // unrelated catalog package via the loose substring rule.
+        let installed = InstalledPackage {
+            name: "ms-resource:appDisplayName".to_owned(),
+            local_id: r"MSIX\Microsoft.DesktopAppInstaller_1.28.239.0_arm64__8wekyb3d8bbwe".to_owned(),
+            installed_version: "1.28.239.0".to_owned(),
+            publisher: None,
+            scope: Some("User".to_owned()),
+            installer_category: Some("msix".to_owned()),
+            install_location: None,
+            package_family_names: vec!["Microsoft.DesktopAppInstaller_8wekyb3d8bbwe".to_owned()],
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+        };
+        let candidates = vec![SearchMatch {
+            source_name: "winget".to_owned(),
+            source_kind: SourceKind::PreIndexed,
+            id: "Microsoft.AppInstaller".to_owned(),
+            name: "App Installer".to_owned(),
+            moniker: None,
+            version: Some("1.28.240.0".to_owned()),
+            channel: None,
+            match_criteria: None,
+        }];
+
+        assert!(correlate_installed_package(&installed, &candidates, true).is_none());
     }
 
     #[test]
