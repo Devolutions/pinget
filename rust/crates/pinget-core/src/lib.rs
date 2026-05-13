@@ -6335,6 +6335,7 @@ fn uninstall_package(installed: &ListMatch, request: &UninstallRequest) -> Resul
 
 #[cfg(windows)]
 fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Result<Option<i32>> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
@@ -6383,14 +6384,24 @@ fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Resul
                             return Ok(Some(exit_code));
                         }
 
-                        let mut cmd = Command::new("cmd");
                         let log_path = request.log_path.as_ref().map(|value| value.display().to_string());
-                        cmd.arg("/C").arg(build_uninstall_command_with_mode(
+                        let uninstall_line = build_uninstall_command_with_mode(
                             &uninstall_cmd,
                             request.mode,
                             quiet_uninstall_cmd.is_some(),
                             log_path.as_deref(),
-                        ));
+                        );
+                        // `UninstallString` is a complete command line and may already contain
+                        // its own quotes (e.g. `"C:\path with spaces\unins.exe"`). Passing it
+                        // through Command::arg causes Rust's CRT-style quoting to backslash-escape
+                        // those embedded quotes (`\"...\"`), which cmd.exe does not understand and
+                        // rejects with "is not recognized as an internal or external command".
+                        // Use `cmd /S /C "<line>"`: `/S` makes cmd strip only the outermost pair
+                        // of quotes, leaving the embedded quotes intact. `raw_arg` bypasses Rust's
+                        // automatic quoting so we can feed cmd the literal command line.
+                        let mut cmd = Command::new("cmd");
+                        cmd.raw_arg("/S /C");
+                        cmd.raw_arg(format!("\"{uninstall_line}\""));
                         let status = cmd.status().context("failed to run uninstaller")?;
                         return Ok(Some(status.code().unwrap_or(-1)));
                     }
