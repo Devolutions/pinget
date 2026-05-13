@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/Devolutions/pinget/compare/pinget-core-v0.4.1...pinget-core-v0.4.2) - 2026-05-13
+
+### Other
+
+- apply stable rustfmt to correlation fix
+- bump version to 0.4.2
+- Fix some missing update
+- Fix uninstalling not working for some packages
+
 ## [0.4.0](https://github.com/Devolutions/pinget/compare/v0.3.1...v0.4.0) - 2026-05-11
 
 ### Other
