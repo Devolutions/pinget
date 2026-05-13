@@ -1289,6 +1289,143 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void CorrelateInstalledPackage_TiebreaksOnUnnormalizedNamePrefix()
+    {
+        // `Notepad++` and `Notepad--` both normalize to `notepad` (alphanumeric filter
+        // strips the trailing punctuation). Without a tiebreaker, iteration order
+        // decided the winner. The installed display name's prefix picks the correct one.
+        var installed = new InstalledPackage
+        {
+            Name = "Notepad++ (ARM 64-bit)",
+            LocalId = @"ARP\Machine\X64\Notepad++",
+            InstalledVersion = "8.8.9",
+            Scope = "Machine",
+            InstallerCategory = "exe",
+            PackageFamilyNames = [],
+            ProductCodes = [],
+            UpgradeCodes = [],
+        };
+        var candidates = new List<SearchMatch>
+        {
+            new()
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "ndd.Notepad--",
+                Name = "Notepad--",
+                Version = "1.0.0",
+            },
+            new()
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "Notepad++.Notepad++",
+                Name = "Notepad++",
+                Version = "8.9.5",
+            },
+        };
+
+        var correlated = Repository.CorrelateInstalledPackage(installed, candidates, loose: true);
+        Assert.NotNull(correlated);
+        Assert.Equal("Notepad++.Notepad++", correlated!.Id);
+    }
+
+    [Fact]
+    public void CorrelateInstalledPackage_PrefersAnchoredCandidateOverWordFragment()
+    {
+        // Loose substring match used to pick up `Studio` anywhere in the installed name
+        // — so `ZeroBrane.Studio` could outrank `Microsoft.DotNet.SDK.10` because both
+        // scored 700 and iteration order favored the alphabetically-later candidate.
+        var installed = new InstalledPackage
+        {
+            Name = "Microsoft .NET SDK 10.0.101 (arm64) from Visual Studio",
+            LocalId = @"ARP\Machine\X64\{7E9F8584-06E7-445E-9165-7486CC1B56C3}",
+            InstalledVersion = "40.10.18029",
+            Scope = "Machine",
+            InstallerCategory = "msi",
+            PackageFamilyNames = [],
+            ProductCodes = [],
+            UpgradeCodes = [],
+        };
+        var candidates = new List<SearchMatch>
+        {
+            new() { SourceName = "winget", SourceKind = SourceKind.PreIndexed, Id = "ZeroBrane.Studio", Name = "Studio", Version = "1.0" },
+            new() { SourceName = "winget", SourceKind = SourceKind.PreIndexed, Id = "BrickLink.Studio", Name = "Studio", Version = "1.0" },
+            new() { SourceName = "winget", SourceKind = SourceKind.PreIndexed, Id = "Microsoft.DotNet.SDK.10", Name = "Microsoft .NET SDK 10.0", Version = "10.0.204" },
+        };
+
+        var correlated = Repository.CorrelateInstalledPackage(installed, candidates, loose: true);
+        Assert.NotNull(correlated);
+        Assert.Equal("Microsoft.DotNet.SDK.10", correlated!.Id);
+    }
+
+    [Fact]
+    public void CorrelateInstalledPackage_MsixCorrelatesByName()
+    {
+        // Previously hard-skipped via `LocalId.StartsWith("MSIX\\")` → null, which
+        // prevented obvious MSIX updates (Microsoft.Teams etc.) from ever surfacing.
+        // Name-based correlation now runs uniformly.
+        var installed = new InstalledPackage
+        {
+            Name = "Microsoft Teams",
+            LocalId = @"MSIX\MSTeams_25290.205.4069.4894_arm64__8wekyb3d8bbwe",
+            InstalledVersion = "25290.205.4069.4894",
+            Scope = "User",
+            InstallerCategory = "msix",
+            PackageFamilyNames = ["MSTeams_8wekyb3d8bbwe"],
+            ProductCodes = [],
+            UpgradeCodes = [],
+        };
+        var candidates = new List<SearchMatch>
+        {
+            new()
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "Microsoft.Teams",
+                Name = "Microsoft Teams",
+                Version = "26106.1906.4665.7308",
+            },
+        };
+
+        var correlated = Repository.CorrelateInstalledPackage(installed, candidates, loose: true);
+        Assert.NotNull(correlated);
+        Assert.Equal("Microsoft.Teams", correlated!.Id);
+    }
+
+    [Fact]
+    public void CorrelateInstalledPackage_MsixWithResourceStringNameDoesNotCorrelate()
+    {
+        // Some MSIX entries have unresolved resource-string display names
+        // (e.g. `ms-resource:appDisplayName`). They shouldn't latch onto an
+        // unrelated catalog package via the loose substring rule.
+        var installed = new InstalledPackage
+        {
+            Name = "ms-resource:appDisplayName",
+            LocalId = @"MSIX\Microsoft.DesktopAppInstaller_1.28.239.0_arm64__8wekyb3d8bbwe",
+            InstalledVersion = "1.28.239.0",
+            Scope = "User",
+            InstallerCategory = "msix",
+            PackageFamilyNames = ["Microsoft.DesktopAppInstaller_8wekyb3d8bbwe"],
+            ProductCodes = [],
+            UpgradeCodes = [],
+        };
+        var candidates = new List<SearchMatch>
+        {
+            new()
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "Microsoft.AppInstaller",
+                Name = "App Installer",
+                Version = "1.28.240.0",
+            },
+        };
+
+        Assert.Null(Repository.CorrelateInstalledPackage(installed, candidates, loose: true));
+    }
+
+    [Fact]
     public void BuildUninstallCommand_AppendsSilentSwitchOnlyWhenNeeded()
     {
         Assert.Equal("\"C:\\Program Files\\ShareX\\unins000.exe\" /S",
