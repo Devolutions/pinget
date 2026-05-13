@@ -2663,10 +2663,7 @@ fn correlate_installed_package(
                 normalized == candidate_name
             }) {
                 900
-            } else if allow_loose_name_match
-                && candidate_name.len() >= 6
-                && installed_name.contains(&candidate_name)
-            {
+            } else if allow_loose_name_match && candidate_name.len() >= 6 && installed_name.contains(&candidate_name) {
                 700
             } else {
                 0
@@ -8266,8 +8263,7 @@ Installers:
             },
         ];
 
-        let correlated =
-            correlate_installed_package(&installed, &candidates, true).expect("correlated");
+        let correlated = correlate_installed_package(&installed, &candidates, true).expect("correlated");
         assert_eq!(correlated.id, "Notepad++.Notepad++");
     }
 
@@ -8323,8 +8319,7 @@ Installers:
             },
         ];
 
-        let correlated =
-            correlate_installed_package(&installed, &candidates, true).expect("correlated");
+        let correlated = correlate_installed_package(&installed, &candidates, true).expect("correlated");
         assert_eq!(correlated.id, "Microsoft.DotNet.SDK.10");
     }
 
@@ -8357,8 +8352,7 @@ Installers:
             match_criteria: None,
         }];
 
-        let correlated =
-            correlate_installed_package(&installed, &candidates, true).expect("correlated");
+        let correlated = correlate_installed_package(&installed, &candidates, true).expect("correlated");
         assert_eq!(correlated.id, "Microsoft.Teams");
     }
 
