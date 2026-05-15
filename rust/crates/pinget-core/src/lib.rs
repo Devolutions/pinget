@@ -562,6 +562,13 @@ struct InstalledPackage {
     product_codes: Vec<String>,
     upgrade_codes: Vec<String>,
     correlated: Option<SearchMatch>,
+    // True when `installed_version` was rewritten to a catalog Version via
+    // versionData.mszyml's aMiV/aMaV range. Such versions compare meaningfully
+    // against the catalog's Version; raw ARP DisplayVersions usually don't.
+    // Used by dedupe so that, when the same id has both a canonical and a raw
+    // install row, we prefer the canonical (e.g. `Microsoft.DotNet.SDK.10`
+    // 10.0.108 over the VS-installed 40.10.18029 that doesn't map).
+    installed_version_canonical: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -634,6 +641,14 @@ struct PackageVersionDataEntry {
     manifest_relative_path: String,
     #[serde(rename = "s256H")]
     manifest_hash: String,
+    // ARP version range covered by this catalog version. WinGet writes these
+    // into versionData.mszyml so an installed ARP DisplayVersion (which may be
+    // an MSI build number with no relation to the catalog Version) can be
+    // mapped back to the catalog Version it corresponds to.
+    #[serde(rename = "aMiV", default)]
+    arp_min_version: Option<String>,
+    #[serde(rename = "aMaV", default)]
+    arp_max_version: Option<String>,
 }
 
 pub struct Repository {
@@ -980,19 +995,56 @@ impl Repository {
         }
         let mut installed = collect_installed_packages(query.install_scope.as_deref())?;
 
+        if needs_available {
+            // Authoritative correlation via the v2 index's identity tables
+            // (PackageFamilyName / ProductCode / UpgradeCode). This is winget's
+            // primary path and resolves cases where display-name matching is
+            // ambiguous (Microsoft.Teams vs Microsoft.Teams.Free) or impossible
+            // (MSIX with `ms-resource:` placeholder names).
+            warnings.extend(self.correlate_installed_via_index(&mut installed, query.source.as_deref())?);
+        }
+
         if needs_available && has_filter {
-            // Filtered lookup: search sources with the user's query
+            // Filtered lookup: search sources with the user's query for any
+            // installed package not already resolved by identity.
             let available_query = package_query_from_list_query(query);
             let (matches, source_warnings, _) = self.search_located(&available_query, SearchSemantics::Many)?;
             warnings.extend(source_warnings);
             let candidates: Vec<SearchMatch> = matches.into_iter().map(|c| c.display).collect();
             for package in &mut installed {
+                if package.correlated.is_some() {
+                    continue;
+                }
                 package.correlated =
                     correlate_installed_package(package, &candidates, allow_loose_list_correlation(query));
             }
         } else if needs_available {
             // Unfiltered upgrade: look up each installed package by its correlation names
             warnings.extend(self.correlate_all_installed(&mut installed)?);
+        }
+
+        if needs_available {
+            // Enrich rows that correlated via the name-based fallback. Those
+            // rows skipped the v2-index aMiV/aMaV pass that runs inside
+            // `correlate_installed_via_index`, so they still carry the raw
+            // ARP DisplayVersion (e.g. `JetBrains Rider 2025.3.0.1` showing
+            // build `253.28294.112` instead of the marketing `2025.3.0.1`).
+            // Also resolves MSIX placeholder names like
+            // `ms-resource:appDisplayName` to the catalog's display name —
+            // winget pulls these through Windows.Management.Deployment; the
+            // catalog name is the parity-faithful substitute pinget has
+            // available without taking a WinRT dependency.
+            warnings.extend(self.enrich_correlated_via_index(&mut installed, query.source.as_deref())?);
+        }
+
+        // For `upgrade`, collapse multiple installed entries that map to the
+        // same catalog package id (different ARP rows for side-by-side .NET
+        // SDKs, several runtime versions of WindowsAppRuntime, the MSIX shim
+        // alongside an ARP install of Edge, etc.). Keep the entry with the
+        // highest installed_version so the upgrade comparison runs against
+        // the user's newest install — matches winget's one-row-per-id output.
+        if query.upgrade_only {
+            installed = dedupe_correlated_for_upgrade(installed);
         }
 
         let mut matches = installed
@@ -1036,8 +1088,12 @@ impl Repository {
     }
 
     /// For unfiltered upgrade/list, search the entire available index and correlate
-    /// against all installed packages.
+    /// against all installed packages. Skips packages already correlated via the
+    /// v2 identity tables.
     fn correlate_all_installed(&mut self, installed: &mut [InstalledPackage]) -> Result<Vec<String>> {
+        if installed.iter().all(|p| p.correlated.is_some()) {
+            return Ok(Vec::new());
+        }
         let all_query = PackageQuery {
             query: None,
             id: None,
@@ -1061,10 +1117,204 @@ impl Repository {
         let candidates: Vec<SearchMatch> = matches.into_iter().map(|c| c.display).collect();
 
         for package in installed.iter_mut() {
+            if package.correlated.is_some() {
+                continue;
+            }
             package.correlated = correlate_installed_package(package, &candidates, true);
         }
 
         Ok(warnings)
+    }
+
+    /// Correlates installed packages against the v2 pre-indexed catalog using
+    /// PackageFamilyName / ProductCode / UpgradeCode lookups — winget's
+    /// authoritative correlation path. Also rewrites `installed_version` to
+    /// the catalog Version whose ARP range covers the ARP DisplayVersion, so
+    /// packages whose ARP version is an MSI build number (e.g. .NET SDK,
+    /// Python) compare against a meaningful catalog version. Packages without
+    /// any of the three identifiers, or whose identifiers don't match a
+    /// catalog entry, are left untouched for the name-based fallback.
+    fn correlate_installed_via_index(
+        &mut self,
+        installed: &mut [InstalledPackage],
+        requested_source: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let source_indices: Vec<usize> = self
+            .store
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                source.kind == SourceKind::PreIndexed
+                    && match requested_source {
+                        Some(name) => source.name.eq_ignore_ascii_case(name),
+                        None => true,
+                    }
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        for source_index in source_indices {
+            let resolved: Vec<(usize, V2PackageMetadata, &'static str)> = {
+                let connection = match self.open_preindexed_connection(source_index) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if !v2_identity_tables_present(&connection) {
+                    continue;
+                }
+                let mut acc = Vec::new();
+                for (idx, package) in installed.iter().enumerate() {
+                    if package.correlated.is_some() {
+                        continue;
+                    }
+                    let Some((rowid, by)) = lookup_identity_match_v2(&connection, package)? else {
+                        continue;
+                    };
+                    let Some(meta) = fetch_v2_package_metadata(&connection, rowid)? else {
+                        continue;
+                    };
+                    acc.push((idx, meta, by));
+                }
+                acc
+            };
+
+            let source = self.source_clone(source_index);
+            for (idx, meta, by) in resolved {
+                let (canonical_installed, anchored_latest) =
+                    match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
+                        Ok((entries, _)) => (
+                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version),
+                            latest_arp_anchored_version(&entries),
+                        ),
+                        Err(_) => (None, None),
+                    };
+                // When the installed side was rebased to a catalog Version via
+                // aMiV/aMaV, the available side must compare on the same scale:
+                // prefer the latest ARP-anchored Version over `latest_version`,
+                // which can be an internal/MSI build number (e.g. WinAppRuntime
+                // 1.8's `8000.836.2153.0`) that would manufacture a phantom
+                // upgrade against an installed canonical like `1.8.6`.
+                let available_version = match (&canonical_installed, anchored_latest) {
+                    (Some(_), Some(anchored)) => anchored,
+                    _ => meta.latest_version,
+                };
+                let installed_pkg = &mut installed[idx];
+                installed_pkg.correlated = Some(SearchMatch {
+                    source_name: source.name.clone(),
+                    source_kind: source.kind,
+                    id: meta.id,
+                    name: meta.name,
+                    moniker: meta.moniker,
+                    version: Some(available_version),
+                    channel: None,
+                    match_criteria: Some(by.to_owned()),
+                });
+                if let Some(version) = canonical_installed {
+                    installed_pkg.installed_version = version;
+                    installed_pkg.installed_version_canonical = true;
+                }
+            }
+        }
+
+        Ok(Vec::new())
+    }
+
+    /// Runs after both correlation paths to enrich already-correlated rows
+    /// with information that the identity path applies inline but that
+    /// name-based correlation skips:
+    ///   • The MSIX-placeholder name fix — when an MSIX entry's installed
+    ///     name is an unresolved Windows resource string (`ms-resource:...`)
+    ///     winget renders the catalog's `PackageName` instead. We do the
+    ///     same so display-name comparisons match.
+    ///   • The aMiV/aMaV version remap — `JetBrains.Rider` has no
+    ///     ProductCode/PFN/UpgradeCode so it correlates by name; without
+    ///     this pass its installed version stays as the ARP build number
+    ///     `253.28294.112` instead of the catalog Version `2025.3.0.1`.
+    fn enrich_correlated_via_index(
+        &mut self,
+        installed: &mut [InstalledPackage],
+        requested_source: Option<&str>,
+    ) -> Result<Vec<String>> {
+        // Cheap pass first — no SQL required.
+        for package in installed.iter_mut() {
+            apply_msix_resource_string_name_fix(package);
+        }
+
+        // Expensive pass — load versionData for rows whose installed_version
+        // wasn't remapped earlier.
+        let source_indices: Vec<usize> = self
+            .store
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                source.kind == SourceKind::PreIndexed
+                    && match requested_source {
+                        Some(name) => source.name.eq_ignore_ascii_case(name),
+                        None => true,
+                    }
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        for source_index in source_indices {
+            let needs: Vec<(usize, V2PackageMetadata)> = {
+                let connection = match self.open_preindexed_connection(source_index) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if !v2_identity_tables_present(&connection) {
+                    continue;
+                }
+                let mut acc = Vec::new();
+                for (idx, pkg) in installed.iter().enumerate() {
+                    if pkg.installed_version_canonical {
+                        continue;
+                    }
+                    let Some(candidate) = pkg.correlated.as_ref() else {
+                        continue;
+                    };
+                    // Stay within the source the row was correlated to —
+                    // looking up `JetBrains.Rider` in a different catalog
+                    // would either miss or pull the wrong package's range.
+                    if !candidate
+                        .source_name
+                        .eq_ignore_ascii_case(&self.store.sources[source_index].name)
+                    {
+                        continue;
+                    }
+                    let Some(meta) = lookup_v2_metadata_by_id(&connection, &candidate.id)? else {
+                        continue;
+                    };
+                    acc.push((idx, meta));
+                }
+                acc
+            };
+
+            let source = self.source_clone(source_index);
+            for (idx, meta) in needs {
+                let (canonical_installed, anchored_latest) =
+                    match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
+                        Ok((entries, _)) => (
+                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version),
+                            latest_arp_anchored_version(&entries),
+                        ),
+                        Err(_) => (None, None),
+                    };
+                let Some(canonical) = canonical_installed else {
+                    continue;
+                };
+                let pkg = &mut installed[idx];
+                pkg.installed_version = canonical;
+                pkg.installed_version_canonical = true;
+                if let (Some(correlated), Some(anchored)) = (pkg.correlated.as_mut(), anchored_latest) {
+                    correlated.version = Some(anchored);
+                }
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     pub fn search_versions(&mut self, query: &PackageQuery) -> Result<VersionsResult> {
@@ -2468,6 +2718,57 @@ fn installed_package_matches_upgrade_filter(package: &InstalledPackage, query: &
         || (query.include_unknown && installed_package_has_unknown_version(package) && package.correlated.is_some())
 }
 
+/// Collapses installed entries that correlate to the same catalog package id
+/// (case-insensitive within a source) down to a single representative — the
+/// one with the highest installed version. Uncorrelated entries pass through
+/// untouched; they can't appear in `upgrade` output anyway (the upgrade
+/// filter requires a correlation), so they're effectively a no-op here.
+fn dedupe_correlated_for_upgrade(packages: Vec<InstalledPackage>) -> Vec<InstalledPackage> {
+    use std::collections::HashMap;
+    let mut by_id: HashMap<(String, String), InstalledPackage> = HashMap::new();
+    let mut uncorrelated: Vec<InstalledPackage> = Vec::new();
+
+    for package in packages {
+        match package.correlated.as_ref() {
+            Some(candidate) => {
+                let key = (
+                    candidate.id.to_ascii_lowercase(),
+                    candidate.source_name.to_ascii_lowercase(),
+                );
+                let keep_new = match by_id.get(&key) {
+                    Some(existing) => {
+                        // Prefer rows whose `installed_version` was remapped to
+                        // a catalog Version (via aMiV/aMaV). Comparing a raw
+                        // ARP DisplayVersion like `40.10.18029` against the
+                        // catalog's `10.0.300` is meaningless and would also
+                        // hide the row that legitimately upgrades to it.
+                        match (
+                            package.installed_version_canonical,
+                            existing.installed_version_canonical,
+                        ) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            _ => {
+                                compare_version(&package.installed_version, &existing.installed_version)
+                                    == Ordering::Greater
+                            }
+                        }
+                    }
+                    None => true,
+                };
+                if keep_new {
+                    by_id.insert(key, package);
+                }
+            }
+            None => uncorrelated.push(package),
+        }
+    }
+
+    let mut result = uncorrelated;
+    result.extend(by_id.into_values());
+    result
+}
+
 fn find_applicable_pin<'a>(item: &ListMatch, pins: &'a [PinRecord]) -> Option<&'a PinRecord> {
     let mut source_specific = None;
     let mut source_agnostic = None;
@@ -2642,17 +2943,22 @@ fn correlate_installed_package(
     candidates: &[SearchMatch],
     allow_loose_name_match: bool,
 ) -> Option<SearchMatch> {
-    // Note: MSIX packages used to be hard-skipped here, but that prevented obvious
-    // correlations like `Microsoft Teams` (MSIX) → `Microsoft.Teams` (catalog).
-    // Name-based correlation now applies uniformly; MSIX entries whose installed
-    // name is an unresolved resource string (e.g. `ms-resource:appDisplayName`)
-    // simply fail to match and return None, same as before.
+    // MSIX entries can only be correlated through their PackageFamilyName.
+    // That lookup happens earlier in `correlate_installed_via_index`; if it
+    // didn't find a match, name-based fallback is wrong — the catalog
+    // doesn't carry this MSIX's identity, so any name collision (e.g. the
+    // self-updating `Microsoft Edge Stable` MSIX or the Store stub
+    // `Notepad++` MSIX) would manufacture a phantom correlation that winget
+    // doesn't make.
+    if package.local_id.starts_with("MSIX\\") {
+        return None;
+    }
 
     let installed_name = normalize_correlation_name(&package.name);
     let installed_name_lower = package.name.to_ascii_lowercase();
     let candidate_names = correlation_name_candidates(&package.name);
 
-    candidates
+    let mut scored: Vec<(i32, SearchMatch)> = candidates
         .iter()
         .filter_map(|candidate| {
             let candidate_name = normalize_correlation_name(&candidate.name);
@@ -2696,8 +3002,25 @@ fn correlate_installed_package(
 
             Some((base_score + prefix_bonus, candidate.clone()))
         })
-        .max_by_key(|(score, _)| *score)
-        .map(|(_, candidate)| candidate)
+        .collect();
+
+    scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut iter = scored.into_iter();
+    let (top_score, top_match) = iter.next()?;
+
+    // Reject ambiguous wins. When the user has e.g. `Git` (publisher "The Git
+    // Development Community") installed, both `Git.Git` and `Microsoft.Git`
+    // normalize their names to `git` and tie at the same score — the only
+    // signal that disambiguates them, publisher, isn't part of this scoring
+    // function. winget refuses the correlation in this case (the install
+    // shows up with an empty Source); we do the same to avoid manufacturing
+    // a fake upgrade against the wrong package.
+    if let Some((next_score, _)) = iter.next()
+        && next_score == top_score
+    {
+        return None;
+    }
+    Some(top_match)
 }
 
 fn correlation_name_candidates(name: &str) -> Vec<String> {
@@ -2739,6 +3062,176 @@ fn normalize_correlation_name(value: &str) -> String {
         .collect()
 }
 
+struct V2PackageMetadata {
+    rowid: i64,
+    id: String,
+    name: String,
+    moniker: Option<String>,
+    latest_version: String,
+    package_hash: String,
+}
+
+/// Looks up a v2 catalog package whose identity (PackageFamilyName, ProductCode,
+/// or UpgradeCode) matches the installed package. Returns the `packages.rowid`
+/// and the field that produced the match. This is winget's primary correlation
+/// path; falling back to display-name matching is only correct for ARP entries
+/// that lack all three identifiers.
+fn lookup_identity_match_v2(
+    connection: &Connection,
+    package: &InstalledPackage,
+) -> Result<Option<(i64, &'static str)>> {
+    for pfn in &package.package_family_names {
+        if let Some(rowid) = query_optional_value(
+            connection,
+            "SELECT package FROM pfns2 WHERE pfn = ?1 LIMIT 1",
+            vec![SqlValue::Text(pfn.to_ascii_lowercase())],
+            |row| row_i64(row, 0),
+        )? {
+            return Ok(Some((rowid, "PackageFamilyName")));
+        }
+    }
+    // UpgradeCode wins over ProductCode. The UpgradeCode is the MSI *family*
+    // identity — it stays stable across versions, while ProductCode changes
+    // every release. When a single ProductCode happens to also be listed
+    // under a sibling catalog package (e.g. `OpenJS.NodeJS.LTS` carries
+    // installer rows from earlier LTS-line ProductCodes, while the v24
+    // install actually belongs to `OpenJS.NodeJS.22` via its UpgradeCode),
+    // the upgrade-side match represents the user's "package family" — the
+    // one winget uses.
+    for code in &package.upgrade_codes {
+        if let Some(rowid) = query_optional_value(
+            connection,
+            "SELECT package FROM upgradecodes2 WHERE upgradecode = ?1 LIMIT 1",
+            vec![SqlValue::Text(code.to_ascii_lowercase())],
+            |row| row_i64(row, 0),
+        )? {
+            return Ok(Some((rowid, "UpgradeCode")));
+        }
+    }
+    for code in &package.product_codes {
+        if let Some(rowid) = query_optional_value(
+            connection,
+            "SELECT package FROM productcodes2 WHERE productcode = ?1 LIMIT 1",
+            vec![SqlValue::Text(code.to_ascii_lowercase())],
+            |row| row_i64(row, 0),
+        )? {
+            return Ok(Some((rowid, "ProductCode")));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolves a v2 package by its catalog id back to its rowid + hash so the
+/// post-correlation enrichment pass can load versionData for rows that
+/// correlated through the name-based fallback (which throws the rowid away).
+fn lookup_v2_metadata_by_id(connection: &Connection, package_id: &str) -> Result<Option<V2PackageMetadata>> {
+    query_optional_value(
+        connection,
+        "SELECT rowid, id, name, moniker, latest_version, hash FROM packages WHERE id = ?1 COLLATE NOCASE LIMIT 1",
+        vec![SqlValue::Text(package_id.to_owned())],
+        |row| {
+            Ok(V2PackageMetadata {
+                rowid: row_i64(row, 0)?,
+                id: row_string(row, 1)?,
+                name: row_string(row, 2)?,
+                moniker: row_opt_string(row, 3)?,
+                latest_version: row_string(row, 4)?,
+                package_hash: row_hex_string(row, 5)?,
+            })
+        },
+    )
+}
+
+/// MSIX entries whose Windows resource-string display name (e.g.
+/// `ms-resource:appDisplayName`) hasn't been resolved by the AppX runtime
+/// would otherwise leak that placeholder into pinget's output. winget
+/// resolves it via `Windows.Management.Deployment` and shows the catalog's
+/// `PackageName`; we mirror that by substituting the correlated catalog
+/// name once the package is correlated, which is the parity-faithful
+/// substitute we can produce without taking a WinRT dependency.
+fn apply_msix_resource_string_name_fix(package: &mut InstalledPackage) {
+    if !package.local_id.starts_with("MSIX\\") {
+        return;
+    }
+    if !package.name.starts_with("ms-resource:") {
+        return;
+    }
+    let Some(candidate) = package.correlated.as_ref() else {
+        return;
+    };
+    if !candidate.name.is_empty() {
+        package.name = candidate.name.clone();
+    }
+}
+
+fn fetch_v2_package_metadata(connection: &Connection, package_rowid: i64) -> Result<Option<V2PackageMetadata>> {
+    query_optional_value(
+        connection,
+        "SELECT id, name, moniker, latest_version, hash FROM packages WHERE rowid = ?1",
+        vec![SqlValue::Integer(package_rowid)],
+        |row| {
+            Ok(V2PackageMetadata {
+                rowid: package_rowid,
+                id: row_string(row, 0)?,
+                name: row_string(row, 1)?,
+                moniker: row_opt_string(row, 2)?,
+                latest_version: row_string(row, 3)?,
+                package_hash: row_hex_string(row, 4)?,
+            })
+        },
+    )
+}
+
+fn v2_identity_tables_present(connection: &Connection) -> bool {
+    query_optional_value(
+        connection,
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'productcodes2' LIMIT 1",
+        Vec::new(),
+        |row| row_i64(row, 0),
+    )
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Translates an ARP DisplayVersion to the catalog Version it maps to.
+/// For packages like the .NET SDK or Python the ARP version is an MSI build
+/// number (e.g. `10.1.826.23019`) unrelated to the public version
+/// (`10.0.108`). winget records the ARP range per catalog version in
+/// versionData.mszyml as `aMiV` / `aMaV`; we look for the entry whose range
+/// contains the installed version.
+fn map_arp_version_to_catalog(entries: &[PackageVersionDataEntry], arp_version: &str) -> Option<String> {
+    if arp_version.is_empty() || arp_version.eq_ignore_ascii_case("Unknown") {
+        return None;
+    }
+    for entry in entries {
+        let (Some(min), Some(max)) = (entry.arp_min_version.as_deref(), entry.arp_max_version.as_deref()) else {
+            continue;
+        };
+        if compare_version(arp_version, min) != Ordering::Less && compare_version(arp_version, max) != Ordering::Greater
+        {
+            return Some(entry.version.clone());
+        }
+    }
+    None
+}
+
+/// Returns the latest catalog Version that carries ARP-range metadata
+/// (`aMiV` / `aMaV`). Packages like `Microsoft.WindowsAppRuntime.1.8` also
+/// publish "internal" version rows whose `v` is an MSI build number
+/// (`8000.836.2153.0`) without ARP bounds. Those rows are not user-facing
+/// upgrade targets — when the installed side was matched through an ARP
+/// range, the available side must be a peer that also exposes ARP bounds so
+/// the two versions compare on the same scale. Returns `None` when no entry
+/// has bounds; the caller should fall back to `packages.latest_version`.
+fn latest_arp_anchored_version(entries: &[PackageVersionDataEntry]) -> Option<String> {
+    entries
+        .iter()
+        .filter(|e| e.arp_min_version.is_some() && e.arp_max_version.is_some())
+        .max_by(|a, b| compare_version(&a.version, &b.version))
+        .map(|entry| entry.version.clone())
+}
+
 #[cfg(windows)]
 fn collect_installed_packages(scope: Option<&str>) -> Result<Vec<InstalledPackage>> {
     let mut packages = Vec::new();
@@ -2747,10 +3240,20 @@ fn collect_installed_packages(scope: Option<&str>) -> Result<Vec<InstalledPackag
     let machine = !matches!(scope, Some(value) if value.eq_ignore_ascii_case("user"));
     let user = !matches!(scope, Some(value) if value.eq_ignore_ascii_case("machine"));
 
+    // MSI registers UpgradeCode → ProductCode mappings under
+    // `HKLM\SOFTWARE\Classes\Installer\UpgradeCodes` (per-machine) and
+    // `HKCU\Software\Microsoft\Installer\UpgradeCodes` (per-user). Most ARP
+    // entries don't expose `UpgradeCode` directly, so winget reads it from
+    // here. Without it, packages like `OpenJS.NodeJS.22` (correlated only via
+    // UpgradeCode in the v2 index) fall back to a sibling correlation (e.g.
+    // `OpenJS.NodeJS.LTS`) that manufactures a spurious upgrade.
+    let upgrade_codes = collect_msi_upgrade_codes(machine, user);
+
     if machine {
         collect_uninstall_view(
             &mut packages,
             &mut seen,
+            &upgrade_codes,
             RegKey::predef(HKEY_LOCAL_MACHINE),
             "Machine",
             "X64",
@@ -2759,6 +3262,7 @@ fn collect_installed_packages(scope: Option<&str>) -> Result<Vec<InstalledPackag
         collect_uninstall_view(
             &mut packages,
             &mut seen,
+            &upgrade_codes,
             RegKey::predef(HKEY_LOCAL_MACHINE),
             "Machine",
             "X86",
@@ -2777,6 +3281,7 @@ fn collect_installed_packages(scope: Option<&str>) -> Result<Vec<InstalledPackag
         collect_uninstall_view(
             &mut packages,
             &mut seen,
+            &upgrade_codes,
             RegKey::predef(HKEY_CURRENT_USER),
             "User",
             "X64",
@@ -2794,6 +3299,92 @@ fn collect_installed_packages(scope: Option<&str>) -> Result<Vec<InstalledPackag
     Ok(packages)
 }
 
+/// Builds a `ProductCode → UpgradeCode` map (both in standard
+/// `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` lowercase format) by walking the
+/// MSI Installer registry. Subkeys under `Installer\UpgradeCodes` are named
+/// by the flipped UpgradeCode GUID, and each subkey's *value names* are the
+/// flipped ProductCodes registered under that UpgradeCode.
+#[cfg(windows)]
+fn collect_msi_upgrade_codes(include_machine: bool, include_user: bool) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    if include_machine {
+        collect_msi_upgrade_codes_from(
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+            r"SOFTWARE\Classes\Installer\UpgradeCodes",
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut map,
+        );
+    }
+    if include_user {
+        collect_msi_upgrade_codes_from(
+            RegKey::predef(HKEY_CURRENT_USER),
+            r"Software\Microsoft\Installer\UpgradeCodes",
+            KEY_READ,
+            &mut map,
+        );
+    }
+    map
+}
+
+#[cfg(windows)]
+fn collect_msi_upgrade_codes_from(
+    root: RegKey,
+    path: &str,
+    flags: u32,
+    map: &mut std::collections::HashMap<String, String>,
+) {
+    let Ok(upgrade_codes) = root.open_subkey_with_flags(path, flags) else {
+        return;
+    };
+    for key_name in upgrade_codes.enum_keys().flatten() {
+        let Some(upgrade_code) = unflip_packed_guid(&key_name) else {
+            continue;
+        };
+        let Ok(subkey) = upgrade_codes.open_subkey_with_flags(&key_name, flags) else {
+            continue;
+        };
+        for (value_name, _) in subkey.enum_values().flatten() {
+            if let Some(product_code) = unflip_packed_guid(&value_name) {
+                // ARP-side keys are likely to win the latest insert; first one
+                // is fine — we just need *any* mapping. Use `entry` so the
+                // first writer per ProductCode wins to stay deterministic.
+                map.entry(product_code).or_insert_with(|| upgrade_code.clone());
+            }
+        }
+    }
+}
+
+/// Converts the 32-character "packed GUID" used inside the MSI Installer
+/// registry hive back to the standard `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`
+/// lowercase form. The packing reverses each of the 11 chunks (sized 8/4/4
+/// then eight 2-char byte pairs) of the GUID's hex representation.
+fn unflip_packed_guid(packed: &str) -> Option<String> {
+    if packed.len() != 32 || !packed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    const CHUNKS: [usize; 11] = [8, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2];
+    let bytes = packed.as_bytes();
+    let mut reversed = String::with_capacity(32);
+    let mut offset = 0;
+    for size in CHUNKS {
+        let chunk = &bytes[offset..offset + size];
+        for &c in chunk.iter().rev() {
+            reversed.push(c as char);
+        }
+        offset += size;
+    }
+    let r = reversed.to_ascii_lowercase();
+    Some(format!(
+        "{{{}-{}-{}-{}-{}}}",
+        &r[0..8],
+        &r[8..12],
+        &r[12..16],
+        &r[16..20],
+        &r[20..32]
+    ))
+}
+
 #[cfg(not(windows))]
 fn collect_installed_packages(_scope: Option<&str>) -> Result<Vec<InstalledPackage>> {
     Ok(Vec::new())
@@ -2803,6 +3394,7 @@ fn collect_installed_packages(_scope: Option<&str>) -> Result<Vec<InstalledPacka
 fn collect_uninstall_view(
     packages: &mut Vec<InstalledPackage>,
     seen: &mut BTreeSet<String>,
+    upgrade_code_map: &std::collections::HashMap<String, String>,
     root: RegKey,
     scope: &str,
     arch: &str,
@@ -2840,7 +3432,18 @@ fn collect_uninstall_view(
         if product_codes.is_empty() && looks_like_product_code(&key_name) {
             product_codes.push(key_name.to_ascii_lowercase());
         }
-        let upgrade_codes = read_reg_string(&subkey, "UpgradeCode").into_iter().collect::<Vec<_>>();
+        let mut upgrade_codes = read_reg_string(&subkey, "UpgradeCode").into_iter().collect::<Vec<_>>();
+        if upgrade_codes.is_empty() {
+            // ARP rarely exposes UpgradeCode directly. Recover it from the MSI
+            // Installer registry hive so identity correlation can fall back to
+            // upgradecodes2 when productcodes2 picks the wrong sibling.
+            for code in &product_codes {
+                if let Some(uc) = upgrade_code_map.get(&code.to_ascii_lowercase()) {
+                    upgrade_codes.push(uc.clone());
+                    break;
+                }
+            }
+        }
         let installer_category =
             if local_id.starts_with("ARP\\") && read_reg_dword(&subkey, "WindowsInstaller") == Some(1) {
                 Some("msi".to_owned())
@@ -2873,6 +3476,7 @@ fn collect_uninstall_view(
             product_codes,
             upgrade_codes,
             correlated: None,
+            installed_version_canonical: false,
         });
     }
 
@@ -2936,6 +3540,7 @@ fn collect_appmodel_packages(
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         });
     }
 
@@ -8160,6 +8765,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -8200,6 +8806,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
         let query = ListQuery {
             tag: Some("powertoys".to_owned()),
@@ -8239,6 +8846,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
         let candidates = vec![
             SearchMatch {
@@ -8285,6 +8893,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
         let candidates = vec![
             SearchMatch {
@@ -8324,10 +8933,14 @@ Installers:
     }
 
     #[test]
-    fn msix_packages_correlate_by_name() {
-        // Previously hard-skipped via `package.local_id.starts_with("MSIX\\")` →
-        // None, which prevented obvious MSIX updates (Microsoft.Teams etc.) from
-        // ever surfacing. Name-based correlation now runs uniformly.
+    fn msix_packages_do_not_correlate_via_name() {
+        // MSIX correlation must go through the v2 index's `pfns2` table — name
+        // fallback is wrong because two MSIX packages can legitimately share a
+        // display name without sharing identity (`Microsoft Edge Stable` MSIX
+        // vs the catalog `Microsoft.Edge` MSI, `Notepad++` Store stub MSIX vs
+        // the catalog Inno installer). Even when the names match exactly the
+        // catalog `Microsoft.Teams` doesn't represent the same MSIX without a
+        // PFN hit; that lookup happens in `correlate_installed_via_index`.
         let installed = InstalledPackage {
             name: "Microsoft Teams".to_owned(),
             local_id: r"MSIX\MSTeams_25290.205.4069.4894_arm64__8wekyb3d8bbwe".to_owned(),
@@ -8340,6 +8953,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -8352,8 +8966,56 @@ Installers:
             match_criteria: None,
         }];
 
-        let correlated = correlate_installed_package(&installed, &candidates, true).expect("correlated");
-        assert_eq!(correlated.id, "Microsoft.Teams");
+        assert!(correlate_installed_package(&installed, &candidates, true).is_none());
+    }
+
+    #[test]
+    fn name_fallback_refuses_ambiguous_winners() {
+        // The user has Git installed (publisher "The Git Development Community"
+        // — but publisher isn't in the scoring function). Two catalog packages
+        // both expose name "Git": `Git.Git` and `Microsoft.Git`. Without
+        // publisher disambiguation they score identically; winget refuses to
+        // correlate (the install lists with empty Source). pinget must do the
+        // same to avoid manufacturing an upgrade against the wrong catalog
+        // package.
+        let installed = InstalledPackage {
+            name: "Git".to_owned(),
+            local_id: r"ARP\Machine\X64\Git_is1".to_owned(),
+            installed_version: "2.53.0".to_owned(),
+            publisher: Some("The Git Development Community".to_owned()),
+            scope: Some("Machine".to_owned()),
+            installer_category: Some("exe".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            installed_version_canonical: false,
+        };
+        let candidates = vec![
+            SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Git.Git".to_owned(),
+                name: "Git".to_owned(),
+                moniker: None,
+                version: Some("2.54.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+            SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Microsoft.Git".to_owned(),
+                name: "Git".to_owned(),
+                moniker: None,
+                version: Some("2.53.0.0.7".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+        ];
+
+        assert!(correlate_installed_package(&installed, &candidates, true).is_none());
     }
 
     #[test]
@@ -8373,6 +9035,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -8402,6 +9065,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -8440,6 +9104,7 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            installed_version_canonical: false,
         };
 
         assert!(installed_package_has_upgrade(&package));
@@ -8468,6 +9133,7 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            installed_version_canonical: false,
         };
         let query = ListQuery {
             upgrade_only: true,
@@ -8889,6 +9555,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
         let sparse = InstalledPackage {
             name: "PowerToys.SparseApp".to_owned(),
@@ -8902,6 +9569,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
         let extension = InstalledPackage {
             name: "PowerToys FileLocksmith Context Menu".to_owned(),
@@ -8915,6 +9583,7 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            installed_version_canonical: false,
         };
 
         assert!(list_sort_weight(&main) < list_sort_weight(&sparse));
@@ -9039,5 +9708,339 @@ Installers:
             ]),
             build_winget_uninstall_arguments_with_scope(&installed, &request, false)
         );
+    }
+
+    fn version_entry(version: &str, arp_min: Option<&str>, arp_max: Option<&str>) -> PackageVersionDataEntry {
+        PackageVersionDataEntry {
+            version: version.to_owned(),
+            manifest_relative_path: format!("manifests/x/{version}"),
+            manifest_hash: "00".repeat(32),
+            arp_min_version: arp_min.map(str::to_owned),
+            arp_max_version: arp_max.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn map_arp_version_returns_catalog_version_inside_range() {
+        // Real winget data: .NET SDK 10.0.108 declares its ARP DisplayVersion is
+        // `10.1.826.23019`. compare_version on that against the catalog Version
+        // `10.0.108` claims installed > available, so without this mapping the
+        // upgrade was silently dropped.
+        let entries = vec![
+            version_entry("10.0.300", Some("10.3.26.23102"), Some("10.3.26.23102")),
+            version_entry("10.0.108", Some("10.1.826.23019"), Some("10.1.826.23019")),
+            version_entry("10.0.107", Some("10.1.726.21808"), Some("10.1.726.21808")),
+        ];
+
+        assert_eq!(
+            map_arp_version_to_catalog(&entries, "10.1.826.23019").as_deref(),
+            Some("10.0.108")
+        );
+    }
+
+    #[test]
+    fn map_arp_version_returns_none_when_no_range_matches() {
+        // VS-installed .NET SDK reports ARP DisplayVersion `40.10.18029` which
+        // doesn't sit inside any aMiV..aMaV bucket. Caller must keep the
+        // original installed version (and accept that no upgrade can be
+        // computed) — same as winget's behavior.
+        let entries = vec![
+            version_entry("10.0.300", Some("10.3.26.23102"), Some("10.3.26.23102")),
+            version_entry("10.0.108", Some("10.1.826.23019"), Some("10.1.826.23019")),
+        ];
+
+        assert!(map_arp_version_to_catalog(&entries, "40.10.18029").is_none());
+    }
+
+    #[test]
+    fn map_arp_version_skips_entries_missing_arp_bounds() {
+        // Older catalog packages predate AppsAndFeaturesEntries and have no
+        // aMiV/aMaV. Those entries must be ignored — not silently treated as
+        // an unbounded range.
+        let entries = vec![
+            version_entry("9.0.300", None, None),
+            version_entry("9.0.117", Some("9.1.1726.23010"), Some("9.1.1726.23010")),
+        ];
+
+        assert_eq!(
+            map_arp_version_to_catalog(&entries, "9.1.1726.23010").as_deref(),
+            Some("9.0.117")
+        );
+        assert!(map_arp_version_to_catalog(&entries, "1.0.0").is_none());
+    }
+
+    #[test]
+    fn map_arp_version_handles_inclusive_range_endpoints() {
+        // aMiV/aMaV are inclusive bounds — a version equal to either endpoint
+        // must still map.
+        let entries = vec![version_entry("3.14.5", Some("3.14.5.0"), Some("3.14.5.999"))];
+
+        assert_eq!(
+            map_arp_version_to_catalog(&entries, "3.14.5.0").as_deref(),
+            Some("3.14.5")
+        );
+        assert_eq!(
+            map_arp_version_to_catalog(&entries, "3.14.5.999").as_deref(),
+            Some("3.14.5")
+        );
+        assert_eq!(
+            map_arp_version_to_catalog(&entries, "3.14.5.500").as_deref(),
+            Some("3.14.5")
+        );
+    }
+
+    #[test]
+    fn map_arp_version_ignores_unknown_marker() {
+        // collect_installed_packages writes the literal "Unknown" when ARP has
+        // no DisplayVersion. Trying to map that would falsely match the first
+        // entry whose aMiV..aMaV string-compares to include "Unknown".
+        let entries = vec![version_entry("1.0.0", Some("1.0.0"), Some("1.0.0"))];
+
+        assert!(map_arp_version_to_catalog(&entries, "Unknown").is_none());
+        assert!(map_arp_version_to_catalog(&entries, "").is_none());
+    }
+
+    #[test]
+    fn latest_arp_anchored_skips_internal_versions() {
+        // Microsoft.WindowsAppRuntime.1.8 publishes both an internal build
+        // version (`8000.836.2153.0`, no ARP bounds) and user-facing versions
+        // (`1.8.6`, `1.8.5`, …). The internal row shouldn't win — comparing
+        // it against an installed canonical of `1.8.6` would falsely report
+        // an upgrade. Returns the highest anchored Version instead.
+        let entries = vec![
+            version_entry("8000.836.2153.0", None, None),
+            version_entry("1.8.6", Some("8000.806.2252.0"), Some("8000.806.2252.0")),
+            version_entry("1.8.5", Some("8000.770.947.0"), Some("8000.770.947.0")),
+            version_entry("1.8.0", Some("8000.616.304.0"), Some("8000.616.304.0")),
+        ];
+
+        assert_eq!(latest_arp_anchored_version(&entries).as_deref(), Some("1.8.6"));
+    }
+
+    #[test]
+    fn latest_arp_anchored_returns_none_without_bounds() {
+        // App Installer's versionData has no aMiV/aMaV — every version is a
+        // user-facing MSIX Version. Caller must fall back to
+        // `packages.latest_version` in this case.
+        let entries = vec![
+            version_entry("1.28.240.0", None, None),
+            version_entry("1.27.470.0", None, None),
+        ];
+
+        assert!(latest_arp_anchored_version(&entries).is_none());
+    }
+
+    #[test]
+    fn version_data_parses_arp_bounds_from_winget_payload() {
+        // Sanity check that aMiV/aMaV deserialize from a real-world
+        // versionData.mszyml payload shape. Without `default`, packages
+        // predating AppsAndFeaturesEntries would fail to parse.
+        let payload = "sV: 1.0\nvD:\n- v: 10.0.300\n  aMiV: 10.3.26.23102\n  aMaV: 10.3.26.23102\n  rP: manifests/m/Microsoft/DotNet/SDK/10/10.0.300/4f87\n  s256H: 0e633f7fa41d0322ff185d25783951f2ed343f27965b165066d9f75d5689a48b\n- v: 9.0.0\n  rP: manifests/m/Microsoft/DotNet/SDK/10/9.0.0/0000\n  s256H: 0e633f7fa41d0322ff185d25783951f2ed343f27965b165066d9f75d5689a48b\n";
+
+        let document = serde_yaml::from_str::<PackageVersionDataDocument>(payload).expect("parse versionData.mszyml");
+        assert_eq!(document.versions.len(), 2);
+        assert_eq!(document.versions[0].arp_min_version.as_deref(), Some("10.3.26.23102"));
+        assert_eq!(document.versions[0].arp_max_version.as_deref(), Some("10.3.26.23102"));
+        assert!(document.versions[1].arp_min_version.is_none());
+        assert!(document.versions[1].arp_max_version.is_none());
+    }
+
+    #[test]
+    fn msix_resource_string_name_resolves_to_catalog_name() {
+        // App Installer's MSIX manifest stores DisplayName as
+        // `ms-resource:appDisplayName`. Once we correlate it via PFN, we
+        // know the catalog calls it `App Installer` — show that instead of
+        // the unresolved placeholder, matching winget's output.
+        let mut package = InstalledPackage {
+            name: "ms-resource:appDisplayName".to_owned(),
+            local_id: r"MSIX\Microsoft.DesktopAppInstaller_1.28.239.0_arm64__8wekyb3d8bbwe".to_owned(),
+            installed_version: "1.28.239.0".to_owned(),
+            publisher: None,
+            scope: Some("User".to_owned()),
+            installer_category: Some("msix".to_owned()),
+            install_location: None,
+            package_family_names: vec!["Microsoft.DesktopAppInstaller_8wekyb3d8bbwe".to_owned()],
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: Some(SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Microsoft.AppInstaller".to_owned(),
+                name: "App Installer".to_owned(),
+                moniker: None,
+                version: Some("1.28.240.0".to_owned()),
+                channel: None,
+                match_criteria: Some("PackageFamilyName".to_owned()),
+            }),
+            installed_version_canonical: false,
+        };
+        apply_msix_resource_string_name_fix(&mut package);
+        assert_eq!(package.name, "App Installer");
+    }
+
+    #[test]
+    fn msix_resource_string_fix_is_a_noop_when_not_msix() {
+        // ARP rows can also carry unusual display names; the fix is gated
+        // on the local_id prefix so a `ms-resource:` literal that somehow
+        // appears in an ARP DisplayName (extremely unlikely, but possible)
+        // doesn't get silently rewritten.
+        let mut package = InstalledPackage {
+            name: "ms-resource:appDisplayName".to_owned(),
+            local_id: r"ARP\Machine\X64\{deadbeef}".to_owned(),
+            installed_version: "1.0".to_owned(),
+            publisher: None,
+            scope: Some("Machine".to_owned()),
+            installer_category: Some("msi".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: Some(SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Some.Package".to_owned(),
+                name: "Should Not Apply".to_owned(),
+                moniker: None,
+                version: Some("1.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            }),
+            installed_version_canonical: false,
+        };
+        apply_msix_resource_string_name_fix(&mut package);
+        assert_eq!(package.name, "ms-resource:appDisplayName");
+    }
+
+    #[test]
+    fn msix_resource_string_fix_skips_resolved_names() {
+        // The vast majority of MSIX entries have already-resolved names
+        // (`Microsoft Teams`, `Notepad++`, etc.). The fix must not touch
+        // those — `meta.name` and the installed name may legitimately
+        // differ (`Microsoft Teams` vs `Microsoft Teams (work or school)`).
+        let mut package = InstalledPackage {
+            name: "Microsoft Teams".to_owned(),
+            local_id: r"MSIX\MSTeams_25290.205.4069.4894_arm64__8wekyb3d8bbwe".to_owned(),
+            installed_version: "25290.205.4069.4894".to_owned(),
+            publisher: None,
+            scope: Some("User".to_owned()),
+            installer_category: Some("msix".to_owned()),
+            install_location: None,
+            package_family_names: vec!["MSTeams_8wekyb3d8bbwe".to_owned()],
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: Some(SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Microsoft.Teams".to_owned(),
+                name: "Microsoft Teams Catalog Name".to_owned(),
+                moniker: None,
+                version: Some("26106.1906.4665.7308".to_owned()),
+                channel: None,
+                match_criteria: Some("PackageFamilyName".to_owned()),
+            }),
+            installed_version_canonical: false,
+        };
+        apply_msix_resource_string_name_fix(&mut package);
+        assert_eq!(package.name, "Microsoft Teams");
+    }
+
+    #[test]
+    fn unflip_packed_guid_reverses_msi_installer_packing() {
+        // The MSI Installer hive packs GUIDs by char-reversing each of the 11
+        // chunks (8/4/4/2*8). This is the encoding used inside
+        // `HKLM\SOFTWARE\Classes\Installer\UpgradeCodes\<key>` subkey names
+        // and their value names. Verified against the user's installed
+        // Node.js ProductCode `{9292CBD9-...}` whose packed form (from the
+        // live registry) is `9DBC2929593B4D2488740C8E00C4F652`.
+        assert_eq!(
+            unflip_packed_guid("9DBC2929593B4D2488740C8E00C4F652").as_deref(),
+            Some("{9292cbd9-b395-42d4-8847-c0e8004c6f25}")
+        );
+        // And the reverse case — Node.js UpgradeCode `{47c07a3a-...}` packed
+        // form `A3A70C74FE2431248AD5F8A59570C782`.
+        assert_eq!(
+            unflip_packed_guid("A3A70C74FE2431248AD5F8A59570C782").as_deref(),
+            Some("{47c07a3a-42ef-4213-a85d-8f5a59077c28}")
+        );
+        // Reject non-32-char or non-hex inputs.
+        assert!(unflip_packed_guid("nothex").is_none());
+        assert!(unflip_packed_guid("9DBC2929593B4D2488740C8E00C4F65").is_none()); // 31 chars
+        assert!(unflip_packed_guid("ZZZZZZZZ593B4D2488740C8E00C4F652").is_none());
+    }
+
+    fn installed_with_correlated(id: &str, installed_version: &str, canonical: bool) -> InstalledPackage {
+        InstalledPackage {
+            name: format!("{id} install"),
+            local_id: format!(r"ARP\Machine\X64\{id}"),
+            installed_version: installed_version.to_owned(),
+            publisher: None,
+            scope: Some("Machine".to_owned()),
+            installer_category: Some("msi".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: Some(SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: id.to_owned(),
+                name: id.to_owned(),
+                moniker: None,
+                version: Some("99.0.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            }),
+            installed_version_canonical: canonical,
+        }
+    }
+
+    #[test]
+    fn dedupe_keeps_canonical_row_over_raw_arp_row() {
+        // Two installed entries correlate to the same catalog id. One had its
+        // ARP version remapped to a catalog Version via aMiV/aMaV (canonical);
+        // the other did not (e.g. VS-installed .NET SDK whose ARP
+        // `40.10.18029` doesn't fit any bucket). Without the canonical
+        // preference, `compare_version` says `40.x.x.x > 10.0.108` so the
+        // wrong row wins and the upgrade silently disappears.
+        let raw = installed_with_correlated("Microsoft.DotNet.SDK.10", "40.10.18029", false);
+        let canonical = installed_with_correlated("Microsoft.DotNet.SDK.10", "10.0.108", true);
+
+        let result = dedupe_correlated_for_upgrade(vec![raw, canonical]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].installed_version, "10.0.108");
+        assert!(result[0].installed_version_canonical);
+    }
+
+    #[test]
+    fn dedupe_keeps_highest_among_canonical_rows() {
+        let lower = installed_with_correlated("Microsoft.WindowsAppRuntime.1.7", "1.7.7", true);
+        let higher = installed_with_correlated("Microsoft.WindowsAppRuntime.1.7", "1.7.9", true);
+
+        let result = dedupe_correlated_for_upgrade(vec![lower, higher]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].installed_version, "1.7.9");
+    }
+
+    #[test]
+    fn dedupe_leaves_uncorrelated_rows_alone() {
+        // Uncorrelated entries don't reach upgrade output anyway (the
+        // upgrade filter requires correlation), but the dedupe pass must not
+        // drop them — `pinget list` could share this code path in the future.
+        let uncorrelated = InstalledPackage {
+            name: "Foo".to_owned(),
+            local_id: r"ARP\Machine\X64\Foo".to_owned(),
+            installed_version: "1.0".to_owned(),
+            publisher: None,
+            scope: Some("Machine".to_owned()),
+            installer_category: Some("exe".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            installed_version_canonical: false,
+        };
+        let result = dedupe_correlated_for_upgrade(vec![uncorrelated]);
+        assert_eq!(result.len(), 1);
     }
 }

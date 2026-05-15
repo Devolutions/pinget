@@ -595,6 +595,15 @@ internal static class PreIndexedSource
         public string ManifestRelativePath { get; set; } = "";
         [YamlDotNet.Serialization.YamlMember(Alias = "s256H")]
         public string ManifestHash { get; set; } = "";
+        // ARP version range covered by this catalog version. WinGet writes
+        // these into versionData.mszyml so an installed ARP DisplayVersion
+        // (which may be an MSI build number unrelated to the catalog
+        // Version) can be mapped back to the catalog Version it
+        // corresponds to.
+        [YamlDotNet.Serialization.YamlMember(Alias = "aMiV")]
+        public string? ArpMinVersion { get; set; }
+        [YamlDotNet.Serialization.YamlMember(Alias = "aMaV")]
+        public string? ArpMaxVersion { get; set; }
     }
 
     internal class V2VersionDataDocument

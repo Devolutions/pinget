@@ -495,9 +495,16 @@ public record InstallResult
 // Internal type for installed package tracking
 internal record InstalledPackage
 {
-    public required string Name { get; init; }
+    // Mutable so the post-correlation enrichment pass can resolve MSIX
+    // `ms-resource:` placeholder names to the catalog's display name —
+    // matching winget's behavior of pulling these through
+    // Windows.Management.Deployment.
+    public required string Name { get; set; }
     public required string LocalId { get; init; }
-    public required string InstalledVersion { get; init; }
+    // Mutable so identity correlation can rewrite ARP DisplayVersion to the
+    // catalog Version it maps to via versionData.mszyml's aMiV/aMaV ranges.
+    // Keeps comparisons against catalog versions on a common scale.
+    public required string InstalledVersion { get; set; }
     public string? Publisher { get; init; }
     public string? Scope { get; init; }
     public string? InstallerCategory { get; init; }
@@ -506,6 +513,11 @@ internal record InstalledPackage
     public List<string> ProductCodes { get; init; } = [];
     public List<string> UpgradeCodes { get; init; } = [];
     public SearchMatch? Correlated { get; set; }
+    // True when `InstalledVersion` was remapped to a catalog Version. Used by
+    // dedupe so canonical-versioned rows beat raw-ARP rows for the same id
+    // (e.g. `Microsoft.DotNet.SDK.10` 10.0.108 wins over a VS-installed
+    // 40.10.18029 that doesn't fit any aMiV bucket).
+    public bool InstalledVersionCanonical { get; set; }
 }
 
 internal enum SearchSemantics
