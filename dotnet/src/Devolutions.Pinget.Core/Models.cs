@@ -202,6 +202,7 @@ public record Installer
     public InstallerSwitches Switches { get; init; } = new();
     public List<string> Commands { get; init; } = [];
     public List<string> PackageDependencies { get; init; } = [];
+    public bool RequireExplicitUpgrade { get; init; }
 }
 
 public record InstallerSwitches
@@ -265,6 +266,11 @@ public record Manifest
     public List<string> PackageDependencies { get; init; } = [];
     public List<Documentation> Documentation { get; init; } = [];
     public List<Installer> Installers { get; init; } = [];
+    // `RequireExplicitUpgrade: true` opts a package out of bulk
+    // `pinget upgrade` output (winget parity). Users can still upgrade by
+    // explicit id. Set at top-level or per-installer; treated as true
+    // when any installer asserts it.
+    public bool RequireExplicitUpgrade { get; init; }
 }
 
 public record InstallRequest
@@ -495,9 +501,16 @@ public record InstallResult
 // Internal type for installed package tracking
 internal record InstalledPackage
 {
-    public required string Name { get; init; }
+    // Mutable so the post-correlation enrichment pass can resolve MSIX
+    // `ms-resource:` placeholder names to the catalog's display name —
+    // matching winget's behavior of pulling these through
+    // Windows.Management.Deployment.
+    public required string Name { get; set; }
     public required string LocalId { get; init; }
-    public required string InstalledVersion { get; init; }
+    // Mutable so identity correlation can rewrite ARP DisplayVersion to the
+    // catalog Version it maps to via versionData.mszyml's aMiV/aMaV ranges.
+    // Keeps comparisons against catalog versions on a common scale.
+    public required string InstalledVersion { get; set; }
     public string? Publisher { get; init; }
     public string? Scope { get; init; }
     public string? InstallerCategory { get; init; }
@@ -506,6 +519,15 @@ internal record InstalledPackage
     public List<string> ProductCodes { get; init; } = [];
     public List<string> UpgradeCodes { get; init; } = [];
     public SearchMatch? Correlated { get; set; }
+    // True when `InstalledVersion` was remapped to a catalog Version. Used by
+    // dedupe so canonical-versioned rows beat raw-ARP rows for the same id
+    // (e.g. `Microsoft.DotNet.SDK.10` 10.0.108 wins over a VS-installed
+    // 40.10.18029 that doesn't fit any aMiV bucket).
+    public bool InstalledVersionCanonical { get; set; }
+    // True when the correlated catalog package's latest version sets
+    // RequireExplicitUpgrade: true. winget hides those rows from bulk
+    // `upgrade`; we mirror that. Users can still upgrade by explicit id.
+    public bool CorrelatedRequiresExplicitUpgrade { get; set; }
 }
 
 internal enum SearchSemantics

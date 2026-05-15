@@ -498,6 +498,25 @@ public class Repository : IDisposable
         if (!OperatingSystem.IsWindows())
             warnings.Add(InstalledStateUnsupportedWarning);
 
+        if (needsAvailable)
+        {
+            // Authoritative correlation via the v2 index's identity tables
+            // (PackageFamilyName / ProductCode / UpgradeCode). This is
+            // winget's primary path and resolves cases where display-name
+            // matching is ambiguous (Microsoft.Teams vs Microsoft.Teams.Free)
+            // or impossible (MSIX with `ms-resource:` placeholder names).
+            warnings.AddRange(CorrelateInstalledViaIndex(installed, query.Source));
+
+            // ARP entries without identity keys (no PFN/PC/UC) still match
+            // winget's ARP correlation when their (DisplayName, Publisher),
+            // run through NameNormalization, lands on a single package in
+            // norm_names2 ∩ norm_publishers2. Covers Inno Setup-style
+            // installers, MSIs without ProductCode in ARP, and vendors
+            // that publish a DisplayName different from the catalog's
+            // PackageName but matching an AppsAndFeaturesEntries name.
+            warnings.AddRange(CorrelateInstalledByNormalizedIdentity(installed, query.Source));
+        }
+
         if (needsAvailable && hasFilter)
         {
             var availableQuery = PackageQueryFromListQuery(query);
@@ -505,12 +524,39 @@ public class Repository : IDisposable
             warnings.AddRange(srcWarnings);
             var candidates = matches.Select(m => m.Display).ToList();
             foreach (var pkg in installed)
+            {
+                if (pkg.Correlated is not null) continue;
                 pkg.Correlated = CorrelateInstalledPackage(pkg, candidates, AllowLooseListCorrelation(query));
+            }
         }
         else if (needsAvailable)
         {
             warnings.AddRange(CorrelateAllInstalled(installed));
         }
+
+        if (needsAvailable)
+        {
+            // Enrich rows that correlated via the name-based fallback. Those
+            // rows skipped the v2-index aMiV/aMaV pass that runs inside
+            // CorrelateInstalledViaIndex, so they still carry the raw ARP
+            // DisplayVersion (e.g. `JetBrains Rider 2025.3.0.1` showing
+            // build `253.28294.112` instead of the marketing `2025.3.0.1`).
+            // Also resolves MSIX placeholder names like
+            // `ms-resource:appDisplayName` to the catalog's display name —
+            // winget pulls these through Windows.Management.Deployment; the
+            // catalog name is the parity-faithful substitute pinget has
+            // available without taking a WinRT dependency.
+            warnings.AddRange(EnrichCorrelatedViaIndex(installed, query.Source));
+        }
+
+        // For `upgrade`, collapse multiple installed entries that map to the
+        // same catalog package id (side-by-side .NET SDKs, several runtime
+        // versions of WindowsAppRuntime, the MSIX shim alongside an ARP
+        // install of Edge, etc.). Keep the entry with the highest
+        // installed_version so the upgrade comparison runs against the
+        // user's newest install — matches winget's one-row-per-id output.
+        if (query.UpgradeOnly)
+            installed = DedupeCorrelatedForUpgrade(installed);
 
         var filtered = installed
             .Where(p => ListPackageMatches(p, query) &&
@@ -1536,6 +1582,7 @@ public class Repository : IDisposable
                         Switches = switches,
                         Commands = InstArr("Commands"),
                         PackageDependencies = InstArr("PackageDependencies"),
+                        RequireExplicitUpgrade = ReadBool(instDict, "RequireExplicitUpgrade"),
                     });
                 }
             }
@@ -1554,6 +1601,9 @@ public class Repository : IDisposable
                 }
             }
         }
+
+        var topLevelRequireExplicit = ReadBool(dict, "RequireExplicitUpgrade");
+        var anyInstallerRequireExplicit = installers.Any(i => i.RequireExplicitUpgrade);
 
         return new Manifest
         {
@@ -1580,6 +1630,29 @@ public class Repository : IDisposable
             Documentation = docs,
             Installers = installers,
             PackageDependencies = dependencies,
+            RequireExplicitUpgrade = topLevelRequireExplicit || anyInstallerRequireExplicit,
+        };
+    }
+
+    private static bool ReadBool(IDictionary<string, object?> dict, string key)
+    {
+        if (!dict.TryGetValue(key, out var raw) || raw is null) return false;
+        return raw switch
+        {
+            bool b => b,
+            string s => s.Equals("true", StringComparison.OrdinalIgnoreCase),
+            _ => false,
+        };
+    }
+
+    private static bool ReadBool(IDictionary<object, object> dict, string key)
+    {
+        if (!dict.TryGetValue(key, out var raw) || raw is null) return false;
+        return raw switch
+        {
+            bool b => b,
+            string s => s.Equals("true", StringComparison.OrdinalIgnoreCase),
+            _ => false,
         };
     }
 
@@ -1770,28 +1843,37 @@ public class Repository : IDisposable
 
     private List<string> CorrelateAllInstalled(List<InstalledPackage> installed)
     {
+        // Skip work entirely when every entry was resolved by identity.
+        if (installed.All(p => p.Correlated is not null))
+            return [];
         var allQuery = new PackageQuery { Count = 100_000 };
         var (matches, warnings, _, _) = SearchLocated(allQuery, SearchSemantics.Many);
         var candidates = matches.Select(m => m.Display).ToList();
         foreach (var pkg in installed)
+        {
+            if (pkg.Correlated is not null) continue;
             pkg.Correlated = CorrelateInstalledPackage(pkg, candidates, true);
+        }
         return warnings;
     }
 
     internal static SearchMatch? CorrelateInstalledPackage(InstalledPackage pkg, List<SearchMatch> candidates, bool loose)
     {
-        // Note: MSIX packages used to be hard-skipped here, but that prevented obvious
-        // correlations like `Microsoft Teams` (MSIX) → `Microsoft.Teams` (catalog).
-        // Name-based correlation now applies uniformly; MSIX entries whose installed
-        // name is an unresolved resource string (e.g. `ms-resource:appDisplayName`)
-        // simply fail to match and return null, same as before.
+        // MSIX entries can only be correlated through their PackageFamilyName.
+        // That lookup happens earlier in CorrelateInstalledViaIndex; if it
+        // didn't find a match, name-based fallback is wrong — the catalog
+        // doesn't carry this MSIX's identity, so any name collision (e.g. the
+        // self-updating `Microsoft Edge Stable` MSIX or the Store stub
+        // `Notepad++` MSIX) would manufacture a phantom correlation that
+        // winget doesn't make.
+        if (pkg.LocalId.StartsWith(@"MSIX\", StringComparison.OrdinalIgnoreCase))
+            return null;
 
         var installedName = NormalizeCorrelationName(pkg.Name);
         var installedNameLower = pkg.Name.ToLowerInvariant();
         var candidateNames = CorrelationNameCandidates(pkg.Name);
 
-        SearchMatch? best = null;
-        int bestScore = 0;
+        var scored = new List<(int Score, SearchMatch Match)>();
         foreach (var candidate in candidates)
         {
             var candidateNorm = NormalizeCorrelationName(candidate.Name);
@@ -1828,10 +1910,545 @@ public class Repository : IDisposable
             else
                 prefixBonus = 0;
 
-            var score = baseScore + prefixBonus;
-            if (score > bestScore) { bestScore = score; best = candidate; }
+            scored.Add((baseScore + prefixBonus, candidate));
         }
-        return best;
+
+        if (scored.Count == 0) return null;
+
+        scored.Sort((a, b) => b.Score.CompareTo(a.Score));
+        var (topScore, topMatch) = scored[0];
+        // Reject ambiguous wins. When the user has e.g. `Git` (publisher
+        // "The Git Development Community") installed, both `Git.Git` and
+        // `Microsoft.Git` normalize their names to `git` and tie at the same
+        // score — the only signal that disambiguates them, publisher, isn't
+        // part of this scoring function. winget refuses the correlation in
+        // this case (the install lists with empty Source); we do the same to
+        // avoid manufacturing a fake upgrade against the wrong package.
+        if (scored.Count > 1 && scored[1].Score == topScore)
+            return null;
+        return topMatch;
+    }
+
+    // ── Identity correlation against the v2 index ─────────────────────────
+
+    /// <summary>
+    /// Looks up a v2 catalog package whose identity (PackageFamilyName,
+    /// ProductCode, or UpgradeCode) matches the installed package. Returns
+    /// the packages.rowid and the field that produced the match. UpgradeCode
+    /// is tried *before* ProductCode because it's the MSI family identity —
+    /// stable across versions — while ProductCode changes every release. For
+    /// installs whose ProductCode happens to also be carried under a sibling
+    /// catalog package (e.g. `OpenJS.NodeJS.LTS` retains old LTS-line
+    /// ProductCodes while the live install actually belongs to
+    /// `OpenJS.NodeJS.22` via its UpgradeCode), the upgrade-side match
+    /// represents the user's package family — the one winget uses.
+    /// </summary>
+    private static (long Rowid, string MatchedBy)? LookupIdentityMatchV2(
+        Microsoft.Data.Sqlite.SqliteConnection conn, InstalledPackage pkg)
+    {
+        foreach (var pfn in pkg.PackageFamilyNames)
+        {
+            var rowid = QueryOptionalLong(conn,
+                "SELECT package FROM pfns2 WHERE pfn = @v LIMIT 1",
+                pfn.ToLowerInvariant());
+            if (rowid is long r) return (r, "PackageFamilyName");
+        }
+        foreach (var code in pkg.UpgradeCodes)
+        {
+            var rowid = QueryOptionalLong(conn,
+                "SELECT package FROM upgradecodes2 WHERE upgradecode = @v LIMIT 1",
+                code.ToLowerInvariant());
+            if (rowid is long r) return (r, "UpgradeCode");
+        }
+        foreach (var code in pkg.ProductCodes)
+        {
+            var rowid = QueryOptionalLong(conn,
+                "SELECT package FROM productcodes2 WHERE productcode = @v LIMIT 1",
+                code.ToLowerInvariant());
+            if (rowid is long r) return (r, "ProductCode");
+        }
+        return null;
+    }
+
+    private static long? QueryOptionalLong(Microsoft.Data.Sqlite.SqliteConnection conn, string sql, string value)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.Parameters.AddWithValue("@v", value);
+        var result = cmd.ExecuteScalar();
+        if (result is null || result is DBNull) return null;
+        return Convert.ToInt64(result);
+    }
+
+    private static bool V2IdentityTablesPresent(Microsoft.Data.Sqlite.SqliteConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'productcodes2' LIMIT 1";
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private record V2PackageMetadata(long Rowid, string Id, string Name, string? Moniker, string LatestVersion, string PackageHash);
+
+    private static V2PackageMetadata? FetchV2PackageMetadata(Microsoft.Data.Sqlite.SqliteConnection conn, long packageRowid)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, name, moniker, latest_version, hash FROM packages WHERE rowid = @rowid LIMIT 1";
+        cmd.Parameters.AddWithValue("@rowid", packageRowid);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        var hashValue = reader.GetValue(4);
+        var hash = hashValue is byte[] blob
+            ? Convert.ToHexString(blob).ToLowerInvariant()
+            : (hashValue?.ToString() ?? string.Empty).ToLowerInvariant();
+        return new V2PackageMetadata(
+            packageRowid,
+            reader.GetString(0),
+            reader.GetString(1),
+            reader.IsDBNull(2) ? null : reader.GetString(2),
+            reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+            hash);
+    }
+
+    /// <summary>
+    /// Translates an ARP DisplayVersion to the catalog Version it maps to.
+    /// For packages like the .NET SDK or Python the ARP version is an MSI
+    /// build number (e.g. `10.1.826.23019`) unrelated to the public version
+    /// (`10.0.108`). winget records the ARP range per catalog version in
+    /// versionData.mszyml as `aMiV` / `aMaV`; we look for the entry whose
+    /// range contains the installed version.
+    /// </summary>
+    internal static string? MapArpVersionToCatalog(IReadOnlyList<PreIndexedSource.V2VersionDataEntry> entries, string arpVersion)
+    {
+        if (string.IsNullOrEmpty(arpVersion) || arpVersion.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
+            return null;
+        foreach (var entry in entries)
+        {
+            if (entry.ArpMinVersion is null || entry.ArpMaxVersion is null) continue;
+            if (RestSource.CompareVersionStrings(arpVersion, entry.ArpMinVersion) >= 0 &&
+                RestSource.CompareVersionStrings(arpVersion, entry.ArpMaxVersion) <= 0)
+            {
+                return entry.Version;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Returns the latest catalog Version that carries ARP-range metadata.
+    /// Packages like `Microsoft.WindowsAppRuntime.1.8` also publish "internal"
+    /// version rows whose `v` is an MSI build number (`8000.836.2153.0`)
+    /// without ARP bounds — those aren't user-facing upgrade targets. When
+    /// the installed side was matched through an ARP range, the available
+    /// side must be a peer that also exposes ARP bounds so the two versions
+    /// compare on the same scale. Returns null when no entry has bounds.
+    /// </summary>
+    internal static string? LatestArpAnchoredVersion(IReadOnlyList<PreIndexedSource.V2VersionDataEntry> entries)
+    {
+        PreIndexedSource.V2VersionDataEntry? best = null;
+        foreach (var entry in entries)
+        {
+            if (entry.ArpMinVersion is null || entry.ArpMaxVersion is null) continue;
+            if (best is null || RestSource.CompareVersionStrings(entry.Version, best.Version) > 0)
+                best = entry;
+        }
+        return best?.Version;
+    }
+
+    /// <summary>
+    /// Correlates installed packages against the v2 pre-indexed catalog
+    /// using PackageFamilyName / ProductCode / UpgradeCode lookups — winget's
+    /// authoritative correlation path. Also rewrites `InstalledVersion` to
+    /// the catalog Version whose ARP range covers the ARP DisplayVersion, so
+    /// packages whose ARP version is an MSI build number compare against a
+    /// meaningful catalog version. Packages without any identifier or whose
+    /// identifiers don't match a catalog entry are left untouched for the
+    /// name-based fallback.
+    /// </summary>
+    private List<string> CorrelateInstalledViaIndex(List<InstalledPackage> installed, string? requestedSource)
+    {
+        var warnings = new List<string>();
+        for (int sourceIndex = 0; sourceIndex < _store.Sources.Count; sourceIndex++)
+        {
+            var source = _store.Sources[sourceIndex];
+            if (source.Kind != SourceKind.PreIndexed) continue;
+            if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            Microsoft.Data.Sqlite.SqliteConnection conn;
+            try { conn = OpenPreindexedConnection(sourceIndex); }
+            catch { continue; }
+
+            var resolved = new List<(int InstalledIndex, V2PackageMetadata Meta, string MatchedBy)>();
+            using (conn)
+            {
+                if (!V2IdentityTablesPresent(conn)) continue;
+                for (int i = 0; i < installed.Count; i++)
+                {
+                    if (installed[i].Correlated is not null) continue;
+                    var hit = LookupIdentityMatchV2(conn, installed[i]);
+                    if (hit is null) continue;
+                    var meta = FetchV2PackageMetadata(conn, hit.Value.Rowid);
+                    if (meta is null) continue;
+                    resolved.Add((i, meta, hit.Value.MatchedBy));
+                }
+            }
+
+            foreach (var (idx, meta, matchedBy) in resolved)
+            {
+                string? canonicalInstalled = null;
+                string? anchoredLatest = null;
+                try
+                {
+                    using var conn2 = OpenPreindexedConnection(sourceIndex);
+                    var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
+                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    anchoredLatest = LatestArpAnchoredVersion(entries);
+                }
+                catch { /* version data fetch is best-effort; fall back below */ }
+
+                // When the installed side was rebased to a catalog Version
+                // via aMiV/aMaV, the available side must compare on the same
+                // scale: prefer the latest ARP-anchored Version over
+                // `latest_version`, which can be an internal/MSI build
+                // number that would manufacture a phantom upgrade against
+                // an installed canonical.
+                var availableVersion = (canonicalInstalled is not null && anchoredLatest is not null)
+                    ? anchoredLatest
+                    : meta.LatestVersion;
+
+                installed[idx].Correlated = new SearchMatch
+                {
+                    SourceName = source.Name,
+                    SourceKind = source.Kind,
+                    Id = meta.Id,
+                    Name = meta.Name,
+                    Moniker = meta.Moniker,
+                    Version = availableVersion,
+                    MatchCriteria = matchedBy,
+                };
+                if (canonicalInstalled is not null)
+                {
+                    installed[idx].InstalledVersion = canonicalInstalled;
+                    installed[idx].InstalledVersionCanonical = true;
+                }
+            }
+        }
+        return warnings;
+    }
+
+    /// <summary>
+    /// Mid-tier correlation that mirrors winget's ARP normalization path.
+    /// For each installed package without a PFN/PC/UC identity match, the
+    /// (DisplayName, Publisher) is run through NameNormalization and
+    /// intersected against the v2 index's norm_names2 and norm_publishers2
+    /// tables. A single resulting package_rowid produces a correlation;
+    /// ambiguous matches are skipped, matching winget's empty-Source
+    /// behavior when normalization can't pick a winner.
+    /// </summary>
+    private List<string> CorrelateInstalledByNormalizedIdentity(List<InstalledPackage> installed, string? requestedSource)
+    {
+        var warnings = new List<string>();
+        for (int sourceIndex = 0; sourceIndex < _store.Sources.Count; sourceIndex++)
+        {
+            var source = _store.Sources[sourceIndex];
+            if (source.Kind != SourceKind.PreIndexed) continue;
+            if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            Microsoft.Data.Sqlite.SqliteConnection conn;
+            try { conn = OpenPreindexedConnection(sourceIndex); }
+            catch { continue; }
+
+            var resolved = new List<(int Index, V2PackageMetadata Meta)>();
+            using (conn)
+            {
+                if (!V2NormalizedIdentityTablesPresent(conn)) continue;
+                for (int i = 0; i < installed.Count; i++)
+                {
+                    var pkg = installed[i];
+                    if (pkg.Correlated is not null) continue;
+                    // MSIX entries belong to the PFN-only path; matches
+                    // `CorrelateInstalledPackage`'s MSIX hard-block.
+                    if (pkg.LocalId.StartsWith(@"MSIX\", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.IsNullOrWhiteSpace(pkg.Publisher)) continue;
+
+                    var normName = NameNormalization.NormalizeName(pkg.Name).Name;
+                    if (string.IsNullOrEmpty(normName)) continue;
+                    var normPub = NameNormalization.NormalizePublisher(pkg.Publisher);
+                    if (string.IsNullOrEmpty(normPub)) continue;
+
+                    var rowid = LookupUniqueNormalizedIdentity(conn, normName, normPub);
+                    if (rowid is null) continue;
+                    var meta = FetchV2PackageMetadata(conn, rowid.Value);
+                    if (meta is null) continue;
+                    resolved.Add((i, meta));
+                }
+            }
+
+            foreach (var (idx, meta) in resolved)
+            {
+                string? canonicalInstalled = null;
+                string? anchoredLatest = null;
+                try
+                {
+                    using var conn2 = OpenPreindexedConnection(sourceIndex);
+                    var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
+                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    anchoredLatest = LatestArpAnchoredVersion(entries);
+                }
+                catch { /* best-effort */ }
+
+                var availableVersion = (canonicalInstalled is not null && anchoredLatest is not null)
+                    ? anchoredLatest
+                    : meta.LatestVersion;
+
+                installed[idx].Correlated = new SearchMatch
+                {
+                    SourceName = source.Name,
+                    SourceKind = source.Kind,
+                    Id = meta.Id,
+                    Name = meta.Name,
+                    Moniker = meta.Moniker,
+                    Version = availableVersion,
+                    MatchCriteria = "NormalizedNameAndPublisher",
+                };
+                if (canonicalInstalled is not null)
+                {
+                    installed[idx].InstalledVersion = canonicalInstalled;
+                    installed[idx].InstalledVersionCanonical = true;
+                }
+            }
+        }
+        return warnings;
+    }
+
+    private static bool V2NormalizedIdentityTablesPresent(Microsoft.Data.Sqlite.SqliteConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'norm_names2' LIMIT 1";
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    /// <summary>
+    /// Returns the catalog packages.rowid whose (norm_name, norm_publisher)
+    /// pair matches the installed package — if and only if the match is
+    /// unique. Multiple matches mean normalization couldn't disambiguate
+    /// (an ARP DisplayName that normalizes the same as two distinct catalog
+    /// packages); winget refuses to correlate and we do the same.
+    /// </summary>
+    // Test-only entry points. Keep these internal so the assembly's
+    // InternalsVisibleTo grant exposes them just to Core.Tests.
+    internal static long? LookupUniqueNormalizedIdentityForTesting(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
+        => LookupUniqueNormalizedIdentity(conn, normName, normPublisher);
+
+    internal static bool InstalledPackageMatchesUpgradeFilterForTesting(InstalledPackage pkg, ListQuery query)
+        => InstalledPackageMatchesUpgradeFilter(pkg, query);
+
+    private static long? LookupUniqueNormalizedIdentity(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            SELECT DISTINCT n.package FROM norm_names2 n
+            WHERE n.norm_name = @name
+            AND EXISTS (SELECT 1 FROM norm_publishers2 p WHERE p.package = n.package AND p.norm_publisher = @pub)
+            LIMIT 2";
+        cmd.Parameters.AddWithValue("@name", normName);
+        cmd.Parameters.AddWithValue("@pub", normPublisher);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        var first = reader.GetInt64(0);
+        if (reader.Read()) return null; // ambiguous
+        return first;
+    }
+
+    /// <summary>
+    /// Resolves a v2 package by its catalog id back to its rowid + hash so
+    /// the post-correlation enrichment pass can load versionData for rows
+    /// that correlated through the name-based fallback (which throws the
+    /// rowid away).
+    /// </summary>
+    private static V2PackageMetadata? LookupV2MetadataById(Microsoft.Data.Sqlite.SqliteConnection conn, string packageId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT rowid, id, name, moniker, latest_version, hash FROM packages WHERE id = @id COLLATE NOCASE LIMIT 1";
+        cmd.Parameters.AddWithValue("@id", packageId);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        var hashValue = reader.GetValue(5);
+        var hash = hashValue is byte[] blob
+            ? Convert.ToHexString(blob).ToLowerInvariant()
+            : (hashValue?.ToString() ?? string.Empty).ToLowerInvariant();
+        return new V2PackageMetadata(
+            reader.GetInt64(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            reader.IsDBNull(3) ? null : reader.GetString(3),
+            reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+            hash);
+    }
+
+    /// <summary>
+    /// MSIX entries whose Windows resource-string display name (e.g.
+    /// <c>ms-resource:appDisplayName</c>) hasn't been resolved by the AppX
+    /// runtime would otherwise leak that placeholder into pinget's output.
+    /// winget resolves it via Windows.Management.Deployment and shows the
+    /// catalog's PackageName; we mirror that by substituting the correlated
+    /// catalog name once the package is correlated, which is the
+    /// parity-faithful substitute we can produce without taking a WinRT
+    /// dependency.
+    /// </summary>
+    internal static void ApplyMsixResourceStringNameFix(InstalledPackage package)
+    {
+        if (!package.LocalId.StartsWith(@"MSIX\", StringComparison.OrdinalIgnoreCase)) return;
+        if (!package.Name.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase)) return;
+        var candidate = package.Correlated;
+        if (candidate is null) return;
+        if (!string.IsNullOrEmpty(candidate.Name)) package.Name = candidate.Name;
+    }
+
+    /// <summary>
+    /// Runs after both correlation paths to enrich already-correlated rows
+    /// with information that the identity path applies inline but that
+    /// name-based correlation skips: the MSIX-placeholder name fix and the
+    /// aMiV/aMaV version remap. Without this, packages without a
+    /// ProductCode/PFN/UpgradeCode (e.g. JetBrains.Rider) keep showing the
+    /// raw ARP DisplayVersion (`253.28294.112`) instead of the catalog
+    /// Version (`2025.3.0.1`).
+    /// </summary>
+    private List<string> EnrichCorrelatedViaIndex(List<InstalledPackage> installed, string? requestedSource)
+    {
+        // Cheap pass first — no SQL required.
+        foreach (var pkg in installed)
+            ApplyMsixResourceStringNameFix(pkg);
+
+        // Expensive pass — load versionData for rows whose installed_version
+        // wasn't remapped earlier.
+        var warnings = new List<string>();
+        for (int sourceIndex = 0; sourceIndex < _store.Sources.Count; sourceIndex++)
+        {
+            var source = _store.Sources[sourceIndex];
+            if (source.Kind != SourceKind.PreIndexed) continue;
+            if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            Microsoft.Data.Sqlite.SqliteConnection conn;
+            try { conn = OpenPreindexedConnection(sourceIndex); }
+            catch { continue; }
+
+            var needs = new List<(int Index, V2PackageMetadata Meta)>();
+            using (conn)
+            {
+                if (!V2IdentityTablesPresent(conn)) continue;
+                for (int i = 0; i < installed.Count; i++)
+                {
+                    var pkg = installed[i];
+                    if (pkg.Correlated is null) continue;
+                    // Stay within the source the row was correlated to —
+                    // looking up `JetBrains.Rider` in a different catalog
+                    // would either miss or pull the wrong package's range.
+                    if (!pkg.Correlated.SourceName.Equals(source.Name, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    var meta = LookupV2MetadataById(conn, pkg.Correlated.Id);
+                    if (meta is null) continue;
+                    needs.Add((i, meta));
+                }
+            }
+
+            foreach (var (idx, meta) in needs)
+            {
+                // Load versionData once: needed for both the aMiV/aMaV
+                // remap (if installed_version isn't canonical yet) and to
+                // locate the latest manifest for RequireExplicitUpgrade.
+                List<PreIndexedSource.V2VersionDataEntry>? entries = null;
+                try
+                {
+                    using var conn2 = OpenPreindexedConnection(sourceIndex);
+                    var (loaded, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
+                    entries = loaded;
+                }
+                catch { /* best-effort */ }
+
+                if (entries is null) continue;
+
+                if (!installed[idx].InstalledVersionCanonical)
+                {
+                    var canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    var anchoredLatest = LatestArpAnchoredVersion(entries);
+                    if (canonicalInstalled is not null)
+                    {
+                        installed[idx].InstalledVersion = canonicalInstalled;
+                        installed[idx].InstalledVersionCanonical = true;
+                        if (installed[idx].Correlated is SearchMatch correlated && anchoredLatest is not null)
+                            installed[idx].Correlated = correlated with { Version = anchoredLatest };
+                    }
+                }
+
+                // RequireExplicitUpgrade is on the latest version's
+                // installer manifest. winget hides those from bulk
+                // `upgrade` (Edge, Steam, Discord). Peek at the first
+                // versionData entry (latest by sort order) and read its
+                // manifest to mirror that filtering.
+                var latest = entries.Count > 0 ? entries[0] : null;
+                if (latest is not null)
+                {
+                    try
+                    {
+                        var bytes = PreIndexedSource.GetCachedSourceFile(
+                            _client, "V2_M", source, latest.ManifestRelativePath, latest.ManifestHash);
+                        var manifest = ParseYamlManifest(bytes);
+                        installed[idx].CorrelatedRequiresExplicitUpgrade = manifest.RequireExplicitUpgrade;
+                    }
+                    catch { /* best-effort */ }
+                }
+            }
+        }
+        return warnings;
+    }
+
+    /// <summary>
+    /// Collapses installed entries that correlate to the same catalog package
+    /// id (case-insensitive within a source) down to a single representative
+    /// — the one with the highest installed version, preferring rows whose
+    /// version was successfully remapped via aMiV/aMaV. Uncorrelated entries
+    /// pass through untouched (they can't appear in upgrade output anyway).
+    /// </summary>
+    internal static List<InstalledPackage> DedupeCorrelatedForUpgrade(List<InstalledPackage> packages)
+    {
+        var byId = new Dictionary<(string Id, string Source), InstalledPackage>();
+        var uncorrelated = new List<InstalledPackage>();
+        foreach (var pkg in packages)
+        {
+            if (pkg.Correlated is null)
+            {
+                uncorrelated.Add(pkg);
+                continue;
+            }
+            var key = (
+                pkg.Correlated.Id.ToLowerInvariant(),
+                pkg.Correlated.SourceName.ToLowerInvariant()
+            );
+            if (!byId.TryGetValue(key, out var existing))
+            {
+                byId[key] = pkg;
+                continue;
+            }
+            // Prefer rows whose ARP version was mapped to a catalog Version.
+            // Comparing a raw ARP DisplayVersion like `40.10.18029` against
+            // the catalog's `10.0.300` is meaningless and would also hide
+            // the row that legitimately upgrades to it.
+            bool keepNew;
+            if (pkg.InstalledVersionCanonical && !existing.InstalledVersionCanonical)
+                keepNew = true;
+            else if (!pkg.InstalledVersionCanonical && existing.InstalledVersionCanonical)
+                keepNew = false;
+            else
+                keepNew = RestSource.CompareVersionStrings(pkg.InstalledVersion, existing.InstalledVersion) > 0;
+            if (keepNew) byId[key] = pkg;
+        }
+
+        var result = new List<InstalledPackage>(uncorrelated);
+        result.AddRange(byId.Values);
+        return result;
     }
 
     private static List<string> CorrelationNameCandidates(string name)
@@ -1903,9 +2520,18 @@ public class Repository : IDisposable
         return true;
     }
 
-    private static bool InstalledPackageMatchesUpgradeFilter(InstalledPackage pkg, ListQuery query) =>
-        InstalledPackageHasUpgrade(pkg) ||
-        (query.IncludeUnknown && InstalledPackageHasUnknownVersion(pkg) && pkg.Correlated is not null);
+    private static bool InstalledPackageMatchesUpgradeFilter(InstalledPackage pkg, ListQuery query)
+    {
+        // Hide RequireExplicitUpgrade packages from bulk `upgrade` output to
+        // match winget (Edge, Steam, Discord, several MSIX packages). When
+        // the user explicitly filtered by id/name/etc., they're targeting
+        // a specific package and want to see it regardless — same allowance
+        // winget makes.
+        if (pkg.CorrelatedRequiresExplicitUpgrade && !ListQueryNeedsAvailableLookup(query))
+            return false;
+        return InstalledPackageHasUpgrade(pkg)
+            || (query.IncludeUnknown && InstalledPackageHasUnknownVersion(pkg) && pkg.Correlated is not null);
+    }
 
     internal static PinRecord? FindApplicablePin(ListMatch match, IReadOnlyList<PinRecord> pins)
     {

@@ -1360,11 +1360,14 @@ public class RepositoryParityTests
     }
 
     [Fact]
-    public void CorrelateInstalledPackage_MsixCorrelatesByName()
+    public void CorrelateInstalledPackage_MsixPackagesDoNotCorrelateViaName()
     {
-        // Previously hard-skipped via `LocalId.StartsWith("MSIX\\")` → null, which
-        // prevented obvious MSIX updates (Microsoft.Teams etc.) from ever surfacing.
-        // Name-based correlation now runs uniformly.
+        // MSIX correlation must go through the v2 index's `pfns2` table —
+        // name fallback is wrong because two MSIX packages can legitimately
+        // share a display name without sharing identity (Microsoft Edge
+        // Stable MSIX vs the catalog Microsoft.Edge MSI; Notepad++ Store
+        // stub MSIX vs the catalog Inno installer). The PFN lookup happens
+        // earlier in CorrelateInstalledViaIndex.
         var installed = new InstalledPackage
         {
             Name = "Microsoft Teams",
@@ -1388,9 +1391,539 @@ public class RepositoryParityTests
             },
         };
 
-        var correlated = Repository.CorrelateInstalledPackage(installed, candidates, loose: true);
-        Assert.NotNull(correlated);
-        Assert.Equal("Microsoft.Teams", correlated!.Id);
+        Assert.Null(Repository.CorrelateInstalledPackage(installed, candidates, loose: true));
+    }
+
+    [Fact]
+    public void CorrelateInstalledPackage_RefusesAmbiguousWinners()
+    {
+        // Two catalog packages both expose name "Git" (Git.Git and
+        // Microsoft.Git). Without publisher disambiguation they score
+        // identically; winget refuses to correlate (the install lists with
+        // empty Source). pinget must do the same to avoid manufacturing an
+        // upgrade against the wrong catalog package.
+        var installed = new InstalledPackage
+        {
+            Name = "Git",
+            LocalId = @"ARP\Machine\X64\Git_is1",
+            InstalledVersion = "2.53.0",
+            Publisher = "The Git Development Community",
+            Scope = "Machine",
+            InstallerCategory = "exe",
+            PackageFamilyNames = [],
+            ProductCodes = [],
+            UpgradeCodes = [],
+        };
+        var candidates = new List<SearchMatch>
+        {
+            new() { SourceName = "winget", SourceKind = SourceKind.PreIndexed, Id = "Git.Git", Name = "Git", Version = "2.54.0" },
+            new() { SourceName = "winget", SourceKind = SourceKind.PreIndexed, Id = "Microsoft.Git", Name = "Git", Version = "2.53.0.0.7" },
+        };
+
+        Assert.Null(Repository.CorrelateInstalledPackage(installed, candidates, loose: true));
+    }
+
+    [Fact]
+    public void MapArpVersionToCatalog_ReturnsCatalogVersionInsideRange()
+    {
+        // .NET SDK 10.0.108 declares its ARP DisplayVersion is
+        // `10.1.826.23019`. Without this mapping the upgrade was silently
+        // dropped because compare_version says `10.1.x > 10.0.108`.
+        var entries = new List<PreIndexedSource.V2VersionDataEntry>
+        {
+            new() { Version = "10.0.300", ArpMinVersion = "10.3.26.23102", ArpMaxVersion = "10.3.26.23102" },
+            new() { Version = "10.0.108", ArpMinVersion = "10.1.826.23019", ArpMaxVersion = "10.1.826.23019" },
+            new() { Version = "10.0.107", ArpMinVersion = "10.1.726.21808", ArpMaxVersion = "10.1.726.21808" },
+        };
+
+        Assert.Equal("10.0.108", Repository.MapArpVersionToCatalog(entries, "10.1.826.23019"));
+    }
+
+    [Fact]
+    public void MapArpVersionToCatalog_ReturnsNullWhenNoRangeMatches()
+    {
+        var entries = new List<PreIndexedSource.V2VersionDataEntry>
+        {
+            new() { Version = "10.0.300", ArpMinVersion = "10.3.26.23102", ArpMaxVersion = "10.3.26.23102" },
+        };
+        Assert.Null(Repository.MapArpVersionToCatalog(entries, "40.10.18029"));
+        Assert.Null(Repository.MapArpVersionToCatalog(entries, "Unknown"));
+        Assert.Null(Repository.MapArpVersionToCatalog(entries, ""));
+    }
+
+    [Fact]
+    public void LatestArpAnchoredVersion_SkipsInternalRows()
+    {
+        // Microsoft.WindowsAppRuntime.1.8 publishes both an internal build
+        // version (`8000.836.2153.0`, no ARP bounds) and user-facing
+        // versions (`1.8.6`, `1.8.5`, …). The internal row shouldn't win.
+        var entries = new List<PreIndexedSource.V2VersionDataEntry>
+        {
+            new() { Version = "8000.836.2153.0" },
+            new() { Version = "1.8.6", ArpMinVersion = "8000.806.2252.0", ArpMaxVersion = "8000.806.2252.0" },
+            new() { Version = "1.8.5", ArpMinVersion = "8000.770.947.0",  ArpMaxVersion = "8000.770.947.0" },
+        };
+        Assert.Equal("1.8.6", Repository.LatestArpAnchoredVersion(entries));
+    }
+
+    [Fact]
+    public void LatestArpAnchoredVersion_ReturnsNullWhenNoBounds()
+    {
+        var entries = new List<PreIndexedSource.V2VersionDataEntry>
+        {
+            new() { Version = "1.28.240.0" },
+            new() { Version = "1.27.470.0" },
+        };
+        Assert.Null(Repository.LatestArpAnchoredVersion(entries));
+    }
+
+    [Fact]
+    public void NormalizePublisher_Microsoft_Corporation_Strips_To_Microsoft()
+    {
+        // Fixture observed in the live catalog's norm_publishers2.
+        Assert.Equal("microsoft", NameNormalization.NormalizePublisher("Microsoft Corporation"));
+    }
+
+    [Fact]
+    public void NormalizePublisher_JetBrains_Sro_Strips_To_JetBrains()
+    {
+        Assert.Equal("jetbrains", NameNormalization.NormalizePublisher("JetBrains s.r.o."));
+    }
+
+    [Fact]
+    public void NormalizePublisher_Without_LegalSuffix_Keeps_All_Tokens()
+    {
+        // "The Git Development Community" has no recognized legal-entity
+        // suffix, so all tokens stay — matches the live catalog row.
+        Assert.Equal(
+            "thegitdevelopmentcommunity",
+            NameNormalization.NormalizePublisher("The Git Development Community"));
+    }
+
+    [Fact]
+    public void NormalizePublisher_Strips_Common_Suffixes()
+    {
+        Assert.Equal("foo", NameNormalization.NormalizePublisher("Foo Inc"));
+        Assert.Equal("foobar", NameNormalization.NormalizePublisher("Foo Bar LLC"));
+        Assert.Equal("foo", NameNormalization.NormalizePublisher("Foo GmbH"));
+    }
+
+    [Fact]
+    public void NormalizeName_Strips_VersionDelimited_Token()
+    {
+        // `2025.3.0.1` matches VersionDelimited. Bare `2026` doesn't.
+        Assert.Equal("jetbrainsrider", NameNormalization.NormalizeName("JetBrains Rider 2025.3.0.1").Name);
+        Assert.Equal(
+            "visualstudioprofessional2026",
+            NameNormalization.NormalizeName("Visual Studio Professional 2026").Name);
+    }
+
+    [Fact]
+    public void NormalizeName_Strips_Architecture_Suffix()
+    {
+        var r = NameNormalization.NormalizeName("PowerToys (Preview) x64");
+        Assert.Equal("powertoys", r.Name);
+        Assert.Equal(NameNormalization.Architecture.X64, r.Architecture);
+    }
+
+    [Fact]
+    public void NormalizeName_Strips_Known_Locale()
+    {
+        var r = NameNormalization.NormalizeName("Foo en-US Edition");
+        Assert.Equal("en-us", r.Locale);
+    }
+
+    [Fact]
+    public void NormalizeName_Keeps_Unknown_Locale_Shaped_Tokens()
+    {
+        var r = NameNormalization.NormalizeName("Foo XY-AB");
+        Assert.Equal(string.Empty, r.Locale);
+    }
+
+    [Fact]
+    public void NormalizeName_Strips_Parens_Content()
+    {
+        Assert.Equal("foo", NameNormalization.NormalizeName("Foo (beta)").Name);
+    }
+
+    [Fact]
+    public void NormalizeName_Microsoft_Edge_Matches_Catalog()
+    {
+        Assert.Equal("microsoftedge", NameNormalization.NormalizeName("Microsoft Edge").Name);
+    }
+
+    [Fact]
+    public void NormalizeName_Keeps_Year_Only_Suffix()
+    {
+        Assert.Equal("foo2026", NameNormalization.NormalizeName("Foo 2026").Name);
+    }
+
+    [Fact]
+    public void Manifest_Parses_RequireExplicitUpgrade_AtTopLevel()
+    {
+        // Top-level RequireExplicitUpgrade flag propagates to
+        // Manifest.RequireExplicitUpgrade. winget catalogs put the flag
+        // here for browser packages and self-updating apps that opt out
+        // of bulk `upgrade`.
+        var yaml = @"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: explicit-upgrade fixture
+RequireExplicitUpgrade: true
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.exe
+    InstallerSha256: ABC123
+";
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+        Assert.True(manifest.RequireExplicitUpgrade);
+    }
+
+    [Fact]
+    public void Manifest_Parses_RequireExplicitUpgrade_OnInstaller()
+    {
+        // Per-installer flag — only one of several installers declares
+        // it, but the Manifest aggregate is still true because the user
+        // could pick that installer when upgrading.
+        var yaml = @"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: explicit-upgrade fixture
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.x64.exe
+    InstallerSha256: ABC123
+  - Architecture: arm64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.arm64.exe
+    InstallerSha256: DEF456
+    RequireExplicitUpgrade: true
+";
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+        Assert.True(manifest.RequireExplicitUpgrade);
+        Assert.False(manifest.Installers[0].RequireExplicitUpgrade);
+        Assert.True(manifest.Installers[1].RequireExplicitUpgrade);
+    }
+
+    [Fact]
+    public void Manifest_WithoutRequireExplicitUpgrade_DefaultsToFalse()
+    {
+        var yaml = @"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: baseline fixture
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.exe
+    InstallerSha256: ABC123
+";
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+        Assert.False(manifest.RequireExplicitUpgrade);
+    }
+
+    [Fact]
+    public void LookupUniqueNormalizedIdentity_ReturnsUniqueMatch()
+    {
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE norm_names2 (norm_name TEXT, package INT64);
+                CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);
+                INSERT INTO norm_names2 VALUES ('microsoftedge', 100);
+                INSERT INTO norm_publishers2 VALUES ('microsoft', 100);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "microsoftedge", "microsoft");
+        Assert.Equal(100L, rowid);
+    }
+
+    [Fact]
+    public void LookupUniqueNormalizedIdentity_RejectsAmbiguousMatch()
+    {
+        // Two distinct packages share the same (norm_name, norm_publisher)
+        // — winget refuses to correlate when it can't disambiguate.
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE norm_names2 (norm_name TEXT, package INT64);
+                CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);
+                INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);
+                INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('thegitdevelopmentcommunity', 200);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "git", "thegitdevelopmentcommunity");
+        Assert.Null(rowid);
+    }
+
+    [Fact]
+    public void LookupUniqueNormalizedIdentity_RequiresPublisherIntersect()
+    {
+        // norm_name has multiple matches; only one shares the publisher
+        // with the installed package. Intersect picks the right one.
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE norm_names2 (norm_name TEXT, package INT64);
+                CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);
+                INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);
+                INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('microsoft', 200);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "git", "thegitdevelopmentcommunity");
+        Assert.Equal(100L, rowid);
+    }
+
+    [Fact]
+    public void LookupUniqueNormalizedIdentity_MissesWhenPublisherDoesNotMatch()
+    {
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE norm_names2 (norm_name TEXT, package INT64);
+                CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);
+                INSERT INTO norm_names2 VALUES ('foo', 100);
+                INSERT INTO norm_publishers2 VALUES ('bar', 200);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "foo", "bar");
+        Assert.Null(rowid);
+    }
+
+    [Fact]
+    public void UpgradeFilter_HidesRequireExplicitUpgrade_ByDefault()
+    {
+        // winget hides RequireExplicitUpgrade rows from bulk `upgrade`
+        // (Edge, Steam, Discord). pinget must do the same.
+        var pkg = new InstalledPackage
+        {
+            Name = "Edge",
+            LocalId = @"ARP\Machine\X64\Edge",
+            InstalledVersion = "100.0",
+            Scope = "Machine",
+            InstallerCategory = "exe",
+            Correlated = new SearchMatch
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "Microsoft.Edge",
+                Name = "Microsoft Edge",
+                Version = "110.0",
+            },
+            CorrelatedRequiresExplicitUpgrade = true,
+        };
+
+        var bulkQuery = new ListQuery { UpgradeOnly = true };
+        Assert.False(
+            Repository.InstalledPackageMatchesUpgradeFilterForTesting(pkg, bulkQuery),
+            "RequireExplicitUpgrade row must be hidden from bulk upgrade");
+
+        // When the user explicitly targets it by id, winget shows it.
+        var filteredQuery = new ListQuery { UpgradeOnly = true, Id = "Microsoft.Edge" };
+        Assert.True(
+            Repository.InstalledPackageMatchesUpgradeFilterForTesting(pkg, filteredQuery),
+            "RequireExplicitUpgrade row must surface when the user filters for it");
+
+        // Without the flag, the row appears in bulk upgrade.
+        pkg.CorrelatedRequiresExplicitUpgrade = false;
+        Assert.True(Repository.InstalledPackageMatchesUpgradeFilterForTesting(pkg, bulkQuery));
+    }
+
+    [Fact]
+    public void ApplyMsixResourceStringNameFix_ResolvesPlaceholderToCatalogName()
+    {
+        // App Installer's MSIX manifest stores DisplayName as
+        // `ms-resource:appDisplayName`. Once we correlate it via PFN, we
+        // know the catalog calls it "App Installer" — show that instead of
+        // the unresolved placeholder, matching winget's output.
+        var package = new InstalledPackage
+        {
+            Name = "ms-resource:appDisplayName",
+            LocalId = @"MSIX\Microsoft.DesktopAppInstaller_1.28.239.0_arm64__8wekyb3d8bbwe",
+            InstalledVersion = "1.28.239.0",
+            Scope = "User",
+            InstallerCategory = "msix",
+            PackageFamilyNames = ["Microsoft.DesktopAppInstaller_8wekyb3d8bbwe"],
+            Correlated = new SearchMatch
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "Microsoft.AppInstaller",
+                Name = "App Installer",
+                Version = "1.28.240.0",
+                MatchCriteria = "PackageFamilyName",
+            },
+        };
+        Repository.ApplyMsixResourceStringNameFix(package);
+        Assert.Equal("App Installer", package.Name);
+    }
+
+    [Fact]
+    public void ApplyMsixResourceStringNameFix_NoopForNonMsix()
+    {
+        // The fix is gated on LocalId starting with "MSIX\\" so an unusual
+        // ARP DisplayName that happens to contain "ms-resource:" doesn't
+        // get silently rewritten.
+        var package = new InstalledPackage
+        {
+            Name = "ms-resource:appDisplayName",
+            LocalId = @"ARP\Machine\X64\{deadbeef}",
+            InstalledVersion = "1.0",
+            Scope = "Machine",
+            InstallerCategory = "msi",
+            Correlated = new SearchMatch
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "Some.Package",
+                Name = "Should Not Apply",
+                Version = "1.0",
+            },
+        };
+        Repository.ApplyMsixResourceStringNameFix(package);
+        Assert.Equal("ms-resource:appDisplayName", package.Name);
+    }
+
+    [Fact]
+    public void ApplyMsixResourceStringNameFix_SkipsResolvedNames()
+    {
+        // MSIX entries with already-resolved names must not be touched —
+        // installed Name and catalog Name may legitimately differ.
+        var package = new InstalledPackage
+        {
+            Name = "Microsoft Teams",
+            LocalId = @"MSIX\MSTeams_25290.205.4069.4894_arm64__8wekyb3d8bbwe",
+            InstalledVersion = "25290.205.4069.4894",
+            Scope = "User",
+            InstallerCategory = "msix",
+            PackageFamilyNames = ["MSTeams_8wekyb3d8bbwe"],
+            Correlated = new SearchMatch
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "Microsoft.Teams",
+                Name = "Microsoft Teams Catalog Name",
+                Version = "26106.1906.4665.7308",
+                MatchCriteria = "PackageFamilyName",
+            },
+        };
+        Repository.ApplyMsixResourceStringNameFix(package);
+        Assert.Equal("Microsoft Teams", package.Name);
+    }
+
+    [Fact]
+    public void UnflipPackedGuid_ReversesMsiInstallerPacking()
+    {
+        // Verified against the live Installer hive: the user's installed
+        // Node.js ProductCode `{9292CBD9-...}` packs to
+        // `9DBC2929593B4D2488740C8E00C4F652`.
+        Assert.Equal(
+            "{9292cbd9-b395-42d4-8847-c0e8004c6f25}",
+            InstalledPackages.UnflipPackedGuid("9DBC2929593B4D2488740C8E00C4F652"));
+        Assert.Equal(
+            "{47c07a3a-42ef-4213-a85d-8f5a59077c28}",
+            InstalledPackages.UnflipPackedGuid("A3A70C74FE2431248AD5F8A59570C782"));
+        Assert.Null(InstalledPackages.UnflipPackedGuid("nothex"));
+        Assert.Null(InstalledPackages.UnflipPackedGuid("9DBC2929593B4D2488740C8E00C4F65"));
+        Assert.Null(InstalledPackages.UnflipPackedGuid("ZZZZZZZZ593B4D2488740C8E00C4F652"));
+    }
+
+    [Fact]
+    public void DedupeCorrelatedForUpgrade_PrefersCanonicalRowOverRawArp()
+    {
+        // VS-installed .NET SDK has ARP `40.10.18029` (no canonical mapping)
+        // while the proper install has `10.0.108` (canonical). Without the
+        // canonical preference, compare_version picks the wrong row and the
+        // upgrade disappears.
+        var raw = InstalledWithCorrelation("Microsoft.DotNet.SDK.10", "40.10.18029", canonical: false);
+        var canonical = InstalledWithCorrelation("Microsoft.DotNet.SDK.10", "10.0.108", canonical: true);
+
+        var result = Repository.DedupeCorrelatedForUpgrade([raw, canonical]);
+        Assert.Single(result);
+        Assert.Equal("10.0.108", result[0].InstalledVersion);
+        Assert.True(result[0].InstalledVersionCanonical);
+    }
+
+    [Fact]
+    public void DedupeCorrelatedForUpgrade_KeepsHighestAmongCanonical()
+    {
+        var lower = InstalledWithCorrelation("Microsoft.WindowsAppRuntime.1.7", "1.7.7", canonical: true);
+        var higher = InstalledWithCorrelation("Microsoft.WindowsAppRuntime.1.7", "1.7.9", canonical: true);
+
+        var result = Repository.DedupeCorrelatedForUpgrade([lower, higher]);
+        Assert.Single(result);
+        Assert.Equal("1.7.9", result[0].InstalledVersion);
+    }
+
+    [Fact]
+    public void DedupeCorrelatedForUpgrade_LeavesUncorrelatedAlone()
+    {
+        var uncorrelated = new InstalledPackage
+        {
+            Name = "Foo",
+            LocalId = @"ARP\Machine\X64\Foo",
+            InstalledVersion = "1.0",
+            Scope = "Machine",
+            InstallerCategory = "exe",
+        };
+        var result = Repository.DedupeCorrelatedForUpgrade([uncorrelated]);
+        Assert.Single(result);
+    }
+
+    private static InstalledPackage InstalledWithCorrelation(string id, string installedVersion, bool canonical)
+    {
+        return new InstalledPackage
+        {
+            Name = $"{id} install",
+            LocalId = $@"ARP\Machine\X64\{id}",
+            InstalledVersion = installedVersion,
+            Scope = "Machine",
+            InstallerCategory = "msi",
+            Correlated = new SearchMatch
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = id,
+                Name = id,
+                Version = "99.0.0",
+            },
+            InstalledVersionCanonical = canonical,
+        };
     }
 
     [Fact]

@@ -16,11 +16,21 @@ internal static class InstalledPackages
         bool machine = !string.Equals(scope, "user", StringComparison.OrdinalIgnoreCase);
         bool user = !string.Equals(scope, "machine", StringComparison.OrdinalIgnoreCase);
 
+        // MSI registers UpgradeCode → ProductCode mappings under
+        // HKLM\SOFTWARE\Classes\Installer\UpgradeCodes (per-machine) and
+        // HKCU\Software\Microsoft\Installer\UpgradeCodes (per-user). Most
+        // ARP entries don't expose UpgradeCode directly, so winget reads it
+        // from here. Without it, packages like OpenJS.NodeJS.22 (correlated
+        // only via UpgradeCode in the v2 index) fall back to a sibling
+        // correlation (e.g. OpenJS.NodeJS.LTS) that manufactures a spurious
+        // upgrade.
+        var upgradeCodes = CollectMsiUpgradeCodes(machine, user);
+
         if (machine)
         {
-            CollectArpPackages(packages, seen, Microsoft.Win32.RegistryHive.LocalMachine, "Machine", "X64",
+            CollectArpPackages(packages, seen, upgradeCodes, Microsoft.Win32.RegistryHive.LocalMachine, "Machine", "X64",
                 Microsoft.Win32.RegistryView.Registry64);
-            CollectArpPackages(packages, seen, Microsoft.Win32.RegistryHive.LocalMachine, "Machine", "X86",
+            CollectArpPackages(packages, seen, upgradeCodes, Microsoft.Win32.RegistryHive.LocalMachine, "Machine", "X86",
                 Microsoft.Win32.RegistryView.Registry32);
             CollectAppModelPackages(packages, seen, Microsoft.Win32.RegistryHive.LocalMachine, "Machine",
                 Microsoft.Win32.RegistryView.Registry64);
@@ -28,7 +38,7 @@ internal static class InstalledPackages
 
         if (user)
         {
-            CollectArpPackages(packages, seen, Microsoft.Win32.RegistryHive.CurrentUser, "User", "X64",
+            CollectArpPackages(packages, seen, upgradeCodes, Microsoft.Win32.RegistryHive.CurrentUser, "User", "X64",
                 Microsoft.Win32.RegistryView.Registry64);
             CollectAppModelPackages(packages, seen, Microsoft.Win32.RegistryHive.CurrentUser, "User",
                 Microsoft.Win32.RegistryView.Registry64);
@@ -37,9 +47,102 @@ internal static class InstalledPackages
         return packages;
     }
 
+    /// <summary>
+    /// Builds a ProductCode → UpgradeCode map (both in standard
+    /// {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} lowercase format) by walking
+    /// the MSI Installer registry. Subkeys under Installer\UpgradeCodes are
+    /// named by the flipped UpgradeCode GUID, and each subkey's value names
+    /// are the flipped ProductCodes registered under that UpgradeCode.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static Dictionary<string, string> CollectMsiUpgradeCodes(bool includeMachine, bool includeUser)
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (includeMachine)
+        {
+            CollectMsiUpgradeCodesFrom(
+                Microsoft.Win32.RegistryHive.LocalMachine,
+                @"SOFTWARE\Classes\Installer\UpgradeCodes",
+                Microsoft.Win32.RegistryView.Registry64,
+                map);
+        }
+        if (includeUser)
+        {
+            CollectMsiUpgradeCodesFrom(
+                Microsoft.Win32.RegistryHive.CurrentUser,
+                @"Software\Microsoft\Installer\UpgradeCodes",
+                Microsoft.Win32.RegistryView.Registry64,
+                map);
+        }
+        return map;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void CollectMsiUpgradeCodesFrom(
+        Microsoft.Win32.RegistryHive hive, string path, Microsoft.Win32.RegistryView view,
+        Dictionary<string, string> map)
+    {
+        try
+        {
+            using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
+            using var root = baseKey.OpenSubKey(path);
+            if (root is null) return;
+            foreach (var keyName in root.GetSubKeyNames())
+            {
+                var upgradeCode = UnflipPackedGuid(keyName);
+                if (upgradeCode is null) continue;
+                using var subkey = root.OpenSubKey(keyName);
+                if (subkey is null) continue;
+                foreach (var valueName in subkey.GetValueNames())
+                {
+                    var productCode = UnflipPackedGuid(valueName);
+                    if (productCode is null) continue;
+                    // First mapping wins — keeps the map deterministic if
+                    // the same ProductCode is registered under multiple
+                    // UpgradeCodes (rare, but possible for repackaged MSIs).
+                    map.TryAdd(productCode, upgradeCode);
+                }
+            }
+        }
+        catch
+        {
+            // Installer hive missing or unreadable; identity correlation
+            // falls back to ProductCode-only and the harness will flag a
+            // mismatch if it matters.
+        }
+    }
+
+    /// <summary>
+    /// Converts the 32-character "packed GUID" used inside the MSI Installer
+    /// registry hive back to the standard
+    /// {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} lowercase form. The packing
+    /// reverses each of the 11 chunks (sized 8/4/4 then eight 2-char byte
+    /// pairs) of the GUID's hex representation.
+    /// </summary>
+    internal static string? UnflipPackedGuid(string packed)
+    {
+        if (packed.Length != 32) return null;
+        foreach (var c in packed)
+        {
+            if (!Uri.IsHexDigit(c)) return null;
+        }
+        int[] chunks = [8, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2];
+        var sb = new System.Text.StringBuilder(32);
+        int offset = 0;
+        foreach (var size in chunks)
+        {
+            for (int i = size - 1; i >= 0; i--)
+                sb.Append(packed[offset + i]);
+            offset += size;
+        }
+        var r = sb.ToString().ToLowerInvariant();
+        return $"{{{r[..8]}-{r[8..12]}-{r[12..16]}-{r[16..20]}-{r[20..32]}}}";
+    }
+
     [SupportedOSPlatform("windows")]
     private static void CollectArpPackages(
         List<InstalledPackage> packages, HashSet<string> seen,
+        Dictionary<string, string> upgradeCodeMap,
         Microsoft.Win32.RegistryHive hive, string scopeLabel, string archLabel,
         Microsoft.Win32.RegistryView view)
     {
@@ -108,6 +211,23 @@ internal static class InstalledPackages
                         var upgradeCodes = new List<string>();
                         if (!string.IsNullOrWhiteSpace(upgradeCode))
                             upgradeCodes.Add(upgradeCode);
+                        if (upgradeCodes.Count == 0)
+                        {
+                            // ARP rarely exposes UpgradeCode directly. Recover
+                            // it from the MSI Installer registry hive so
+                            // identity correlation can fall back to
+                            // upgradecodes2 when productcodes2 picks the wrong
+                            // sibling (Node.js 24.x being attributed to
+                            // OpenJS.NodeJS.LTS rather than OpenJS.NodeJS.22).
+                            foreach (var code in productCodes)
+                            {
+                                if (upgradeCodeMap.TryGetValue(code, out var uc))
+                                {
+                                    upgradeCodes.Add(uc);
+                                    break;
+                                }
+                            }
+                        }
 
                         packages.Add(new InstalledPackage
                         {

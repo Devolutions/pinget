@@ -60,3 +60,26 @@ jobs:
           $dotnetPinget = Resolve-Path 'dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.exe'
           $pingetModule = Resolve-Path 'dist/powershell-module/Devolutions.Pinget.Client/Devolutions.Pinget.Client.psd1'
           pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts/Parity-Compare-WingetParity.ps1') -RustWinget $rustPinget -DotnetWinget $dotnetPinget -PowerShellModulePath $pingetModule
+
+      - name: Run upgrade-parity diff
+        shell: pwsh
+        # CI runners have very few user-installed apps so the row counts are
+        # small; the value here is regression-catching: a winget table-format
+        # change or a break in pinget's `upgrade --output json` schema will
+        # surface as a parse failure before users notice. The fixture is
+        # uploaded as an artifact so cross-machine corpora can be assembled
+        # from real machines later.
+        run: |
+          $rustPinget = Resolve-Path 'rust/target/debug/pinget.exe'
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts/Test-UpgradeParity.ps1') `
+            -Pinget $rustPinget `
+            -FixturePath 'parity-upgrade-fixture.json' `
+            -FailOnDiff
+
+      - name: Upload parity fixture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-upgrade-fixture
+          path: parity-upgrade-fixture.json
+          if-no-files-found: ignore
