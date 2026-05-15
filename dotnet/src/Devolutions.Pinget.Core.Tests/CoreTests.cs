@@ -1559,6 +1559,93 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void Manifest_Parses_RequireExplicitUpgrade_AtTopLevel()
+    {
+        // Top-level RequireExplicitUpgrade flag propagates to
+        // Manifest.RequireExplicitUpgrade. winget catalogs put the flag
+        // here for browser packages and self-updating apps that opt out
+        // of bulk `upgrade`.
+        var yaml = @"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: explicit-upgrade fixture
+RequireExplicitUpgrade: true
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.exe
+    InstallerSha256: ABC123
+";
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+        Assert.True(manifest.RequireExplicitUpgrade);
+    }
+
+    [Fact]
+    public void Manifest_Parses_RequireExplicitUpgrade_OnInstaller()
+    {
+        // Per-installer flag — only one of several installers declares
+        // it, but the Manifest aggregate is still true because the user
+        // could pick that installer when upgrading.
+        var yaml = @"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: explicit-upgrade fixture
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.x64.exe
+    InstallerSha256: ABC123
+  - Architecture: arm64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.arm64.exe
+    InstallerSha256: DEF456
+    RequireExplicitUpgrade: true
+";
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+        Assert.True(manifest.RequireExplicitUpgrade);
+        Assert.False(manifest.Installers[0].RequireExplicitUpgrade);
+        Assert.True(manifest.Installers[1].RequireExplicitUpgrade);
+    }
+
+    [Fact]
+    public void Manifest_WithoutRequireExplicitUpgrade_DefaultsToFalse()
+    {
+        var yaml = @"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: baseline fixture
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.exe
+    InstallerSha256: ABC123
+";
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+        Assert.False(manifest.RequireExplicitUpgrade);
+    }
+
+    [Fact]
     public void LookupUniqueNormalizedIdentity_ReturnsUniqueMatch()
     {
         using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
@@ -1636,6 +1723,45 @@ public class RepositoryParityTests
 
         var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "foo", "bar");
         Assert.Null(rowid);
+    }
+
+    [Fact]
+    public void UpgradeFilter_HidesRequireExplicitUpgrade_ByDefault()
+    {
+        // winget hides RequireExplicitUpgrade rows from bulk `upgrade`
+        // (Edge, Steam, Discord). pinget must do the same.
+        var pkg = new InstalledPackage
+        {
+            Name = "Edge",
+            LocalId = @"ARP\Machine\X64\Edge",
+            InstalledVersion = "100.0",
+            Scope = "Machine",
+            InstallerCategory = "exe",
+            Correlated = new SearchMatch
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "Microsoft.Edge",
+                Name = "Microsoft Edge",
+                Version = "110.0",
+            },
+            CorrelatedRequiresExplicitUpgrade = true,
+        };
+
+        var bulkQuery = new ListQuery { UpgradeOnly = true };
+        Assert.False(
+            Repository.InstalledPackageMatchesUpgradeFilterForTesting(pkg, bulkQuery),
+            "RequireExplicitUpgrade row must be hidden from bulk upgrade");
+
+        // When the user explicitly targets it by id, winget shows it.
+        var filteredQuery = new ListQuery { UpgradeOnly = true, Id = "Microsoft.Edge" };
+        Assert.True(
+            Repository.InstalledPackageMatchesUpgradeFilterForTesting(pkg, filteredQuery),
+            "RequireExplicitUpgrade row must surface when the user filters for it");
+
+        // Without the flag, the row appears in bulk upgrade.
+        pkg.CorrelatedRequiresExplicitUpgrade = false;
+        Assert.True(Repository.InstalledPackageMatchesUpgradeFilterForTesting(pkg, bulkQuery));
     }
 
     [Fact]

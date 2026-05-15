@@ -1582,6 +1582,7 @@ public class Repository : IDisposable
                         Switches = switches,
                         Commands = InstArr("Commands"),
                         PackageDependencies = InstArr("PackageDependencies"),
+                        RequireExplicitUpgrade = ReadBool(instDict, "RequireExplicitUpgrade"),
                     });
                 }
             }
@@ -1600,6 +1601,9 @@ public class Repository : IDisposable
                 }
             }
         }
+
+        var topLevelRequireExplicit = ReadBool(dict, "RequireExplicitUpgrade");
+        var anyInstallerRequireExplicit = installers.Any(i => i.RequireExplicitUpgrade);
 
         return new Manifest
         {
@@ -1626,6 +1630,29 @@ public class Repository : IDisposable
             Documentation = docs,
             Installers = installers,
             PackageDependencies = dependencies,
+            RequireExplicitUpgrade = topLevelRequireExplicit || anyInstallerRequireExplicit,
+        };
+    }
+
+    private static bool ReadBool(IDictionary<string, object?> dict, string key)
+    {
+        if (!dict.TryGetValue(key, out var raw) || raw is null) return false;
+        return raw switch
+        {
+            bool b => b,
+            string s => s.Equals("true", StringComparison.OrdinalIgnoreCase),
+            _ => false,
+        };
+    }
+
+    private static bool ReadBool(IDictionary<object, object> dict, string key)
+    {
+        if (!dict.TryGetValue(key, out var raw) || raw is null) return false;
+        return raw switch
+        {
+            bool b => b,
+            string s => s.Equals("true", StringComparison.OrdinalIgnoreCase),
+            _ => false,
         };
     }
 
@@ -2202,11 +2229,6 @@ public class Repository : IDisposable
         return cmd.ExecuteScalar() is not null;
     }
 
-    // Test-only entry point. Keep internal so InternalsVisibleTo exposes
-    // it just to Core.Tests.
-    internal static long? LookupUniqueNormalizedIdentityForTesting(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
-        => LookupUniqueNormalizedIdentity(conn, normName, normPublisher);
-
     /// <summary>
     /// Returns the catalog packages.rowid whose (norm_name, norm_publisher)
     /// pair matches the installed package — if and only if the match is
@@ -2214,6 +2236,14 @@ public class Repository : IDisposable
     /// (an ARP DisplayName that normalizes the same as two distinct catalog
     /// packages); winget refuses to correlate and we do the same.
     /// </summary>
+    // Test-only entry points. Keep these internal so the assembly's
+    // InternalsVisibleTo grant exposes them just to Core.Tests.
+    internal static long? LookupUniqueNormalizedIdentityForTesting(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
+        => LookupUniqueNormalizedIdentity(conn, normName, normPublisher);
+
+    internal static bool InstalledPackageMatchesUpgradeFilterForTesting(InstalledPackage pkg, ListQuery query)
+        => InstalledPackageMatchesUpgradeFilter(pkg, query);
+
     private static long? LookupUniqueNormalizedIdentity(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
     {
         using var cmd = conn.CreateCommand();
@@ -2312,7 +2342,6 @@ public class Repository : IDisposable
                 for (int i = 0; i < installed.Count; i++)
                 {
                     var pkg = installed[i];
-                    if (pkg.InstalledVersionCanonical) continue;
                     if (pkg.Correlated is null) continue;
                     // Stay within the source the row was correlated to —
                     // looking up `JetBrains.Rider` in a different catalog
@@ -2327,23 +2356,49 @@ public class Repository : IDisposable
 
             foreach (var (idx, meta) in needs)
             {
-                string? canonicalInstalled = null;
-                string? anchoredLatest = null;
+                // Load versionData once: needed for both the aMiV/aMaV
+                // remap (if installed_version isn't canonical yet) and to
+                // locate the latest manifest for RequireExplicitUpgrade.
+                List<PreIndexedSource.V2VersionDataEntry>? entries = null;
                 try
                 {
                     using var conn2 = OpenPreindexedConnection(sourceIndex);
-                    var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
-                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
-                    anchoredLatest = LatestArpAnchoredVersion(entries);
+                    var (loaded, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
+                    entries = loaded;
                 }
-                catch { /* version data fetch is best-effort */ }
+                catch { /* best-effort */ }
 
-                if (canonicalInstalled is null) continue;
-                installed[idx].InstalledVersion = canonicalInstalled;
-                installed[idx].InstalledVersionCanonical = true;
-                if (installed[idx].Correlated is SearchMatch correlated && anchoredLatest is not null)
+                if (entries is null) continue;
+
+                if (!installed[idx].InstalledVersionCanonical)
                 {
-                    installed[idx].Correlated = correlated with { Version = anchoredLatest };
+                    var canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    var anchoredLatest = LatestArpAnchoredVersion(entries);
+                    if (canonicalInstalled is not null)
+                    {
+                        installed[idx].InstalledVersion = canonicalInstalled;
+                        installed[idx].InstalledVersionCanonical = true;
+                        if (installed[idx].Correlated is SearchMatch correlated && anchoredLatest is not null)
+                            installed[idx].Correlated = correlated with { Version = anchoredLatest };
+                    }
+                }
+
+                // RequireExplicitUpgrade is on the latest version's
+                // installer manifest. winget hides those from bulk
+                // `upgrade` (Edge, Steam, Discord). Peek at the first
+                // versionData entry (latest by sort order) and read its
+                // manifest to mirror that filtering.
+                var latest = entries.Count > 0 ? entries[0] : null;
+                if (latest is not null)
+                {
+                    try
+                    {
+                        var bytes = PreIndexedSource.GetCachedSourceFile(
+                            _client, "V2_M", source, latest.ManifestRelativePath, latest.ManifestHash);
+                        var manifest = ParseYamlManifest(bytes);
+                        installed[idx].CorrelatedRequiresExplicitUpgrade = manifest.RequireExplicitUpgrade;
+                    }
+                    catch { /* best-effort */ }
                 }
             }
         }
@@ -2465,9 +2520,18 @@ public class Repository : IDisposable
         return true;
     }
 
-    private static bool InstalledPackageMatchesUpgradeFilter(InstalledPackage pkg, ListQuery query) =>
-        InstalledPackageHasUpgrade(pkg) ||
-        (query.IncludeUnknown && InstalledPackageHasUnknownVersion(pkg) && pkg.Correlated is not null);
+    private static bool InstalledPackageMatchesUpgradeFilter(InstalledPackage pkg, ListQuery query)
+    {
+        // Hide RequireExplicitUpgrade packages from bulk `upgrade` output to
+        // match winget (Edge, Steam, Discord, several MSIX packages). When
+        // the user explicitly filtered by id/name/etc., they're targeting
+        // a specific package and want to see it regardless — same allowance
+        // winget makes.
+        if (pkg.CorrelatedRequiresExplicitUpgrade && !ListQueryNeedsAvailableLookup(query))
+            return false;
+        return InstalledPackageHasUpgrade(pkg)
+            || (query.IncludeUnknown && InstalledPackageHasUnknownVersion(pkg) && pkg.Correlated is not null);
+    }
 
     internal static PinRecord? FindApplicablePin(ListMatch match, IReadOnlyList<PinRecord> pins)
     {

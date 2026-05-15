@@ -202,6 +202,7 @@ public record Installer
     public InstallerSwitches Switches { get; init; } = new();
     public List<string> Commands { get; init; } = [];
     public List<string> PackageDependencies { get; init; } = [];
+    public bool RequireExplicitUpgrade { get; init; }
 }
 
 public record InstallerSwitches
@@ -265,6 +266,11 @@ public record Manifest
     public List<string> PackageDependencies { get; init; } = [];
     public List<Documentation> Documentation { get; init; } = [];
     public List<Installer> Installers { get; init; } = [];
+    // `RequireExplicitUpgrade: true` opts a package out of bulk
+    // `pinget upgrade` output (winget parity). Users can still upgrade by
+    // explicit id. Set at top-level or per-installer; treated as true
+    // when any installer asserts it.
+    public bool RequireExplicitUpgrade { get; init; }
 }
 
 public record InstallRequest
@@ -518,6 +524,10 @@ internal record InstalledPackage
     // (e.g. `Microsoft.DotNet.SDK.10` 10.0.108 wins over a VS-installed
     // 40.10.18029 that doesn't fit any aMiV bucket).
     public bool InstalledVersionCanonical { get; set; }
+    // True when the correlated catalog package's latest version sets
+    // RequireExplicitUpgrade: true. winget hides those rows from bulk
+    // `upgrade`; we mirror that. Users can still upgrade by explicit id.
+    public bool CorrelatedRequiresExplicitUpgrade { get; set; }
 }
 
 internal enum SearchSemantics

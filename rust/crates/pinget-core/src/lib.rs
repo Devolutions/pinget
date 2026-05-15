@@ -280,6 +280,11 @@ pub struct Manifest {
     pub package_dependencies: Vec<String>,
     pub documentation: Vec<Documentation>,
     pub installers: Vec<Installer>,
+    // `RequireExplicitUpgrade: true` opts a package out of bulk
+    // `pinget upgrade` output (winget parity). Users can still upgrade by
+    // explicit `id`. Set at top-level or per-installer; treated as true
+    // when any installer asserts it.
+    pub require_explicit_upgrade: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -312,6 +317,7 @@ pub struct Installer {
     pub switches: InstallerSwitches,
     pub commands: Vec<String>,
     pub package_dependencies: Vec<String>,
+    pub require_explicit_upgrade: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -571,6 +577,10 @@ struct InstalledPackage {
     // install row, we prefer the canonical (e.g. `Microsoft.DotNet.SDK.10`
     // 10.0.108 over the VS-installed 40.10.18029 that doesn't map).
     installed_version_canonical: bool,
+    // True when the correlated catalog package's latest version sets
+    // `RequireExplicitUpgrade: true`. winget hides those rows from bulk
+    // `upgrade`; we mirror that. Users can still upgrade by explicit id.
+    correlated_requires_explicit_upgrade: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1138,6 +1148,100 @@ impl Repository {
         Ok(warnings)
     }
 
+    /// Correlates installed packages against the v2 pre-indexed catalog using
+    /// PackageFamilyName / ProductCode / UpgradeCode lookups — winget's
+    /// authoritative correlation path. Also rewrites `installed_version` to
+    /// the catalog Version whose ARP range covers the ARP DisplayVersion, so
+    /// packages whose ARP version is an MSI build number (e.g. .NET SDK,
+    /// Python) compare against a meaningful catalog version. Packages without
+    /// any of the three identifiers, or whose identifiers don't match a
+    /// catalog entry, are left untouched for the name-based fallback.
+    fn correlate_installed_via_index(
+        &mut self,
+        installed: &mut [InstalledPackage],
+        requested_source: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let source_indices: Vec<usize> = self
+            .store
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                source.kind == SourceKind::PreIndexed
+                    && match requested_source {
+                        Some(name) => source.name.eq_ignore_ascii_case(name),
+                        None => true,
+                    }
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        for source_index in source_indices {
+            let resolved: Vec<(usize, V2PackageMetadata, &'static str)> = {
+                let connection = match self.open_preindexed_connection(source_index) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if !v2_identity_tables_present(&connection) {
+                    continue;
+                }
+                let mut acc = Vec::new();
+                for (idx, package) in installed.iter().enumerate() {
+                    if package.correlated.is_some() {
+                        continue;
+                    }
+                    let Some((rowid, by)) = lookup_identity_match_v2(&connection, package)? else {
+                        continue;
+                    };
+                    let Some(meta) = fetch_v2_package_metadata(&connection, rowid)? else {
+                        continue;
+                    };
+                    acc.push((idx, meta, by));
+                }
+                acc
+            };
+
+            let source = self.source_clone(source_index);
+            for (idx, meta, by) in resolved {
+                let (canonical_installed, anchored_latest) =
+                    match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
+                        Ok((entries, _)) => (
+                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version),
+                            latest_arp_anchored_version(&entries),
+                        ),
+                        Err(_) => (None, None),
+                    };
+                // When the installed side was rebased to a catalog Version via
+                // aMiV/aMaV, the available side must compare on the same scale:
+                // prefer the latest ARP-anchored Version over `latest_version`,
+                // which can be an internal/MSI build number (e.g. WinAppRuntime
+                // 1.8's `8000.836.2153.0`) that would manufacture a phantom
+                // upgrade against an installed canonical like `1.8.6`.
+                let available_version = match (&canonical_installed, anchored_latest) {
+                    (Some(_), Some(anchored)) => anchored,
+                    _ => meta.latest_version,
+                };
+                let installed_pkg = &mut installed[idx];
+                installed_pkg.correlated = Some(SearchMatch {
+                    source_name: source.name.clone(),
+                    source_kind: source.kind,
+                    id: meta.id,
+                    name: meta.name,
+                    moniker: meta.moniker,
+                    version: Some(available_version),
+                    channel: None,
+                    match_criteria: Some(by.to_owned()),
+                });
+                if let Some(version) = canonical_installed {
+                    installed_pkg.installed_version = version;
+                    installed_pkg.installed_version_canonical = true;
+                }
+            }
+        }
+
+        Ok(Vec::new())
+    }
+
     /// Mid-tier correlation that mirrors winget's ARP normalization path.
     /// For each installed package without a PFN/PC/UC identity match, the
     /// (DisplayName, Publisher) is run through the NameNormalizer and
@@ -1246,100 +1350,6 @@ impl Repository {
         Ok(Vec::new())
     }
 
-    /// Correlates installed packages against the v2 pre-indexed catalog using
-    /// PackageFamilyName / ProductCode / UpgradeCode lookups — winget's
-    /// authoritative correlation path. Also rewrites `installed_version` to
-    /// the catalog Version whose ARP range covers the ARP DisplayVersion, so
-    /// packages whose ARP version is an MSI build number (e.g. .NET SDK,
-    /// Python) compare against a meaningful catalog version. Packages without
-    /// any of the three identifiers, or whose identifiers don't match a
-    /// catalog entry, are left untouched for the name-based fallback.
-    fn correlate_installed_via_index(
-        &mut self,
-        installed: &mut [InstalledPackage],
-        requested_source: Option<&str>,
-    ) -> Result<Vec<String>> {
-        let source_indices: Vec<usize> = self
-            .store
-            .sources
-            .iter()
-            .enumerate()
-            .filter(|(_, source)| {
-                source.kind == SourceKind::PreIndexed
-                    && match requested_source {
-                        Some(name) => source.name.eq_ignore_ascii_case(name),
-                        None => true,
-                    }
-            })
-            .map(|(index, _)| index)
-            .collect();
-
-        for source_index in source_indices {
-            let resolved: Vec<(usize, V2PackageMetadata, &'static str)> = {
-                let connection = match self.open_preindexed_connection(source_index) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                if !v2_identity_tables_present(&connection) {
-                    continue;
-                }
-                let mut acc = Vec::new();
-                for (idx, package) in installed.iter().enumerate() {
-                    if package.correlated.is_some() {
-                        continue;
-                    }
-                    let Some((rowid, by)) = lookup_identity_match_v2(&connection, package)? else {
-                        continue;
-                    };
-                    let Some(meta) = fetch_v2_package_metadata(&connection, rowid)? else {
-                        continue;
-                    };
-                    acc.push((idx, meta, by));
-                }
-                acc
-            };
-
-            let source = self.source_clone(source_index);
-            for (idx, meta, by) in resolved {
-                let (canonical_installed, anchored_latest) =
-                    match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
-                        Ok((entries, _)) => (
-                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version),
-                            latest_arp_anchored_version(&entries),
-                        ),
-                        Err(_) => (None, None),
-                    };
-                // When the installed side was rebased to a catalog Version via
-                // aMiV/aMaV, the available side must compare on the same scale:
-                // prefer the latest ARP-anchored Version over `latest_version`,
-                // which can be an internal/MSI build number (e.g. WinAppRuntime
-                // 1.8's `8000.836.2153.0`) that would manufacture a phantom
-                // upgrade against an installed canonical like `1.8.6`.
-                let available_version = match (&canonical_installed, anchored_latest) {
-                    (Some(_), Some(anchored)) => anchored,
-                    _ => meta.latest_version,
-                };
-                let installed_pkg = &mut installed[idx];
-                installed_pkg.correlated = Some(SearchMatch {
-                    source_name: source.name.clone(),
-                    source_kind: source.kind,
-                    id: meta.id,
-                    name: meta.name,
-                    moniker: meta.moniker,
-                    version: Some(available_version),
-                    channel: None,
-                    match_criteria: Some(by.to_owned()),
-                });
-                if let Some(version) = canonical_installed {
-                    installed_pkg.installed_version = version;
-                    installed_pkg.installed_version_canonical = true;
-                }
-            }
-        }
-
-        Ok(Vec::new())
-    }
-
     /// Runs after both correlation paths to enrich already-correlated rows
     /// with information that the identity path applies inline but that
     /// name-based correlation skips:
@@ -1389,9 +1399,6 @@ impl Repository {
                 }
                 let mut acc = Vec::new();
                 for (idx, pkg) in installed.iter().enumerate() {
-                    if pkg.installed_version_canonical {
-                        continue;
-                    }
                     let Some(candidate) = pkg.correlated.as_ref() else {
                         continue;
                     };
@@ -1414,22 +1421,46 @@ impl Repository {
 
             let source = self.source_clone(source_index);
             for (idx, meta) in needs {
-                let (canonical_installed, anchored_latest) =
-                    match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
-                        Ok((entries, _)) => (
-                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version),
-                            latest_arp_anchored_version(&entries),
-                        ),
-                        Err(_) => (None, None),
-                    };
-                let Some(canonical) = canonical_installed else {
-                    continue;
+                // Load versionData once: we may need it for both the
+                // aMiV/aMaV remap (only if installed_version isn't already
+                // canonical) and to locate the latest manifest for the
+                // RequireExplicitUpgrade flag.
+                let entries = match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
+                    Ok((entries, _)) => entries,
+                    Err(_) => continue,
                 };
-                let pkg = &mut installed[idx];
-                pkg.installed_version = canonical;
-                pkg.installed_version_canonical = true;
-                if let (Some(correlated), Some(anchored)) = (pkg.correlated.as_mut(), anchored_latest) {
-                    correlated.version = Some(anchored);
+
+                if !installed[idx].installed_version_canonical {
+                    let canonical_installed = map_arp_version_to_catalog(&entries, &installed[idx].installed_version);
+                    let anchored_latest = latest_arp_anchored_version(&entries);
+                    if let Some(canonical) = canonical_installed {
+                        installed[idx].installed_version = canonical;
+                        installed[idx].installed_version_canonical = true;
+                        if let (Some(correlated), Some(anchored)) =
+                            (installed[idx].correlated.as_mut(), anchored_latest)
+                        {
+                            correlated.version = Some(anchored);
+                        }
+                    }
+                }
+
+                // RequireExplicitUpgrade is set on the installer manifest
+                // for the latest catalog version. winget hides these from
+                // bulk `upgrade` (Edge, Steam, Discord and others). We
+                // peek at the first versionData entry (latest by sort
+                // order) and read its manifest to mirror that filtering.
+                if let Some(latest) = entries.first() {
+                    let bytes_result = self.get_cached_source_file(
+                        "V2_M",
+                        &source,
+                        &latest.manifest_relative_path,
+                        Some(latest.manifest_hash.as_str()),
+                    );
+                    if let Ok(bytes) = bytes_result
+                        && let Ok(manifest) = parse_yaml_manifest(&bytes.bytes)
+                    {
+                        installed[idx].correlated_requires_explicit_upgrade = manifest.require_explicit_upgrade;
+                    }
                 }
             }
         }
@@ -2834,6 +2865,14 @@ fn installed_package_has_unknown_version(package: &InstalledPackage) -> bool {
 }
 
 fn installed_package_matches_upgrade_filter(package: &InstalledPackage, query: &ListQuery) -> bool {
+    // Hide RequireExplicitUpgrade packages from bulk `upgrade` output to
+    // match winget (Edge, Steam, Discord, several MSIX packages). When
+    // the user explicitly filtered by id/name/etc., they're targeting a
+    // specific package and want to see it regardless — same allowance
+    // winget makes.
+    if package.correlated_requires_explicit_upgrade && !list_query_needs_available_lookup(query) {
+        return false;
+    }
     installed_package_has_upgrade(package)
         || (query.include_unknown && installed_package_has_unknown_version(package) && package.correlated.is_some())
 }
@@ -3635,6 +3674,7 @@ fn collect_uninstall_view(
             upgrade_codes,
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         });
     }
 
@@ -3699,6 +3739,7 @@ fn collect_appmodel_packages(
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         });
     }
 
@@ -5642,6 +5683,8 @@ fn parse_yaml_manifest_bundle(bytes: &[u8]) -> Result<(Manifest, JsonValue)> {
     let name = yaml_localized_string(&merged, "PackageName").ok_or_else(|| anyhow!("manifest missing PackageName"))?;
 
     let installers = parse_yaml_installers(&merged);
+    let top_level_require_explicit = yaml_scalar_bool(&merged, "RequireExplicitUpgrade");
+    let any_installer_require_explicit = installers.iter().any(|i| i.require_explicit_upgrade);
 
     Ok((
         Manifest {
@@ -5669,6 +5712,7 @@ fn parse_yaml_manifest_bundle(bytes: &[u8]) -> Result<(Manifest, JsonValue)> {
             package_dependencies: yaml_package_dependencies(&merged),
             documentation: yaml_documentation_list(&merged),
             installers,
+            require_explicit_upgrade: top_level_require_explicit || any_installer_require_explicit,
         },
         collapse_structured_document(&JsonValue::Array(documents)),
     ))
@@ -5735,10 +5779,13 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
                     switches: json_installer_switches(item).with_fallback(&installer_switch_defaults),
                     commands: json_string_list(item, "Commands"),
                     package_dependencies: json_package_dependencies(item),
+                    require_explicit_upgrade: json_bool(item, "RequireExplicitUpgrade"),
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let top_level_require_explicit = json_bool(selected, "RequireExplicitUpgrade");
+    let any_installer_require_explicit = installers.iter().any(|i| i.require_explicit_upgrade);
 
     let manifest = Manifest {
         id: package_id.to_owned(),
@@ -5765,6 +5812,7 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
         package_dependencies: json_package_dependencies(selected),
         documentation: json_documentation_list(default_locale),
         installers,
+        require_explicit_upgrade: top_level_require_explicit || any_installer_require_explicit,
     };
 
     Ok((
@@ -6139,6 +6187,28 @@ fn installer_from_yaml(root: &YamlMapping, switches: InstallerSwitches) -> Insta
         switches,
         commands: yaml_string_list(root, "Commands"),
         package_dependencies: yaml_package_dependencies(root),
+        require_explicit_upgrade: yaml_scalar_bool(root, "RequireExplicitUpgrade"),
+    }
+}
+
+/// Reads a YAML scalar boolean. Accepts `true`/`false` (any casing) plus
+/// the legacy `True`/`False` variants the winget catalog mixes in.
+fn yaml_scalar_bool(root: &YamlMapping, key: &str) -> bool {
+    let Some(value) = root.get(YamlValue::from(key)) else {
+        return false;
+    };
+    match value {
+        YamlValue::Bool(b) => *b,
+        YamlValue::String(s) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+fn json_bool(value: &JsonValue, key: &str) -> bool {
+    match value.get(key) {
+        Some(JsonValue::Bool(b)) => *b,
+        Some(JsonValue::String(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
     }
 }
 
@@ -7948,7 +8018,9 @@ mod tests {
                     },
                     commands: vec!["testpkg".to_owned()],
                     package_dependencies: vec!["Microsoft.UI.Xaml.2.8".to_owned()],
+                    require_explicit_upgrade: false,
                 }],
+                require_explicit_upgrade: false,
             },
             selected_installer: Some(Installer {
                 architecture: Some("x64".to_owned()),
@@ -7969,6 +8041,7 @@ mod tests {
                 },
                 commands: vec!["testpkg".to_owned()],
                 package_dependencies: vec!["Microsoft.UI.Xaml.2.8".to_owned()],
+                require_explicit_upgrade: false,
             }),
             cached_files: vec![PathBuf::from(r"C:\temp\cache\Test.Package.yaml")],
             warnings: vec!["cache warmed".to_owned()],
@@ -8029,6 +8102,221 @@ mod tests {
             document["Installers"][0]["InstallerSwitches"]["Silent"].as_str(),
             Some("/quiet")
         );
+    }
+
+    #[test]
+    fn manifest_parses_require_explicit_upgrade_at_top_level() {
+        // Top-level RequireExplicitUpgrade flag should propagate to
+        // Manifest.require_explicit_upgrade. winget catalogs typically
+        // place the flag here for browser packages and similar
+        // self-updating apps that opt out of bulk `upgrade`.
+        let yaml = r#"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: explicit-upgrade fixture
+RequireExplicitUpgrade: true
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.exe
+    InstallerSha256: ABC123
+"#;
+        let manifest = parse_yaml_manifest(yaml.as_bytes()).expect("parse");
+        assert!(manifest.require_explicit_upgrade);
+    }
+
+    #[test]
+    fn manifest_parses_require_explicit_upgrade_on_installer() {
+        // Per-installer flag — only one of several installers declares it,
+        // but the Manifest aggregate must still be `true` because the user
+        // could pick that installer when upgrading.
+        let yaml = r#"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: explicit-upgrade fixture
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.x64.exe
+    InstallerSha256: ABC123
+  - Architecture: arm64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.arm64.exe
+    InstallerSha256: DEF456
+    RequireExplicitUpgrade: true
+"#;
+        let manifest = parse_yaml_manifest(yaml.as_bytes()).expect("parse");
+        assert!(manifest.require_explicit_upgrade);
+        assert!(!manifest.installers[0].require_explicit_upgrade);
+        assert!(manifest.installers[1].require_explicit_upgrade);
+    }
+
+    #[test]
+    fn manifest_without_require_explicit_upgrade_defaults_to_false() {
+        let yaml = r#"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: baseline fixture
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.exe
+    InstallerSha256: ABC123
+"#;
+        let manifest = parse_yaml_manifest(yaml.as_bytes()).expect("parse");
+        assert!(!manifest.require_explicit_upgrade);
+    }
+
+    #[test]
+    fn upgrade_filter_hides_require_explicit_upgrade_by_default() {
+        // winget hides `RequireExplicitUpgrade` rows from bulk `upgrade`
+        // (Edge, Steam, Discord). pinget must do the same — the filter is
+        // the only gate that enforces it.
+        let mut pkg = InstalledPackage {
+            name: "Edge".to_owned(),
+            local_id: r"ARP\Machine\X64\Edge".to_owned(),
+            installed_version: "100.0".to_owned(),
+            publisher: None,
+            scope: Some("Machine".to_owned()),
+            installer_category: Some("exe".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: Some(SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Microsoft.Edge".to_owned(),
+                name: "Microsoft Edge".to_owned(),
+                moniker: None,
+                version: Some("110.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            }),
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: true,
+        };
+        let bulk_query = ListQuery {
+            upgrade_only: true,
+            ..ListQuery::default()
+        };
+        assert!(
+            !installed_package_matches_upgrade_filter(&pkg, &bulk_query),
+            "RequireExplicitUpgrade row must be hidden from bulk upgrade"
+        );
+
+        // When the user explicitly targets it by id, winget shows it —
+        // pinget must do the same so `pinget upgrade Microsoft.Edge` works.
+        let filtered_query = ListQuery {
+            upgrade_only: true,
+            id: Some("Microsoft.Edge".to_owned()),
+            ..ListQuery::default()
+        };
+        assert!(
+            installed_package_matches_upgrade_filter(&pkg, &filtered_query),
+            "RequireExplicitUpgrade row must surface when the user filters for it explicitly"
+        );
+
+        // Without the flag, the row appears in bulk upgrade as usual.
+        pkg.correlated_requires_explicit_upgrade = false;
+        assert!(installed_package_matches_upgrade_filter(&pkg, &bulk_query));
+    }
+
+    #[test]
+    fn lookup_unique_normalized_identity_returns_unique_match() {
+        // Single (norm_name, norm_publisher) intersection — happy path.
+        let connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+                 INSERT INTO norm_names2 VALUES ('microsoftedge', 100);\n\
+                 INSERT INTO norm_publishers2 VALUES ('microsoft', 100);",
+            )
+            .expect("seed schema");
+
+        let rowid = lookup_unique_normalized_identity(&connection, "microsoftedge", "microsoft")
+            .expect("query")
+            .expect("unique match");
+        assert_eq!(rowid, 100);
+    }
+
+    #[test]
+    fn lookup_unique_normalized_identity_rejects_ambiguous_match() {
+        // Two distinct packages share the same (norm_name, norm_publisher)
+        // — the Git case where both `Git.Git` and a hypothetical sibling
+        // normalize identically. winget refuses to correlate when it can't
+        // disambiguate; pinget must do the same.
+        let connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+                 INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
+                 INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('thegitdevelopmentcommunity', 200);",
+            )
+            .expect("seed schema");
+
+        let rowid = lookup_unique_normalized_identity(&connection, "git", "thegitdevelopmentcommunity").expect("query");
+        assert!(rowid.is_none(), "ambiguous match must not correlate");
+    }
+
+    #[test]
+    fn lookup_unique_normalized_identity_requires_publisher_intersect() {
+        // norm_name has multiple matches but only one shares its
+        // norm_publisher with the installed package. Winget's intersect
+        // logic still picks the right one — verify.
+        let connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+                 INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
+                 INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('microsoft', 200);",
+            )
+            .expect("seed schema");
+
+        let rowid = lookup_unique_normalized_identity(&connection, "git", "thegitdevelopmentcommunity").expect("query");
+        assert_eq!(rowid, Some(100));
+    }
+
+    #[test]
+    fn lookup_unique_normalized_identity_misses_when_publisher_does_not_match() {
+        // Name matches but no publisher row for that package id —
+        // intersection is empty so we don't correlate.
+        let connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+                 INSERT INTO norm_names2 VALUES ('foo', 100);\n\
+                 INSERT INTO norm_publishers2 VALUES ('bar', 200);",
+            )
+            .expect("seed schema");
+
+        let rowid = lookup_unique_normalized_identity(&connection, "foo", "bar").expect("query");
+        assert!(rowid.is_none(), "name matches package 100 but publisher matches 200 — no intersection");
     }
 
     #[test]
@@ -8162,6 +8450,7 @@ Installers:
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
             installers: Vec::new(),
+            require_explicit_upgrade: false,
         };
         let existing = ListMatch {
             name: "Contoso App".to_owned(),
@@ -8222,6 +8511,7 @@ Installers:
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
             installers: Vec::new(),
+            require_explicit_upgrade: false,
         };
         let existing = ListMatch {
             name: "Contoso App".to_owned(),
@@ -8378,6 +8668,7 @@ Installers:
             },
             commands: Vec::new(),
             package_dependencies: Vec::new(),
+            require_explicit_upgrade: false,
         };
         let manifest = Manifest {
             id: "Test.Package".to_owned(),
@@ -8403,6 +8694,7 @@ Installers:
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
             installers: Vec::new(),
+            require_explicit_upgrade: false,
         };
 
         let mut silent_request = InstallRequest::new(PackageQuery::default());
@@ -8461,6 +8753,7 @@ Installers:
             switches: InstallerSwitches::default(),
             commands: Vec::new(),
             package_dependencies: Vec::new(),
+            require_explicit_upgrade: false,
         };
         let manifest = Manifest {
             id: "Test.Package".to_owned(),
@@ -8486,6 +8779,7 @@ Installers:
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
             installers: Vec::new(),
+            require_explicit_upgrade: false,
         };
         let mut progress_request = InstallRequest::new(PackageQuery::default());
         progress_request.mode = InstallerMode::SilentWithProgress;
@@ -8547,6 +8841,7 @@ Installers:
             },
             commands: Vec::new(),
             package_dependencies: Vec::new(),
+            require_explicit_upgrade: false,
         };
         let manifest = Manifest {
             id: "ShareX.ShareX".to_owned(),
@@ -8572,6 +8867,7 @@ Installers:
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
             installers: Vec::new(),
+            require_explicit_upgrade: false,
         };
         let mut request = InstallRequest::new(PackageQuery::default());
         request.mode = InstallerMode::Silent;
@@ -8731,6 +9027,7 @@ Installers:
                 switches: InstallerSwitches::default(),
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
+                require_explicit_upgrade: false,
             },
             Installer {
                 architecture: Some("x64".to_owned()),
@@ -8748,6 +9045,7 @@ Installers:
                 switches: InstallerSwitches::default(),
                 commands: vec!["demo".to_owned()],
                 package_dependencies: Vec::new(),
+                require_explicit_upgrade: false,
             },
         ];
         let query = PackageQuery {
@@ -8782,6 +9080,7 @@ Installers:
                 switches: InstallerSwitches::default(),
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
+                require_explicit_upgrade: false,
             },
             Installer {
                 architecture: Some("x64".to_owned()),
@@ -8799,6 +9098,7 @@ Installers:
                 switches: InstallerSwitches::default(),
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
+                require_explicit_upgrade: false,
             },
         ];
 
@@ -8825,6 +9125,7 @@ Installers:
                 switches: InstallerSwitches::default(),
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
+                require_explicit_upgrade: false,
             },
             Installer {
                 architecture: Some("x64".to_owned()),
@@ -8842,6 +9143,7 @@ Installers:
                 switches: InstallerSwitches::default(),
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
+                require_explicit_upgrade: false,
             },
         ];
         let query = PackageQuery {
@@ -8873,6 +9175,7 @@ Installers:
                 switches: InstallerSwitches::default(),
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
+                require_explicit_upgrade: false,
             },
             Installer {
                 architecture: Some("x64".to_owned()),
@@ -8890,6 +9193,7 @@ Installers:
                 switches: InstallerSwitches::default(),
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
+                require_explicit_upgrade: false,
             },
         ];
         let query = PackageQuery {
@@ -8924,6 +9228,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -8965,6 +9270,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let query = ListQuery {
             tag: Some("powertoys".to_owned()),
@@ -9005,6 +9311,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let candidates = vec![
             SearchMatch {
@@ -9052,6 +9359,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let candidates = vec![
             SearchMatch {
@@ -9112,6 +9420,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -9149,6 +9458,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let candidates = vec![
             SearchMatch {
@@ -9194,6 +9504,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -9224,6 +9535,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -9263,6 +9575,7 @@ Installers:
                 match_criteria: None,
             }),
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
 
         assert!(installed_package_has_upgrade(&package));
@@ -9292,6 +9605,7 @@ Installers:
                 match_criteria: None,
             }),
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let query = ListQuery {
             upgrade_only: true,
@@ -9714,6 +10028,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let sparse = InstalledPackage {
             name: "PowerToys.SparseApp".to_owned(),
@@ -9728,6 +10043,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let extension = InstalledPackage {
             name: "PowerToys FileLocksmith Context Menu".to_owned(),
@@ -9742,6 +10058,7 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
 
         assert!(list_sort_weight(&main) < list_sort_weight(&sparse));
@@ -10031,6 +10348,7 @@ Installers:
                 match_criteria: Some("PackageFamilyName".to_owned()),
             }),
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         apply_msix_resource_string_name_fix(&mut package);
         assert_eq!(package.name, "App Installer");
@@ -10064,6 +10382,7 @@ Installers:
                 match_criteria: None,
             }),
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         apply_msix_resource_string_name_fix(&mut package);
         assert_eq!(package.name, "ms-resource:appDisplayName");
@@ -10097,6 +10416,7 @@ Installers:
                 match_criteria: Some("PackageFamilyName".to_owned()),
             }),
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         apply_msix_resource_string_name_fix(&mut package);
         assert_eq!(package.name, "Microsoft Teams");
@@ -10149,6 +10469,7 @@ Installers:
                 match_criteria: None,
             }),
             installed_version_canonical: canonical,
+            correlated_requires_explicit_upgrade: false,
         }
     }
 
@@ -10197,84 +10518,9 @@ Installers:
             upgrade_codes: Vec::new(),
             correlated: None,
             installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
         };
         let result = dedupe_correlated_for_upgrade(vec![uncorrelated]);
         assert_eq!(result.len(), 1);
-    }
-
-    #[test]
-    fn lookup_unique_normalized_identity_returns_unique_match() {
-        // Single (norm_name, norm_publisher) intersection — happy path.
-        let connection = Connection::open_in_memory().expect("open in-memory db");
-        connection
-            .execute_batch(
-                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
-                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
-                 INSERT INTO norm_names2 VALUES ('microsoftedge', 100);\n\
-                 INSERT INTO norm_publishers2 VALUES ('microsoft', 100);",
-            )
-            .expect("seed schema");
-
-        let rowid = lookup_unique_normalized_identity(&connection, "microsoftedge", "microsoft")
-            .expect("query")
-            .expect("unique match");
-        assert_eq!(rowid, 100);
-    }
-
-    #[test]
-    fn lookup_unique_normalized_identity_rejects_ambiguous_match() {
-        // Two distinct packages share the same (norm_name, norm_publisher)
-        // — the Git case where both `Git.Git` and a hypothetical sibling
-        // normalize identically. winget refuses to correlate when it can't
-        // disambiguate; pinget must do the same.
-        let connection = Connection::open_in_memory().expect("open in-memory db");
-        connection
-            .execute_batch(
-                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
-                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
-                 INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
-                 INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('thegitdevelopmentcommunity', 200);",
-            )
-            .expect("seed schema");
-
-        let rowid = lookup_unique_normalized_identity(&connection, "git", "thegitdevelopmentcommunity").expect("query");
-        assert!(rowid.is_none(), "ambiguous match must not correlate");
-    }
-
-    #[test]
-    fn lookup_unique_normalized_identity_requires_publisher_intersect() {
-        // norm_name has multiple matches but only one shares its
-        // norm_publisher with the installed package. Winget's intersect
-        // logic still picks the right one — verify.
-        let connection = Connection::open_in_memory().expect("open in-memory db");
-        connection
-            .execute_batch(
-                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
-                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
-                 INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
-                 INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('microsoft', 200);",
-            )
-            .expect("seed schema");
-
-        let rowid = lookup_unique_normalized_identity(&connection, "git", "thegitdevelopmentcommunity").expect("query");
-        assert_eq!(rowid, Some(100));
-    }
-
-    #[test]
-    fn lookup_unique_normalized_identity_misses_when_publisher_does_not_match() {
-        // Name matches but no publisher row for that package id —
-        // intersection is empty so we don't correlate.
-        let connection = Connection::open_in_memory().expect("open in-memory db");
-        connection
-            .execute_batch(
-                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
-                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
-                 INSERT INTO norm_names2 VALUES ('foo', 100);\n\
-                 INSERT INTO norm_publishers2 VALUES ('bar', 200);",
-            )
-            .expect("seed schema");
-
-        let rowid = lookup_unique_normalized_identity(&connection, "foo", "bar").expect("query");
-        assert!(rowid.is_none(), "name matches package 100 but publisher matches 200 — no intersection");
     }
 }
