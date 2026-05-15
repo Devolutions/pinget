@@ -1,3 +1,5 @@
+mod name_normalization;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{Display, Formatter};

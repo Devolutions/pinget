@@ -1478,6 +1478,87 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void NormalizePublisher_Microsoft_Corporation_Strips_To_Microsoft()
+    {
+        // Fixture observed in the live catalog's norm_publishers2.
+        Assert.Equal("microsoft", NameNormalization.NormalizePublisher("Microsoft Corporation"));
+    }
+
+    [Fact]
+    public void NormalizePublisher_JetBrains_Sro_Strips_To_JetBrains()
+    {
+        Assert.Equal("jetbrains", NameNormalization.NormalizePublisher("JetBrains s.r.o."));
+    }
+
+    [Fact]
+    public void NormalizePublisher_Without_LegalSuffix_Keeps_All_Tokens()
+    {
+        // "The Git Development Community" has no recognized legal-entity
+        // suffix, so all tokens stay — matches the live catalog row.
+        Assert.Equal(
+            "thegitdevelopmentcommunity",
+            NameNormalization.NormalizePublisher("The Git Development Community"));
+    }
+
+    [Fact]
+    public void NormalizePublisher_Strips_Common_Suffixes()
+    {
+        Assert.Equal("foo", NameNormalization.NormalizePublisher("Foo Inc"));
+        Assert.Equal("foobar", NameNormalization.NormalizePublisher("Foo Bar LLC"));
+        Assert.Equal("foo", NameNormalization.NormalizePublisher("Foo GmbH"));
+    }
+
+    [Fact]
+    public void NormalizeName_Strips_VersionDelimited_Token()
+    {
+        // `2025.3.0.1` matches VersionDelimited. Bare `2026` doesn't.
+        Assert.Equal("jetbrainsrider", NameNormalization.NormalizeName("JetBrains Rider 2025.3.0.1").Name);
+        Assert.Equal(
+            "visualstudioprofessional2026",
+            NameNormalization.NormalizeName("Visual Studio Professional 2026").Name);
+    }
+
+    [Fact]
+    public void NormalizeName_Strips_Architecture_Suffix()
+    {
+        var r = NameNormalization.NormalizeName("PowerToys (Preview) x64");
+        Assert.Equal("powertoys", r.Name);
+        Assert.Equal(NameNormalization.Architecture.X64, r.Architecture);
+    }
+
+    [Fact]
+    public void NormalizeName_Strips_Known_Locale()
+    {
+        var r = NameNormalization.NormalizeName("Foo en-US Edition");
+        Assert.Equal("en-us", r.Locale);
+    }
+
+    [Fact]
+    public void NormalizeName_Keeps_Unknown_Locale_Shaped_Tokens()
+    {
+        var r = NameNormalization.NormalizeName("Foo XY-AB");
+        Assert.Equal(string.Empty, r.Locale);
+    }
+
+    [Fact]
+    public void NormalizeName_Strips_Parens_Content()
+    {
+        Assert.Equal("foo", NameNormalization.NormalizeName("Foo (beta)").Name);
+    }
+
+    [Fact]
+    public void NormalizeName_Microsoft_Edge_Matches_Catalog()
+    {
+        Assert.Equal("microsoftedge", NameNormalization.NormalizeName("Microsoft Edge").Name);
+    }
+
+    [Fact]
+    public void NormalizeName_Keeps_Year_Only_Suffix()
+    {
+        Assert.Equal("foo2026", NameNormalization.NormalizeName("Foo 2026").Name);
+    }
+
+    [Fact]
     public void ApplyMsixResourceStringNameFix_ResolvesPlaceholderToCatalogName()
     {
         // App Installer's MSIX manifest stores DisplayName as
