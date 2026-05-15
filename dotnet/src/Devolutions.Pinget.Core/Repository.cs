@@ -506,6 +506,15 @@ public class Repository : IDisposable
             // matching is ambiguous (Microsoft.Teams vs Microsoft.Teams.Free)
             // or impossible (MSIX with `ms-resource:` placeholder names).
             warnings.AddRange(CorrelateInstalledViaIndex(installed, query.Source));
+
+            // ARP entries without identity keys (no PFN/PC/UC) still match
+            // winget's ARP correlation when their (DisplayName, Publisher),
+            // run through NameNormalization, lands on a single package in
+            // norm_names2 ∩ norm_publishers2. Covers Inno Setup-style
+            // installers, MSIs without ProductCode in ARP, and vendors
+            // that publish a DisplayName different from the catalog's
+            // PackageName but matching an AppsAndFeaturesEntries name.
+            warnings.AddRange(CorrelateInstalledByNormalizedIdentity(installed, query.Source));
         }
 
         if (needsAvailable && hasFilter)
@@ -2098,6 +2107,128 @@ public class Repository : IDisposable
             }
         }
         return warnings;
+    }
+
+    /// <summary>
+    /// Mid-tier correlation that mirrors winget's ARP normalization path.
+    /// For each installed package without a PFN/PC/UC identity match, the
+    /// (DisplayName, Publisher) is run through NameNormalization and
+    /// intersected against the v2 index's norm_names2 and norm_publishers2
+    /// tables. A single resulting package_rowid produces a correlation;
+    /// ambiguous matches are skipped, matching winget's empty-Source
+    /// behavior when normalization can't pick a winner.
+    /// </summary>
+    private List<string> CorrelateInstalledByNormalizedIdentity(List<InstalledPackage> installed, string? requestedSource)
+    {
+        var warnings = new List<string>();
+        for (int sourceIndex = 0; sourceIndex < _store.Sources.Count; sourceIndex++)
+        {
+            var source = _store.Sources[sourceIndex];
+            if (source.Kind != SourceKind.PreIndexed) continue;
+            if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            Microsoft.Data.Sqlite.SqliteConnection conn;
+            try { conn = OpenPreindexedConnection(sourceIndex); }
+            catch { continue; }
+
+            var resolved = new List<(int Index, V2PackageMetadata Meta)>();
+            using (conn)
+            {
+                if (!V2NormalizedIdentityTablesPresent(conn)) continue;
+                for (int i = 0; i < installed.Count; i++)
+                {
+                    var pkg = installed[i];
+                    if (pkg.Correlated is not null) continue;
+                    // MSIX entries belong to the PFN-only path; matches
+                    // `CorrelateInstalledPackage`'s MSIX hard-block.
+                    if (pkg.LocalId.StartsWith(@"MSIX\", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.IsNullOrWhiteSpace(pkg.Publisher)) continue;
+
+                    var normName = NameNormalization.NormalizeName(pkg.Name).Name;
+                    if (string.IsNullOrEmpty(normName)) continue;
+                    var normPub = NameNormalization.NormalizePublisher(pkg.Publisher);
+                    if (string.IsNullOrEmpty(normPub)) continue;
+
+                    var rowid = LookupUniqueNormalizedIdentity(conn, normName, normPub);
+                    if (rowid is null) continue;
+                    var meta = FetchV2PackageMetadata(conn, rowid.Value);
+                    if (meta is null) continue;
+                    resolved.Add((i, meta));
+                }
+            }
+
+            foreach (var (idx, meta) in resolved)
+            {
+                string? canonicalInstalled = null;
+                string? anchoredLatest = null;
+                try
+                {
+                    using var conn2 = OpenPreindexedConnection(sourceIndex);
+                    var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
+                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    anchoredLatest = LatestArpAnchoredVersion(entries);
+                }
+                catch { /* best-effort */ }
+
+                var availableVersion = (canonicalInstalled is not null && anchoredLatest is not null)
+                    ? anchoredLatest
+                    : meta.LatestVersion;
+
+                installed[idx].Correlated = new SearchMatch
+                {
+                    SourceName = source.Name,
+                    SourceKind = source.Kind,
+                    Id = meta.Id,
+                    Name = meta.Name,
+                    Moniker = meta.Moniker,
+                    Version = availableVersion,
+                    MatchCriteria = "NormalizedNameAndPublisher",
+                };
+                if (canonicalInstalled is not null)
+                {
+                    installed[idx].InstalledVersion = canonicalInstalled;
+                    installed[idx].InstalledVersionCanonical = true;
+                }
+            }
+        }
+        return warnings;
+    }
+
+    private static bool V2NormalizedIdentityTablesPresent(Microsoft.Data.Sqlite.SqliteConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'norm_names2' LIMIT 1";
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    // Test-only entry point. Keep internal so InternalsVisibleTo exposes
+    // it just to Core.Tests.
+    internal static long? LookupUniqueNormalizedIdentityForTesting(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
+        => LookupUniqueNormalizedIdentity(conn, normName, normPublisher);
+
+    /// <summary>
+    /// Returns the catalog packages.rowid whose (norm_name, norm_publisher)
+    /// pair matches the installed package — if and only if the match is
+    /// unique. Multiple matches mean normalization couldn't disambiguate
+    /// (an ARP DisplayName that normalizes the same as two distinct catalog
+    /// packages); winget refuses to correlate and we do the same.
+    /// </summary>
+    private static long? LookupUniqueNormalizedIdentity(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            SELECT DISTINCT n.package FROM norm_names2 n
+            WHERE n.norm_name = @name
+            AND EXISTS (SELECT 1 FROM norm_publishers2 p WHERE p.package = n.package AND p.norm_publisher = @pub)
+            LIMIT 2";
+        cmd.Parameters.AddWithValue("@name", normName);
+        cmd.Parameters.AddWithValue("@pub", normPublisher);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        var first = reader.GetInt64(0);
+        if (reader.Read()) return null; // ambiguous
+        return first;
     }
 
     /// <summary>

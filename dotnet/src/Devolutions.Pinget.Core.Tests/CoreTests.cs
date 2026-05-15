@@ -1559,6 +1559,86 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void LookupUniqueNormalizedIdentity_ReturnsUniqueMatch()
+    {
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE norm_names2 (norm_name TEXT, package INT64);
+                CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);
+                INSERT INTO norm_names2 VALUES ('microsoftedge', 100);
+                INSERT INTO norm_publishers2 VALUES ('microsoft', 100);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "microsoftedge", "microsoft");
+        Assert.Equal(100L, rowid);
+    }
+
+    [Fact]
+    public void LookupUniqueNormalizedIdentity_RejectsAmbiguousMatch()
+    {
+        // Two distinct packages share the same (norm_name, norm_publisher)
+        // — winget refuses to correlate when it can't disambiguate.
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE norm_names2 (norm_name TEXT, package INT64);
+                CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);
+                INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);
+                INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('thegitdevelopmentcommunity', 200);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "git", "thegitdevelopmentcommunity");
+        Assert.Null(rowid);
+    }
+
+    [Fact]
+    public void LookupUniqueNormalizedIdentity_RequiresPublisherIntersect()
+    {
+        // norm_name has multiple matches; only one shares the publisher
+        // with the installed package. Intersect picks the right one.
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE norm_names2 (norm_name TEXT, package INT64);
+                CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);
+                INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);
+                INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('microsoft', 200);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "git", "thegitdevelopmentcommunity");
+        Assert.Equal(100L, rowid);
+    }
+
+    [Fact]
+    public void LookupUniqueNormalizedIdentity_MissesWhenPublisherDoesNotMatch()
+    {
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE norm_names2 (norm_name TEXT, package INT64);
+                CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);
+                INSERT INTO norm_names2 VALUES ('foo', 100);
+                INSERT INTO norm_publishers2 VALUES ('bar', 200);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "foo", "bar");
+        Assert.Null(rowid);
+    }
+
+    [Fact]
     public void ApplyMsixResourceStringNameFix_ResolvesPlaceholderToCatalogName()
     {
         // App Installer's MSIX manifest stores DisplayName as

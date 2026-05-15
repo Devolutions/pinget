@@ -1004,6 +1004,16 @@ impl Repository {
             // ambiguous (Microsoft.Teams vs Microsoft.Teams.Free) or impossible
             // (MSIX with `ms-resource:` placeholder names).
             warnings.extend(self.correlate_installed_via_index(&mut installed, query.source.as_deref())?);
+
+            // ARP entries that lack identity keys (no PFN/PC/UC) still match
+            // winget's ARP correlation when their (DisplayName, Publisher),
+            // run through the NameNormalizer, lands on a single package in
+            // norm_names2 ∩ norm_publishers2. Covers Inno Setup-style
+            // installers, MSIs whose ARP keys don't include ProductCode, and
+            // any vendor that publishes a DisplayName that differs from the
+            // catalog's PackageName but matches an AppsAndFeaturesEntries
+            // DisplayName.
+            warnings.extend(self.correlate_installed_by_normalized_identity(&mut installed, query.source.as_deref())?);
         }
 
         if needs_available && has_filter {
@@ -1126,6 +1136,114 @@ impl Repository {
         }
 
         Ok(warnings)
+    }
+
+    /// Mid-tier correlation that mirrors winget's ARP normalization path.
+    /// For each installed package without a PFN/PC/UC identity match, the
+    /// (DisplayName, Publisher) is run through the NameNormalizer and
+    /// intersected against the v2 index's `norm_names2` and
+    /// `norm_publishers2` tables. A single resulting `package_rowid`
+    /// produces a correlation; ambiguous matches are skipped, matching
+    /// winget's empty-Source behavior when normalization can't pick a
+    /// winner.
+    fn correlate_installed_by_normalized_identity(
+        &mut self,
+        installed: &mut [InstalledPackage],
+        requested_source: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let source_indices: Vec<usize> = self
+            .store
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                source.kind == SourceKind::PreIndexed
+                    && match requested_source {
+                        Some(name) => source.name.eq_ignore_ascii_case(name),
+                        None => true,
+                    }
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        for source_index in source_indices {
+            let resolved: Vec<(usize, V2PackageMetadata)> = {
+                let connection = match self.open_preindexed_connection(source_index) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if !v2_normalized_identity_tables_present(&connection) {
+                    continue;
+                }
+                let mut acc = Vec::new();
+                for (idx, pkg) in installed.iter().enumerate() {
+                    if pkg.correlated.is_some() {
+                        continue;
+                    }
+                    // MSIX entries belong to the PFN-only path; skipping
+                    // here mirrors `correlate_installed_package`'s
+                    // hard-block on MSIX (their `ms-resource:` placeholder
+                    // names normalize to garbage anyway).
+                    if pkg.local_id.starts_with("MSIX\\") {
+                        continue;
+                    }
+                    let Some(publisher) = pkg.publisher.as_deref() else {
+                        continue;
+                    };
+                    let normalized_name = name_normalization::normalize_name(&pkg.name).name;
+                    if normalized_name.is_empty() {
+                        continue;
+                    }
+                    let normalized_publisher = name_normalization::normalize_publisher(publisher);
+                    if normalized_publisher.is_empty() {
+                        continue;
+                    }
+                    let Some(rowid) =
+                        lookup_unique_normalized_identity(&connection, &normalized_name, &normalized_publisher)?
+                    else {
+                        continue;
+                    };
+                    let Some(meta) = fetch_v2_package_metadata(&connection, rowid)? else {
+                        continue;
+                    };
+                    acc.push((idx, meta));
+                }
+                acc
+            };
+
+            let source = self.source_clone(source_index);
+            for (idx, meta) in resolved {
+                let (canonical_installed, anchored_latest) =
+                    match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
+                        Ok((entries, _)) => (
+                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version),
+                            latest_arp_anchored_version(&entries),
+                        ),
+                        Err(_) => (None, None),
+                    };
+                let available_version = match (&canonical_installed, anchored_latest) {
+                    (Some(_), Some(anchored)) => anchored,
+                    _ => meta.latest_version,
+                };
+                let installed_pkg = &mut installed[idx];
+                installed_pkg.correlated = Some(SearchMatch {
+                    source_name: source.name.clone(),
+                    source_kind: source.kind,
+                    id: meta.id,
+                    name: meta.name,
+                    moniker: meta.moniker,
+                    version: Some(available_version),
+                    channel: None,
+                    match_criteria: Some("NormalizedNameAndPublisher".to_owned()),
+                });
+                if let Some(version) = canonical_installed {
+                    installed_pkg.installed_version = version;
+                    installed_pkg.installed_version_canonical = true;
+                }
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// Correlates installed packages against the v2 pre-indexed catalog using
@@ -3182,6 +3300,44 @@ fn fetch_v2_package_metadata(connection: &Connection, package_rowid: i64) -> Res
             })
         },
     )
+}
+
+fn v2_normalized_identity_tables_present(connection: &Connection) -> bool {
+    query_optional_value(
+        connection,
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'norm_names2' LIMIT 1",
+        Vec::new(),
+        |row| row_i64(row, 0),
+    )
+    .ok()
+    .flatten()
+    .is_some()
+}
+
+/// Returns the catalog `packages.rowid` whose `(norm_name, norm_publisher)`
+/// pair matches the installed package — if and only if the match is
+/// unique. Multiple matches mean the normalization wasn't strong enough to
+/// disambiguate (e.g. an ARP DisplayName that normalizes the same as two
+/// distinct catalog packages); winget refuses to correlate in that case
+/// and we do the same.
+fn lookup_unique_normalized_identity(
+    connection: &Connection,
+    norm_name: &str,
+    norm_publisher: &str,
+) -> Result<Option<i64>> {
+    let rows: Vec<i64> = query_rows(
+        connection,
+        "SELECT DISTINCT n.package FROM norm_names2 n \
+         WHERE n.norm_name = ?1 \
+         AND EXISTS (SELECT 1 FROM norm_publishers2 p WHERE p.package = n.package AND p.norm_publisher = ?2) \
+         LIMIT 2",
+        vec![
+            SqlValue::Text(norm_name.to_owned()),
+            SqlValue::Text(norm_publisher.to_owned()),
+        ],
+        |row| row_i64(row, 0),
+    )?;
+    if rows.len() == 1 { Ok(Some(rows[0])) } else { Ok(None) }
 }
 
 fn v2_identity_tables_present(connection: &Connection) -> bool {
@@ -10044,5 +10200,81 @@ Installers:
         };
         let result = dedupe_correlated_for_upgrade(vec![uncorrelated]);
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn lookup_unique_normalized_identity_returns_unique_match() {
+        // Single (norm_name, norm_publisher) intersection — happy path.
+        let connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+                 INSERT INTO norm_names2 VALUES ('microsoftedge', 100);\n\
+                 INSERT INTO norm_publishers2 VALUES ('microsoft', 100);",
+            )
+            .expect("seed schema");
+
+        let rowid = lookup_unique_normalized_identity(&connection, "microsoftedge", "microsoft")
+            .expect("query")
+            .expect("unique match");
+        assert_eq!(rowid, 100);
+    }
+
+    #[test]
+    fn lookup_unique_normalized_identity_rejects_ambiguous_match() {
+        // Two distinct packages share the same (norm_name, norm_publisher)
+        // — the Git case where both `Git.Git` and a hypothetical sibling
+        // normalize identically. winget refuses to correlate when it can't
+        // disambiguate; pinget must do the same.
+        let connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+                 INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
+                 INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('thegitdevelopmentcommunity', 200);",
+            )
+            .expect("seed schema");
+
+        let rowid = lookup_unique_normalized_identity(&connection, "git", "thegitdevelopmentcommunity").expect("query");
+        assert!(rowid.is_none(), "ambiguous match must not correlate");
+    }
+
+    #[test]
+    fn lookup_unique_normalized_identity_requires_publisher_intersect() {
+        // norm_name has multiple matches but only one shares its
+        // norm_publisher with the installed package. Winget's intersect
+        // logic still picks the right one — verify.
+        let connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+                 INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
+                 INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('microsoft', 200);",
+            )
+            .expect("seed schema");
+
+        let rowid = lookup_unique_normalized_identity(&connection, "git", "thegitdevelopmentcommunity").expect("query");
+        assert_eq!(rowid, Some(100));
+    }
+
+    #[test]
+    fn lookup_unique_normalized_identity_misses_when_publisher_does_not_match() {
+        // Name matches but no publisher row for that package id —
+        // intersection is empty so we don't correlate.
+        let connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .execute_batch(
+                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+                 INSERT INTO norm_names2 VALUES ('foo', 100);\n\
+                 INSERT INTO norm_publishers2 VALUES ('bar', 200);",
+            )
+            .expect("seed schema");
+
+        let rowid = lookup_unique_normalized_identity(&connection, "foo", "bar").expect("query");
+        assert!(rowid.is_none(), "name matches package 100 but publisher matches 200 — no intersection");
     }
 }
