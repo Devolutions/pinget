@@ -6930,8 +6930,8 @@ fn can_reuse_installer_download(path: &Path, expected_hash: Option<&str>) -> Res
         return Ok(true);
     }
 
-    let cached = fs::read(path).context("failed to read cached installer")?;
-    Ok(hash_matches(expected_hash, &cached))
+    let cached = fs::File::open(path).context("failed to open cached installer")?;
+    Ok(sha256_hex_reader(cached)?.eq_ignore_ascii_case(expected_hash.unwrap_or_default()))
 }
 
 fn hash_matches(expected_hash: Option<&str>, bytes: &[u8]) -> bool {
@@ -6942,11 +6942,32 @@ fn hash_matches(expected_hash: Option<&str>, bytes: &[u8]) -> bool {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    hex_encode(&digest)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         output.push_str(&format!("{byte:02X}"));
     }
     output
+}
+
+fn sha256_hex_reader(mut reader: impl Read) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .context("failed to read bytes while hashing installer")?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    let digest = hasher.finalize();
+    Ok(hex_encode(&digest))
 }
 
 fn pins_db_path(app_root: &Path) -> PathBuf {
@@ -7610,6 +7631,7 @@ fn uninstall_package(_installed: &ListMatch, _request: &UninstallRequest) -> Res
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
@@ -7625,14 +7647,43 @@ mod tests {
         ))
     }
 
-    fn set_process_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
-        // SAFETY: These tests change process-global environment variables in a narrow scope and restore them before returning.
-        unsafe { std::env::set_var(key, value) };
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<OsString>,
     }
 
-    fn remove_process_env(key: &str) {
-        // SAFETY: These tests change process-global environment variables in a narrow scope and restore them before returning.
-        unsafe { std::env::remove_var(key) };
+    impl EnvVarGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                prior: std::env::var_os(key),
+            }
+        }
+
+        fn set(&self, value: impl AsRef<std::ffi::OsStr>) {
+            // SAFETY: Tests use these helpers in a narrow scope and Drop restores the prior value before the test exits.
+            unsafe { std::env::set_var(self.key, value) };
+        }
+
+        fn remove(&self) {
+            // SAFETY: Tests use these helpers in a narrow scope and Drop restores the prior value before the test exits.
+            unsafe { std::env::remove_var(self.key) };
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.prior.as_ref() {
+                Some(value) => {
+                    // SAFETY: This restores the exact prior process environment value captured at guard creation.
+                    unsafe { std::env::set_var(self.key, value) };
+                }
+                None => {
+                    // SAFETY: This restores the prior unset state captured at guard creation.
+                    unsafe { std::env::remove_var(self.key) };
+                }
+            }
+        }
     }
 
     #[test]
@@ -7655,11 +7706,11 @@ mod tests {
         let explicit = PathBuf::from(r"C:\temp\explicit-downloads");
         let env_path = PathBuf::from(r"C:\temp\env-downloads");
         let legacy_env_path = PathBuf::from(r"C:\temp\legacy-downloads");
-        let prior_primary = std::env::var_os("PINGET_DOWNLOAD_CACHE_DIR");
-        let prior_legacy = std::env::var_os("PINGET_DOWNLOAD_CACHE");
+        let primary_guard = EnvVarGuard::new("PINGET_DOWNLOAD_CACHE_DIR");
+        let legacy_guard = EnvVarGuard::new("PINGET_DOWNLOAD_CACHE");
 
-        set_process_env("PINGET_DOWNLOAD_CACHE_DIR", &env_path);
-        set_process_env("PINGET_DOWNLOAD_CACHE", &legacy_env_path);
+        primary_guard.set(&env_path);
+        legacy_guard.set(&legacy_env_path);
 
         assert_eq!(
             resolve_installer_download_cache_root(&app_root, Some(explicit.as_path())),
@@ -7667,23 +7718,14 @@ mod tests {
         );
         assert_eq!(resolve_installer_download_cache_root(&app_root, None), env_path);
 
-        remove_process_env("PINGET_DOWNLOAD_CACHE_DIR");
+        primary_guard.remove();
         assert_eq!(resolve_installer_download_cache_root(&app_root, None), legacy_env_path);
 
-        remove_process_env("PINGET_DOWNLOAD_CACHE");
+        legacy_guard.remove();
         assert_eq!(
             resolve_installer_download_cache_root(&app_root, None),
             app_root.join("downloads")
         );
-
-        match prior_primary {
-            Some(value) => set_process_env("PINGET_DOWNLOAD_CACHE_DIR", value),
-            None => remove_process_env("PINGET_DOWNLOAD_CACHE_DIR"),
-        }
-        match prior_legacy {
-            Some(value) => set_process_env("PINGET_DOWNLOAD_CACHE", value),
-            None => remove_process_env("PINGET_DOWNLOAD_CACHE"),
-        }
     }
 
     #[test]

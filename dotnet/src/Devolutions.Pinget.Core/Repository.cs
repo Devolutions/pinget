@@ -3042,7 +3042,14 @@ public class Repository : IDisposable
         if (expectedHash is null)
             return true;
 
-        return Sha256Hex(File.ReadAllBytes(installerPath)).Equals(expectedHash, StringComparison.OrdinalIgnoreCase);
+        using var stream = File.OpenRead(installerPath);
+        return Sha256Hex(stream).Equals(expectedHash, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string Sha256Hex(Stream data)
+    {
+        var hash = SHA256.HashData(data);
+        return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
     private class VersionComparer : IComparer<string>
