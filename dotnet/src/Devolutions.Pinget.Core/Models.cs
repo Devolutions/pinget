@@ -39,7 +39,7 @@ public record RepositoryOptions
     /// </summary>
     public string? AppRoot { get; init; }
     /// <summary>
-    /// Persistent installer download cache root. A null value uses PINGET_DOWNLOAD_CACHE when set, otherwise {AppRoot}\downloads.
+    /// Persistent installer download cache root. A null value uses PINGET_DOWNLOAD_CACHE_DIR when set, then PINGET_DOWNLOAD_CACHE, otherwise {AppRoot}\downloads.
     /// </summary>
     public string? DownloadCacheDirectory { get; init; }
     public string UserAgent { get; init; } = "pinget-dotnet/0.1";

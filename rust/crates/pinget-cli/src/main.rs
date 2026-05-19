@@ -2216,7 +2216,8 @@ fn map_manifest_version(version: &str) -> String {
 fn do_download(repository: &mut Repository, request: &InstallRequest, download_dir: Option<&str>) -> Result<()> {
     let dir = match download_dir {
         Some(d) => PathBuf::from(d),
-        None => std::env::var_os("PINGET_DOWNLOAD_CACHE")
+        None => std::env::var_os("PINGET_DOWNLOAD_CACHE_DIR")
+            .or_else(|| std::env::var_os("PINGET_DOWNLOAD_CACHE"))
             .map(PathBuf::from)
             .unwrap_or(std::env::current_dir()?),
     };

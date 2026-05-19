@@ -719,6 +719,7 @@ var dlScopeOpt = new Option<string?>("--scope", "Install scope");
 var dlIgnoreSecurityHashOpt = new Option<bool>("--ignore-security-hash", "Ignore installer hash mismatches");
 var dlSkipDependenciesOpt = new Option<bool>("--skip-dependencies", "Skip package dependencies");
 var dlAcceptPkgAgreementsOpt = new Option<bool>("--accept-package-agreements", "Accept package agreements");
+const string downloadCacheDirectoryEnvironmentVariable = "PINGET_DOWNLOAD_CACHE_DIR";
 const string downloadCacheEnvironmentVariable = "PINGET_DOWNLOAD_CACHE";
 downloadCommand.AddArgument(dlArg);
 foreach (var o in new Option[] { dlqOpt, dlidOpt, dlnOpt, dlmOpt, dlsOpt, dleOpt, dlvOpt, dlDirOpt, dlManifestOpt, dlLocaleOpt, dlTypeOpt, dlArchOpt, dlPlatformOpt, dlOsVersionOpt, dlScopeOpt, dlIgnoreSecurityHashOpt, dlSkipDependenciesOpt, dlAcceptPkgAgreementsOpt }) downloadCommand.AddOption(o);
@@ -742,6 +743,7 @@ downloadCommand.SetHandler((ctx) =>
         InstallScope = ctx.ParseResult.GetValueForOption(dlScopeOpt),
     };
     var dir = ctx.ParseResult.GetValueForOption(dlDirOpt)
+        ?? Environment.GetEnvironmentVariable(downloadCacheDirectoryEnvironmentVariable)
         ?? Environment.GetEnvironmentVariable(downloadCacheEnvironmentVariable)
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
     using var repo = Repository.Open();

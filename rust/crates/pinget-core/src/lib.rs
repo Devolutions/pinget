@@ -1769,7 +1769,8 @@ impl Repository {
             let _ = self.uninstall_request(&uninstall_request);
         }
 
-        let (_, installer_path) = self.download_installer_for_request(request, &self.download_cache_root)?;
+        let download_cache_root = self.download_cache_root.clone();
+        let (_, installer_path) = self.download_installer_for_request(request, &download_cache_root)?;
 
         let installer_type = installer.installer_type.as_deref().unwrap_or("exe").to_lowercase();
 
@@ -4722,8 +4723,14 @@ fn cache_root(app_root: &Path) -> PathBuf {
 fn resolve_installer_download_cache_root(app_root: &Path, configured_root: Option<&Path>) -> PathBuf {
     configured_root
         .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("PINGET_DOWNLOAD_CACHE").map(PathBuf::from))
+        .or_else(installer_download_cache_root_from_environment)
         .unwrap_or_else(|| app_root.join("downloads"))
+}
+
+fn installer_download_cache_root_from_environment() -> Option<PathBuf> {
+    std::env::var_os("PINGET_DOWNLOAD_CACHE_DIR")
+        .or_else(|| std::env::var_os("PINGET_DOWNLOAD_CACHE"))
+        .map(PathBuf::from)
 }
 
 fn default_cache_root_fallback() -> PathBuf {
@@ -7618,6 +7625,16 @@ mod tests {
         ))
     }
 
+    fn set_process_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: These tests change process-global environment variables in a narrow scope and restore them before returning.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    fn remove_process_env(key: &str) {
+        // SAFETY: These tests change process-global environment variables in a narrow scope and restore them before returning.
+        unsafe { std::env::remove_var(key) };
+    }
+
     #[test]
     fn repository_options_capture_custom_host_settings() {
         let options = RepositoryOptions::new(PathBuf::from(r"C:\temp\pinget-test"))
@@ -7637,28 +7654,35 @@ mod tests {
         let app_root = PathBuf::from(r"C:\temp\pinget-test");
         let explicit = PathBuf::from(r"C:\temp\explicit-downloads");
         let env_path = PathBuf::from(r"C:\temp\env-downloads");
-        let prior = std::env::var_os("PINGET_DOWNLOAD_CACHE");
+        let legacy_env_path = PathBuf::from(r"C:\temp\legacy-downloads");
+        let prior_primary = std::env::var_os("PINGET_DOWNLOAD_CACHE_DIR");
+        let prior_legacy = std::env::var_os("PINGET_DOWNLOAD_CACHE");
 
-        unsafe { std::env::set_var("PINGET_DOWNLOAD_CACHE", &env_path) };
+        set_process_env("PINGET_DOWNLOAD_CACHE_DIR", &env_path);
+        set_process_env("PINGET_DOWNLOAD_CACHE", &legacy_env_path);
 
         assert_eq!(
             resolve_installer_download_cache_root(&app_root, Some(explicit.as_path())),
             explicit
         );
-        assert_eq!(
-            resolve_installer_download_cache_root(&app_root, None),
-            env_path
-        );
+        assert_eq!(resolve_installer_download_cache_root(&app_root, None), env_path);
 
-        unsafe { std::env::remove_var("PINGET_DOWNLOAD_CACHE") };
+        remove_process_env("PINGET_DOWNLOAD_CACHE_DIR");
+        assert_eq!(resolve_installer_download_cache_root(&app_root, None), legacy_env_path);
+
+        remove_process_env("PINGET_DOWNLOAD_CACHE");
         assert_eq!(
             resolve_installer_download_cache_root(&app_root, None),
             app_root.join("downloads")
         );
 
-        match prior {
-            Some(value) => unsafe { std::env::set_var("PINGET_DOWNLOAD_CACHE", value) },
-            None => unsafe { std::env::remove_var("PINGET_DOWNLOAD_CACHE") },
+        match prior_primary {
+            Some(value) => set_process_env("PINGET_DOWNLOAD_CACHE_DIR", value),
+            None => remove_process_env("PINGET_DOWNLOAD_CACHE_DIR"),
+        }
+        match prior_legacy {
+            Some(value) => set_process_env("PINGET_DOWNLOAD_CACHE", value),
+            None => remove_process_env("PINGET_DOWNLOAD_CACHE"),
         }
     }
 
@@ -7668,12 +7692,8 @@ mod tests {
         fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache directory");
         fs::write(&path, b"pinget").expect("write cached installer");
 
-        assert!(
-            can_reuse_installer_download(&path, Some(&sha256_hex(b"pinget"))).expect("reuse matched hash")
-        );
-        assert!(
-            !can_reuse_installer_download(&path, Some("DEADBEEF")).expect("reject mismatched hash")
-        );
+        assert!(can_reuse_installer_download(&path, Some(&sha256_hex(b"pinget"))).expect("reuse matched hash"));
+        assert!(!can_reuse_installer_download(&path, Some("DEADBEEF")).expect("reject mismatched hash"));
         assert!(can_reuse_installer_download(&path, None).expect("reuse without hash"));
     }
 
@@ -8411,7 +8431,10 @@ Installers:
             .expect("seed schema");
 
         let rowid = lookup_unique_normalized_identity(&connection, "foo", "bar").expect("query");
-        assert!(rowid.is_none(), "name matches package 100 but publisher matches 200 — no intersection");
+        assert!(
+            rowid.is_none(),
+            "name matches package 100 but publisher matches 200 — no intersection"
+        );
     }
 
     #[test]

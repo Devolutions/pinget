@@ -13,6 +13,7 @@ namespace Devolutions.Pinget.Core;
 public class Repository : IDisposable
 {
     private const string AppRootEnvironmentVariable = "PINGET_APPROOT";
+    private const string DownloadCacheDirectoryEnvironmentVariable = "PINGET_DOWNLOAD_CACHE_DIR";
     private const string DownloadCacheEnvironmentVariable = "PINGET_DOWNLOAD_CACHE";
 
     internal const string InstalledStateUnsupportedWarning = "Installed package discovery is not supported on this platform; returning no installed packages.";
@@ -67,7 +68,8 @@ public class Repository : IDisposable
     internal static string ResolveInstallerDownloadCacheRoot(string appRoot, string? configuredDirectory)
     {
         var effectiveDirectory = string.IsNullOrWhiteSpace(configuredDirectory)
-            ? Environment.GetEnvironmentVariable(DownloadCacheEnvironmentVariable)
+            ? Environment.GetEnvironmentVariable(DownloadCacheDirectoryEnvironmentVariable)
+                ?? Environment.GetEnvironmentVariable(DownloadCacheEnvironmentVariable)
             : configuredDirectory;
 
         if (string.IsNullOrWhiteSpace(effectiveDirectory))
