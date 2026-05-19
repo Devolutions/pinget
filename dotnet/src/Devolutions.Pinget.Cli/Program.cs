@@ -1,12 +1,10 @@
 using System.CommandLine;
 using System.Security.Cryptography;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Devolutions.Pinget.Cli;
 using Devolutions.Pinget.Cli.Extensions;
 using Devolutions.Pinget.Cli.Helpers;
 using Devolutions.Pinget.Core;
-using YamlDotNet.Serialization;
 
 if (args.Length == 1 && (string.Equals(args[0], "--version", StringComparison.OrdinalIgnoreCase) || string.Equals(args[0], "-v", StringComparison.OrdinalIgnoreCase)))
 {
@@ -19,8 +17,6 @@ var rootCommand = new RootCommand("Pinget: portable winget in pure C#");
 var outputOption = new Option<string?>("--output", "Output format: text, json, or yaml").WithAliases("-o");
 outputOption.FromAmong("text", "json", "yaml");
 rootCommand.AddGlobalOption(outputOption);
-
-var JsonOpts = new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
 var infoOption = new Option<bool>("--info", "Display general info");
 rootCommand.AddGlobalOption(infoOption);
@@ -417,7 +413,7 @@ sourceExportCmd.SetHandler(() =>
         s.Explicit,
         s.Priority,
     });
-    Console.WriteLine(JsonSerializer.Serialize(new { Sources = sources }, JsonOpts));
+    Console.WriteLine(JsonSerializer.Serialize(new { Sources = sources }, Json.Options));
 });
 
 sourceAddCmd.SetHandler((ctx) =>
@@ -560,7 +556,7 @@ exportCommand.SetHandler((output, source, includeVersions) =>
             }
         }
     };
-    File.WriteAllText(output, JsonSerializer.Serialize(export, JsonOpts));
+    File.WriteAllText(output, JsonSerializer.Serialize(export, Json.Options));
     Console.WriteLine($"Exported {packages.Count} packages to {output}");
 }, exOutputOpt, exSourceOpt, exVersionsOpt);
 
