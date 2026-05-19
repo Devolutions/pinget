@@ -68,7 +68,7 @@ pinget install --id Devolutions.MsRdpEx --scope user --silent
 pinget uninstall --id Devolutions.MsRdpEx --silent
 ```
 
-Set `PINGET_DOWNLOAD_CACHE_DIR` to choose a persistent installer cache directory. `pinget install` reuses that cache automatically, and `pinget download` / `Export-PingetPackage` also use it as the default target when no download directory is supplied. `PINGET_DOWNLOAD_CACHE` is also accepted as a compatibility alias.
+Set `PINGET_DOWNLOAD_CACHE_DIR` to choose a persistent installer cache directory. `pinget install` reuses that cache automatically, and `pinget download` / `Export-PingetPackage` also use it as the default target when no download directory is supplied. When not set, downloads default to the system temp cache path.
 
 ## PowerShell module
 
