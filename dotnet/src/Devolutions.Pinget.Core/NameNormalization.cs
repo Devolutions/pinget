@@ -15,7 +15,7 @@ namespace Devolutions.Pinget.Core;
 /// suffixes before comparing. This class reproduces those transformations
 /// so we can correlate the same set of ARP rows winget does.
 /// </summary>
-internal static class NameNormalization
+internal static partial class NameNormalization
 {
     internal enum Architecture
     {
@@ -38,7 +38,7 @@ internal static class NameNormalization
 
         // SAP Business Object program names follow a specific pattern that
         // breaks under the regular flow; winget short-circuits them.
-        if (SapPackage.IsMatch(name))
+        if (SapPackage().IsMatch(name))
         {
             return new NormalizedName(name, Architecture.Unknown, string.Empty);
         }
@@ -49,13 +49,13 @@ internal static class NameNormalization
         // Preserve KB numbers from within parens before the bracket strippers
         // would eat them — winget keeps `KB1234567` as part of the normalized
         // name because it's the only meaningful identifier on some patches.
-        name = KbNumbers.Replace(name, "$1");
+        name = KbNumbers().Replace(name, "$1");
 
         while (RemoveAll(ProgramNameRegexes, ref name)) { }
 
-        var tokens = SplitWithLegalSuffixExclusion(ProgramNameSplit, name, stopOnExclusion: false);
+        var tokens = SplitWithLegalSuffixExclusion(ProgramNameSplit(), name, stopOnExclusion: false);
         name = string.Concat(tokens);
-        name = NonLettersAndDigits.Replace(name, string.Empty);
+        name = NonLettersAndDigits().Replace(name, string.Empty);
 
         return new NormalizedName(name.ToLowerInvariant(), architecture, locale.ToLowerInvariant());
     }
@@ -77,9 +77,9 @@ internal static class NameNormalization
         // Publisher split stops at the FIRST legal-entity suffix it sees
         // (after the first token), so "Foo Inc Internal Sub Bar" keeps just
         // "Foo" — "Inc" cuts off everything beyond.
-        var tokens = SplitWithLegalSuffixExclusion(PublisherNameSplit, publisher, stopOnExclusion: true);
+        var tokens = SplitWithLegalSuffixExclusion(PublisherNameSplit(), publisher, stopOnExclusion: true);
         publisher = string.Concat(tokens);
-        publisher = NonLettersAndDigits.Replace(publisher, string.Empty);
+        publisher = NonLettersAndDigits().Replace(publisher, string.Empty);
         return publisher.ToLowerInvariant();
     }
 
@@ -137,18 +137,18 @@ internal static class NameNormalization
     {
         // Order matters: "32/64-bit" is a superstring of "64-bit"; "X64"/
         // "AMD64" must beat "X32"/"X86" because of "x86-64".
-        if (Remove(Architecture32Or64Bit, ref value))
+        if (Remove(Architecture32Or64Bit(), ref value))
             return Architecture.Unknown;
-        if (Remove(ArchitectureX64, ref value) || Remove(Architecture64Bit, ref value))
+        if (Remove(ArchitectureX64(), ref value) || Remove(Architecture64Bit(), ref value))
             return Architecture.X64;
-        if (Remove(ArchitectureX32, ref value) || Remove(Architecture32Bit, ref value))
+        if (Remove(ArchitectureX32(), ref value) || Remove(Architecture32Bit(), ref value))
             return Architecture.X86;
         return Architecture.Unknown;
     }
 
     private static string RemoveLocale(ref string value)
     {
-        var matches = Locale.Matches(value);
+        var matches = Locale().Matches(value);
         if (matches.Count == 0) return string.Empty;
 
         var newValue = new System.Text.StringBuilder(value.Length);
@@ -213,72 +213,94 @@ internal static class NameNormalization
         return result;
     }
 
-    // ── Regex patterns. .NET regex supports variable-length lookbehind
-    // directly, so the C++ patterns port over unchanged. ─────────────────
+    // ── Regex patterns. Source-generated for NativeAOT compatibility —
+    // RegexOptions.Compiled would silently fall back to the interpreter
+    // under AOT, but [GeneratedRegex] produces specialized code at compile
+    // time. .NET regex supports variable-length lookbehind directly, so the
+    // C++ patterns port over unchanged. ──────────────────────────────────
 
-    private const RegexOptions Opts = RegexOptions.IgnoreCase | RegexOptions.Compiled;
+    [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])(X32|X86)(?=\P{Nd}|$)(?:\sEDITION)?", RegexOptions.IgnoreCase)]
+    private static partial Regex ArchitectureX32();
+    [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])(X64|AMD64|X86([\p{Pd}\p{Pc}]64))(?=\P{Nd}|$)(?:\sEDITION)?", RegexOptions.IgnoreCase)]
+    private static partial Regex ArchitectureX64();
+    [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])(32[\p{Pd}\p{Pc}\p{Z}]?BIT)S?(?:\sEDITION)?", RegexOptions.IgnoreCase)]
+    private static partial Regex Architecture32Bit();
+    [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])(64[\p{Pd}\p{Pc}\p{Z}]?BIT)S?(?:\sEDITION)?", RegexOptions.IgnoreCase)]
+    private static partial Regex Architecture64Bit();
+    [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])((64[\\/]32|32[\\/]64)[\p{Pd}\p{Pc}\p{Z}]?BIT)S?(?:\sEDITION)?", RegexOptions.IgnoreCase)]
+    private static partial Regex Architecture32Or64Bit();
 
-    private static readonly Regex ArchitectureX32 =
-        new(@"(?<=^|[^\p{L}\p{Nd}])(X32|X86)(?=\P{Nd}|$)(?:\sEDITION)?", Opts);
-    private static readonly Regex ArchitectureX64 =
-        new(@"(?<=^|[^\p{L}\p{Nd}])(X64|AMD64|X86([\p{Pd}\p{Pc}]64))(?=\P{Nd}|$)(?:\sEDITION)?", Opts);
-    private static readonly Regex Architecture32Bit =
-        new(@"(?<=^|[^\p{L}\p{Nd}])(32[\p{Pd}\p{Pc}\p{Z}]?BIT)S?(?:\sEDITION)?", Opts);
-    private static readonly Regex Architecture64Bit =
-        new(@"(?<=^|[^\p{L}\p{Nd}])(64[\p{Pd}\p{Pc}\p{Z}]?BIT)S?(?:\sEDITION)?", Opts);
-    private static readonly Regex Architecture32Or64Bit =
-        new(@"(?<=^|[^\p{L}\p{Nd}])((64[\\/]32|32[\\/]64)[\p{Pd}\p{Pc}\p{Z}]?BIT)S?(?:\sEDITION)?", Opts);
+    [GeneratedRegex(@"(?<![A-Z])((?:\p{Lu}{2,3}(-(CANS|CYRL|LATN|MONG))?-\p{Lu}{2})(?![A-Z])(?:-VALENCIA)?)", RegexOptions.IgnoreCase)]
+    private static partial Regex Locale();
 
-    private static readonly Regex Locale =
-        new(@"(?<![A-Z])((?:\p{Lu}{2,3}(-(CANS|CYRL|LATN|MONG))?-\p{Lu}{2})(?![A-Z])(?:-VALENCIA)?)", Opts);
+    [GeneratedRegex(@"^(?:[\p{Lu}\p{Nd}]+[\._])+[\p{Lu}\p{Nd}]+(?:-(?:\p{Nd}+\.)+\p{Nd}+)(?:-(?:\p{Lu}{2}(?:_\p{Lu}{2})?|CORE))(?:-(?:\p{Lu}{2}|\p{Nd}{2}))$", RegexOptions.IgnoreCase)]
+    private static partial Regex SapPackage();
 
-    private static readonly Regex SapPackage =
-        new(@"^(?:[\p{Lu}\p{Nd}]+[\._])+[\p{Lu}\p{Nd}]+(?:-(?:\p{Nd}+\.)+\p{Nd}+)(?:-(?:\p{Lu}{2}(?:_\p{Lu}{2})?|CORE))(?:-(?:\p{Lu}{2}|\p{Nd}{2}))$", Opts);
+    [GeneratedRegex(@"\((KB\d+)\)", RegexOptions.IgnoreCase)]
+    private static partial Regex KbNumbers();
+    [GeneratedRegex(@"[^\p{L}\p{Nd}]", RegexOptions.IgnoreCase)]
+    private static partial Regex NonLettersAndDigits();
 
-    private static readonly Regex KbNumbers = new(@"\((KB\d+)\)", Opts);
-    private static readonly Regex NonLettersAndDigits = new(@"[^\p{L}\p{Nd}]", Opts);
+    [GeneratedRegex(@"(?<!\p{L})(?:http[s]?|ftp)://", RegexOptions.IgnoreCase)]
+    private static partial Regex UriProtocol();
+    [GeneratedRegex(@"((?<!\p{L})(?:V|VER|VERSI(?:O|Ó)N|VERSÃO|VERSIE|WERSJA|BUILD|RELEASE|RC|SP)\P{L}?)?\p{Nd}+([\p{Po}\p{Pd}\p{Pc}]\p{Nd}?(RC|B|A|R|SP|K)?\p{Nd}+)+([\p{Po}\p{Pd}\p{Pc}]?[\p{L}\p{Nd}]+)*", RegexOptions.IgnoreCase)]
+    private static partial Regex VersionDelimited();
+    [GeneratedRegex(@"(FOR\s)?(?<!\p{L})(?:P|V|R|VER|VERSI(?:O|Ó)N|VERSÃO|VERSIE|WERSJA|BUILD|RELEASE|RC|SP)(?:\P{L}|\P{L}\p{L})?(\p{Nd}|\.\p{Nd})+(?:RC|B|A|R|V|SP)?\p{Nd}?", RegexOptions.IgnoreCase)]
+    private static partial Regex Version();
+    [GeneratedRegex(@"(?<!\p{L})(?:(?:V|VER|VERSI(?:O|Ó)N|VERSÃO|VERSIE|WERSJA|BUILD|RELEASE|RC|SP)\P{L})?\p{Lu}\p{Nd}+(?:[\p{Po}\p{Pd}\p{Pc}]\p{Nd}+)+", RegexOptions.IgnoreCase)]
+    private static partial Regex VersionLetter();
+    [GeneratedRegex(@"\([^\(\)]*\)|\[[^\[\]]*\]", RegexOptions.IgnoreCase)]
+    private static partial Regex NonNestedBracket();
+    [GeneratedRegex("(?:\\p{Ps}.*\\p{Pe}|\".*\")", RegexOptions.IgnoreCase)]
+    private static partial Regex BracketEnclosed();
+    [GeneratedRegex(@"^[^\p{L}\p{Nd}]+", RegexOptions.IgnoreCase)]
+    private static partial Regex LeadingSymbols();
+    [GeneratedRegex(@"\P{L}+$", RegexOptions.IgnoreCase)]
+    private static partial Regex TrailingNonLetters();
+    [GeneratedRegex(@"^\(.*?\)", RegexOptions.IgnoreCase)]
+    private static partial Regex PrefixParens();
+    [GeneratedRegex("(\\(\\s*\\)|\\[\\s*\\]|\"\\s*\")", RegexOptions.IgnoreCase)]
+    private static partial Regex EmptyParens();
+    [GeneratedRegex(@"\sEN\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex EnSuffix();
+    [GeneratedRegex(@"[^\p{L}\p{Nd}]+$", RegexOptions.IgnoreCase)]
+    private static partial Regex TrailingSymbols();
+    [GeneratedRegex(@"((INSTALLED\sAT|IN)\s)?[CDEF]:\\(.+?\\)*[^\s]*\\?", RegexOptions.IgnoreCase)]
+    private static partial Regex FilePath();
+    [GeneratedRegex(@"\(CHANGE\s#\d{1,2}\sTO\s[CDEF]:\\(.+?\\)*[^\s]*\\?\)", RegexOptions.IgnoreCase)]
+    private static partial Regex FilePathGhs();
+    [GeneratedRegex(@"\([CDEF]:\\(.+?\\)*[^\s]*\\?\)", RegexOptions.IgnoreCase)]
+    private static partial Regex FilePathParens();
+    [GeneratedRegex("\"[CDEF]:\\\\(.+?\\\\)*[^\\s]*\\\\?\"", RegexOptions.IgnoreCase)]
+    private static partial Regex FilePathQuotes();
+    [GeneratedRegex(@"(?<=^ROBLOX\s(PLAYER|STUDIO))(\sFOR\s.*)", RegexOptions.IgnoreCase)]
+    private static partial Regex Roblox();
+    [GeneratedRegex(@"(?<=^BOMGAR\s(JUMP\sCLIENT|(ACCESS|REPRESENTATIVE)\sCONSOLE|BUTTON)|^EMBEDDED\sCALLBACK)(\s.*)", RegexOptions.IgnoreCase)]
+    private static partial Regex Bomgar();
+    [GeneratedRegex(@"(?:(?<=^\p{L})|(?<=\P{L}\p{L}))(\.|/)(?=\p{L}(?:\P{L}|$))", RegexOptions.IgnoreCase)]
+    private static partial Regex AcronymSeparators();
+    [GeneratedRegex(@"(?<=^|\s)[^\p{L}]+(?=\s|$)", RegexOptions.IgnoreCase)]
+    private static partial Regex NonLetters();
+    [GeneratedRegex(@"[^\p{L}\p{Nd}\+\&]", RegexOptions.IgnoreCase)]
+    private static partial Regex ProgramNameSplit();
+    [GeneratedRegex(@"[^\p{L}\p{Nd}]", RegexOptions.IgnoreCase)]
+    private static partial Regex PublisherNameSplit();
 
-    private static readonly Regex UriProtocol = new(@"(?<!\p{L})(?:http[s]?|ftp)://", Opts);
-    private static readonly Regex VersionDelimited =
-        new(@"((?<!\p{L})(?:V|VER|VERSI(?:O|Ó)N|VERSÃO|VERSIE|WERSJA|BUILD|RELEASE|RC|SP)\P{L}?)?\p{Nd}+([\p{Po}\p{Pd}\p{Pc}]\p{Nd}?(RC|B|A|R|SP|K)?\p{Nd}+)+([\p{Po}\p{Pd}\p{Pc}]?[\p{L}\p{Nd}]+)*", Opts);
-    private static readonly Regex Version =
-        new(@"(FOR\s)?(?<!\p{L})(?:P|V|R|VER|VERSI(?:O|Ó)N|VERSÃO|VERSIE|WERSJA|BUILD|RELEASE|RC|SP)(?:\P{L}|\P{L}\p{L})?(\p{Nd}|\.\p{Nd})+(?:RC|B|A|R|V|SP)?\p{Nd}?", Opts);
-    private static readonly Regex VersionLetter =
-        new(@"(?<!\p{L})(?:(?:V|VER|VERSI(?:O|Ó)N|VERSÃO|VERSIE|WERSJA|BUILD|RELEASE|RC|SP)\P{L})?\p{Lu}\p{Nd}+(?:[\p{Po}\p{Pd}\p{Pc}]\p{Nd}+)+", Opts);
-    private static readonly Regex NonNestedBracket = new(@"\([^\(\)]*\)|\[[^\[\]]*\]", Opts);
-    private static readonly Regex BracketEnclosed = new("(?:\\p{Ps}.*\\p{Pe}|\".*\")", Opts);
-    private static readonly Regex LeadingSymbols = new(@"^[^\p{L}\p{Nd}]+", Opts);
-    private static readonly Regex TrailingNonLetters = new(@"\P{L}+$", Opts);
-    private static readonly Regex PrefixParens = new(@"^\(.*?\)", Opts);
-    private static readonly Regex EmptyParens = new("(\\(\\s*\\)|\\[\\s*\\]|\"\\s*\")", Opts);
-    private static readonly Regex EnSuffix = new(@"\sEN\s*$", Opts);
-    private static readonly Regex TrailingSymbols = new(@"[^\p{L}\p{Nd}]+$", Opts);
-    private static readonly Regex FilePath = new(@"((INSTALLED\sAT|IN)\s)?[CDEF]:\\(.+?\\)*[^\s]*\\?", Opts);
-    private static readonly Regex FilePathGhs = new(@"\(CHANGE\s#\d{1,2}\sTO\s[CDEF]:\\(.+?\\)*[^\s]*\\?\)", Opts);
-    private static readonly Regex FilePathParens = new(@"\([CDEF]:\\(.+?\\)*[^\s]*\\?\)", Opts);
-    private static readonly Regex FilePathQuotes = new("\"[CDEF]:\\\\(.+?\\\\)*[^\\s]*\\\\?\"", Opts);
-    private static readonly Regex Roblox = new(@"(?<=^ROBLOX\s(PLAYER|STUDIO))(\sFOR\s.*)", Opts);
-    private static readonly Regex Bomgar =
-        new(@"(?<=^BOMGAR\s(JUMP\sCLIENT|(ACCESS|REPRESENTATIVE)\sCONSOLE|BUTTON)|^EMBEDDED\sCALLBACK)(\s.*)", Opts);
-    private static readonly Regex AcronymSeparators =
-        new(@"(?:(?<=^\p{L})|(?<=\P{L}\p{L}))(\.|/)(?=\p{L}(?:\P{L}|$))", Opts);
-    private static readonly Regex NonLetters = new(@"(?<=^|\s)[^\p{L}]+(?=\s|$)", Opts);
-    private static readonly Regex ProgramNameSplit = new(@"[^\p{L}\p{Nd}\+\&]", Opts);
-    private static readonly Regex PublisherNameSplit = new(@"[^\p{L}\p{Nd}]", Opts);
-
+    // Source-generated regex methods return cached singletons, so building
+    // these arrays once is just storing the cached references.
     private static readonly Regex[] ProgramNameRegexes =
     [
-        Roblox, Bomgar, PrefixParens, EmptyParens,
-        FilePathGhs, FilePathParens, FilePathQuotes, FilePath,
-        VersionLetter, VersionDelimited, Version, EnSuffix,
-        NonNestedBracket, BracketEnclosed, UriProtocol,
-        LeadingSymbols, TrailingSymbols,
+        Roblox(), Bomgar(), PrefixParens(), EmptyParens(),
+        FilePathGhs(), FilePathParens(), FilePathQuotes(), FilePath(),
+        VersionLetter(), VersionDelimited(), Version(), EnSuffix(),
+        NonNestedBracket(), BracketEnclosed(), UriProtocol(),
+        LeadingSymbols(), TrailingSymbols(),
     ];
 
     private static readonly Regex[] PublisherNameRegexes =
     [
-        VersionDelimited, Version, NonNestedBracket, BracketEnclosed,
-        UriProtocol, NonLetters, TrailingNonLetters, AcronymSeparators,
+        VersionDelimited(), Version(), NonNestedBracket(), BracketEnclosed(),
+        UriProtocol(), NonLetters(), TrailingNonLetters(), AcronymSeparators(),
     ];
 
     // ── Locale + legal-entity-suffix lists ─────────────────────────────────

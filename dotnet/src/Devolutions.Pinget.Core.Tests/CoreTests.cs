@@ -1765,6 +1765,71 @@ Installers:
     }
 
     [Fact]
+    public void UpgradeFilter_HidesLacksCompatibleInstaller_ByDefault()
+    {
+        var pkg = new InstalledPackage
+        {
+            Name = "Foo",
+            LocalId = @"ARP\Machine\X64\Foo",
+            InstalledVersion = "1.0",
+            Scope = "Machine",
+            InstallerCategory = "exe",
+            Correlated = new SearchMatch
+            {
+                SourceName = "winget",
+                SourceKind = SourceKind.PreIndexed,
+                Id = "Test.Foo",
+                Name = "Foo",
+                Version = "2.0",
+            },
+            CorrelatedLacksCompatibleInstaller = true,
+        };
+
+        var bulkQuery = new ListQuery { UpgradeOnly = true };
+        Assert.False(Repository.InstalledPackageMatchesUpgradeFilterForTesting(pkg, bulkQuery));
+
+        var filteredQuery = new ListQuery { UpgradeOnly = true, Id = "Test.Foo" };
+        Assert.True(Repository.InstalledPackageMatchesUpgradeFilterForTesting(pkg, filteredQuery));
+
+        pkg.CorrelatedLacksCompatibleInstaller = false;
+        Assert.True(Repository.InstalledPackageMatchesUpgradeFilterForTesting(pkg, bulkQuery));
+    }
+
+    private static Manifest SyntheticManifestWithInstallerArches(params string[] arches)
+    {
+        var installers = arches.Select(a => new Installer { Architecture = a }).ToList();
+        return new Manifest { Id = "Test", Name = "Test", Version = "1.0", Installers = installers };
+    }
+
+    [Fact]
+    public void ManifestHasCompatibleInstaller_NeutralAlwaysMatches()
+    {
+        Assert.True(Repository.ManifestHasCompatibleInstallerForTesting(
+            SyntheticManifestWithInstallerArches("neutral")));
+    }
+
+    [Fact]
+    public void ManifestHasCompatibleInstaller_EmptyInstallersPassThrough()
+    {
+        Assert.True(Repository.ManifestHasCompatibleInstallerForTesting(
+            SyntheticManifestWithInstallerArches()));
+    }
+
+    [Fact]
+    public void ManifestHasCompatibleInstaller_RejectsAlienArchOnly()
+    {
+        Assert.False(Repository.ManifestHasCompatibleInstallerForTesting(
+            SyntheticManifestWithInstallerArches("ppc")));
+    }
+
+    [Fact]
+    public void ManifestHasCompatibleInstaller_MixedSetPassesIfAnyMatch()
+    {
+        Assert.True(Repository.ManifestHasCompatibleInstallerForTesting(
+            SyntheticManifestWithInstallerArches("ppc", "neutral")));
+    }
+
+    [Fact]
     public void ApplyMsixResourceStringNameFix_ResolvesPlaceholderToCatalogName()
     {
         // App Installer's MSIX manifest stores DisplayName as
