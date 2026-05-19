@@ -1653,10 +1653,11 @@ public class Repository : IDisposable
     // Hand-rolled YAML node reader. Replaces YamlDotNet's generic Deserialize
     // path, which is reflection-heavy and emits IL3050/IL2026 warnings under
     // NativeAOT. Produces the same untyped object tree shape that
-    // `Deserialize<object?>` produces — Dictionary<object,object> for
-    // mappings, List<object> for sequences, string for scalars (or null for
-    // YAML null tags) — so all downstream pattern matches (`is IList<object>`,
-    // `is IDictionary<object,object>`) keep working unchanged.
+    // `Deserialize<object?>` produces — Dictionary<object,object?> for
+    // mappings, List<object?> for sequences, string for scalars (or null for
+    // YAML null tags). Nullability is compile-time only, so all downstream
+    // pattern matches (`is IList<object>`, `is IDictionary<object,object>`)
+    // keep working unchanged at runtime.
     private static object? ReadYamlDocument(YamlDotNet.Core.IParser parser)
     {
         parser.Consume<YamlDotNet.Core.Events.DocumentStart>();
@@ -1676,12 +1677,12 @@ public class Repository : IDisposable
             case YamlDotNet.Core.Events.MappingStart:
             {
                 parser.MoveNext();
-                var dict = new Dictionary<object, object>();
+                var dict = new Dictionary<object, object?>();
                 while (parser.Current is not YamlDotNet.Core.Events.MappingEnd)
                 {
                     var key = ReadYamlNode(parser);
                     var value = ReadYamlNode(parser);
-                    if (key is not null) dict[key] = value ?? "";
+                    if (key is not null) dict[key] = value;
                 }
                 parser.MoveNext();
                 return dict;
@@ -1689,11 +1690,10 @@ public class Repository : IDisposable
             case YamlDotNet.Core.Events.SequenceStart:
             {
                 parser.MoveNext();
-                var list = new List<object>();
+                var list = new List<object?>();
                 while (parser.Current is not YamlDotNet.Core.Events.SequenceEnd)
                 {
-                    var item = ReadYamlNode(parser);
-                    if (item is not null) list.Add(item);
+                    list.Add(ReadYamlNode(parser));
                 }
                 parser.MoveNext();
                 return list;
