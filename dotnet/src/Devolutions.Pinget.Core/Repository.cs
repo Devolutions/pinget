@@ -2241,6 +2241,9 @@ public class Repository : IDisposable
     internal static long? LookupUniqueNormalizedIdentityForTesting(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
         => LookupUniqueNormalizedIdentity(conn, normName, normPublisher);
 
+    internal static bool ManifestHasCompatibleInstallerForTesting(Manifest manifest)
+        => ManifestHasCompatibleInstaller(manifest);
+
     internal static bool InstalledPackageMatchesUpgradeFilterForTesting(InstalledPackage pkg, ListQuery query)
         => InstalledPackageMatchesUpgradeFilter(pkg, query);
 
@@ -2397,6 +2400,7 @@ public class Repository : IDisposable
                             _client, "V2_M", source, latest.ManifestRelativePath, latest.ManifestHash);
                         var manifest = ParseYamlManifest(bytes);
                         installed[idx].CorrelatedRequiresExplicitUpgrade = manifest.RequireExplicitUpgrade;
+                        installed[idx].CorrelatedLacksCompatibleInstaller = !ManifestHasCompatibleInstaller(manifest);
                     }
                     catch { /* best-effort */ }
                 }
@@ -2522,15 +2526,27 @@ public class Repository : IDisposable
 
     private static bool InstalledPackageMatchesUpgradeFilter(InstalledPackage pkg, ListQuery query)
     {
-        // Hide RequireExplicitUpgrade packages from bulk `upgrade` output to
-        // match winget (Edge, Steam, Discord, several MSIX packages). When
-        // the user explicitly filtered by id/name/etc., they're targeting
-        // a specific package and want to see it regardless — same allowance
-        // winget makes.
+        // Hide RequireExplicitUpgrade rows from bulk `upgrade` (Edge, Steam,
+        // Discord). Explicit `--id` filters surface them regardless.
         if (pkg.CorrelatedRequiresExplicitUpgrade && !ListQueryNeedsAvailableLookup(query))
+            return false;
+        // Hide rows whose latest catalog version has no installer the host
+        // can run — winget refuses to upgrade past an unusable architecture.
+        if (pkg.CorrelatedLacksCompatibleInstaller && !ListQueryNeedsAvailableLookup(query))
             return false;
         return InstalledPackageHasUpgrade(pkg)
             || (query.IncludeUnknown && InstalledPackageHasUnknownVersion(pkg) && pkg.Correlated is not null);
+    }
+
+    private static bool ManifestHasCompatibleInstaller(Manifest manifest)
+    {
+        if (manifest.Installers.Count == 0) return true;
+        var allowed = PreferredArchitectures(CurrentArchitecture());
+        return manifest.Installers.Any(installer =>
+        {
+            var arch = installer.Architecture ?? "neutral";
+            return allowed.Any(candidate => candidate.Equals(arch, StringComparison.OrdinalIgnoreCase));
+        });
     }
 
     internal static PinRecord? FindApplicablePin(ListMatch match, IReadOnlyList<PinRecord> pins)
