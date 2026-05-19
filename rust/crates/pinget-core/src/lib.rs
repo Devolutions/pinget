@@ -3564,6 +3564,7 @@ fn collect_msi_upgrade_codes_from(
 /// registry hive back to the standard `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`
 /// lowercase form. The packing reverses each of the 11 chunks (sized 8/4/4
 /// then eight 2-char byte pairs) of the GUID's hex representation.
+#[cfg(windows)]
 fn unflip_packed_guid(packed: &str) -> Option<String> {
     if packed.len() != 32 || !packed.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -10629,6 +10630,7 @@ Installers:
         assert_eq!(package.name, "Microsoft Teams");
     }
 
+    #[cfg(windows)]
     #[test]
     fn unflip_packed_guid_reverses_msi_installer_packing() {
         // The MSI Installer hive packs GUIDs by char-reversing each of the 11
