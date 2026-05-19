@@ -6929,12 +6929,12 @@ fn can_reuse_installer_download(path: &Path, expected_hash: Option<&str>) -> Res
         return Ok(false);
     }
 
-    if expected_hash.is_none() {
+    let Some(expected_hash) = expected_hash else {
         return Ok(true);
-    }
+    };
 
     let cached = fs::File::open(path).context("failed to open cached installer")?;
-    Ok(sha256_hex_reader(cached)?.eq_ignore_ascii_case(expected_hash.unwrap_or_default()))
+    Ok(sha256_hex_reader(cached)?.eq_ignore_ascii_case(expected_hash))
 }
 
 fn installer_download_destination(download_root: &Path, filename: &str, url: &str, expected_hash: Option<&str>) -> PathBuf {
