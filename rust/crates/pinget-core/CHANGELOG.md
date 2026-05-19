@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/Devolutions/pinget/compare/pinget-core-v0.4.2...pinget-core-v0.5.0) - 2026-05-19
+
+### Other
+
+- Fix for failing check
+- Filter upgrades to architectures the host can run
+- Enhance pinget upgrade output  ([#23](https://github.com/Devolutions/pinget/pull/23))
+- *(release)* prepare for publishing
+
 ## [0.4.2](https://github.com/Devolutions/pinget/compare/pinget-core-v0.4.1...pinget-core-v0.4.2) - 2026-05-13
 
 ### Other
