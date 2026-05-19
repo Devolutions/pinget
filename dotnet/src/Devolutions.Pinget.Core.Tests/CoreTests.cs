@@ -763,21 +763,17 @@ public class ModelsTests
     }
 
     [Fact]
-    public void ResolveInstallerDownloadCacheRoot_PrefersOptionsThenEnvironmentThenAppRoot()
+    public void ResolveInstallerDownloadCacheRoot_PrefersOptionsThenEnvironmentThenTempPath()
     {
         const string directoryEnvironmentVariable = "PINGET_DOWNLOAD_CACHE_DIR";
-        const string legacyEnvironmentVariable = "PINGET_DOWNLOAD_CACHE";
         var priorDirectory = Environment.GetEnvironmentVariable(directoryEnvironmentVariable);
-        var priorLegacy = Environment.GetEnvironmentVariable(legacyEnvironmentVariable);
         var appRoot = Path.Combine(Path.GetTempPath(), "pinget-app-root");
         var configured = Path.Combine(Path.GetTempPath(), "pinget-configured-downloads");
         var fromEnvironment = Path.Combine(Path.GetTempPath(), "pinget-env-downloads");
-        var fromLegacyEnvironment = Path.Combine(Path.GetTempPath(), "pinget-legacy-downloads");
 
         try
         {
             Environment.SetEnvironmentVariable(directoryEnvironmentVariable, fromEnvironment);
-            Environment.SetEnvironmentVariable(legacyEnvironmentVariable, fromLegacyEnvironment);
 
             Assert.Equal(
                 Path.GetFullPath(configured),
@@ -788,18 +784,12 @@ public class ModelsTests
 
             Environment.SetEnvironmentVariable(directoryEnvironmentVariable, null);
             Assert.Equal(
-                Path.GetFullPath(fromLegacyEnvironment),
-                Repository.ResolveInstallerDownloadCacheRoot(appRoot, null));
-
-            Environment.SetEnvironmentVariable(legacyEnvironmentVariable, null);
-            Assert.Equal(
-                Path.Combine(appRoot, "downloads"),
+                Path.Combine(Path.GetTempPath(), "cache"),
                 Repository.ResolveInstallerDownloadCacheRoot(appRoot, null));
         }
         finally
         {
             Environment.SetEnvironmentVariable(directoryEnvironmentVariable, priorDirectory);
-            Environment.SetEnvironmentVariable(legacyEnvironmentVariable, priorLegacy);
         }
     }
 

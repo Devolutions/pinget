@@ -15,7 +15,6 @@ public class Repository : IDisposable
 {
     private const string AppRootEnvironmentVariable = "PINGET_APPROOT";
     private const string DownloadCacheDirectoryEnvironmentVariable = "PINGET_DOWNLOAD_CACHE_DIR";
-    private const string DownloadCacheEnvironmentVariable = "PINGET_DOWNLOAD_CACHE";
 
     internal const string InstalledStateUnsupportedWarning = "Installed package discovery is not supported on this platform; returning no installed packages.";
     internal const string InstallUnsupportedWarning = "Installing packages is not supported on this platform; no changes were made.";
@@ -70,11 +69,10 @@ public class Repository : IDisposable
     {
         var effectiveDirectory = string.IsNullOrWhiteSpace(configuredDirectory)
             ? Environment.GetEnvironmentVariable(DownloadCacheDirectoryEnvironmentVariable)
-                ?? Environment.GetEnvironmentVariable(DownloadCacheEnvironmentVariable)
             : configuredDirectory;
 
         if (string.IsNullOrWhiteSpace(effectiveDirectory))
-            return Path.Combine(appRoot, "downloads");
+            return Path.Combine(Path.GetTempPath(), "cache");
 
         return Path.GetFullPath(effectiveDirectory);
     }

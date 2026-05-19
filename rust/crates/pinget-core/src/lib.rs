@@ -4727,13 +4727,11 @@ fn resolve_installer_download_cache_root(app_root: &Path, configured_root: Optio
     configured_root
         .map(Path::to_path_buf)
         .or_else(installer_download_cache_root_from_environment)
-        .unwrap_or_else(|| app_root.join("downloads"))
+        .unwrap_or_else(default_cache_root_fallback)
 }
 
 fn installer_download_cache_root_from_environment() -> Option<PathBuf> {
-    std::env::var_os("PINGET_DOWNLOAD_CACHE_DIR")
-        .or_else(|| std::env::var_os("PINGET_DOWNLOAD_CACHE"))
-        .map(PathBuf::from)
+    std::env::var_os("PINGET_DOWNLOAD_CACHE_DIR").map(PathBuf::from)
 }
 
 fn default_cache_root_fallback() -> PathBuf {
@@ -7718,16 +7716,13 @@ mod tests {
     }
 
     #[test]
-    fn installer_download_cache_root_prefers_explicit_root_then_environment_then_app_root() {
+    fn installer_download_cache_root_prefers_explicit_root_then_environment_then_temp() {
         let app_root = PathBuf::from(r"C:\temp\pinget-test");
         let explicit = PathBuf::from(r"C:\temp\explicit-downloads");
         let env_path = PathBuf::from(r"C:\temp\env-downloads");
-        let legacy_env_path = PathBuf::from(r"C:\temp\legacy-downloads");
         let primary_guard = EnvVarGuard::new("PINGET_DOWNLOAD_CACHE_DIR");
-        let legacy_guard = EnvVarGuard::new("PINGET_DOWNLOAD_CACHE");
 
         primary_guard.set(&env_path);
-        legacy_guard.set(&legacy_env_path);
 
         assert_eq!(
             resolve_installer_download_cache_root(&app_root, Some(explicit.as_path())),
@@ -7736,12 +7731,9 @@ mod tests {
         assert_eq!(resolve_installer_download_cache_root(&app_root, None), env_path);
 
         primary_guard.remove();
-        assert_eq!(resolve_installer_download_cache_root(&app_root, None), legacy_env_path);
-
-        legacy_guard.remove();
         assert_eq!(
             resolve_installer_download_cache_root(&app_root, None),
-            app_root.join("downloads")
+            default_cache_root_fallback()
         );
     }
 

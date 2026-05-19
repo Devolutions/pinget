@@ -9,7 +9,6 @@ namespace Devolutions.Pinget.PowerShell.Engine;
 public sealed class PingetClient : IDisposable
 {
     private const string DownloadCacheDirectoryEnvironmentVariable = "PINGET_DOWNLOAD_CACHE_DIR";
-    private const string DownloadCacheEnvironmentVariable = "PINGET_DOWNLOAD_CACHE";
     private readonly Repository _repository;
 
     private PingetClient(Repository repository)
@@ -183,8 +182,7 @@ public sealed class PingetClient : IDisposable
 
         var outputDirectory = string.IsNullOrWhiteSpace(downloadDirectory)
             ? Environment.GetEnvironmentVariable(DownloadCacheDirectoryEnvironmentVariable)
-                ?? Environment.GetEnvironmentVariable(DownloadCacheEnvironmentVariable)
-                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads")
+                ?? Path.Combine(Path.GetTempPath(), "cache")
             : downloadDirectory;
 
         var (manifest, installerPath) = _repository.DownloadInstaller(request, outputDirectory);

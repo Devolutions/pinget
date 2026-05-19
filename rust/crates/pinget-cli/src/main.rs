@@ -2217,9 +2217,8 @@ fn do_download(repository: &mut Repository, request: &InstallRequest, download_d
     let dir = match download_dir {
         Some(d) => PathBuf::from(d),
         None => std::env::var_os("PINGET_DOWNLOAD_CACHE_DIR")
-            .or_else(|| std::env::var_os("PINGET_DOWNLOAD_CACHE"))
             .map(PathBuf::from)
-            .unwrap_or(std::env::current_dir()?),
+            .unwrap_or_else(|| std::env::temp_dir().join("cache")),
     };
 
     let (manifest, path) = repository.download_installer_for_request(request, &dir)?;
