@@ -155,10 +155,34 @@ public static extern int GetCurrentPackageFullName(ref uint packageFullNameLengt
     return $rc -ne 15700
 }
 
+function Test-UsesPackagedLayout {
+    param([string]$AppRoot)
+
+    # Mirrors uses_packaged_layout in pinget-core: a packaged WinGet app root
+    # is %LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState.
+    if (-not $AppRoot) { return $false }
+    $leaf = Split-Path -Leaf $AppRoot
+    if ($leaf -ine "LocalState") { return $false }
+    $parent = Split-Path -Parent $AppRoot
+    if (-not $parent) { return $false }
+    $family = Split-Path -Leaf $parent
+    if ($family -ine "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe") { return $false }
+    $grand = Split-Path -Parent $parent
+    if (-not $grand) { return $false }
+    return ((Split-Path -Leaf $grand) -ieq "Packages")
+}
+
 function Get-ExpectedUserSettingsPath {
-    # Matches default_app_root + user_settings_path in pinget-core: packaged
-    # callers write to %LOCALAPPDATA%\Packages\...\LocalState\settings.json;
-    # non-packaged callers write to %LOCALAPPDATA%\Devolutions\Pinget\user-settings.json.
+    # Matches default_app_root + user_settings_path in pinget-core: PINGET_APPROOT
+    # wins, then packaged callers write to %LOCALAPPDATA%\Packages\...\LocalState\settings.json,
+    # then non-packaged callers fall back to %LOCALAPPDATA%\Devolutions\Pinget\user-settings.json.
+    if ($env:PINGET_APPROOT) {
+        if (Test-UsesPackagedLayout -AppRoot $env:PINGET_APPROOT) {
+            return Join-Path $env:PINGET_APPROOT "settings.json"
+        }
+        return Join-Path $env:PINGET_APPROOT "user-settings.json"
+    }
+
     if (Test-IsPackagedProcess) {
         return Get-PackagedSettingsPath
     }
