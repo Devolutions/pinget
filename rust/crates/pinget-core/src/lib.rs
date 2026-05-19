@@ -142,6 +142,7 @@ impl Default for SourceStore {
 pub struct RepositoryOptions {
     pub app_root: PathBuf,
     pub user_agent: String,
+    pub download_cache_root: Option<PathBuf>,
 }
 
 impl RepositoryOptions {
@@ -150,6 +151,7 @@ impl RepositoryOptions {
         Self {
             app_root: app_root.into(),
             user_agent: DEFAULT_USER_AGENT.to_owned(),
+            download_cache_root: None,
         }
     }
 
@@ -162,6 +164,13 @@ impl RepositoryOptions {
     #[must_use]
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
+        self
+    }
+
+    /// Overrides the persistent installer download cache root.
+    #[must_use]
+    pub fn with_download_cache_root(mut self, download_cache_root: impl Into<PathBuf>) -> Self {
+        self.download_cache_root = Some(download_cache_root.into());
         self
     }
 }
@@ -665,6 +674,7 @@ struct PackageVersionDataEntry {
 
 pub struct Repository {
     app_root: PathBuf,
+    download_cache_root: PathBuf,
     client: Client,
     store: SourceStore,
     use_system_winget_sources: bool,
@@ -678,15 +688,24 @@ impl Repository {
 
     /// Opens the repository with explicit hosting options for library consumers.
     pub fn open_with_options(options: RepositoryOptions) -> Result<Self> {
-        ensure_app_dirs(&options.app_root)?;
-        let use_system_winget_sources = uses_system_winget_source_commands(&options.app_root);
-        let store = load_store(&options.app_root)?;
+        let RepositoryOptions {
+            app_root,
+            user_agent,
+            download_cache_root,
+        } = options;
+
+        ensure_app_dirs(&app_root)?;
+        let download_cache_root = resolve_installer_download_cache_root(&app_root, download_cache_root.as_deref());
+        fs::create_dir_all(&download_cache_root).context("failed to create installer download cache root")?;
+        let use_system_winget_sources = uses_system_winget_source_commands(&app_root);
+        let store = load_store(&app_root)?;
         let client = Client::builder()
-            .user_agent(&options.user_agent)
+            .user_agent(&user_agent)
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {
-            app_root: options.app_root,
+            app_root,
+            download_cache_root,
             client,
             store,
             use_system_winget_sources,
@@ -695,6 +714,10 @@ impl Repository {
 
     pub fn app_root(&self) -> &Path {
         &self.app_root
+    }
+
+    pub fn download_cache_root(&self) -> &Path {
+        &self.download_cache_root
     }
 
     pub fn list_sources(&self) -> Vec<SourceRecord> {
@@ -1656,6 +1679,9 @@ impl Repository {
                 .unwrap_or("installer")
         });
         let dest = download_dir.join(filename);
+        if can_reuse_installer_download(&dest, installer.sha256.as_deref())? {
+            return Ok((manifest, dest));
+        }
 
         let response = self.client.get(url).send().context("failed to download installer")?;
         if !response.status().is_success() {
@@ -1743,8 +1769,7 @@ impl Repository {
             let _ = self.uninstall_request(&uninstall_request);
         }
 
-        let temp_dir = std::env::temp_dir().join("pinget-install");
-        let (_, installer_path) = self.download_installer_for_request(request, &temp_dir)?;
+        let (_, installer_path) = self.download_installer_for_request(request, &self.download_cache_root)?;
 
         let installer_type = installer.installer_type.as_deref().unwrap_or("exe").to_lowercase();
 
@@ -4694,6 +4719,13 @@ fn cache_root(app_root: &Path) -> PathBuf {
     }
 }
 
+fn resolve_installer_download_cache_root(app_root: &Path, configured_root: Option<&Path>) -> PathBuf {
+    configured_root
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("PINGET_DOWNLOAD_CACHE").map(PathBuf::from))
+        .unwrap_or_else(|| app_root.join("downloads"))
+}
+
 fn default_cache_root_fallback() -> PathBuf {
     std::env::temp_dir().join("cache")
 }
@@ -6882,6 +6914,19 @@ fn verify_installer_hash(expected_hash: Option<&str>, bytes: &[u8], ignore_secur
     Ok(())
 }
 
+fn can_reuse_installer_download(path: &Path, expected_hash: Option<&str>) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    if expected_hash.is_none() {
+        return Ok(true);
+    }
+
+    let cached = fs::read(path).context("failed to read cached installer")?;
+    Ok(hash_matches(expected_hash, &cached))
+}
+
 fn hash_matches(expected_hash: Option<&str>, bytes: &[u8]) -> bool {
     expected_hash
         .map(|expected| sha256_hex(bytes).eq_ignore_ascii_case(expected))
@@ -7575,11 +7620,61 @@ mod tests {
 
     #[test]
     fn repository_options_capture_custom_host_settings() {
-        let options =
-            RepositoryOptions::new(PathBuf::from(r"C:\temp\pinget-test")).with_user_agent("pinget-rs-tests/1.0");
+        let options = RepositoryOptions::new(PathBuf::from(r"C:\temp\pinget-test"))
+            .with_user_agent("pinget-rs-tests/1.0")
+            .with_download_cache_root(PathBuf::from(r"C:\temp\pinget-downloads"));
 
         assert_eq!(options.app_root, PathBuf::from(r"C:\temp\pinget-test"));
         assert_eq!(options.user_agent, "pinget-rs-tests/1.0");
+        assert_eq!(
+            options.download_cache_root,
+            Some(PathBuf::from(r"C:\temp\pinget-downloads"))
+        );
+    }
+
+    #[test]
+    fn installer_download_cache_root_prefers_explicit_root_then_environment_then_app_root() {
+        let app_root = PathBuf::from(r"C:\temp\pinget-test");
+        let explicit = PathBuf::from(r"C:\temp\explicit-downloads");
+        let env_path = PathBuf::from(r"C:\temp\env-downloads");
+        let prior = std::env::var_os("PINGET_DOWNLOAD_CACHE");
+
+        unsafe { std::env::set_var("PINGET_DOWNLOAD_CACHE", &env_path) };
+
+        assert_eq!(
+            resolve_installer_download_cache_root(&app_root, Some(explicit.as_path())),
+            explicit
+        );
+        assert_eq!(
+            resolve_installer_download_cache_root(&app_root, None),
+            env_path
+        );
+
+        unsafe { std::env::remove_var("PINGET_DOWNLOAD_CACHE") };
+        assert_eq!(
+            resolve_installer_download_cache_root(&app_root, None),
+            app_root.join("downloads")
+        );
+
+        match prior {
+            Some(value) => unsafe { std::env::set_var("PINGET_DOWNLOAD_CACHE", value) },
+            None => unsafe { std::env::remove_var("PINGET_DOWNLOAD_CACHE") },
+        }
+    }
+
+    #[test]
+    fn cached_installer_downloads_are_reused_only_when_valid() {
+        let path = temp_app_root("installer-download-cache").join("installer.bin");
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache directory");
+        fs::write(&path, b"pinget").expect("write cached installer");
+
+        assert!(
+            can_reuse_installer_download(&path, Some(&sha256_hex(b"pinget"))).expect("reuse matched hash")
+        );
+        assert!(
+            !can_reuse_installer_download(&path, Some("DEADBEEF")).expect("reject mismatched hash")
+        );
+        assert!(can_reuse_installer_download(&path, None).expect("reuse without hash"));
     }
 
     #[test]

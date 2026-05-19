@@ -13,6 +13,7 @@ namespace Devolutions.Pinget.Core;
 public class Repository : IDisposable
 {
     private const string AppRootEnvironmentVariable = "PINGET_APPROOT";
+    private const string DownloadCacheEnvironmentVariable = "PINGET_DOWNLOAD_CACHE";
 
     internal const string InstalledStateUnsupportedWarning = "Installed package discovery is not supported on this platform; returning no installed packages.";
     internal const string InstallUnsupportedWarning = "Installing packages is not supported on this platform; no changes were made.";
@@ -23,6 +24,7 @@ public class Repository : IDisposable
     private static int s_sqliteNativeLibraryInitialized;
 
     private readonly string _appRoot;
+    private readonly string _installerDownloadCacheRoot;
     private readonly HttpClient _client;
     private readonly bool _useSystemWingetSources;
     private readonly Action<RepositoryWarning>? _diagnostics;
@@ -30,12 +32,14 @@ public class Repository : IDisposable
 
     private Repository(
         string appRoot,
+        string installerDownloadCacheRoot,
         HttpClient client,
         SourceStore store,
         bool useSystemWingetSources,
         Action<RepositoryWarning>? diagnostics)
     {
         _appRoot = appRoot;
+        _installerDownloadCacheRoot = installerDownloadCacheRoot;
         _client = client;
         _store = store;
         _useSystemWingetSources = useSystemWingetSources;
@@ -50,12 +54,26 @@ public class Repository : IDisposable
         options ??= new RepositoryOptions();
         EnsureSqliteNativeLibraryLoaded();
         var appRoot = SourceStoreManager.NormalizeAppRoot(options.AppRoot ?? Environment.GetEnvironmentVariable(AppRootEnvironmentVariable));
+        var installerDownloadCacheRoot = ResolveInstallerDownloadCacheRoot(appRoot, options.DownloadCacheDirectory);
         SourceStoreManager.EnsureAppDirs(appRoot);
+        Directory.CreateDirectory(installerDownloadCacheRoot);
         var useSystemWingetSources = SourceStoreManager.UsesSystemWingetSourceCommands(appRoot);
         var store = SourceStoreManager.Load(appRoot);
         var client = new HttpClient();
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
-        return new Repository(appRoot, client, store, useSystemWingetSources, options.Diagnostics);
+        return new Repository(appRoot, installerDownloadCacheRoot, client, store, useSystemWingetSources, options.Diagnostics);
+    }
+
+    internal static string ResolveInstallerDownloadCacheRoot(string appRoot, string? configuredDirectory)
+    {
+        var effectiveDirectory = string.IsNullOrWhiteSpace(configuredDirectory)
+            ? Environment.GetEnvironmentVariable(DownloadCacheEnvironmentVariable)
+            : configuredDirectory;
+
+        if (string.IsNullOrWhiteSpace(effectiveDirectory))
+            return Path.Combine(appRoot, "downloads");
+
+        return Path.GetFullPath(effectiveDirectory);
     }
 
     internal static IEnumerable<string> GetSqliteNativeLibraryCandidates(string assemblyDirectory)
@@ -611,6 +629,8 @@ public class Repository : IDisposable
         var filename = request.Rename ?? url.Split('/').Last().Split('?').First();
         if (string.IsNullOrEmpty(filename)) filename = "installer";
         var dest = Path.Combine(downloadDir, filename);
+        if (CanReuseInstallerDownload(dest, installer.Sha256))
+            return (manifest, dest);
 
         using var response = _client.GetAsync(url).GetAwaiter().GetResult();
         response.EnsureSuccessStatusCode();
@@ -702,8 +722,7 @@ public class Repository : IDisposable
             }
         }
 
-        var tempDir = Path.Combine(Path.GetTempPath(), "pinget-install");
-        var (_, installerPath) = DownloadInstaller(request, tempDir);
+        var (_, installerPath) = DownloadInstaller(request, _installerDownloadCacheRoot);
 
         var installerType = (selectedInstaller.InstallerType ?? "exe").ToLowerInvariant();
         var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller);
@@ -3011,6 +3030,17 @@ public class Repository : IDisposable
     {
         var hash = SHA256.HashData(data);
         return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static bool CanReuseInstallerDownload(string installerPath, string? expectedHash)
+    {
+        if (!File.Exists(installerPath))
+            return false;
+
+        if (expectedHash is null)
+            return true;
+
+        return Sha256Hex(File.ReadAllBytes(installerPath)).Equals(expectedHash, StringComparison.OrdinalIgnoreCase);
     }
 
     private class VersionComparer : IComparer<string>

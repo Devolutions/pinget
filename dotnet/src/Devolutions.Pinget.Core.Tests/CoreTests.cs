@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Microsoft.Data.Sqlite;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Xunit;
@@ -761,6 +762,37 @@ public class ModelsTests
     }
 
     [Fact]
+    public void ResolveInstallerDownloadCacheRoot_PrefersOptionsThenEnvironmentThenAppRoot()
+    {
+        const string environmentVariable = "PINGET_DOWNLOAD_CACHE";
+        var prior = Environment.GetEnvironmentVariable(environmentVariable);
+        var appRoot = Path.Combine(Path.GetTempPath(), "pinget-app-root");
+        var configured = Path.Combine(Path.GetTempPath(), "pinget-configured-downloads");
+        var fromEnvironment = Path.Combine(Path.GetTempPath(), "pinget-env-downloads");
+
+        try
+        {
+            Environment.SetEnvironmentVariable(environmentVariable, fromEnvironment);
+
+            Assert.Equal(
+                Path.GetFullPath(configured),
+                Repository.ResolveInstallerDownloadCacheRoot(appRoot, configured));
+            Assert.Equal(
+                Path.GetFullPath(fromEnvironment),
+                Repository.ResolveInstallerDownloadCacheRoot(appRoot, null));
+
+            Environment.SetEnvironmentVariable(environmentVariable, null);
+            Assert.Equal(
+                Path.Combine(appRoot, "downloads"),
+                Repository.ResolveInstallerDownloadCacheRoot(appRoot, null));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(environmentVariable, prior);
+        }
+    }
+
+    [Fact]
     public void TryGetWinGetPackageIdentityFromLocalId_UsesSourceIdentifierSuffix()
     {
         SourceRecord source = new()
@@ -1140,6 +1172,49 @@ public class RepositoryParityTests
             var (_, installerPath) = repo.DownloadInstaller(request, Path.Combine(appRoot, "downloads"));
             Assert.True(File.Exists(installerPath));
             Assert.Equal(payload, File.ReadAllBytes(installerPath));
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void DownloadInstaller_ReusesCachedFileWhenHashMatches()
+    {
+        var payload = "pinget-test-payload"u8.ToArray();
+        var expectedHash = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
+        var requestCount = 0;
+        using var server = new TestHttpServer(payload, _ => requestCount++);
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            var manifestPath = TestPaths.WriteManifest(appRoot, $$"""
+                PackageIdentifier: Test.Package
+                PackageVersion: 1.0.0
+                PackageName: Test Package
+                ManifestType: merged
+                ManifestVersion: 1.10.0
+                Installers:
+                  - InstallerType: exe
+                    InstallerUrl: {{server.Url}}
+                    InstallerSha256: {{expectedHash}}
+                """);
+
+            using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            var request = new InstallRequest
+            {
+                Query = new PackageQuery(),
+                ManifestPath = manifestPath,
+            };
+            var downloadDir = Path.Combine(appRoot, "downloads");
+
+            var (_, firstInstallerPath) = repo.DownloadInstaller(request, downloadDir);
+            var (_, secondInstallerPath) = repo.DownloadInstaller(request, downloadDir);
+
+            Assert.Equal(firstInstallerPath, secondInstallerPath);
+            Assert.Equal(1, requestCount);
+            Assert.Equal(payload, File.ReadAllBytes(secondInstallerPath));
         }
         finally
         {

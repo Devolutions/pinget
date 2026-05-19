@@ -68,6 +68,8 @@ pinget install --id Devolutions.MsRdpEx --scope user --silent
 pinget uninstall --id Devolutions.MsRdpEx --silent
 ```
 
+Set `PINGET_DOWNLOAD_CACHE` to choose a persistent installer cache directory. `pinget install` reuses that cache automatically, and `pinget download` / `Export-PingetPackage` also use it as the default target when no download directory is supplied.
+
 ## PowerShell module
 
 The **`Devolutions.Pinget.Client`** module is available from the PowerShell Gallery:

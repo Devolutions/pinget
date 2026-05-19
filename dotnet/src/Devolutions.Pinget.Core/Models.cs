@@ -38,6 +38,10 @@ public record RepositoryOptions
     /// Storage root for source state and caches. A null value uses the real Desktop App Installer / WinGet state on Windows.
     /// </summary>
     public string? AppRoot { get; init; }
+    /// <summary>
+    /// Persistent installer download cache root. A null value uses PINGET_DOWNLOAD_CACHE when set, otherwise {AppRoot}\downloads.
+    /// </summary>
+    public string? DownloadCacheDirectory { get; init; }
     public string UserAgent { get; init; } = "pinget-dotnet/0.1";
     public Action<RepositoryWarning>? Diagnostics { get; init; }
 }
