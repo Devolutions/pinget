@@ -3,6 +3,7 @@ using Microsoft.Data.Sqlite;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Xunit;
@@ -800,6 +801,30 @@ public class ModelsTests
             Environment.SetEnvironmentVariable(directoryEnvironmentVariable, priorDirectory);
             Environment.SetEnvironmentVariable(legacyEnvironmentVariable, priorLegacy);
         }
+    }
+
+    [Fact]
+    public void ResolveInstallerDownloadDestination_UsesManifestHashSubdirectory()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "pinget-downloads");
+        var path = Repository.ResolveInstallerDownloadDestination(
+            root,
+            "installer.exe",
+            "https://example.test/installer.exe",
+            "AABBCCDD");
+
+        Assert.Equal(Path.Combine(root, "aabbccdd", "installer.exe"), path);
+    }
+
+    [Fact]
+    public void ResolveInstallerDownloadDestination_UsesUrlHashSubdirectoryWhenManifestHashMissing()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "pinget-downloads");
+        const string url = "https://example.test/installer.exe?query=1";
+        var expectedCacheKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(url))).ToLowerInvariant();
+        var path = Repository.ResolveInstallerDownloadDestination(root, "installer.exe", url, null);
+
+        Assert.Equal(Path.Combine(root, expectedCacheKey, "installer.exe"), path);
     }
 
     [Fact]

@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Nodes;
 using System.Threading;
 using Microsoft.Data.Sqlite;
@@ -630,7 +631,10 @@ public class Repository : IDisposable
         Directory.CreateDirectory(downloadDir);
         var filename = request.Rename ?? url.Split('/').Last().Split('?').First();
         if (string.IsNullOrEmpty(filename)) filename = "installer";
-        var dest = Path.Combine(downloadDir, filename);
+        var dest = ResolveInstallerDownloadDestination(downloadDir, filename, url, installer.Sha256);
+        var parentDirectory = Path.GetDirectoryName(dest)
+            ?? throw new InvalidOperationException("Installer cache destination has no parent directory");
+        Directory.CreateDirectory(parentDirectory);
         if (CanReuseInstallerDownload(dest, installer.Sha256))
             return (manifest, dest);
 
@@ -3044,6 +3048,24 @@ public class Repository : IDisposable
 
         using var stream = File.OpenRead(installerPath);
         return Sha256Hex(stream).Equals(expectedHash, StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static string ResolveInstallerDownloadDestination(
+        string downloadRoot,
+        string filename,
+        string url,
+        string? expectedHash)
+    {
+        var cacheKey = InstallerDownloadCacheKey(url, expectedHash);
+        return Path.Combine(downloadRoot, cacheKey, filename);
+    }
+
+    private static string InstallerDownloadCacheKey(string url, string? expectedHash)
+    {
+        if (!string.IsNullOrWhiteSpace(expectedHash))
+            return expectedHash.Trim().ToLowerInvariant();
+
+        return Sha256Hex(Encoding.UTF8.GetBytes(url));
     }
 
     private static string Sha256Hex(Stream data)

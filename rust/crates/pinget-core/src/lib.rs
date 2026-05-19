@@ -1669,7 +1669,6 @@ impl Repository {
             .as_deref()
             .ok_or_else(|| anyhow!("Installer has no URL"))?;
 
-        fs::create_dir_all(download_dir)?;
         let filename = request.rename.as_deref().unwrap_or_else(|| {
             url.rsplit('/')
                 .next()
@@ -1678,7 +1677,11 @@ impl Repository {
                 .next()
                 .unwrap_or("installer")
         });
-        let dest = download_dir.join(filename);
+        let dest = installer_download_destination(download_dir, filename, url, installer.sha256.as_deref());
+        fs::create_dir_all(
+            dest.parent()
+                .ok_or_else(|| anyhow!("installer cache destination has no parent directory"))?,
+        )?;
         if can_reuse_installer_download(&dest, installer.sha256.as_deref())? {
             return Ok((manifest, dest));
         }
@@ -6934,6 +6937,20 @@ fn can_reuse_installer_download(path: &Path, expected_hash: Option<&str>) -> Res
     Ok(sha256_hex_reader(cached)?.eq_ignore_ascii_case(expected_hash.unwrap_or_default()))
 }
 
+fn installer_download_destination(download_root: &Path, filename: &str, url: &str, expected_hash: Option<&str>) -> PathBuf {
+    download_root
+        .join(installer_download_cache_key(url, expected_hash))
+        .join(filename)
+}
+
+fn installer_download_cache_key(url: &str, expected_hash: Option<&str>) -> String {
+    expected_hash
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase)
+        .unwrap_or_else(|| sha256_hex(url.as_bytes()).to_lowercase())
+}
+
 fn hash_matches(expected_hash: Option<&str>, bytes: &[u8]) -> bool {
     expected_hash
         .map(|expected| sha256_hex(bytes).eq_ignore_ascii_case(expected))
@@ -7737,6 +7754,32 @@ mod tests {
         assert!(can_reuse_installer_download(&path, Some(&sha256_hex(b"pinget"))).expect("reuse matched hash"));
         assert!(!can_reuse_installer_download(&path, Some("DEADBEEF")).expect("reject mismatched hash"));
         assert!(can_reuse_installer_download(&path, None).expect("reuse without hash"));
+    }
+
+    #[test]
+    fn installer_download_destination_uses_expected_hash_subdirectory_when_available() {
+        let root = PathBuf::from(r"C:\temp\downloads");
+        let expected_hash = "AABBCCDD";
+        let path = installer_download_destination(
+            &root,
+            "installer.exe",
+            "https://example.test/installer.exe",
+            Some(expected_hash),
+        );
+
+        assert_eq!(path, root.join("aabbccdd").join("installer.exe"));
+    }
+
+    #[test]
+    fn installer_download_destination_uses_url_hash_subdirectory_when_manifest_hash_is_missing() {
+        let root = PathBuf::from(r"C:\temp\downloads");
+        let url = "https://example.test/installer.exe?query=1";
+        let path = installer_download_destination(&root, "installer.exe", url, None);
+
+        assert_eq!(
+            path,
+            root.join(sha256_hex(url.as_bytes()).to_lowercase()).join("installer.exe")
+        );
     }
 
     #[test]
