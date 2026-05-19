@@ -2,22 +2,21 @@ using System.CommandLine;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Devolutions.Pinget.Cli;
+using Devolutions.Pinget.Cli.Extensions;
+using Devolutions.Pinget.Cli.Helpers;
 using Devolutions.Pinget.Core;
 using YamlDotNet.Serialization;
 
-const string Version = "0.4.2";
-const string UpgradeUnsupportedWarning = "Upgrading packages is not supported on this platform; no changes were made.";
-
 if (args.Length == 1 && (string.Equals(args[0], "--version", StringComparison.OrdinalIgnoreCase) || string.Equals(args[0], "-v", StringComparison.OrdinalIgnoreCase)))
 {
-    PrintVersion();
+    Print.Version();
     return 0;
 }
 
 var rootCommand = new RootCommand("Pinget: portable winget in pure C#");
 
-var outputOption = new Option<string?>("--output", "Output format: text, json, or yaml");
-outputOption.AddAlias("-o");
+var outputOption = new Option<string?>("--output", "Output format: text, json, or yaml").WithAliases("-o");
 outputOption.FromAmong("text", "json", "yaml");
 rootCommand.AddGlobalOption(outputOption);
 
@@ -26,28 +25,13 @@ var JsonOpts = new JsonSerializerOptions { WriteIndented = true, PropertyNamingP
 var infoOption = new Option<bool>("--info", "Display general info");
 rootCommand.AddGlobalOption(infoOption);
 
-// ── Common options ──
-Option<string?> QueryArg(string description = "Query")
-{
-    var o = new Option<string?>("--query", description);
-    o.AddAlias("-q");
-    return o;
-}
-Option<string?> IdOpt() => new("--id", "Filter by id");
-Option<string?> NameOpt() => new("--name", "Filter by name");
-Option<string?> MonikerOpt() => new("--moniker", "Filter by moniker");
-Option<string?> SourceOpt() { var o = new Option<string?>("--source", "Source name"); o.AddAlias("-s"); return o; }
-Option<bool> ExactOpt() { var o = new Option<bool>("--exact", "Exact match"); o.AddAlias("-e"); return o; }
-Option<int?> CountOpt() { var o = new Option<int?>("--count", "Max results"); o.AddAlias("-n"); return o; }
-Option<string?> VersionOpt() { var o = new Option<string?>("--version", "Version"); o.AddAlias("-v"); return o; }
-
 // ── Search command ──
 var searchCommand = new Command("search", "Search for packages");
-var sqArg = new Argument<string?>("query", () => null, "Search query");
-var sqOpt = QueryArg(); var sidOpt = IdOpt(); var snOpt = NameOpt(); var smOpt = MonikerOpt();
-var ssOpt = SourceOpt(); var seOpt = ExactOpt(); var scOpt = CountOpt();
+var sqArg = QueryArguments.Search;
+var sqOpt = CommonOptions.Query; var sidOpt = CommonOptions.Id; var snOpt = CommonOptions.Name; var smOpt = CommonOptions.Moniker;
+var ssOpt = CommonOptions.Source; var seOpt = CommonOptions.Exact; var scOpt = CommonOptions.Count;
 var sTagOpt = new Option<string?>("--tag", "Filter by tag");
-var sCmdOpt = new Option<string?>("--command", "Filter by command"); sCmdOpt.AddAlias("--cmd");
+var sCmdOpt = new Option<string?>("--command", "Filter by command").WithAliases("--cmd");
 var sVersionsOpt = new Option<bool>("--versions", "Show versions");
 var sManifestsOpt = new Option<bool>("--manifests", "Return show-style manifests");
 foreach (var o in new Option[] { sqOpt, sidOpt, snOpt, smOpt, ssOpt, seOpt, scOpt, sTagOpt, sCmdOpt, sVersionsOpt, sManifestsOpt })
@@ -56,7 +40,7 @@ searchCommand.AddArgument(sqArg);
 
 searchCommand.SetHandler((ctx) =>
 {
-    var output = GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption));
+    var output = Output.GetFormat(ctx.ParseResult.GetValueForOption(outputOption));
     var query = new PackageQuery
     {
         Query = ctx.ParseResult.GetValueForArgument(sqArg) ?? ctx.ParseResult.GetValueForOption(sqOpt),
@@ -78,31 +62,31 @@ searchCommand.SetHandler((ctx) =>
         if (ctx.ParseResult.GetValueForOption(sVersionsOpt))
             throw new InvalidOperationException("--manifests cannot be combined with --versions");
 
-        WriteStructuredOutput(repo.SearchManifests(query), output);
+        Output.WriteStructuredOutput(repo.SearchManifests(query), output);
     }
     else if (ctx.ParseResult.GetValueForOption(sVersionsOpt))
     {
         var result = repo.SearchVersions(query);
-        if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
-        else PrintVersions(result);
+        if (output != OutputFormat.Text) Output.WriteStructuredOutput(result, output);
+        else Print.Versions(result);
     }
     else
     {
         var result = repo.Search(query);
-        if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
-        else PrintSearch(result);
+        if (output != OutputFormat.Text) Output.WriteStructuredOutput(result, output);
+        else Print.Search(result);
     }
 });
 
 // ── Show command ──
 var showCommand = new Command("show", "Show package info");
-var shArg = new Argument<string?>("query", () => null, "Package query");
-var shqOpt = QueryArg(); var shidOpt = IdOpt(); var shnOpt = NameOpt(); var shmOpt = MonikerOpt();
-var shsOpt = SourceOpt(); var sheOpt = ExactOpt(); var shvOpt = VersionOpt();
+var shArg = QueryArguments.Package;
+var shqOpt = CommonOptions.Query; var shidOpt = CommonOptions.Id; var shnOpt = CommonOptions.Name; var shmOpt = CommonOptions.Moniker;
+var shsOpt = CommonOptions.Source; var sheOpt = CommonOptions.Exact; var shvOpt = CommonOptions.Version;
 var shVerOpt = new Option<bool>("--versions", "Show available versions");
 var shLocaleOpt = new Option<string?>("--locale", "Installer locale");
 var shTypeOpt = new Option<string?>("--installer-type", "Installer type");
-var shArchOpt = new Option<string?>("--architecture", "Architecture"); shArchOpt.AddAlias("-a");
+var shArchOpt = new Option<string?>("--architecture", "Architecture").WithAliases("-a");
 var shScopeOpt = new Option<string?>("--scope", "Install scope");
 foreach (var o in new Option[] { shqOpt, shidOpt, shnOpt, shmOpt, shsOpt, sheOpt, shvOpt, shVerOpt, shLocaleOpt, shTypeOpt, shArchOpt, shScopeOpt })
     showCommand.AddOption(o);
@@ -110,7 +94,7 @@ showCommand.AddArgument(shArg);
 
 showCommand.SetHandler((ctx) =>
 {
-    var output = GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption));
+    var output = Output.GetFormat(ctx.ParseResult.GetValueForOption(outputOption));
     var query = new PackageQuery
     {
         Query = ctx.ParseResult.GetValueForArgument(shArg) ?? ctx.ParseResult.GetValueForOption(shqOpt),
@@ -130,28 +114,27 @@ showCommand.SetHandler((ctx) =>
     if (ctx.ParseResult.GetValueForOption(shVerOpt))
     {
         var result = repo.ShowVersions(query);
-        if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
-        else PrintVersions(result);
+        if (output != OutputFormat.Text) Output.WriteStructuredOutput(result, output);
+        else Print.Versions(result);
     }
     else
     {
         var result = repo.Show(query);
-        if (output != OutputFormat.Text) WriteManifestStructuredOutput(result.ToSerializableManifest(), output);
-        else PrintShow(result);
+        if (output != OutputFormat.Text) Output.WriteManifestStructuredOutput(result.ToSerializableManifest(), output);
+        else Print.Show(result);
     }
 });
 
 // ── List command ──
-var listCommand = new Command("list", "List installed packages");
-listCommand.AddAlias("ls");
-var lArg = new Argument<string?>("query", () => null, "Package query");
-var lqOpt = QueryArg(); var lidOpt = IdOpt(); var lnOpt = NameOpt(); var lmOpt = MonikerOpt();
-var lsOpt = SourceOpt(); var leOpt = ExactOpt(); var lcOpt = CountOpt();
+var listCommand = new Command("list", "List installed packages").WithAliases("ls");
+var lArg = QueryArguments.Package;
+var lqOpt = CommonOptions.Query; var lidOpt = CommonOptions.Id; var lnOpt = CommonOptions.Name; var lmOpt = CommonOptions.Moniker;
+var lsOpt = CommonOptions.Source; var leOpt = CommonOptions.Exact; var lcOpt = CommonOptions.Count;
 var lTagOpt = new Option<string?>("--tag", "Filter by tag");
-var lCmdOpt = new Option<string?>("--command", "Filter by command"); lCmdOpt.AddAlias("--cmd");
+var lCmdOpt = new Option<string?>("--command", "Filter by command").WithAliases("--cmd");
 var lScopeOpt = new Option<string?>("--scope", "Install scope");
 var lUpgradeOpt = new Option<bool>("--upgrade-available", "Show upgradeable only");
-var lUnknownOpt = new Option<bool>("--include-unknown", "Include unknown versions"); lUnknownOpt.AddAlias("-u");
+var lUnknownOpt = new Option<bool>("--include-unknown", "Include unknown versions").WithAliases("-u");
 var lPinnedOpt = new Option<bool>("--include-pinned", "Include pinned packages");
 var lDetailsOpt = new Option<bool>("--details", "Show details");
 foreach (var o in new Option[] { lqOpt, lidOpt, lnOpt, lmOpt, lsOpt, leOpt, lcOpt, lTagOpt, lCmdOpt, lScopeOpt, lUpgradeOpt, lUnknownOpt, lPinnedOpt, lDetailsOpt })
@@ -160,7 +143,7 @@ listCommand.AddArgument(lArg);
 
 listCommand.SetHandler((ctx) =>
 {
-    var output = GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption));
+    var output = Output.GetFormat(ctx.ParseResult.GetValueForOption(outputOption));
     var details = ctx.ParseResult.GetValueForOption(lDetailsOpt);
     var upgrade = ctx.ParseResult.GetValueForOption(lUpgradeOpt);
     var query = new ListQuery
@@ -182,45 +165,44 @@ listCommand.SetHandler((ctx) =>
 
     using var repo = Repository.Open();
     var result = repo.List(query);
-    if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
-    else PrintListResult(result, details, upgrade);
+    if (output != OutputFormat.Text) Output.WriteStructuredOutput(result, output);
+    else Print.ListResult(result, details, upgrade);
 });
 
 // ── Upgrade command ──
-var upgradeCommand = new Command("upgrade", "Upgrade packages");
-upgradeCommand.AddAlias("update");
-var uArg = new Argument<string?>("query", () => null, "Package query");
-var uqOpt = QueryArg(); var uidOpt = IdOpt(); var unOpt = NameOpt(); var umOpt = MonikerOpt();
-var usOpt = SourceOpt(); var ueOpt = ExactOpt(); var ucOpt = CountOpt(); var uvOpt = VersionOpt();
-var uManifestOpt = new Option<string?>("--manifest", "Local manifest file or directory"); uManifestOpt.AddAlias("-m");
+var upgradeCommand = new Command("upgrade", "Upgrade packages").WithAliases("update");
+var uArg = QueryArguments.Package;
+var uqOpt = CommonOptions.Query; var uidOpt = CommonOptions.Id; var unOpt = CommonOptions.Name; var umOpt = CommonOptions.Moniker;
+var usOpt = CommonOptions.Source; var ueOpt = CommonOptions.Exact; var ucOpt = CommonOptions.Count; var uvOpt = CommonOptions.Version;
+var uManifestOpt = new Option<string?>("--manifest", "Local manifest file or directory").WithAliases("-m");
 var uLocaleOpt = new Option<string?>("--locale", "Installer locale");
 var uTypeOpt = new Option<string?>("--installer-type", "Installer type");
-var uArchOpt = new Option<string?>("--architecture", "Architecture"); uArchOpt.AddAlias("-a");
+var uArchOpt = new Option<string?>("--architecture", "Architecture").WithAliases("-a");
 var uPlatformOpt = new Option<string?>("--platform", "Target platform");
 var uOsVersionOpt = new Option<string?>("--os-version", "Target OS version");
 var uScopeOpt = new Option<string?>("--scope", "Install scope");
-var uUnknownOpt = new Option<bool>("--include-unknown", "Include unknown"); uUnknownOpt.AddAlias("-u");
+var uUnknownOpt = new Option<bool>("--include-unknown", "Include unknown").WithAliases("-u");
 var uPinnedOpt = new Option<bool>("--include-pinned", "Include pinned");
-var uAllOpt = new Option<bool>("--all", "Upgrade all"); uAllOpt.AddAlias("-r"); uAllOpt.AddAlias("--recurse");
+var uAllOpt = new Option<bool>("--all", "Upgrade all").WithAliases("-r", "--recurse");
 var uLogOpt = new Option<string?>("--log", "Installer log path");
 var uCustomOpt = new Option<string?>("--custom", "Additional installer switches");
 var uOverrideOpt = new Option<string?>("--override", "Override installer arguments");
-var uLocationOpt = new Option<string?>("--location", "Install location"); uLocationOpt.AddAlias("-l");
+var uLocationOpt = new Option<string?>("--location", "Install location").WithAliases("-l");
 var uIgnoreSecurityHashOpt = new Option<bool>("--ignore-security-hash", "Ignore installer hash mismatches");
 var uSkipDependenciesOpt = new Option<bool>("--skip-dependencies", "Skip package dependencies");
 var uDependencySourceOpt = new Option<string?>("--dependency-source", "Source to use when resolving dependencies");
 var uAcceptPkgAgreementsOpt = new Option<bool>("--accept-package-agreements", "Accept package agreements");
 var uForceOpt = new Option<bool>("--force", "Force install behavior");
 var uUninstallPreviousOpt = new Option<bool>("--uninstall-previous", "Uninstall previous versions before installing");
-var uSilentOpt = new Option<bool>("--silent", "Silent install"); uSilentOpt.AddAlias("-h");
-var uInteractiveOpt = new Option<bool>("--interactive", "Interactive install"); uInteractiveOpt.AddAlias("-i");
+var uSilentOpt = new Option<bool>("--silent", "Silent install").WithAliases("-h");
+var uInteractiveOpt = new Option<bool>("--interactive", "Interactive install").WithAliases("-i");
 foreach (var o in new Option[] { uqOpt, uidOpt, unOpt, umOpt, usOpt, ueOpt, ucOpt, uvOpt, uManifestOpt, uLocaleOpt, uTypeOpt, uArchOpt, uPlatformOpt, uOsVersionOpt, uScopeOpt, uUnknownOpt, uPinnedOpt, uAllOpt, uLogOpt, uCustomOpt, uOverrideOpt, uLocationOpt, uIgnoreSecurityHashOpt, uSkipDependenciesOpt, uDependencySourceOpt, uAcceptPkgAgreementsOpt, uForceOpt, uUninstallPreviousOpt, uSilentOpt, uInteractiveOpt })
     upgradeCommand.AddOption(o);
 upgradeCommand.AddArgument(uArg);
 
 upgradeCommand.SetHandler((ctx) =>
 {
-    var output = GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption));
+    var output = Output.GetFormat(ctx.ParseResult.GetValueForOption(outputOption));
     var manifestPath = ctx.ParseResult.GetValueForOption(uManifestOpt);
     var interactive = ctx.ParseResult.GetValueForOption(uInteractiveOpt);
     var silent = ctx.ParseResult.GetValueForOption(uSilentOpt);
@@ -276,14 +258,14 @@ upgradeCommand.SetHandler((ctx) =>
     using var repo = Repository.Open();
     if (doInstall && !OperatingSystem.IsWindows())
     {
-        PrintWarnings([UpgradeUnsupportedWarning]);
+        Print.Warnings([Consts.UpgradeUnsupportedWarning]);
         Console.WriteLine("No changes were made.");
         return;
     }
 
     var result = repo.List(query);
     var mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress;
-    var baseInstallRequest = CreateInstallRequest(
+    var baseInstallRequest = RequestCreator.Install(
         installQuery,
         manifestPath,
         mode,
@@ -303,13 +285,13 @@ upgradeCommand.SetHandler((ctx) =>
 
     if (!doInstall)
     {
-        if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
-        else PrintListResult(result, false, true);
+        if (output != OutputFormat.Text) Output.WriteStructuredOutput(result, output);
+        else Print.ListResult(result, false, true);
     }
     else if (!string.IsNullOrWhiteSpace(manifestPath))
     {
         var installResult = repo.Install(baseInstallRequest);
-        PrintPackageActionResult(installResult, "upgrade", "upgraded");
+        Print.PackageActionResult(installResult, "upgrade", "upgraded");
     }
     else
     {
@@ -327,7 +309,7 @@ upgradeCommand.SetHandler((ctx) =>
                 Console.WriteLine($"Upgrading {m.Id} from {m.InstalledVersion} to {m.AvailableVersion ?? "?"} ...");
                 try
                 {
-                    var pin = FindMatchingPin(m, pins);
+                    var pin = Pin.FindMatching(m, pins);
                     if (pin?.PinType == PinType.Blocking)
                     {
                         Console.WriteLine($"  Package is blocked by pin {pin.Version}; remove the pin before upgrading.");
@@ -351,7 +333,7 @@ upgradeCommand.SetHandler((ctx) =>
                         },
                         ManifestPath = null,
                     });
-                    PrintWarnings(r.Warnings);
+                    Print.Warnings(r.Warnings);
                     Console.WriteLine(r.NoOp
                         ? $"  No changes were made for {m.Id}"
                         : r.Success
@@ -380,25 +362,23 @@ var sourceExportCmd = new Command("export", "Export sources");
 var sourceAddCmd = new Command("add", "Add source");
 var saNameArg = new Argument<string?>("name", () => null, "Source name");
 var saArgArg = new Argument<string?>("arg", () => null, "Source URL");
-var saNameOpt = new Option<string?>("--name", "Source name"); saNameOpt.AddAlias("-n");
-var saArgOpt = new Option<string?>("--arg", "Source URL"); saArgOpt.AddAlias("-a");
-var saTypeOpt = new Option<string?>("--type", "Source type"); saTypeOpt.AddAlias("-t");
+var saNameOpt = new Option<string?>("--name", "Source name").WithAliases("-n");
+var saArgOpt = new Option<string?>("--arg", "Source URL").WithAliases("-a");
+var saTypeOpt = new Option<string?>("--type", "Source type").WithAliases("-t");
 var saTrustLevelOpt = new Option<string?>("--trust-level", "Source trust level");
 var saExplicitOpt = new Option<bool>("--explicit", "Exclude source from discovery unless specified");
 sourceAddCmd.AddArgument(saNameArg); sourceAddCmd.AddArgument(saArgArg);
 foreach (var o in new Option[] { saNameOpt, saArgOpt, saTypeOpt, saTrustLevelOpt, saExplicitOpt }) sourceAddCmd.AddOption(o);
-var sourceEditCmd = new Command("edit", "Edit source");
-sourceEditCmd.AddAlias("config");
-sourceEditCmd.AddAlias("set");
-var seNameOpt = new Option<string?>("--name", "Source name"); seNameOpt.AddAlias("-n");
-var seExplicitOpt = new Option<bool?>("--explicit", "Excludes a source from discovery (true or false)"); seExplicitOpt.AddAlias("-e");
+var sourceEditCmd = new Command("edit", "Edit source").WithAliases("config", "set");
+var seNameOpt = new Option<string?>("--name", "Source name").WithAliases("-n");
+var seExplicitOpt = new Option<bool?>("--explicit", "Excludes a source from discovery (true or false)").WithAliases("-e");
 sourceEditCmd.AddOption(seNameOpt);
 sourceEditCmd.AddOption(seExplicitOpt);
 var sourceRemoveCmd = new Command("remove", "Remove source");
 var srNameArg = new Argument<string>("name", "Source name");
 sourceRemoveCmd.AddArgument(srNameArg);
 var sourceResetCmd = new Command("reset", "Reset sources");
-var srNameOpt = new Option<string?>("--name", "Source name"); srNameOpt.AddAlias("-n");
+var srNameOpt = new Option<string?>("--name", "Source name").WithAliases("-n");
 var srForceOpt = new Option<bool>("--force", "Force reset");
 sourceResetCmd.AddOption(srNameOpt);
 sourceResetCmd.AddOption(srForceOpt);
@@ -413,7 +393,7 @@ sourceCommand.AddCommand(sourceResetCmd);
 sourceListCmd.SetHandler(() =>
 {
     using var repo = Repository.Open();
-    PrintSources(repo.ListSources());
+    Print.Sources(repo.ListSources());
 });
 
 sourceUpdateCmd.SetHandler((source) =>
@@ -428,25 +408,25 @@ sourceExportCmd.SetHandler(() =>
     using var repo = Repository.Open();
     var sources = repo.ListSources().Select(s => new
     {
-        Name = s.Name,
-        Type = FormatSourceType(s.Kind),
-        Arg = s.Arg,
+        s.Name,
+        Type = Source.FormatType(s.Kind),
+        s.Arg,
         Data = s.Identifier,
-        Identifier = s.Identifier,
-        TrustLevel = s.TrustLevel,
-        Explicit = s.Explicit,
-        Priority = s.Priority,
+        s.Identifier,
+        s.TrustLevel,
+        s.Explicit,
+        s.Priority,
     });
     Console.WriteLine(JsonSerializer.Serialize(new { Sources = sources }, JsonOpts));
 });
 
 sourceAddCmd.SetHandler((ctx) =>
 {
-    var name = ResolveSourceAddValue(
+    var name = Source.ResolveAddValue(
         ctx.ParseResult.GetValueForArgument(saNameArg),
         ctx.ParseResult.GetValueForOption(saNameOpt),
         "name");
-    var arg = ResolveSourceAddValue(
+    var arg = Source.ResolveAddValue(
         ctx.ParseResult.GetValueForArgument(saArgArg),
         ctx.ParseResult.GetValueForOption(saArgOpt),
         "argument");
@@ -454,7 +434,7 @@ sourceAddCmd.SetHandler((ctx) =>
     var trustLevel = ctx.ParseResult.GetValueForOption(saTrustLevelOpt);
     var explicitSource = ctx.ParseResult.GetValueForOption(saExplicitOpt);
     using var repo = Repository.Open();
-    var kind = ParseSourceKind(type);
+    var kind = Source.ParseKind(type);
     repo.AddSource(name, arg, kind, trustLevel ?? "None", explicitSource);
     Console.WriteLine("Done");
 });
@@ -494,15 +474,15 @@ sourceResetCmd.SetHandler((name, force) =>
 // ── Cache warm ──
 var cacheCommand = new Command("cache", "Cache management");
 var cacheWarmCmd = new Command("warm", "Warm manifest cache");
-var cwArg = new Argument<string?>("query", () => null, "Package query");
-var cwqOpt = QueryArg(); var cwidOpt = IdOpt(); var cwsOpt = SourceOpt(); var cweOpt = ExactOpt();
+var cwArg = QueryArguments.Package;
+var cwqOpt = CommonOptions.Query; var cwidOpt = CommonOptions.Id; var cwsOpt = CommonOptions.Source; var cweOpt = CommonOptions.Exact;
 cacheWarmCmd.AddArgument(cwArg);
 foreach (var o in new Option[] { cwqOpt, cwidOpt, cwsOpt, cweOpt }) cacheWarmCmd.AddOption(o);
 cacheCommand.AddCommand(cacheWarmCmd);
 
 cacheWarmCmd.SetHandler((ctx) =>
 {
-    var output = GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption));
+    var output = Output.GetFormat(ctx.ParseResult.GetValueForOption(outputOption));
     var query = new PackageQuery
     {
         Query = ctx.ParseResult.GetValueForArgument(cwArg) ?? ctx.ParseResult.GetValueForOption(cwqOpt),
@@ -512,7 +492,7 @@ cacheWarmCmd.SetHandler((ctx) =>
     };
     using var repo = Repository.Open();
     var result = repo.WarmCache(query);
-    if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
+    if (output != OutputFormat.Text) Output.WriteStructuredOutput(result, output);
     else
     {
         Console.WriteLine($"Warmed cache for {result.Package.Name} [{result.Package.Id}]");
@@ -552,8 +532,8 @@ hashCommand.SetHandler((file, msix) =>
 
 // ── Export ──
 var exportCommand = new Command("export", "Export installed packages");
-var exOutputOpt = new Option<string>("--output", "Output file") { IsRequired = true }; exOutputOpt.AddAlias("-o");
-var exSourceOpt = SourceOpt();
+var exOutputOpt = new Option<string>("--output", "Output file") { IsRequired = true }.WithAliases("-o");
+var exSourceOpt = CommonOptions.Source;
 var exVersionsOpt = new Option<bool>("--include-versions", "Include versions");
 exportCommand.AddOption(exOutputOpt); exportCommand.AddOption(exSourceOpt); exportCommand.AddOption(exVersionsOpt);
 
@@ -589,11 +569,10 @@ var errorCommand = new Command("error", "Look up error codes");
 var errInputArg = new Argument<string>("input", "Error code");
 errorCommand.AddArgument(errInputArg);
 
-errorCommand.SetHandler(PrintErrorLookup, errInputArg);
+errorCommand.SetHandler(Print.ErrorLookup, errInputArg);
 
 // ── Settings ──
-var settingsCommand = new Command("settings", "Settings");
-settingsCommand.AddAlias("config");
+var settingsCommand = new Command("settings", "Settings").WithAliases("config");
 var settingsEnableOpt = new Option<string?>("--enable", "Enables the specific administrator setting");
 var settingsDisableOpt = new Option<string?>("--disable", "Disables the specific administrator setting");
 settingsCommand.AddOption(settingsEnableOpt);
@@ -606,9 +585,7 @@ settingsSetCmd.AddOption(settingsSetNameOpt);
 settingsSetCmd.AddOption(settingsSetValueOpt);
 var settingsResetCmd = new Command("reset", "Resets an admin setting to its default value.");
 var settingsResetNameOpt = new Option<string?>("--setting", "Name of the setting to modify");
-var settingsResetAllOpt = new Option<bool>("--recurse", "Resets all admin settings");
-settingsResetAllOpt.AddAlias("-r");
-settingsResetAllOpt.AddAlias("--all");
+var settingsResetAllOpt = new Option<bool>("--recurse", "Resets all admin settings").WithAliases("-r", "--all");
 settingsResetCmd.AddOption(settingsResetNameOpt);
 settingsResetCmd.AddOption(settingsResetAllOpt);
 settingsCommand.AddCommand(settingsExportCmd);
@@ -637,13 +614,13 @@ settingsCommand.SetHandler((ctx) =>
         return;
     }
 
-    WriteJsonNode(repo.GetUserSettings(), GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption)));
+    Json.WriteNode(repo.GetUserSettings(), Output.GetFormat(ctx.ParseResult.GetValueForOption(outputOption)));
 });
 
 settingsExportCmd.SetHandler((ctx) =>
 {
     using var repo = Repository.Open();
-    WriteJsonNode(repo.GetUserSettings(), GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption)));
+    Json.WriteNode(repo.GetUserSettings(), Output.GetFormat(ctx.ParseResult.GetValueForOption(outputOption)));
 });
 
 settingsSetCmd.SetHandler((ctx) =>
@@ -653,11 +630,11 @@ settingsSetCmd.SetHandler((ctx) =>
         ?? throw new InvalidOperationException("settings set requires --setting.");
     var rawValue = ctx.ParseResult.GetValueForOption(settingsSetValueOpt)
         ?? throw new InvalidOperationException("settings set requires --value.");
-    var value = ParseBooleanSettingValue(rawValue);
+    var value = rawValue.BooleanSetting;
     repo.SetAdminSetting(name, value);
-    var output = GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption));
+    var output = Output.GetFormat(ctx.ParseResult.GetValueForOption(outputOption));
     if (output != OutputFormat.Text)
-        WriteJsonNode(repo.GetAdminSettings(), output);
+        Json.WriteNode(repo.GetAdminSettings(), output);
     else
         Console.WriteLine($"Set admin setting '{name}' to {value.ToString().ToLowerInvariant()}.");
 });
@@ -671,9 +648,9 @@ settingsResetCmd.SetHandler((ctx) =>
         throw new InvalidOperationException("settings reset requires --setting or --all.");
 
     repo.ResetAdminSetting(name, resetAll);
-    var output = GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption));
+    var output = Output.GetFormat(ctx.ParseResult.GetValueForOption(outputOption));
     if (output != OutputFormat.Text)
-        WriteJsonNode(repo.GetAdminSettings(), output);
+        Json.WriteNode(repo.GetAdminSettings(), output);
     else if (resetAll)
         Console.WriteLine("Reset all admin settings.");
     else
@@ -704,15 +681,14 @@ validateCommand.SetHandler((manifest) =>
 }, valManifestArg);
 
 // ── Download ──
-var downloadCommand = new Command("download", "Download installer");
-downloadCommand.AddAlias("dl");
-var dlArg = new Argument<string?>("query", () => null, "Package query");
-var dlqOpt = QueryArg(); var dlidOpt = IdOpt(); var dlnOpt = NameOpt(); var dlmOpt = MonikerOpt(); var dlsOpt = SourceOpt(); var dleOpt = ExactOpt(); var dlvOpt = VersionOpt();
-var dlDirOpt = new Option<string?>("--download-directory", "Download directory"); dlDirOpt.AddAlias("-d");
-var dlManifestOpt = new Option<string?>("--manifest", "Local manifest file or directory"); dlManifestOpt.AddAlias("-m");
+var downloadCommand = new Command("download", "Download installer").WithAliases("dl");
+var dlArg = QueryArguments.Package;
+var dlqOpt = CommonOptions.Query; var dlidOpt = CommonOptions.Id; var dlnOpt = CommonOptions.Name; var dlmOpt = CommonOptions.Moniker; var dlsOpt = CommonOptions.Source; var dleOpt = CommonOptions.Exact; var dlvOpt = CommonOptions.Version;
+var dlDirOpt = new Option<string?>("--download-directory", "Download directory").WithAliases("-d");
+var dlManifestOpt = new Option<string?>("--manifest", "Local manifest file or directory").WithAliases("-m");
 var dlLocaleOpt = new Option<string?>("--locale", "Installer locale");
 var dlTypeOpt = new Option<string?>("--installer-type", "Installer type");
-var dlArchOpt = new Option<string?>("--architecture", "Architecture"); dlArchOpt.AddAlias("-a");
+var dlArchOpt = new Option<string?>("--architecture", "Architecture").WithAliases("-a");
 var dlPlatformOpt = new Option<string?>("--platform", "Target platform");
 var dlOsVersionOpt = new Option<string?>("--os-version", "Target OS version");
 var dlScopeOpt = new Option<string?>("--scope", "Install scope");
@@ -743,7 +719,7 @@ downloadCommand.SetHandler((ctx) =>
     var dir = ctx.ParseResult.GetValueForOption(dlDirOpt)
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
     using var repo = Repository.Open();
-    var request = CreateInstallRequest(
+    var request = RequestCreator.Install(
         query,
         ctx.ParseResult.GetValueForOption(dlManifestOpt),
         InstallerMode.SilentWithProgress,
@@ -769,18 +745,18 @@ downloadCommand.SetHandler((ctx) =>
 var pinCommand = new Command("pin", "Manage pins");
 var pinListCmd = new Command("list", "List pins");
 var pinAddCmd = new Command("add", "Add pin");
-var plArg = new Argument<string?>("query", () => null, "Package query");
-var plqOpt = QueryArg(); var plIdOpt = IdOpt(); var plNameOpt = NameOpt(); var plMonikerOpt = MonikerOpt(); var plSourceOpt = SourceOpt(); var plExactOpt = ExactOpt();
+var plArg = QueryArguments.Package;
+var plqOpt = CommonOptions.Query; var plIdOpt = CommonOptions.Id; var plNameOpt = CommonOptions.Name; var plMonikerOpt = CommonOptions.Moniker; var plSourceOpt = CommonOptions.Source; var plExactOpt = CommonOptions.Exact;
 var plTagOpt = new Option<string?>("--tag", "Filter by tag");
-var plCmdOpt = new Option<string?>("--command", "Filter by command"); plCmdOpt.AddAlias("--cmd");
+var plCmdOpt = new Option<string?>("--command", "Filter by command").WithAliases("--cmd");
 pinListCmd.AddArgument(plArg);
 foreach (var o in new Option[] { plqOpt, plIdOpt, plNameOpt, plMonikerOpt, plSourceOpt, plExactOpt, plTagOpt, plCmdOpt }) pinListCmd.AddOption(o);
 
-var paArg = new Argument<string?>("query", () => null, "Package query");
-var paqOpt = QueryArg(); var paIdOpt = IdOpt(); var paNameOpt = NameOpt(); var paMonikerOpt = MonikerOpt(); var paSourceOpt = SourceOpt(); var paExactOpt = ExactOpt();
+var paArg = QueryArguments.Package;
+var paqOpt = CommonOptions.Query; var paIdOpt = CommonOptions.Id; var paNameOpt = CommonOptions.Name; var paMonikerOpt = CommonOptions.Moniker; var paSourceOpt = CommonOptions.Source; var paExactOpt = CommonOptions.Exact;
 var paTagOpt = new Option<string?>("--tag", "Filter by tag");
-var paCmdOpt = new Option<string?>("--command", "Filter by command"); paCmdOpt.AddAlias("--cmd");
-var paVersionOpt = new Option<string?>("--version", "Pin version"); paVersionOpt.AddAlias("-v");
+var paCmdOpt = new Option<string?>("--command", "Filter by command").WithAliases("--cmd");
+var paVersionOpt = new Option<string?>("--version", "Pin version").WithAliases("-v");
 var paBlockingOpt = new Option<bool>("--blocking", "Blocking pin");
 var paInstalledOpt = new Option<bool>("--installed", "Pin a specific installed version");
 var paForceOpt = new Option<bool>("--force", "Replace an existing pin");
@@ -788,17 +764,17 @@ pinAddCmd.AddArgument(paArg);
 foreach (var o in new Option[] { paqOpt, paIdOpt, paNameOpt, paMonikerOpt, paSourceOpt, paExactOpt, paTagOpt, paCmdOpt, paVersionOpt, paBlockingOpt, paInstalledOpt, paForceOpt }) pinAddCmd.AddOption(o);
 
 var pinRemoveCmd = new Command("remove", "Remove pin");
-var prArg = new Argument<string?>("query", () => null, "Package query");
-var prqOpt = QueryArg(); var prIdOpt = IdOpt(); var prNameOpt = NameOpt(); var prMonikerOpt = MonikerOpt(); var prSourceOpt = SourceOpt(); var prExactOpt = ExactOpt();
+var prArg = QueryArguments.Package;
+var prqOpt = CommonOptions.Query; var prIdOpt = CommonOptions.Id; var prNameOpt = CommonOptions.Name; var prMonikerOpt = CommonOptions.Moniker; var prSourceOpt = CommonOptions.Source; var prExactOpt = CommonOptions.Exact;
 var prTagOpt = new Option<string?>("--tag", "Filter by tag");
-var prCmdOpt = new Option<string?>("--command", "Filter by command"); prCmdOpt.AddAlias("--cmd");
+var prCmdOpt = new Option<string?>("--command", "Filter by command").WithAliases("--cmd");
 var prInstalledOpt = new Option<bool>("--installed", "Remove the pin for a specific installed version");
 pinRemoveCmd.AddArgument(prArg);
 foreach (var o in new Option[] { prqOpt, prIdOpt, prNameOpt, prMonikerOpt, prSourceOpt, prExactOpt, prTagOpt, prCmdOpt, prInstalledOpt }) pinRemoveCmd.AddOption(o);
 
 var pinResetCmd = new Command("reset", "Reset pins");
 var prForceOpt = new Option<bool>("--force", "Force reset");
-var prResetSourceOpt = SourceOpt();
+var prResetSourceOpt = CommonOptions.Source;
 pinResetCmd.AddOption(prForceOpt);
 pinResetCmd.AddOption(prResetSourceOpt);
 pinCommand.AddCommand(pinListCmd); pinCommand.AddCommand(pinAddCmd); pinCommand.AddCommand(pinRemoveCmd); pinCommand.AddCommand(pinResetCmd);
@@ -806,7 +782,7 @@ pinCommand.AddCommand(pinListCmd); pinCommand.AddCommand(pinAddCmd); pinCommand.
 pinListCmd.SetHandler((ctx) =>
 {
     using var repo = Repository.Open();
-    var query = CreatePinQuery(
+    var query = PinQuery.Create(
         ctx.ParseResult.GetValueForArgument(plArg) ?? ctx.ParseResult.GetValueForOption(plqOpt),
         ctx.ParseResult.GetValueForOption(plIdOpt),
         ctx.ParseResult.GetValueForOption(plNameOpt),
@@ -815,7 +791,7 @@ pinListCmd.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(plCmdOpt),
         ctx.ParseResult.GetValueForOption(plSourceOpt),
         ctx.ParseResult.GetValueForOption(plExactOpt));
-    var pins = FilterPins(repo, query);
+    var pins = Pin.Filter(repo, query);
     if (pins.Count == 0) { Console.WriteLine("No pins found."); return; }
     Console.WriteLine($"{"Package Id",-40} {"Version",-20} {"Source",-15} Pin Type");
     Console.WriteLine(new string('-', 85));
@@ -825,7 +801,7 @@ pinListCmd.SetHandler((ctx) =>
 pinAddCmd.SetHandler((ctx) =>
 {
     using var repo = Repository.Open();
-    var query = CreatePinQuery(
+    var query = PinQuery.Create(
         ctx.ParseResult.GetValueForArgument(paArg) ?? ctx.ParseResult.GetValueForOption(paqOpt),
         ctx.ParseResult.GetValueForOption(paIdOpt),
         ctx.ParseResult.GetValueForOption(paNameOpt),
@@ -834,7 +810,7 @@ pinAddCmd.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(paCmdOpt),
         ctx.ParseResult.GetValueForOption(paSourceOpt),
         ctx.ParseResult.GetValueForOption(paExactOpt));
-    EnsurePinQueryProvided(query, "pin add");
+    PinQuery.EnsureProvided(query, "pin add");
 
     var blocking = ctx.ParseResult.GetValueForOption(paBlockingOpt);
     var installed = ctx.ParseResult.GetValueForOption(paInstalledOpt);
@@ -846,14 +822,14 @@ pinAddCmd.SetHandler((ctx) =>
     string? resolvedVersion;
     if (installed)
     {
-        var target = ResolveSingleInstalledPinTarget(repo, query);
+        var target = PinTarget.ResolveSingleInstalled(repo, query);
         packageId = target.Id;
         sourceId = target.SourceName ?? query.Source ?? "";
         resolvedVersion = target.InstalledVersion;
     }
     else
     {
-        var target = ResolveSingleAvailablePinTarget(repo, query);
+        var target = PinTarget.ResolveSingleAvailable(repo, query);
         packageId = target.Id;
         sourceId = target.SourceName;
         resolvedVersion = target.Version;
@@ -874,7 +850,7 @@ pinAddCmd.SetHandler((ctx) =>
 pinRemoveCmd.SetHandler((ctx) =>
 {
     using var repo = Repository.Open();
-    var query = CreatePinQuery(
+    var query = PinQuery.Create(
         ctx.ParseResult.GetValueForArgument(prArg) ?? ctx.ParseResult.GetValueForOption(prqOpt),
         ctx.ParseResult.GetValueForOption(prIdOpt),
         ctx.ParseResult.GetValueForOption(prNameOpt),
@@ -883,18 +859,18 @@ pinRemoveCmd.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(prCmdOpt),
         ctx.ParseResult.GetValueForOption(prSourceOpt),
         ctx.ParseResult.GetValueForOption(prExactOpt));
-    EnsurePinQueryProvided(query, "pin remove");
+    PinQuery.EnsureProvided(query, "pin remove");
 
     PinRecord? pin;
     if (ctx.ParseResult.GetValueForOption(prInstalledOpt))
     {
-        var target = ResolveSingleInstalledPinTarget(repo, query);
+        var target = PinTarget.ResolveSingleInstalled(repo, query);
         pin = repo.ListPins(target.SourceName ?? query.Source ?? "")
             .FirstOrDefault(candidate => candidate.PackageId.Equals(target.Id, StringComparison.OrdinalIgnoreCase));
     }
     else
     {
-        var pins = FilterPins(repo, query);
+        var pins = Pin.Filter(repo, query);
         if (pins.Count == 0)
         {
             Console.WriteLine("No pin found matching the query.");
@@ -925,34 +901,33 @@ pinResetCmd.SetHandler((force, source) =>
 }, prForceOpt, prResetSourceOpt);
 
 // ── Install ──
-var installCommand = new Command("install", "Install a package");
-installCommand.AddAlias("add");
-var iArg = new Argument<string?>("query", () => null, "Package query");
-var iqOpt = QueryArg(); var iidOpt = IdOpt(); var inameOpt = NameOpt(); var imonikerOpt = MonikerOpt(); var isrcOpt = SourceOpt();
-var ieOpt = ExactOpt(); var ivOpt = VersionOpt();
+var installCommand = new Command("install", "Install a package").WithAliases("add");
+var iArg = QueryArguments.Package;
+var iqOpt = CommonOptions.Query; var iidOpt = CommonOptions.Id; var inameOpt = CommonOptions.Name; var imonikerOpt = CommonOptions.Moniker; var isrcOpt = CommonOptions.Source;
+var ieOpt = CommonOptions.Exact; var ivOpt = CommonOptions.Version;
 var ichannelOpt = new Option<string?>("--channel", "Channel");
 var ilocaleOpt = new Option<string?>("--locale", "Installer locale");
 var itypeOpt = new Option<string?>("--installer-type", "Installer type");
-var iarchOpt = new Option<string?>("--architecture", "Architecture"); iarchOpt.AddAlias("-a");
+var iarchOpt = new Option<string?>("--architecture", "Architecture").WithAliases("-a");
 var iplatformOpt = new Option<string?>("--platform", "Target platform");
 var iosVersionOpt = new Option<string?>("--os-version", "Target OS version");
 var iscopeOpt = new Option<string?>("--scope", "Install scope");
-var imanifestOpt = new Option<string?>("--manifest", "Local manifest file or directory"); imanifestOpt.AddAlias("-m");
+var imanifestOpt = new Option<string?>("--manifest", "Local manifest file or directory").WithAliases("-m");
 var ilogOpt = new Option<string?>("--log", "Installer log path");
 var icustomOpt = new Option<string?>("--custom", "Additional installer switches");
 var ioverrideOpt = new Option<string?>("--override", "Override installer arguments");
-var ilocationOpt = new Option<string?>("--location", "Install location"); ilocationOpt.AddAlias("-l");
+var ilocationOpt = new Option<string?>("--location", "Install location").WithAliases("-l");
 var iignoreSecurityHashOpt = new Option<bool>("--ignore-security-hash", "Ignore installer hash mismatches");
 var iskipDepsOpt = new Option<bool>("--skip-dependencies", "Skip package dependencies");
-var idepsOnlyOpt = new Option<bool>("--dependencies-only", "Install dependencies only"); idepsOnlyOpt.AddAlias("--dependencies");
+var idepsOnlyOpt = new Option<bool>("--dependencies-only", "Install dependencies only").WithAliases("--dependencies");
 var idependencySourceOpt = new Option<string?>("--dependency-source", "Source to use when resolving dependencies");
 var iacceptPkgAgreementsOpt = new Option<bool>("--accept-package-agreements", "Accept package agreements");
 var inoUpgradeOpt = new Option<bool>("--no-upgrade", "Skip upgrade if the package is already installed");
 var iforceOpt = new Option<bool>("--force", "Force install behavior");
-var irenameOpt = new Option<string?>("--rename", "Rename the installer or target payload"); irenameOpt.AddAlias("-r");
+var irenameOpt = new Option<string?>("--rename", "Rename the installer or target payload").WithAliases("-r");
 var iuninstallPreviousOpt = new Option<bool>("--uninstall-previous", "Uninstall previous versions before installing");
-var iSilentOpt = new Option<bool>("--silent", "Silent install"); iSilentOpt.AddAlias("-h");
-var iInteractiveOpt = new Option<bool>("--interactive", "Interactive install"); iInteractiveOpt.AddAlias("-i");
+var iSilentOpt = new Option<bool>("--silent", "Silent install").WithAliases("-h");
+var iInteractiveOpt = new Option<bool>("--interactive", "Interactive install").WithAliases("-i");
 installCommand.AddArgument(iArg);
 foreach (var o in new Option[] { iqOpt, iidOpt, inameOpt, imonikerOpt, isrcOpt, ieOpt, ivOpt, ichannelOpt, ilocaleOpt, itypeOpt, iarchOpt, iplatformOpt, iosVersionOpt, iscopeOpt, imanifestOpt, ilogOpt, icustomOpt, ioverrideOpt, ilocationOpt, iignoreSecurityHashOpt, iskipDepsOpt, idepsOnlyOpt, idependencySourceOpt, iacceptPkgAgreementsOpt, inoUpgradeOpt, iforceOpt, irenameOpt, iuninstallPreviousOpt, iSilentOpt, iInteractiveOpt }) installCommand.AddOption(o);
 
@@ -981,7 +956,7 @@ installCommand.SetHandler((ctx) =>
         throw new InvalidOperationException("--silent and --interactive cannot be used together.");
     using var repo = Repository.Open();
     var mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress;
-    var result = repo.Install(CreateInstallRequest(
+    var result = repo.Install(RequestCreator.Install(
         query,
         ctx.ParseResult.GetValueForOption(imanifestOpt),
         mode,
@@ -998,26 +973,24 @@ installCommand.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(iignoreSecurityHashOpt),
         ctx.ParseResult.GetValueForOption(idependencySourceOpt),
         ctx.ParseResult.GetValueForOption(inoUpgradeOpt)));
-    PrintPackageActionResult(result, "install", "installed");
+    Print.PackageActionResult(result, "install", "installed");
 });
 
 // ── Uninstall ──
-var uninstallCommand = new Command("uninstall", "Uninstall a package");
-uninstallCommand.AddAlias("remove");
-uninstallCommand.AddAlias("rm");
-var uiArg = new Argument<string?>("query", () => null, "Package query");
-var uiqOpt = QueryArg(); var uiidOpt = IdOpt(); var uinameOpt = NameOpt(); var uimonikerOpt = MonikerOpt(); var uisOpt = SourceOpt();
-var uieOpt = ExactOpt(); var uivOpt = VersionOpt();
+var uninstallCommand = new Command("uninstall", "Uninstall a package").WithAliases("remove", "rm");
+var uiArg = QueryArguments.Package;
+var uiqOpt = CommonOptions.Query; var uiidOpt = CommonOptions.Id; var uinameOpt = CommonOptions.Name; var uimonikerOpt = CommonOptions.Moniker; var uisOpt = CommonOptions.Source;
+var uieOpt = CommonOptions.Exact; var uivOpt = CommonOptions.Version;
 var uiscopeOpt = new Option<string?>("--scope", "Install scope");
-var uimanifestOpt = new Option<string?>("--manifest", "Local manifest file or directory"); uimanifestOpt.AddAlias("-m");
+var uimanifestOpt = new Option<string?>("--manifest", "Local manifest file or directory").WithAliases("-m");
 var uiproductCodeOpt = new Option<string?>("--product-code", "Installed product code");
-var uiallVersionsOpt = new Option<bool>("--all-versions", "Uninstall all matching versions"); uiallVersionsOpt.AddAlias("--all");
-var uiInteractiveOpt = new Option<bool>("--interactive", "Interactive uninstall"); uiInteractiveOpt.AddAlias("-i");
+var uiallVersionsOpt = new Option<bool>("--all-versions", "Uninstall all matching versions").WithAliases("--all");
+var uiInteractiveOpt = new Option<bool>("--interactive", "Interactive uninstall").WithAliases("-i");
 var uiForceOpt = new Option<bool>("--force", "Force uninstall behavior");
 var uiPurgeOpt = new Option<bool>("--purge", "Purge portable package contents");
 var uiPreserveOpt = new Option<bool>("--preserve", "Preserve portable package contents");
 var uiLogOpt = new Option<string?>("--log", "Uninstaller log path");
-var uiSilentOpt = new Option<bool>("--silent", "Silent uninstall"); uiSilentOpt.AddAlias("-h");
+var uiSilentOpt = new Option<bool>("--silent", "Silent uninstall").WithAliases("-h");
 uninstallCommand.AddArgument(uiArg);
 foreach (var o in new Option[] { uiqOpt, uiidOpt, uinameOpt, uimonikerOpt, uisOpt, uieOpt, uivOpt, uiscopeOpt, uimanifestOpt, uiproductCodeOpt, uiallVersionsOpt, uiInteractiveOpt, uiForceOpt, uiPurgeOpt, uiPreserveOpt, uiLogOpt, uiSilentOpt }) uninstallCommand.AddOption(o);
 
@@ -1051,26 +1024,25 @@ uninstallCommand.SetHandler((ctx) =>
         Preserve = ctx.ParseResult.GetValueForOption(uiPreserveOpt),
         LogPath = ctx.ParseResult.GetValueForOption(uiLogOpt),
     });
-    PrintPackageActionResult(result, "uninstall", "uninstalled");
+    Print.PackageActionResult(result, "uninstall", "uninstalled");
 });
 
 // ── Repair ──
-var repairCommand = new Command("repair", "Repair a package");
-repairCommand.AddAlias("fix");
-var rArg = new Argument<string?>("query", () => null, "Package query");
-var rqOpt = QueryArg(); var ridOpt = IdOpt(); var rnameOpt = NameOpt(); var rmonikerOpt = MonikerOpt(); var rsrcOpt = SourceOpt();
-var reOpt = ExactOpt(); var rvOpt = VersionOpt();
-var rmanifestOpt = new Option<string?>("--manifest", "Local manifest file or directory"); rmanifestOpt.AddAlias("-m");
+var repairCommand = new Command("repair", "Repair a package").WithAliases("fix");
+var rArg = QueryArguments.Package;
+var rqOpt = CommonOptions.Query; var ridOpt = CommonOptions.Id; var rnameOpt = CommonOptions.Name; var rmonikerOpt = CommonOptions.Moniker; var rsrcOpt = CommonOptions.Source;
+var reOpt = CommonOptions.Exact; var rvOpt = CommonOptions.Version;
+var rmanifestOpt = new Option<string?>("--manifest", "Local manifest file or directory").WithAliases("-m");
 var rproductCodeOpt = new Option<string?>("--product-code", "Installed product code");
-var rarchOpt = new Option<string?>("--architecture", "Architecture"); rarchOpt.AddAlias("-a");
+var rarchOpt = new Option<string?>("--architecture", "Architecture").WithAliases("-a");
 var rscopeOpt = new Option<string?>("--scope", "Install scope");
 var rlocaleOpt = new Option<string?>("--locale", "Installer locale");
-var rlogOpt = new Option<string?>("--log", "Installer log path"); rlogOpt.AddAlias("-o");
+var rlogOpt = new Option<string?>("--log", "Installer log path").WithAliases("-o");
 var racceptPkgAgreementsOpt = new Option<bool>("--accept-package-agreements", "Accept package agreements");
 var rignoreSecurityHashOpt = new Option<bool>("--ignore-security-hash", "Ignore installer hash mismatches");
 var rforceOpt = new Option<bool>("--force", "Force repair behavior");
-var rSilentOpt = new Option<bool>("--silent", "Silent install"); rSilentOpt.AddAlias("-h");
-var rInteractiveOpt = new Option<bool>("--interactive", "Interactive install"); rInteractiveOpt.AddAlias("-i");
+var rSilentOpt = new Option<bool>("--silent", "Silent install").WithAliases("-h");
+var rInteractiveOpt = new Option<bool>("--interactive", "Interactive install").WithAliases("-i");
 repairCommand.AddArgument(rArg);
 foreach (var o in new Option[] { rqOpt, ridOpt, rnameOpt, rmonikerOpt, rsrcOpt, reOpt, rvOpt, rmanifestOpt, rproductCodeOpt, rarchOpt, rscopeOpt, rlocaleOpt, rlogOpt, racceptPkgAgreementsOpt, rignoreSecurityHashOpt, rforceOpt, rSilentOpt, rInteractiveOpt }) repairCommand.AddOption(o);
 
@@ -1083,7 +1055,7 @@ repairCommand.SetHandler((ctx) =>
 
     using var repo = Repository.Open();
     var mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress;
-    var result = repo.Repair(CreateRepairRequest(
+    var result = repo.Repair(RequestCreator.Repair(
         new PackageQuery
         {
             Query = ctx.ParseResult.GetValueForArgument(rArg) ?? ctx.ParseResult.GetValueForOption(rqOpt),
@@ -1104,12 +1076,12 @@ repairCommand.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(racceptPkgAgreementsOpt),
         ctx.ParseResult.GetValueForOption(rforceOpt),
         ctx.ParseResult.GetValueForOption(rignoreSecurityHashOpt)));
-    PrintPackageActionResult(result, "repair", "repaired");
+    Print.PackageActionResult(result, "repair", "repaired");
 });
 
 // ── Import ──
 var importCommand = new Command("import", "Import packages");
-var imFileOpt = new Option<string>("--import-file", "Import file") { IsRequired = true }; imFileOpt.AddAlias("-i");
+var imFileOpt = new Option<string>("--import-file", "Import file") { IsRequired = true }.WithAliases("-i");
 var imDryRunOpt = new Option<bool>("--dry-run", "Dry run only");
 var imIgnoreUnavailableOpt = new Option<bool>("--ignore-unavailable", "Ignore unavailable packages");
 var imIgnoreVersionsOpt = new Option<bool>("--ignore-versions", "Ignore package versions in the import file");
@@ -1138,18 +1110,18 @@ importCommand.SetHandler((ctx) =>
     foreach (var source in sources)
     {
         var sourceName = source.TryGetProperty("SourceDetails", out var sourceDetails)
-            ? GetJsonString(sourceDetails, "Name")
+            ? Json.GetString(sourceDetails, "Name")
             : null;
         var packages = source.GetProperty("Packages").EnumerateArray().ToList();
         foreach (var pkg in packages)
         {
             var pkgId = pkg.GetProperty("PackageIdentifier").GetString()!;
-            var pkgVersion = ignoreVersions ? null : GetJsonString(pkg, "Version");
+            var pkgVersion = ignoreVersions ? null : Json.GetString(pkg, "Version");
             if (dryRun)
             {
                 Console.WriteLine($"[dry-run] Would install: {pkgId}");
             }
-            else if (noUpgrade && IsInstalledPackagePresent(repo, pkgId, sourceName))
+            else if (noUpgrade && InstalledPackageChecker.IsPresent(repo, pkgId, sourceName))
             {
                 Console.WriteLine($"[no-upgrade] Skipping already installed package: {pkgId}");
                 skipped++;
@@ -1159,7 +1131,7 @@ importCommand.SetHandler((ctx) =>
                 try
                 {
                     Console.Write($"Installing {pkgId}...");
-                    var result = repo.Install(CreateInstallRequest(
+                    var result = repo.Install(RequestCreator.Install(
                         new PackageQuery
                         {
                             Id = pkgId,
@@ -1185,16 +1157,16 @@ importCommand.SetHandler((ctx) =>
                     if (result.NoOp)
                     {
                         Console.WriteLine(" no-op");
-                        PrintWarnings(result.Warnings);
+                        Print.Warnings(result.Warnings);
                         skipped++;
                     }
                     else
                     {
-                        PrintWarnings(result.Warnings);
+                        Print.Warnings(result.Warnings);
                         Console.WriteLine(result.Success ? " done" : $" failed (exit {result.ExitCode})");
                     }
                 }
-                catch (Exception ex) when (ignoreUnavailable && CanIgnoreUnavailableImportFailure(ex))
+                catch (Exception ex) when (ignoreUnavailable && ex.CanIgnoreUnavailableImportFailure)
                 {
                     Console.WriteLine(" unavailable");
                     Console.Error.WriteLine($"warning: Skipping unavailable package '{pkgId}': {ex.Message}");
@@ -1234,639 +1206,9 @@ rootCommand.SetHandler((ctx) =>
 {
     if (ctx.ParseResult.GetValueForOption(infoOption))
     {
-        PrintInfo();
+        Print.Info();
         return;
     }
 });
 
 return rootCommand.Invoke(args);
-
-// ═══════════════ Output helpers ═══════════════
-
-static void PrintInfo()
-{
-    PrintVersion();
-    Console.WriteLine("Pure C# subset of Pinget (portable winget)");
-    Console.WriteLine($"Runtime: {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}");
-    Console.WriteLine($"OS: {System.Runtime.InteropServices.RuntimeInformation.OSDescription}");
-}
-
-static void PrintVersion() => Console.WriteLine($"pinget v{Version}");
-
-static OutputFormat GetOutputFormat(string? value) =>
-    value?.ToLowerInvariant() switch
-    {
-        "json" => OutputFormat.Json,
-        "yaml" => OutputFormat.Yaml,
-        _ => OutputFormat.Text,
-    };
-
-void WriteStructuredOutput(object value, OutputFormat output)
-{
-    switch (output)
-    {
-        case OutputFormat.Json:
-            if (value is SerializableShowManifest showManifest)
-                Console.WriteLine(JsonSerializer.Serialize(showManifest, PingetJsonContext.Default.SerializableShowManifest));
-            else
-                Console.WriteLine(JsonSerializer.Serialize(value, JsonOpts));
-            break;
-        case OutputFormat.Yaml:
-            Console.Write(new SerializerBuilder().Build().Serialize(value));
-            break;
-        default:
-            throw new InvalidOperationException("Text output should be handled separately.");
-    }
-}
-
-void WriteManifestStructuredOutput(object value, OutputFormat output)
-{
-    if (output == OutputFormat.Yaml && value is List<Dictionary<string, object?>> documents)
-    {
-        var serializer = new SerializerBuilder().Build();
-        foreach (var document in documents)
-        {
-            Console.Write("---\n");
-            Console.Write(serializer.Serialize(document));
-        }
-        return;
-    }
-
-    WriteStructuredOutput(value, output);
-}
-
-static void PrintSearch(SearchResponse result)
-{
-    PrintWarnings(result.Warnings);
-    if (result.Matches.Count == 0) { Console.WriteLine("No package matched the supplied query."); return; }
-
-    bool showMatch = result.Matches.Any(m => m.MatchCriteria is not null);
-    if (showMatch)
-    {
-        Console.WriteLine("{0,-32} {1,-40} {2,-18} {3,-24} Source", "Name", "Id", "Version", "Match");
-        foreach (var m in result.Matches)
-        {
-            Console.WriteLine(
-                "{0,-32} {1,-40} {2,-18} {3,-24} {4}",
-                Trunc(m.Name, 32),
-                Trunc(m.Id, 40),
-                m.Version ?? "Unknown",
-                Trunc(m.MatchCriteria ?? "", 24),
-                m.SourceName);
-        }
-    }
-    else
-    {
-        Console.WriteLine("{0,-36} {1,-42} {2,-18} Source", "Name", "Id", "Version");
-        foreach (var m in result.Matches)
-        {
-            Console.WriteLine(
-                "{0,-36} {1,-42} {2,-18} {3}",
-                Trunc(m.Name, 36),
-                Trunc(m.Id, 42),
-                m.Version ?? "Unknown",
-                m.SourceName);
-        }
-    }
-
-    if (result.Truncated) Console.WriteLine($"<additional entries truncated due to result limit>");
-}
-
-static void PrintVersions(VersionsResult result)
-{
-    PrintWarnings(result.Warnings);
-    Console.WriteLine($"Found {result.Package.Name} [{result.Package.Id}]");
-    Console.WriteLine("Version");
-    Console.WriteLine(new string('-', 40));
-    foreach (var v in result.Versions)
-    {
-        Console.Write(v.Version);
-        if (!string.IsNullOrEmpty(v.Channel)) Console.Write($" [{v.Channel}]");
-        Console.WriteLine();
-    }
-}
-
-static void PrintShow(ShowResult result)
-{
-    PrintWarnings(result.Warnings);
-    Console.WriteLine($"Found {result.Package.Name} [{result.Package.Id}]");
-    var m = result.Manifest;
-    Console.WriteLine($"Version: {m.Version}");
-    PrintOpt("Publisher", m.Publisher);
-    PrintOpt("Publisher Url", m.PublisherUrl);
-    PrintOpt("Publisher Support Url", m.PublisherSupportUrl);
-    PrintOpt("Author", m.Author);
-    PrintOpt("Moniker", m.Moniker);
-    if (m.Description is not null)
-    {
-        Console.WriteLine("Description:");
-        foreach (var line in m.Description.Split('\n'))
-            Console.WriteLine($"  {line.TrimEnd()}");
-    }
-    PrintOpt("Homepage", m.PackageUrl);
-    PrintOpt("License", m.License);
-    PrintOpt("License Url", m.LicenseUrl);
-    PrintOpt("Privacy Url", m.PrivacyUrl);
-    PrintOpt("Copyright", m.Copyright);
-    PrintOpt("Copyright Url", m.CopyrightUrl);
-    PrintOpt("Release Notes Url", m.ReleaseNotesUrl);
-    if (m.Documentation.Count > 0)
-    {
-        Console.WriteLine("Documentation:");
-        foreach (var doc in m.Documentation)
-            Console.WriteLine($"  {doc.Label ?? "Link"}: {doc.Url}");
-    }
-
-    if (result.Manifest.PackageDependencies.Count > 0)
-    {
-        Console.Write("Dependencies:");
-        Console.WriteLine($" {string.Join(", ", result.Manifest.PackageDependencies)}");
-    }
-
-    if (m.Tags.Count > 0) { Console.WriteLine("Tags:"); foreach (var t in m.Tags) Console.WriteLine($"  {t}"); }
-
-    if (result.SelectedInstaller is Installer inst)
-    {
-        Console.WriteLine("Installer:");
-        PrintOpt("  Type", inst.InstallerType);
-        PrintOpt("  Architecture", inst.Architecture);
-        PrintOpt("  Locale", inst.Locale);
-        PrintOpt("  Scope", inst.Scope);
-        PrintOpt("  Url", inst.Url);
-        PrintOpt("  Sha256", inst.Sha256);
-        PrintOpt("  ProductCode", inst.ProductCode);
-        PrintOpt("  ReleaseDate", inst.ReleaseDate);
-    }
-    else if (m.Installers.Count > 0)
-    {
-        Console.WriteLine("Installer:");
-        Console.WriteLine("  No applicable installer found; see logs for more details.");
-    }
-}
-
-static void PrintListResult(ListResponse result, bool details, bool upgrade)
-{
-    PrintWarnings(result.Warnings);
-    if (result.Matches.Count == 0) { Console.WriteLine("No installed package found matching input criteria."); return; }
-
-    if (details)
-    {
-        int total = result.Matches.Count;
-        for (int idx = 0; idx < total; idx++)
-        {
-            var m = result.Matches[idx];
-            if (total > 1)
-                Console.WriteLine($"({idx + 1}/{total}) {m.Name} [{m.Id}]");
-            else
-                Console.WriteLine($"{m.Name} [{m.Id}]");
-            PrintOpt("Version", m.InstalledVersion);
-            PrintOpt("Publisher", m.Publisher);
-            if (m.LocalId != m.Id) PrintOpt("Local Identifier", m.LocalId);
-            PrintOpt("Source", m.SourceName);
-            PrintOpt("Available", m.AvailableVersion);
-        }
-    }
-    else
-    {
-        bool showAvailable = result.Matches.Any(m => !string.IsNullOrEmpty(m.AvailableVersion));
-        string[] headers = showAvailable
-            ? ["Name", "Id", "Version", "Available", "Source"]
-            : ["Name", "Id", "Version", "Source"];
-        var rows = result.Matches.Select(m => showAvailable
-            ? new[] { m.Name, m.Id, m.InstalledVersion, m.AvailableVersion ?? "", m.SourceName ?? "" }
-            : new[] { m.Name, m.Id, m.InstalledVersion, m.SourceName ?? "" }).ToList();
-        PrintTable(headers, rows);
-    }
-
-    if (result.Truncated) Console.WriteLine($"<additional entries truncated due to result limit>");
-    if (upgrade) Console.WriteLine($"{result.Matches.Count} upgrades available.");
-}
-
-static void PrintSources(List<SourceRecord> sources)
-{
-    Console.WriteLine($"{"Name",-12} {"Trust",-8} {"Explicit",-8} Argument");
-    foreach (var s in sources)
-        Console.WriteLine($"{s.Name,-12} {s.TrustLevel,-8} {s.Explicit.ToString().ToLowerInvariant(),-8} {s.Arg}");
-}
-
-static void PrintPackageActionResult(InstallResult result, string action, string actionPastTense)
-{
-    PrintWarnings(result.Warnings);
-    var target = string.IsNullOrWhiteSpace(result.Version)
-        ? result.PackageId
-        : $"{result.PackageId} v{result.Version}";
-    if (result.NoOp)
-        Console.WriteLine($"No changes were made for {target}.");
-    else if (result.Success)
-        Console.WriteLine($"Successfully {actionPastTense} {target}");
-    else
-        Console.Error.WriteLine($"Failed to {action} {target} (exit code: {result.ExitCode})");
-}
-
-static void PrintErrorLookup(string input)
-{
-    if (!long.TryParse(input.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
-        ? input[2..] : input, System.Globalization.NumberStyles.HexNumber, null, out var code))
-    {
-        Console.Error.WriteLine($"error: Could not parse '{input}' as an error code");
-        return;
-    }
-
-    var lookup = LookupHresult(code);
-    if (lookup is not null)
-    {
-        // APPINSTALLER codes (0x8A15xxxx): show symbol on same line
-        if ((code & 0xFFFF0000L) == unchecked((long)0x8A150000))
-            Console.WriteLine($"0x{code:x8} : {lookup.Value.Symbol}");
-        else
-            Console.WriteLine($"0x{code:x8}");
-        Console.WriteLine(lookup.Value.Description);
-    }
-    else
-    {
-        Console.WriteLine($"0x{code:x8}");
-        Console.WriteLine("  Unknown error code");
-    }
-}
-
-static (string Symbol, string Description)? LookupHresult(long code)
-{
-    return (code & 0xFFFF0000L) switch
-    {
-        0x8A150000 => (code & 0xFFFF) switch
-        {
-            0x0001 => ("APPINSTALLER_CLI_ERROR_INTERNAL_ERROR", "An unexpected error occurred."),
-            0x0002 => ("APPINSTALLER_CLI_ERROR_INVALID_CL_ARGUMENTS", "Invalid command line arguments."),
-            0x0003 => ("APPINSTALLER_CLI_ERROR_COMMAND_FAILED", "The command failed."),
-            0x0004 => ("APPINSTALLER_CLI_ERROR_MANIFEST_FAILED", "Opening the manifest failed."),
-            0x0007 => ("APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER", "No applicable installer found."),
-            0x000E => ("APPINSTALLER_CLI_ERROR_PACKAGE_NOT_FOUND", "No package matched the query."),
-            0x0010 => ("APPINSTALLER_CLI_ERROR_SOURCE_NAME_ALREADY_EXISTS", "A source with the given name already exists."),
-            0x0012 => ("APPINSTALLER_CLI_ERROR_NO_SOURCES_DEFINED", "No sources are configured."),
-            0x0013 => ("APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND", "Multiple packages matched the query."),
-            0x0016 => ("APPINSTALLER_CLI_ERROR_NO_APPLICABLE_UPGRADE", "No applicable upgrade found."),
-            _ => null,
-        },
-        _ => code switch
-        {
-            unchecked((long)0x80004005) => ("E_FAIL", "Unspecified error"),
-            unchecked((long)0x80070005) => ("E_ACCESSDENIED", "General access denied error"),
-            unchecked((long)0x80070057) => ("E_INVALIDARG", "One or more arguments are not valid"),
-            unchecked((long)0x8007000E) => ("E_OUTOFMEMORY", "Failed to allocate necessary memory"),
-            _ => null,
-        }
-    };
-}
-
-static void PrintWarnings(List<string> warnings) { foreach (var w in warnings) Console.Error.WriteLine($"warning: {w}"); }
-static void PrintOpt(string label, string? value) { if (value is not null) Console.WriteLine($"{label}: {value}"); }
-static string Trunc(string s, int max) => s.Length <= max ? s : s[..(max - 1)] + ".";
-
-static string ResolveSourceAddValue(string? positionalValue, string? optionValue, string label)
-{
-    if (!string.IsNullOrWhiteSpace(positionalValue) &&
-        !string.IsNullOrWhiteSpace(optionValue) &&
-        !string.Equals(positionalValue, optionValue, StringComparison.Ordinal))
-    {
-        throw new InvalidOperationException($"Conflicting source {label} values were provided.");
-    }
-
-    if (!string.IsNullOrWhiteSpace(optionValue))
-        return optionValue;
-
-    if (!string.IsNullOrWhiteSpace(positionalValue))
-        return positionalValue;
-
-    throw new InvalidOperationException($"source add requires a {label}.");
-}
-
-static SourceKind ParseSourceKind(string? value)
-{
-    if (string.IsNullOrWhiteSpace(value) ||
-        string.Equals(value, "rest", StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(value, "Microsoft.Rest", StringComparison.OrdinalIgnoreCase))
-    {
-        return SourceKind.Rest;
-    }
-
-    if (string.Equals(value, "preindexed", StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(value, "Microsoft.PreIndexed.Package", StringComparison.OrdinalIgnoreCase))
-    {
-        return SourceKind.PreIndexed;
-    }
-
-    throw new InvalidOperationException($"Unsupported source type: {value}");
-}
-
-static string FormatSourceType(SourceKind kind) => kind switch
-{
-    SourceKind.Rest => "Microsoft.Rest",
-    SourceKind.PreIndexed => "Microsoft.PreIndexed.Package",
-    _ => kind.ToString(),
-};
-
-static bool ParseBooleanSettingValue(string value) =>
-    value.Trim().ToLowerInvariant() switch
-    {
-        "true" or "1" or "on" or "yes" or "enabled" => true,
-        "false" or "0" or "off" or "no" or "disabled" => false,
-        _ => throw new InvalidOperationException($"Unsupported admin setting value: {value}")
-    };
-
-static PackageQuery CreatePinQuery(
-    string? query,
-    string? id,
-    string? name,
-    string? moniker,
-    string? tag,
-    string? command,
-    string? source,
-    bool exact) =>
-    new()
-    {
-        Query = query,
-        Id = id,
-        Name = name,
-        Moniker = moniker,
-        Tag = tag,
-        Command = command,
-        Source = source,
-        Exact = exact,
-        Count = 200,
-    };
-
-static void EnsurePinQueryProvided(PackageQuery query, string commandName)
-{
-    if (string.IsNullOrWhiteSpace(query.Query) &&
-        string.IsNullOrWhiteSpace(query.Id) &&
-        string.IsNullOrWhiteSpace(query.Name) &&
-        string.IsNullOrWhiteSpace(query.Moniker) &&
-        string.IsNullOrWhiteSpace(query.Tag) &&
-        string.IsNullOrWhiteSpace(query.Command))
-    {
-        throw new InvalidOperationException($"{commandName} requires a query or explicit filter.");
-    }
-}
-
-static SearchMatch ResolveSingleAvailablePinTarget(Repository repo, PackageQuery query)
-{
-    var result = repo.Search(query);
-    if (result.Matches.Count == 0)
-        throw new InvalidOperationException("No package matched the query.");
-    if (result.Matches.Count > 1)
-        throw new InvalidOperationException("Multiple packages matched the query; refine the query.");
-    return result.Matches[0];
-}
-
-static ListMatch ResolveSingleInstalledPinTarget(Repository repo, PackageQuery query)
-{
-    var result = repo.List(new ListQuery
-    {
-        Query = query.Query,
-        Id = query.Id,
-        Name = query.Name,
-        Moniker = query.Moniker,
-        Tag = query.Tag,
-        Command = query.Command,
-        Source = query.Source,
-        Exact = query.Exact,
-        Count = 200,
-    });
-    if (result.Matches.Count == 0)
-        throw new InvalidOperationException("No installed package matched the query.");
-    if (result.Matches.Count > 1)
-        throw new InvalidOperationException("Multiple installed packages matched the query; refine the query.");
-    return result.Matches[0];
-}
-
-static List<PinRecord> FilterPins(Repository repo, PackageQuery query)
-{
-    IEnumerable<PinRecord> pins = repo.ListPins(query.Source);
-    if (!string.IsNullOrWhiteSpace(query.Id))
-        pins = pins.Where(pin => MatchesText(pin.PackageId, query.Id, query.Exact));
-
-    var needsCatalogResolution =
-        !string.IsNullOrWhiteSpace(query.Query) ||
-        !string.IsNullOrWhiteSpace(query.Name) ||
-        !string.IsNullOrWhiteSpace(query.Moniker) ||
-        !string.IsNullOrWhiteSpace(query.Tag) ||
-        !string.IsNullOrWhiteSpace(query.Command);
-    if (!needsCatalogResolution)
-        return pins.ToList();
-
-    var searchResult = repo.Search(query);
-    var keys = searchResult.Matches
-        .Select(match => $"{match.Id}|{match.SourceName ?? ""}")
-        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-    var ids = searchResult.Matches
-        .Select(match => match.Id)
-        .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-    return pins
-        .Where(pin => keys.Contains($"{pin.PackageId}|{pin.SourceId}") ||
-            (string.IsNullOrWhiteSpace(pin.SourceId) && ids.Contains(pin.PackageId)))
-        .ToList();
-}
-
-static bool MatchesText(string value, string query, bool exact) =>
-    exact
-        ? value.Equals(query, StringComparison.OrdinalIgnoreCase)
-        : value.Contains(query, StringComparison.OrdinalIgnoreCase);
-
-static PinRecord? FindMatchingPin(ListMatch match, IReadOnlyList<PinRecord> pins)
-{
-    PinRecord? sourceSpecific = null;
-    PinRecord? sourceAgnostic = null;
-    foreach (var pin in pins)
-    {
-        if (!pin.PackageId.Equals(match.Id, StringComparison.OrdinalIgnoreCase) &&
-            !pin.PackageId.Equals(match.LocalId, StringComparison.OrdinalIgnoreCase))
-        {
-            continue;
-        }
-
-        if (!string.IsNullOrWhiteSpace(pin.SourceId))
-        {
-            if (!string.IsNullOrWhiteSpace(match.SourceName) &&
-                pin.SourceId.Equals(match.SourceName, StringComparison.OrdinalIgnoreCase))
-            {
-                sourceSpecific = pin;
-                break;
-            }
-        }
-        else if (sourceAgnostic is null)
-        {
-            sourceAgnostic = pin;
-        }
-    }
-
-    return sourceSpecific ?? sourceAgnostic;
-}
-
-static InstallRequest CreateInstallRequest(
-    PackageQuery query,
-    string? manifestPath,
-    InstallerMode mode,
-    string? logPath,
-    string? custom,
-    string? overrideArgs,
-    string? installLocation,
-    bool skipDependencies,
-    bool dependenciesOnly,
-    bool acceptPackageAgreements,
-    bool force,
-    string? rename,
-    bool uninstallPrevious,
-    bool ignoreSecurityHash,
-    string? dependencySource,
-    bool noUpgrade) =>
-    new()
-    {
-        Query = query,
-        ManifestPath = manifestPath,
-        Mode = mode,
-        LogPath = logPath,
-        Custom = custom,
-        Override = overrideArgs,
-        InstallLocation = installLocation,
-        SkipDependencies = skipDependencies,
-        DependenciesOnly = dependenciesOnly,
-        AcceptPackageAgreements = acceptPackageAgreements,
-        Force = force,
-        Rename = rename,
-        UninstallPrevious = uninstallPrevious,
-        IgnoreSecurityHash = ignoreSecurityHash,
-        DependencySource = dependencySource,
-        NoUpgrade = noUpgrade,
-    };
-
-static RepairRequest CreateRepairRequest(
-    PackageQuery query,
-    string? manifestPath,
-    string? productCode,
-    InstallerMode mode,
-    string? logPath,
-    bool acceptPackageAgreements,
-    bool force,
-    bool ignoreSecurityHash) =>
-    new()
-    {
-        Query = query,
-        ManifestPath = manifestPath,
-        ProductCode = productCode,
-        Mode = mode,
-        LogPath = logPath,
-        AcceptPackageAgreements = acceptPackageAgreements,
-        Force = force,
-        IgnoreSecurityHash = ignoreSecurityHash,
-    };
-
-static string? GetJsonString(JsonElement element, string propertyName) =>
-    element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
-        ? value.GetString()
-        : null;
-
-static bool IsInstalledPackagePresent(Repository repo, string packageId, string? sourceName) =>
-    repo.List(new ListQuery
-    {
-        Id = packageId,
-        Source = sourceName,
-        Exact = true,
-        Count = 1,
-    }).Matches.Count > 0;
-
-static bool CanIgnoreUnavailableImportFailure(Exception ex) =>
-    ex is InvalidOperationException &&
-    (ex.Message.Contains("No package matched the query", StringComparison.OrdinalIgnoreCase) ||
-     ex.Message.Contains("No applicable installer found", StringComparison.OrdinalIgnoreCase));
-
-void WriteJsonNode(JsonNode value, OutputFormat output)
-{
-    switch (output)
-    {
-        case OutputFormat.Yaml:
-            var structured = JsonSerializer.Deserialize<object>(value.ToJsonString()) ?? new object();
-            Console.Write(new SerializerBuilder().Build().Serialize(structured));
-            break;
-        default:
-            Console.WriteLine(value.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-            break;
-    }
-}
-
-static void PrintTable(string[] headers, List<string[]> rows)
-{
-    if (headers.Length == 0) return;
-    int cols = headers.Length;
-    var widths = headers.Select(h => h.Length).ToArray();
-    var hasData = new bool[cols];
-
-    foreach (var row in rows)
-        for (int i = 0; i < Math.Min(cols, row.Length); i++)
-            if (!string.IsNullOrEmpty(row[i]))
-            {
-                hasData[i] = true;
-                widths[i] = Math.Max(widths[i], row[i].Length);
-            }
-
-    for (int i = 0; i < cols; i++)
-        if (!hasData[i]) widths[i] = 0;
-
-    var spaceAfter = Enumerable.Repeat(true, cols).ToArray();
-    spaceAfter[^1] = false;
-    for (int i = cols - 1; i >= 1; i--)
-    {
-        if (widths[i] == 0) spaceAfter[i - 1] = false;
-        else break;
-    }
-
-    int totalWidth = widths.Zip(spaceAfter, (w, s) => w + (s ? 1 : 0)).Sum();
-    int consoleWidth = 119;
-    try { consoleWidth = Math.Max(1, Console.WindowWidth - 2); } catch { }
-    if (totalWidth >= consoleWidth)
-    {
-        int extra = totalWidth - consoleWidth + 1;
-        while (extra > 0)
-        {
-            int target = 0;
-            for (int i = 1; i < cols; i++)
-                if (widths[i] > widths[target]) target = i;
-            if (widths[target] > 1) widths[target]--;
-            extra--;
-        }
-        totalWidth = Math.Max(0, consoleWidth - 1);
-    }
-
-    PrintTableLine(headers, widths, spaceAfter);
-    Console.WriteLine(new string('-', totalWidth));
-    foreach (var row in rows)
-        PrintTableLine(row, widths, spaceAfter);
-}
-
-static void PrintTableLine(string[] values, int[] widths, bool[] spaceAfter)
-{
-    var sb = new System.Text.StringBuilder();
-    for (int i = 0; i < Math.Min(values.Length, widths.Length); i++)
-    {
-        if (widths[i] == 0) continue;
-        var val = values[i] ?? "";
-        if (val.Length > widths[i])
-        {
-            sb.Append(Trunc(val, widths[i]));
-            if (spaceAfter[i]) sb.Append(' ');
-        }
-        else
-        {
-            sb.Append(val);
-            if (spaceAfter[i]) sb.Append(' ', widths[i] - val.Length + 1);
-        }
-    }
-    Console.WriteLine(sb.ToString().TrimEnd());
-}
-
-enum OutputFormat
-{
-    Text,
-    Json,
-    Yaml,
-}
