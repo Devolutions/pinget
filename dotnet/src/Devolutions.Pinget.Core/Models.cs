@@ -528,6 +528,9 @@ internal record InstalledPackage
     // RequireExplicitUpgrade: true. winget hides those rows from bulk
     // `upgrade`; we mirror that. Users can still upgrade by explicit id.
     public bool CorrelatedRequiresExplicitUpgrade { get; set; }
+    // True when the correlated catalog package's latest version has no
+    // installer for an architecture the user can actually run.
+    public bool CorrelatedLacksCompatibleInstaller { get; set; }
 }
 
 internal enum SearchSemantics

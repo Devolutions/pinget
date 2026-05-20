@@ -581,6 +581,10 @@ struct InstalledPackage {
     // `RequireExplicitUpgrade: true`. winget hides those rows from bulk
     // `upgrade`; we mirror that. Users can still upgrade by explicit id.
     correlated_requires_explicit_upgrade: bool,
+    // True when the correlated catalog package's latest version has no
+    // installer for an architecture the user can actually run. winget
+    // hides those from `upgrade`; we mirror that.
+    correlated_lacks_compatible_installer: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1460,6 +1464,8 @@ impl Repository {
                         && let Ok(manifest) = parse_yaml_manifest(&bytes.bytes)
                     {
                         installed[idx].correlated_requires_explicit_upgrade = manifest.require_explicit_upgrade;
+                        installed[idx].correlated_lacks_compatible_installer =
+                            !manifest_has_compatible_installer(&manifest);
                     }
                 }
             }
@@ -2865,12 +2871,14 @@ fn installed_package_has_unknown_version(package: &InstalledPackage) -> bool {
 }
 
 fn installed_package_matches_upgrade_filter(package: &InstalledPackage, query: &ListQuery) -> bool {
-    // Hide RequireExplicitUpgrade packages from bulk `upgrade` output to
-    // match winget (Edge, Steam, Discord, several MSIX packages). When
-    // the user explicitly filtered by id/name/etc., they're targeting a
-    // specific package and want to see it regardless — same allowance
-    // winget makes.
+    // Hide RequireExplicitUpgrade rows from bulk `upgrade` (Edge, Steam,
+    // Discord). Explicit `--id` filters surface them regardless.
     if package.correlated_requires_explicit_upgrade && !list_query_needs_available_lookup(query) {
+        return false;
+    }
+    // Hide rows whose latest catalog version has no installer the host can
+    // run — winget refuses to upgrade past an unusable architecture.
+    if package.correlated_lacks_compatible_installer && !list_query_needs_available_lookup(query) {
         return false;
     }
     installed_package_has_upgrade(package)
@@ -3556,6 +3564,7 @@ fn collect_msi_upgrade_codes_from(
 /// registry hive back to the standard `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`
 /// lowercase form. The packing reverses each of the 11 chunks (sized 8/4/4
 /// then eight 2-char byte pairs) of the GUID's hex representation.
+#[cfg(windows)]
 fn unflip_packed_guid(packed: &str) -> Option<String> {
     if packed.len() != 32 || !packed.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -3675,6 +3684,7 @@ fn collect_uninstall_view(
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         });
     }
 
@@ -3740,6 +3750,7 @@ fn collect_appmodel_packages(
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         });
     }
 
@@ -6637,6 +6648,20 @@ fn architecture_rank(
         .unwrap_or(-1)
 }
 
+/// True when at least one installer in `manifest.installers` targets an
+/// architecture the host can run. winget hides upgrades whose latest
+/// version publishes no compatible installer.
+fn manifest_has_compatible_installer(manifest: &Manifest) -> bool {
+    if manifest.installers.is_empty() {
+        return true;
+    }
+    let allowed = preferred_architectures(current_architecture());
+    manifest.installers.iter().any(|installer| {
+        let arch = installer.architecture.as_deref().unwrap_or("neutral");
+        allowed.iter().any(|candidate| candidate.eq_ignore_ascii_case(arch))
+    })
+}
+
 fn preferred_architectures(system_architecture: &str) -> &'static [&'static str] {
     match system_architecture {
         "arm64" => &["arm64", "neutral", "x64", "x86"],
@@ -6672,7 +6697,41 @@ fn matches_optional_ci(value: Option<&str>, requested: Option<&str>) -> bool {
     }
 }
 
+#[cfg(windows)]
 fn current_architecture() -> &'static str {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<&'static str> = OnceLock::new();
+    CELL.get_or_init(|| {
+        // IsWow64Process2's `native_machine` is the OS architecture even
+        // when the process is running under emulation (x64 binary on
+        // arm64 Windows, x86 on x64). Compile-time `consts::ARCH` would
+        // mis-report the host arch in that case.
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+        let mut process_machine: u16 = 0;
+        let mut native_machine: u16 = 0;
+        // SAFETY: GetCurrentProcess returns a pseudo-handle that never fails;
+        // both out-pointers reference local stack u16s that outlive the call.
+        let handle = unsafe { GetCurrentProcess() };
+        // SAFETY: handle is valid per above; pointers are valid.
+        let ok = unsafe { IsWow64Process2(handle, &mut process_machine, &mut native_machine) };
+        if ok != 0 {
+            match native_machine {
+                0xAA64 => return "arm64",
+                0x8664 => return "x64",
+                0x014C => return "x86",
+                _ => {}
+            }
+        }
+        compiled_architecture()
+    })
+}
+
+#[cfg(not(windows))]
+fn current_architecture() -> &'static str {
+    compiled_architecture()
+}
+
+fn compiled_architecture() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "x64",
         "x86" => "x86",
@@ -8216,6 +8275,7 @@ Installers:
             }),
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: true,
+            correlated_lacks_compatible_installer: false,
         };
         let bulk_query = ListQuery {
             upgrade_only: true,
@@ -8241,6 +8301,135 @@ Installers:
         // Without the flag, the row appears in bulk upgrade as usual.
         pkg.correlated_requires_explicit_upgrade = false;
         assert!(installed_package_matches_upgrade_filter(&pkg, &bulk_query));
+    }
+
+    #[test]
+    fn upgrade_filter_hides_lacks_compatible_installer_by_default() {
+        let mut pkg = InstalledPackage {
+            name: "Foo".to_owned(),
+            local_id: r"ARP\Machine\X64\Foo".to_owned(),
+            installed_version: "1.0".to_owned(),
+            publisher: None,
+            scope: Some("Machine".to_owned()),
+            installer_category: Some("exe".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: Some(SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Test.Foo".to_owned(),
+                name: "Foo".to_owned(),
+                moniker: None,
+                version: Some("2.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            }),
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: true,
+        };
+        let bulk_query = ListQuery {
+            upgrade_only: true,
+            ..ListQuery::default()
+        };
+        assert!(!installed_package_matches_upgrade_filter(&pkg, &bulk_query));
+
+        // Explicit `--id` still surfaces it.
+        let filtered_query = ListQuery {
+            upgrade_only: true,
+            id: Some("Test.Foo".to_owned()),
+            ..ListQuery::default()
+        };
+        assert!(installed_package_matches_upgrade_filter(&pkg, &filtered_query));
+
+        // Cleared flag → visible in bulk.
+        pkg.correlated_lacks_compatible_installer = false;
+        assert!(installed_package_matches_upgrade_filter(&pkg, &bulk_query));
+    }
+
+    fn synthetic_manifest_with_installer_arches(arches: &[&str]) -> Manifest {
+        let installers = arches
+            .iter()
+            .map(|a| Installer {
+                architecture: Some((*a).to_owned()),
+                installer_type: None,
+                url: None,
+                sha256: None,
+                product_code: None,
+                locale: None,
+                scope: None,
+                release_date: None,
+                package_family_name: None,
+                upgrade_code: None,
+                platforms: Vec::new(),
+                minimum_os_version: None,
+                switches: InstallerSwitches::default(),
+                commands: Vec::new(),
+                package_dependencies: Vec::new(),
+                require_explicit_upgrade: false,
+            })
+            .collect();
+        Manifest {
+            id: "Test".to_owned(),
+            name: "Test".to_owned(),
+            version: "1.0".to_owned(),
+            channel: String::new(),
+            publisher: None,
+            description: None,
+            moniker: None,
+            package_url: None,
+            publisher_url: None,
+            publisher_support_url: None,
+            license: None,
+            license_url: None,
+            privacy_url: None,
+            author: None,
+            copyright: None,
+            copyright_url: None,
+            release_notes: None,
+            release_notes_url: None,
+            tags: Vec::new(),
+            agreements: Vec::new(),
+            package_dependencies: Vec::new(),
+            documentation: Vec::new(),
+            installers,
+            require_explicit_upgrade: false,
+        }
+    }
+
+    #[test]
+    fn manifest_compatible_installer_neutral_always_matches() {
+        // `neutral` is in every host's allowed list.
+        assert!(manifest_has_compatible_installer(
+            &synthetic_manifest_with_installer_arches(&["neutral"])
+        ));
+    }
+
+    #[test]
+    fn manifest_compatible_installer_empty_installers_pass_through() {
+        // Manifest with no installers (e.g. a docs-only entry): nothing to
+        // filter against, don't hide the row.
+        assert!(manifest_has_compatible_installer(
+            &synthetic_manifest_with_installer_arches(&[])
+        ));
+    }
+
+    #[test]
+    fn manifest_compatible_installer_rejects_alien_arch_only() {
+        // `ppc` is in no host's allowed list — manifest has nothing runnable.
+        assert!(!manifest_has_compatible_installer(
+            &synthetic_manifest_with_installer_arches(&["ppc"])
+        ));
+    }
+
+    #[test]
+    fn manifest_compatible_installer_mixed_set_passes_if_any_match() {
+        // Mixed list where at least `neutral` is in every host's preference.
+        assert!(manifest_has_compatible_installer(
+            &synthetic_manifest_with_installer_arches(&["ppc", "neutral"])
+        ));
     }
 
     #[test]
@@ -8316,7 +8505,10 @@ Installers:
             .expect("seed schema");
 
         let rowid = lookup_unique_normalized_identity(&connection, "foo", "bar").expect("query");
-        assert!(rowid.is_none(), "name matches package 100 but publisher matches 200 — no intersection");
+        assert!(
+            rowid.is_none(),
+            "name matches package 100 but publisher matches 200 — no intersection"
+        );
     }
 
     #[test]
@@ -9229,6 +9421,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -9271,6 +9464,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let query = ListQuery {
             tag: Some("powertoys".to_owned()),
@@ -9312,6 +9506,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let candidates = vec![
             SearchMatch {
@@ -9360,6 +9555,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let candidates = vec![
             SearchMatch {
@@ -9421,6 +9617,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -9459,6 +9656,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let candidates = vec![
             SearchMatch {
@@ -9505,6 +9703,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -9536,6 +9735,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let candidates = vec![SearchMatch {
             source_name: "winget".to_owned(),
@@ -9576,6 +9776,7 @@ Installers:
             }),
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
 
         assert!(installed_package_has_upgrade(&package));
@@ -9606,6 +9807,7 @@ Installers:
             }),
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let query = ListQuery {
             upgrade_only: true,
@@ -10029,6 +10231,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let sparse = InstalledPackage {
             name: "PowerToys.SparseApp".to_owned(),
@@ -10044,6 +10247,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let extension = InstalledPackage {
             name: "PowerToys FileLocksmith Context Menu".to_owned(),
@@ -10059,6 +10263,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
 
         assert!(list_sort_weight(&main) < list_sort_weight(&sparse));
@@ -10349,6 +10554,7 @@ Installers:
             }),
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         apply_msix_resource_string_name_fix(&mut package);
         assert_eq!(package.name, "App Installer");
@@ -10383,6 +10589,7 @@ Installers:
             }),
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         apply_msix_resource_string_name_fix(&mut package);
         assert_eq!(package.name, "ms-resource:appDisplayName");
@@ -10417,11 +10624,13 @@ Installers:
             }),
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         apply_msix_resource_string_name_fix(&mut package);
         assert_eq!(package.name, "Microsoft Teams");
     }
 
+    #[cfg(windows)]
     #[test]
     fn unflip_packed_guid_reverses_msi_installer_packing() {
         // The MSI Installer hive packs GUIDs by char-reversing each of the 11
@@ -10470,6 +10679,7 @@ Installers:
             }),
             installed_version_canonical: canonical,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         }
     }
 
@@ -10519,6 +10729,7 @@ Installers:
             correlated: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
         };
         let result = dedupe_correlated_for_upgrade(vec![uncorrelated]);
         assert_eq!(result.len(), 1);

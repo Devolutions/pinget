@@ -5,8 +5,6 @@ using System.Text.Json.Nodes;
 using System.Threading;
 using Microsoft.Data.Sqlite;
 using YamlDotNet.Core;
-using YamlDotNet.Serialization;
-using YamlDotNet.Serialization.NamingConventions;
 
 namespace Devolutions.Pinget.Core;
 
@@ -1441,16 +1439,13 @@ public class Repository : IDisposable
     internal static object ParseYamlManifestDocuments(byte[] bytes)
     {
         var yaml = System.Text.Encoding.UTF8.GetString(bytes);
-        var deserializer = new DeserializerBuilder()
-            .IgnoreUnmatchedProperties()
-            .Build();
 
         var documents = new List<Dictionary<string, object?>>();
         var parser = new YamlDotNet.Core.Parser(new StringReader(yaml));
         parser.Consume<YamlDotNet.Core.Events.StreamStart>();
         while (parser.Accept<YamlDotNet.Core.Events.DocumentStart>(out _))
         {
-            var doc = deserializer.Deserialize<object?>(parser);
+            var doc = ReadYamlDocument(parser);
             if (NormalizeYamlValue(doc) is Dictionary<string, object?> normalized)
                 documents.Add(normalized);
         }
@@ -1471,9 +1466,6 @@ public class Repository : IDisposable
     internal static Manifest ParseYamlManifest(byte[] bytes)
     {
         var yaml = System.Text.Encoding.UTF8.GetString(bytes);
-        var deserializer = new DeserializerBuilder()
-            .IgnoreUnmatchedProperties()
-            .Build();
 
         // Merge all YAML documents into one dictionary (manifests can be multi-document)
         var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
@@ -1481,11 +1473,13 @@ public class Repository : IDisposable
         parser.Consume<YamlDotNet.Core.Events.StreamStart>();
         while (parser.Accept<YamlDotNet.Core.Events.DocumentStart>(out _))
         {
-            var doc = deserializer.Deserialize<Dictionary<string, object?>>(parser);
-            if (doc is not null)
+            if (ReadYamlDocument(parser) is Dictionary<object, object> doc)
             {
                 foreach (var kvp in doc)
-                    dict[kvp.Key] = kvp.Value;
+                {
+                    var keyStr = kvp.Key.ToString();
+                    if (keyStr is not null) dict[keyStr] = kvp.Value;
+                }
             }
         }
 
@@ -1654,6 +1648,78 @@ public class Repository : IDisposable
             string s => s.Equals("true", StringComparison.OrdinalIgnoreCase),
             _ => false,
         };
+    }
+
+    // Hand-rolled YAML node reader. Replaces YamlDotNet's generic Deserialize
+    // path, which is reflection-heavy and emits IL3050/IL2026 warnings under
+    // NativeAOT. Produces the same untyped object tree shape that
+    // `Deserialize<object?>` produces — Dictionary<object,object?> for
+    // mappings, List<object?> for sequences, string for scalars (or null for
+    // YAML null tags). Nullability is compile-time only, so all downstream
+    // pattern matches (`is IList<object>`, `is IDictionary<object,object>`)
+    // keep working unchanged at runtime.
+    private static object? ReadYamlDocument(YamlDotNet.Core.IParser parser)
+    {
+        parser.Consume<YamlDotNet.Core.Events.DocumentStart>();
+        var value = ReadYamlNode(parser);
+        parser.Consume<YamlDotNet.Core.Events.DocumentEnd>();
+        return value;
+    }
+
+    private static object? ReadYamlNode(YamlDotNet.Core.IParser parser)
+    {
+        var current = parser.Current;
+        switch (current)
+        {
+            case YamlDotNet.Core.Events.Scalar scalar:
+                parser.MoveNext();
+                return ScalarToValue(scalar);
+            case YamlDotNet.Core.Events.MappingStart:
+            {
+                parser.MoveNext();
+                var dict = new Dictionary<object, object?>();
+                while (parser.Current is not YamlDotNet.Core.Events.MappingEnd)
+                {
+                    var key = ReadYamlNode(parser);
+                    var value = ReadYamlNode(parser);
+                    if (key is not null) dict[key] = value;
+                }
+                parser.MoveNext();
+                return dict;
+            }
+            case YamlDotNet.Core.Events.SequenceStart:
+            {
+                parser.MoveNext();
+                var list = new List<object?>();
+                while (parser.Current is not YamlDotNet.Core.Events.SequenceEnd)
+                {
+                    list.Add(ReadYamlNode(parser));
+                }
+                parser.MoveNext();
+                return list;
+            }
+            default:
+                parser.MoveNext();
+                return null;
+        }
+    }
+
+    private static object? ScalarToValue(YamlDotNet.Core.Events.Scalar scalar)
+    {
+        // Match YamlDotNet's plain-scalar null detection so manifest fields
+        // like `Moniker: ~` stay null instead of becoming "", which would
+        // make GetOptStr return "" where it used to return null.
+        if (scalar.Tag.IsEmpty && scalar.Style == YamlDotNet.Core.ScalarStyle.Plain)
+        {
+            var v = scalar.Value;
+            if (v.Length == 0 || v == "~" ||
+                v.Equals("null", StringComparison.OrdinalIgnoreCase) ||
+                v.Equals("Null", StringComparison.Ordinal))
+            {
+                return null;
+            }
+        }
+        return scalar.Value;
     }
 
     private static object? NormalizeYamlValue(object? value)
@@ -2241,6 +2307,9 @@ public class Repository : IDisposable
     internal static long? LookupUniqueNormalizedIdentityForTesting(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
         => LookupUniqueNormalizedIdentity(conn, normName, normPublisher);
 
+    internal static bool ManifestHasCompatibleInstallerForTesting(Manifest manifest)
+        => ManifestHasCompatibleInstaller(manifest);
+
     internal static bool InstalledPackageMatchesUpgradeFilterForTesting(InstalledPackage pkg, ListQuery query)
         => InstalledPackageMatchesUpgradeFilter(pkg, query);
 
@@ -2397,6 +2466,7 @@ public class Repository : IDisposable
                             _client, "V2_M", source, latest.ManifestRelativePath, latest.ManifestHash);
                         var manifest = ParseYamlManifest(bytes);
                         installed[idx].CorrelatedRequiresExplicitUpgrade = manifest.RequireExplicitUpgrade;
+                        installed[idx].CorrelatedLacksCompatibleInstaller = !ManifestHasCompatibleInstaller(manifest);
                     }
                     catch { /* best-effort */ }
                 }
@@ -2522,15 +2592,27 @@ public class Repository : IDisposable
 
     private static bool InstalledPackageMatchesUpgradeFilter(InstalledPackage pkg, ListQuery query)
     {
-        // Hide RequireExplicitUpgrade packages from bulk `upgrade` output to
-        // match winget (Edge, Steam, Discord, several MSIX packages). When
-        // the user explicitly filtered by id/name/etc., they're targeting
-        // a specific package and want to see it regardless — same allowance
-        // winget makes.
+        // Hide RequireExplicitUpgrade rows from bulk `upgrade` (Edge, Steam,
+        // Discord). Explicit `--id` filters surface them regardless.
         if (pkg.CorrelatedRequiresExplicitUpgrade && !ListQueryNeedsAvailableLookup(query))
+            return false;
+        // Hide rows whose latest catalog version has no installer the host
+        // can run — winget refuses to upgrade past an unusable architecture.
+        if (pkg.CorrelatedLacksCompatibleInstaller && !ListQueryNeedsAvailableLookup(query))
             return false;
         return InstalledPackageHasUpgrade(pkg)
             || (query.IncludeUnknown && InstalledPackageHasUnknownVersion(pkg) && pkg.Correlated is not null);
+    }
+
+    private static bool ManifestHasCompatibleInstaller(Manifest manifest)
+    {
+        if (manifest.Installers.Count == 0) return true;
+        var allowed = PreferredArchitectures(CurrentArchitecture());
+        return manifest.Installers.Any(installer =>
+        {
+            var arch = installer.Architecture ?? "neutral";
+            return allowed.Any(candidate => candidate.Equals(arch, StringComparison.OrdinalIgnoreCase));
+        });
     }
 
     internal static PinRecord? FindApplicablePin(ListMatch match, IReadOnlyList<PinRecord> pins)
