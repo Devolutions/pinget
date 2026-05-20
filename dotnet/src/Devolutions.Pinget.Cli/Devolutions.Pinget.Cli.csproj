@@ -31,11 +31,7 @@
     <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
-  <Target Name="UseStaticWindowsRuntimeForNativeAot"
-          AfterTargets="SetupOSSpecificProps"
-          Condition="'$(PublishAot)' == 'true'
-                     and '$(PingetUseStaticWindowsRuntime)' == 'true'
-                     and $([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win-'))">
+  <Target Name="UseStaticWindowsRuntimeForNativeAot" AfterTargets="SetupOSSpecificProps" Condition="'$(PublishAot)' == 'true'&#xD;&#xA;                     and '$(PingetUseStaticWindowsRuntime)' == 'true'&#xD;&#xA;                     and $([System.String]::Copy('$(RuntimeIdentifier)').StartsWith('win-'))">
     <ItemGroup>
       <LinkerArg Remove="/NODEFAULTLIB:libucrt.lib" />
       <LinkerArg Remove="/DEFAULTLIB:ucrt.lib" />

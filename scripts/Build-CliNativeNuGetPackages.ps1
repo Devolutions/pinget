@@ -301,10 +301,10 @@ function Assert-WindowsExecutableMetadata {
 
 function Get-SourceVersion {
     $rustCliManifest = Join-Path $repoRoot 'rust\crates\pinget-cli\Cargo.toml'
-    $dotNetCliProgram = Join-Path $repoRoot 'dotnet\src\Devolutions.Pinget.Cli\Program.cs'
+    $dotNetCliProgram = Join-Path $repoRoot 'dotnet\src\Devolutions.Pinget.Cli\Consts.cs'
 
     $rustMatch = Select-String -Path $rustCliManifest -Pattern '^version = "([^"]+)"$' | Select-Object -First 1
-    $dotNetMatch = Select-String -Path $dotNetCliProgram -Pattern '^const string Version = "([^"]+)";$' | Select-Object -First 1
+    $dotNetMatch = Select-String -Path $dotNetCliProgram -Pattern '^\s*internal const string Version = "([^"]+)";$' | Select-Object -First 1
 
     if (($null -eq $rustMatch) -or ($null -eq $dotNetMatch)) {
         throw 'Unable to detect CLI package version from source files.'
