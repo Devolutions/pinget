@@ -496,40 +496,30 @@ public class Repository : IDisposable
         if (!OperatingSystem.IsWindows())
             warnings.Add(InstalledStateUnsupportedWarning);
 
+        // Even plain `list` should canonicalize installed package ids and
+        // sources when the local package can be correlated back to a source
+        // catalog entry. Available-version lookups stay gated below.
+        warnings.AddRange(CorrelateInstalledViaIndex(installed, query.Source));
+        warnings.AddRange(CorrelateInstalledByNormalizedIdentity(installed, query.Source));
+
         if (needsAvailable)
         {
-            // Authoritative correlation via the v2 index's identity tables
-            // (PackageFamilyName / ProductCode / UpgradeCode). This is
-            // winget's primary path and resolves cases where display-name
-            // matching is ambiguous (Microsoft.Teams vs Microsoft.Teams.Free)
-            // or impossible (MSIX with `ms-resource:` placeholder names).
-            warnings.AddRange(CorrelateInstalledViaIndex(installed, query.Source));
-
-            // ARP entries without identity keys (no PFN/PC/UC) still match
-            // winget's ARP correlation when their (DisplayName, Publisher),
-            // run through NameNormalization, lands on a single package in
-            // norm_names2 ∩ norm_publishers2. Covers Inno Setup-style
-            // installers, MSIs without ProductCode in ARP, and vendors
-            // that publish a DisplayName different from the catalog's
-            // PackageName but matching an AppsAndFeaturesEntries name.
-            warnings.AddRange(CorrelateInstalledByNormalizedIdentity(installed, query.Source));
-        }
-
-        if (needsAvailable && hasFilter)
-        {
             var availableQuery = PackageQueryFromListQuery(query);
-            var (matches, srcWarnings, _, _) = SearchLocated(availableQuery, SearchSemantics.Many);
-            warnings.AddRange(srcWarnings);
-            var candidates = matches.Select(m => m.Display).ToList();
-            foreach (var pkg in installed)
+            if (hasFilter)
             {
-                if (pkg.Correlated is not null) continue;
-                pkg.Correlated = CorrelateInstalledPackage(pkg, candidates, AllowLooseListCorrelation(query));
+                var (matches, srcWarnings, _, _) = SearchLocated(availableQuery, SearchSemantics.Many);
+                warnings.AddRange(srcWarnings);
+                var candidates = matches.Select(m => m.Display).ToList();
+                foreach (var pkg in installed)
+                {
+                    if (pkg.Correlated is not null) continue;
+                    pkg.Correlated = CorrelateInstalledPackage(pkg, candidates, AllowLooseListCorrelation(query));
+                }
             }
-        }
-        else if (needsAvailable)
-        {
-            warnings.AddRange(CorrelateAllInstalled(installed));
+            else
+            {
+                warnings.AddRange(CorrelateAllInstalled(installed));
+            }
         }
 
         if (needsAvailable)

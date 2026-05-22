@@ -1033,7 +1033,7 @@ fn run() -> Result<()> {
 fn print_serialized<T: serde::Serialize>(value: &T, output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Text => bail!("structured output requested without a serializer"),
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        OutputFormat::Json => println!("{}", serialize_json_pretty(value)?),
         OutputFormat::Yaml => print!("{}", serde_yaml::to_string(value)?),
     }
     Ok(())
@@ -1042,7 +1042,7 @@ fn print_serialized<T: serde::Serialize>(value: &T, output: OutputFormat) -> Res
 fn print_manifest_serialized(value: &serde_json::Value, output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Text => bail!("structured output requested without a serializer"),
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        OutputFormat::Json => println!("{}", serialize_json_pretty(value)?),
         OutputFormat::Yaml => {
             if let serde_json::Value::Array(documents) = value {
                 for document in documents {
@@ -1054,6 +1054,10 @@ fn print_manifest_serialized(value: &serde_json::Value, output: OutputFormat) ->
         }
     }
     Ok(())
+}
+
+fn serialize_json_pretty<T: serde::Serialize>(value: &T) -> Result<String> {
+    Ok(serde_json::to_string_pretty(value)?)
 }
 
 impl From<QueryArgs> for PackageQuery {
@@ -2576,6 +2580,7 @@ fn can_ignore_unavailable_import_failure(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pinget_core::VersionKey;
 
     #[test]
     fn resolve_source_add_value_accepts_option_form() {
@@ -2603,5 +2608,181 @@ mod tests {
         assert!(parse_boolean_setting_value("enabled").expect("bool"));
         assert!(!parse_boolean_setting_value("false").expect("bool"));
         assert!(!parse_boolean_setting_value("0").expect("bool"));
+    }
+
+    #[test]
+    fn serialize_json_pretty_preserves_pascal_case_list_fields() {
+        let response = ListResponse {
+            matches: vec![ListMatch {
+                name: "PowerToys".to_owned(),
+                id: "Microsoft.PowerToys".to_owned(),
+                local_id: r"ARP\Machine\X64\PowerToys".to_owned(),
+                installed_version: "0.98.1".to_owned(),
+                available_version: Some("0.99.0".to_owned()),
+                source_name: Some("winget".to_owned()),
+                publisher: Some("Microsoft".to_owned()),
+                scope: Some("Machine".to_owned()),
+                installer_category: Some("msi".to_owned()),
+                install_location: None,
+                package_family_names: Vec::new(),
+                product_codes: Vec::new(),
+                upgrade_codes: Vec::new(),
+            }],
+            warnings: Vec::new(),
+            truncated: false,
+        };
+
+        let json = serialize_json_pretty(&response).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parsed json");
+        let match_value = &value["Matches"][0];
+
+        assert_eq!(match_value["Id"], "Microsoft.PowerToys");
+        assert_eq!(match_value["LocalId"], r"ARP\Machine\X64\PowerToys");
+        assert_eq!(match_value["InstalledVersion"], "0.98.1");
+        assert_eq!(match_value["AvailableVersion"], "0.99.0");
+        assert_eq!(match_value["SourceName"], "winget");
+        assert!(match_value.get("local_id").is_none());
+        assert!(match_value.get("installed_version").is_none());
+        assert!(match_value.get("available_version").is_none());
+        assert!(match_value.get("source_name").is_none());
+    }
+
+    #[test]
+    fn serialize_json_pretty_preserves_pascal_case_search_fields() {
+        let response = SearchResponse {
+            matches: vec![SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Microsoft.PowerToys".to_owned(),
+                name: "PowerToys".to_owned(),
+                moniker: None,
+                version: Some("0.99.0".to_owned()),
+                channel: None,
+                match_criteria: Some("Tag".to_owned()),
+            }],
+            warnings: Vec::new(),
+            truncated: false,
+        };
+
+        let json = serialize_json_pretty(&response).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parsed json");
+        let match_value = &value["Matches"][0];
+
+        assert_eq!(match_value["SourceName"], "winget");
+        assert_eq!(match_value["MatchCriteria"], "Tag");
+        assert!(match_value.get("source_name").is_none());
+        assert!(match_value.get("match_criteria").is_none());
+    }
+
+    #[test]
+    fn serialize_json_pretty_preserves_pascal_case_versions_fields() {
+        let result = VersionsResult {
+            package: SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Microsoft.PowerToys".to_owned(),
+                name: "PowerToys".to_owned(),
+                moniker: None,
+                version: Some("0.99.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+            versions: vec![
+                VersionKey {
+                    version: "0.99.0".to_owned(),
+                    channel: "stable".to_owned(),
+                },
+                VersionKey {
+                    version: "0.100.0-preview".to_owned(),
+                    channel: "preview".to_owned(),
+                },
+            ],
+            warnings: Vec::new(),
+        };
+
+        let json = serialize_json_pretty(&result).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parsed json");
+
+        assert_eq!(value["Versions"][0]["Version"], "0.99.0");
+        assert_eq!(value["Versions"][0]["Channel"], "stable");
+        assert_eq!(value["Versions"][1]["Version"], "0.100.0-preview");
+        assert_eq!(value["Versions"][1]["Channel"], "preview");
+        assert!(value.get("versions").is_none());
+    }
+
+    #[test]
+    fn serialize_json_pretty_preserves_source_export_shape() {
+        let export = serde_json::json!({
+            "Sources": [
+                {
+                    "Name": "winget",
+                    "Type": "Microsoft.PreIndexed.Package",
+                    "Arg": "https://cdn.winget.microsoft.com/cache",
+                    "Data": "Microsoft.Winget.Source_8wekyb3d8bbwe",
+                    "Identifier": "Microsoft.Winget.Source_8wekyb3d8bbwe",
+                    "TrustLevel": "Trusted",
+                    "Explicit": false,
+                    "Priority": 0
+                }
+            ]
+        });
+
+        let json = serialize_json_pretty(&export).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parsed json");
+        let source = &value["Sources"][0];
+
+        assert_eq!(source["Name"], "winget");
+        assert_eq!(source["Type"], "Microsoft.PreIndexed.Package");
+        assert_eq!(source["Arg"], "https://cdn.winget.microsoft.com/cache");
+        assert_eq!(source["Data"], "Microsoft.Winget.Source_8wekyb3d8bbwe");
+        assert_eq!(source["Identifier"], "Microsoft.Winget.Source_8wekyb3d8bbwe");
+        assert_eq!(source["TrustLevel"], "Trusted");
+        assert_eq!(source["Explicit"], false);
+        assert_eq!(source["Priority"], 0);
+        assert!(value.get("sources").is_none());
+    }
+
+    #[test]
+    fn serialize_json_pretty_preserves_show_manifest_shape() {
+        let document = serde_json::json!({
+            "PackageIdentifier": "Microsoft.PowerToys",
+            "PackageName": "PowerToys",
+            "PackageVersion": "0.99.0",
+            "Publisher": "Microsoft",
+            "Author": "Contoso",
+            "Description": "Fancy tools",
+            "PackageUrl": "https://example.test/package",
+            "LicenseUrl": "https://example.test/license",
+            "ReleaseNotesUrl": "https://example.test/release-notes",
+            "Tags": ["utilities", "powertoys"],
+            "PackageDependencies": ["Microsoft.VCRedist.2015+.x64"],
+            "Installers": [
+                {
+                    "InstallerUrl": "https://example.test/installer.exe",
+                    "InstallerSha256": "ABC123",
+                    "InstallerType": "exe",
+                    "ReleaseDate": "2026-05-22"
+                }
+            ]
+        });
+
+        let json = serialize_json_pretty(&document).expect("json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parsed json");
+
+        assert_eq!(value["PackageIdentifier"], "Microsoft.PowerToys");
+        assert_eq!(value["PackageName"], "PowerToys");
+        assert_eq!(value["Publisher"], "Microsoft");
+        assert_eq!(value["Author"], "Contoso");
+        assert_eq!(value["Description"], "Fancy tools");
+        assert_eq!(value["PackageUrl"], "https://example.test/package");
+        assert_eq!(value["LicenseUrl"], "https://example.test/license");
+        assert_eq!(value["ReleaseNotesUrl"], "https://example.test/release-notes");
+        assert_eq!(value["Tags"][0], "utilities");
+        assert_eq!(value["Installers"][0]["InstallerUrl"], "https://example.test/installer.exe");
+        assert_eq!(value["Installers"][0]["InstallerSha256"], "ABC123");
+        assert_eq!(value["Installers"][0]["InstallerType"], "exe");
+        assert_eq!(value["Installers"][0]["ReleaseDate"], "2026-05-22");
+        assert!(value.get("package_identifier").is_none());
+        assert!(value.get("source_name").is_none());
     }
 }
