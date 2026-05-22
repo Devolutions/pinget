@@ -1509,6 +1509,12 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void NormalizePublisher_Software_Strips_To_BaseName()
+    {
+        Assert.Equal("sweetscape", NameNormalization.NormalizePublisher("SweetScape Software"));
+    }
+
+    [Fact]
     public void NormalizeName_Strips_VersionDelimited_Token()
     {
         // `2025.3.0.1` matches VersionDelimited. Bare `2026` doesn't.

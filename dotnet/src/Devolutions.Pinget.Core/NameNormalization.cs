@@ -339,6 +339,6 @@ internal static partial class NameNormalization
         "AB", "AD", "AG", "APS", "AS", "ASA", "BV", "CO", "COMPANY", "CORP", "CORPORATION", "CV",
         "DOO", "EV", "GES", "GESMBH", "GMBH", "HOLDING", "HOLDINGS", "INC", "INCORPORATED", "KG",
         "KS", "LIMITED", "LLC", "LP", "LTD", "LTDA", "MBH", "NV", "PLC", "PS", "PTY", "PVT", "SA",
-        "SARL", "SC", "SCA", "SL", "SP", "SPA", "SRL", "SRO", "SUBSIDIARY",
+        "SARL", "SC", "SCA", "SL", "SOFTWARE", "SP", "SPA", "SRL", "SRO", "SUBSIDIARY",
     ];
 }

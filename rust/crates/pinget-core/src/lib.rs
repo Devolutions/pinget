@@ -68,9 +68,9 @@ const REST_SUPPORTED_CONTRACTS: &[&str] = &[
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SourceKind {
-    #[serde(rename = "preIndexed", alias = "PreIndexed")]
+    #[serde(rename = "PreIndexed", alias = "preIndexed")]
     PreIndexed,
-    #[serde(rename = "rest", alias = "Rest")]
+    #[serde(rename = "Rest", alias = "rest")]
     Rest,
 }
 
@@ -207,6 +207,7 @@ pub struct ListQuery {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct SearchMatch {
     pub source_name: String,
     pub source_kind: SourceKind,
@@ -219,6 +220,7 @@ pub struct SearchMatch {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct SearchResponse {
     pub matches: Vec<SearchMatch>,
     pub warnings: Vec<String>,
@@ -226,6 +228,7 @@ pub struct SearchResponse {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct ListMatch {
     pub name: String,
     pub id: String,
@@ -243,6 +246,7 @@ pub struct ListMatch {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct ListResponse {
     pub matches: Vec<ListMatch>,
     pub warnings: Vec<String>,
@@ -250,6 +254,7 @@ pub struct ListResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct VersionKey {
     pub version: String,
     pub channel: String,
@@ -454,6 +459,7 @@ impl ShowResult {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct VersionsResult {
     pub package: SearchMatch,
     pub versions: Vec<VersionKey>,
@@ -461,6 +467,7 @@ pub struct VersionsResult {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct CacheWarmResult {
     pub package: SearchMatch,
     pub cached_files: Vec<PathBuf>,
@@ -468,6 +475,7 @@ pub struct CacheWarmResult {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct SourceUpdateResult {
     pub name: String,
     pub kind: SourceKind,
@@ -475,6 +483,7 @@ pub struct SourceUpdateResult {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct PinRecord {
     pub package_id: String,
     pub version: String,
@@ -1003,7 +1012,11 @@ impl Repository {
         }
 
         let has_filter = list_query_needs_available_lookup(query);
-        let needs_available = has_filter || query.upgrade_only;
+        // Plain `list` should still correlate installed packages back to their
+        // catalog identities so callers see canonical package ids/source names,
+        // matching winget and the fixed C# Pinget behavior. `upgrade_only`
+        // still adds the available-version specific filtering on top.
+        let needs_available = true;
 
         let mut warnings = Vec::new();
         if !installed_package_discovery_supported() {
@@ -10508,6 +10521,178 @@ Installers:
         ];
 
         assert!(latest_arp_anchored_version(&entries).is_none());
+    }
+
+    #[test]
+    fn list_match_from_installed_prefers_correlated_id_and_source_name() {
+        let package = InstalledPackage {
+            name: "AzCopy v10".to_owned(),
+            local_id: r"ARP\Machine\X64\AzCopy".to_owned(),
+            installed_version: "10.32.2".to_owned(),
+            publisher: Some("Microsoft".to_owned()),
+            scope: Some("Machine".to_owned()),
+            installer_category: Some("exe".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: Some(SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Microsoft.Azure.AZCopy.10".to_owned(),
+                name: "AzCopy v10".to_owned(),
+                moniker: None,
+                version: Some("10.32.3".to_owned()),
+                channel: None,
+                match_criteria: None,
+            }),
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+
+        let item = list_match_from_installed(package);
+
+        assert_eq!(item.id, "Microsoft.Azure.AZCopy.10");
+        assert_eq!(item.local_id, r"ARP\Machine\X64\AzCopy");
+        assert_eq!(item.source_name.as_deref(), Some("winget"));
+        assert_eq!(item.available_version.as_deref(), Some("10.32.3"));
+    }
+
+    #[test]
+    fn plain_list_keeps_canonical_id_distinct_from_local_id_for_correlated_rows() {
+        let package = InstalledPackage {
+            name: "Atlassian CLI".to_owned(),
+            local_id: r"ARP\User\X64\Atlassian.AtlassianCLI_Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned(),
+            installed_version: "1.3.18-stable".to_owned(),
+            publisher: Some("Atlassian".to_owned()),
+            scope: Some("User".to_owned()),
+            installer_category: Some("exe".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: Some(SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Atlassian.AtlassianCLI".to_owned(),
+                name: "Atlassian CLI".to_owned(),
+                moniker: None,
+                version: Some("1.3.18-stable".to_owned()),
+                channel: None,
+                match_criteria: Some("ProductCode".to_owned()),
+            }),
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+
+        let item = list_match_from_installed(package);
+
+        assert_eq!(item.id, "Atlassian.AtlassianCLI");
+        assert_eq!(
+            item.local_id,
+            r"ARP\User\X64\Atlassian.AtlassianCLI_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        );
+        assert_ne!(item.id, item.local_id);
+        assert_eq!(item.source_name.as_deref(), Some("winget"));
+    }
+
+    #[test]
+    fn list_response_serialization_keeps_pascal_case_fields() {
+        let response = ListResponse {
+            matches: vec![ListMatch {
+                name: "PowerToys".to_owned(),
+                id: "Microsoft.PowerToys".to_owned(),
+                local_id: r"ARP\Machine\X64\PowerToys".to_owned(),
+                installed_version: "0.98.1".to_owned(),
+                available_version: Some("0.99.0".to_owned()),
+                source_name: Some("winget".to_owned()),
+                publisher: Some("Microsoft".to_owned()),
+                scope: Some("Machine".to_owned()),
+                installer_category: Some("msi".to_owned()),
+                install_location: None,
+                package_family_names: Vec::new(),
+                product_codes: Vec::new(),
+                upgrade_codes: Vec::new(),
+            }],
+            warnings: Vec::new(),
+            truncated: false,
+        };
+
+        let value = serde_json::to_value(&response).expect("serialize list response");
+        let match_value = &value["Matches"][0];
+
+        assert_eq!(match_value["LocalId"], r"ARP\Machine\X64\PowerToys");
+        assert_eq!(match_value["InstalledVersion"], "0.98.1");
+        assert_eq!(match_value["AvailableVersion"], "0.99.0");
+        assert_eq!(match_value["SourceName"], "winget");
+        assert!(match_value.get("local_id").is_none());
+        assert!(match_value.get("installed_version").is_none());
+        assert!(match_value.get("available_version").is_none());
+        assert!(match_value.get("source_name").is_none());
+    }
+
+    #[test]
+    fn search_response_serialization_preserves_minimum_pascal_case_shape() {
+        let response = SearchResponse {
+            matches: vec![SearchMatch {
+                source_name: "msstore".to_owned(),
+                source_kind: SourceKind::Rest,
+                id: "9WZDNCRFJBMP".to_owned(),
+                name: "Microsoft To Do".to_owned(),
+                moniker: None,
+                version: Some("2.123.456.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            }],
+            warnings: Vec::new(),
+            truncated: false,
+        };
+
+        let value = serde_json::to_value(&response).expect("serialize search response");
+        let match_value = &value["Matches"][0];
+
+        assert_eq!(match_value["Name"], "Microsoft To Do");
+        assert_eq!(match_value["Id"], "9WZDNCRFJBMP");
+        assert_eq!(match_value["Version"], "2.123.456.0");
+        assert_eq!(match_value["SourceName"], "msstore");
+        assert!(match_value.get("source_name").is_none());
+    }
+
+    #[test]
+    fn versions_result_serialization_keeps_pascal_case_fields() {
+        let result = VersionsResult {
+            package: SearchMatch {
+                source_name: "winget".to_owned(),
+                source_kind: SourceKind::PreIndexed,
+                id: "Microsoft.PowerToys".to_owned(),
+                name: "PowerToys".to_owned(),
+                moniker: None,
+                version: Some("0.99.0".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+            versions: vec![
+                VersionKey {
+                    version: "0.99.0".to_owned(),
+                    channel: "stable".to_owned(),
+                },
+                VersionKey {
+                    version: "0.100.0-preview".to_owned(),
+                    channel: "preview".to_owned(),
+                },
+            ],
+            warnings: Vec::new(),
+        };
+
+        let value = serde_json::to_value(&result).expect("serialize versions result");
+
+        assert_eq!(value["Versions"][0]["Version"], "0.99.0");
+        assert_eq!(value["Versions"][0]["Channel"], "stable");
+        assert_eq!(value["Versions"][1]["Version"], "0.100.0-preview");
+        assert_eq!(value["Versions"][1]["Channel"], "preview");
+        assert!(value.get("versions").is_none());
     }
 
     #[test]

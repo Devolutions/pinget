@@ -2,10 +2,11 @@ using System.CommandLine;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Devolutions.Pinget.Cli;
 using Devolutions.Pinget.Core;
 using YamlDotNet.Serialization;
 
-const string Version = "0.4.2";
+const string Version = "0.6.0";
 const string UpgradeUnsupportedWarning = "Upgrading packages is not supported on this platform; no changes were made.";
 
 if (args.Length == 1 && (string.Equals(args[0], "--version", StringComparison.OrdinalIgnoreCase) || string.Equals(args[0], "-v", StringComparison.OrdinalIgnoreCase)))
@@ -20,8 +21,6 @@ var outputOption = new Option<string?>("--output", "Output format: text, json, o
 outputOption.AddAlias("-o");
 outputOption.FromAmong("text", "json", "yaml");
 rootCommand.AddGlobalOption(outputOption);
-
-var JsonOpts = new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
 var infoOption = new Option<bool>("--info", "Display general info");
 rootCommand.AddGlobalOption(infoOption);
@@ -437,7 +436,7 @@ sourceExportCmd.SetHandler(() =>
         Explicit = s.Explicit,
         Priority = s.Priority,
     });
-    Console.WriteLine(JsonSerializer.Serialize(new { Sources = sources }, JsonOpts));
+    Console.WriteLine(StructuredOutputSerializer.SerializeJson(new { Sources = sources }));
 });
 
 sourceAddCmd.SetHandler((ctx) =>
@@ -580,7 +579,7 @@ exportCommand.SetHandler((output, source, includeVersions) =>
             }
         }
     };
-    File.WriteAllText(output, JsonSerializer.Serialize(export, JsonOpts));
+    File.WriteAllText(output, StructuredOutputSerializer.SerializeJson(export));
     Console.WriteLine($"Exported {packages.Count} packages to {output}");
 }, exOutputOpt, exSourceOpt, exVersionsOpt);
 
@@ -1266,13 +1265,10 @@ void WriteStructuredOutput(object value, OutputFormat output)
     switch (output)
     {
         case OutputFormat.Json:
-            if (value is SerializableShowManifest showManifest)
-                Console.WriteLine(JsonSerializer.Serialize(showManifest, PingetJsonContext.Default.SerializableShowManifest));
-            else
-                Console.WriteLine(JsonSerializer.Serialize(value, JsonOpts));
+            Console.WriteLine(StructuredOutputSerializer.SerializeJson(value));
             break;
         case OutputFormat.Yaml:
-            Console.Write(new SerializerBuilder().Build().Serialize(value));
+            Console.Write(StructuredOutputSerializer.SerializeYaml(value));
             break;
         default:
             throw new InvalidOperationException("Text output should be handled separately.");
