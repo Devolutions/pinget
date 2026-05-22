@@ -2579,8 +2579,9 @@ fn can_ignore_unavailable_import_failure(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use pinget_core::VersionKey;
+
+    use super::*;
 
     #[test]
     fn resolve_source_add_value_accepts_option_form() {
@@ -2778,7 +2779,10 @@ mod tests {
         assert_eq!(value["LicenseUrl"], "https://example.test/license");
         assert_eq!(value["ReleaseNotesUrl"], "https://example.test/release-notes");
         assert_eq!(value["Tags"][0], "utilities");
-        assert_eq!(value["Installers"][0]["InstallerUrl"], "https://example.test/installer.exe");
+        assert_eq!(
+            value["Installers"][0]["InstallerUrl"],
+            "https://example.test/installer.exe"
+        );
         assert_eq!(value["Installers"][0]["InstallerSha256"], "ABC123");
         assert_eq!(value["Installers"][0]["InstallerType"], "exe");
         assert_eq!(value["Installers"][0]["ReleaseDate"], "2026-05-22");
