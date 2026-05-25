@@ -7725,9 +7725,10 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest) -> Resu
 }
 
 /// Reads `PortableSymlinkFullPath` from the ARP subkey backing `installed`
-/// when present. winget writes this when it created a `Links\<alias>.exe`
-/// shim for a portable; pinget's own install_portable doesn't currently
-/// create shims, so for pinget-installed entries this returns None.
+/// when present. This value is recorded for portable installs that created a
+/// `Links\<alias>.exe` symlink, including pinget-installed entries when
+/// `install_portable` created that link. Entries without a created/recorded
+/// portable symlink return `None`.
 #[cfg(windows)]
 fn read_portable_symlink_full_path(installed: &ListMatch) -> Option<String> {
     const ARP_PREFIX: &str = r"ARP\";
