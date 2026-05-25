@@ -7770,12 +7770,11 @@ fn try_remove_portable_symlinks(
         let _ = fs::remove_file(path);
     }
 
-    // Defensive sweep: walk Links\ and remove shims whose stored target path
-    // was inside install_location. By this point install_location is already
-    // deleted, so we compare the symlink's stored target string (which the
-    // filesystem retains even after the target itself is gone).
+    // Defensive sweep: walk Links\ and remove shims whose stored target was
+    // inside (or equal to) install_location. By this point install_location is
+    // already deleted, so we compare the symlink's stored target string (which
+    // the filesystem retains even after the target itself is gone).
     let Some(install_dir) = install_location else { return };
-    let install_prefix = install_dir.to_string_lossy().to_ascii_lowercase();
 
     let Some(local) = dirs::data_local_dir() else { return };
     let links_root = local.join("Microsoft").join("WinGet").join("Links");
@@ -7783,11 +7782,34 @@ fn try_remove_portable_symlinks(
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(target) = fs::read_link(&path) else { continue };
-        let target_str = target.to_string_lossy().to_ascii_lowercase();
-        if target_str.starts_with(&install_prefix) {
+        if path_starts_with_case_insensitive(&target, install_dir) {
             let _ = fs::remove_file(&path);
         }
     }
+}
+
+/// Case-insensitive, component-aware path-prefix check for Windows. A raw
+/// `str::starts_with` on the path strings would let `C:\Foo` falsely match
+/// `C:\Foobar`; iterating path components avoids that. Used by the Links\
+/// sweep so an uninstall of one portable can't accidentally delete shims that
+/// belong to a different portable whose install dir happens to share a
+/// string-prefix.
+#[cfg(windows)]
+fn path_starts_with_case_insensitive(child: &Path, parent: &Path) -> bool {
+    let lower_components = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+            .collect()
+    };
+    let parent_components = lower_components(parent);
+    let child_components = lower_components(child);
+    if parent_components.is_empty() || parent_components.len() > child_components.len() {
+        return false;
+    }
+    parent_components
+        .iter()
+        .zip(child_components.iter())
+        .all(|(a, b)| a == b)
 }
 
 /// Best-effort removal of the HKCU/HKLM ARP subkey backing a portable entry.
@@ -8169,17 +8191,39 @@ fn resolve_portable_install_location(
     existing: &Option<ExistingPortableEntry>,
     subkey_name: &str,
 ) -> PathBuf {
-    if let Some(custom) = request.install_location.as_deref()
+    resolve_portable_install_location_pure(
+        request.install_location.as_deref(),
+        existing
+            .as_ref()
+            .and_then(|e| e.install_location.as_deref())
+            .and_then(Path::to_str),
+        subkey_name,
+        &default_user_portable_root(),
+    )
+}
+
+/// Pure resolution rule for the portable install directory. Priority:
+/// `request_location` (CLI override) → `existing_location` (so upgrades
+/// preserve a winget-installed location) → default user portable root joined
+/// with the package's ARP subkey name.
+#[cfg(windows)]
+fn resolve_portable_install_location_pure(
+    request_location: Option<&str>,
+    existing_location: Option<&str>,
+    subkey_name: &str,
+    default_user_portable_root: &Path,
+) -> PathBuf {
+    if let Some(custom) = request_location
         && !custom.is_empty()
     {
         return PathBuf::from(custom);
     }
-    if let Some(entry) = existing
-        && let Some(loc) = entry.install_location.clone()
+    if let Some(loc) = existing_location
+        && !loc.is_empty()
     {
-        return loc;
+        return PathBuf::from(loc);
     }
-    default_user_portable_root().join(subkey_name)
+    default_user_portable_root.join(subkey_name)
 }
 
 #[cfg(windows)]
@@ -8296,6 +8340,253 @@ mod tests {
             "pinget-rs-tests-{label}-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_prefix_check_rejects_string_prefix_collisions() {
+        // Regression: a naive str::starts_with would falsely consider
+        // C:\Foobar a child of C:\Foo and let the Links\ sweep delete unrelated
+        // symlinks. The component-aware check must reject these.
+        assert!(!path_starts_with_case_insensitive(
+            Path::new(r"C:\Foobar\bin.exe"),
+            Path::new(r"C:\Foo"),
+        ));
+        assert!(!path_starts_with_case_insensitive(
+            Path::new(r"C:\Foo\bin.exe.bak"),
+            Path::new(r"C:\Foo\bin.exe"),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_prefix_check_accepts_real_children_and_self() {
+        // Dir install: the symlink target lives inside the install dir.
+        assert!(path_starts_with_case_insensitive(
+            Path::new(r"C:\Foo\sub\bin.exe"),
+            Path::new(r"C:\Foo"),
+        ));
+        // File install: the symlink points at the same file we removed.
+        assert!(path_starts_with_case_insensitive(
+            Path::new(r"C:\Foo\bin.exe"),
+            Path::new(r"C:\Foo\bin.exe"),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_prefix_check_is_case_insensitive() {
+        // Windows paths are case-insensitive — winget and pinget may write
+        // them with different casing.
+        assert!(path_starts_with_case_insensitive(
+            Path::new(r"c:\users\test\appdata\local\microsoft\winget\packages\foo\bin.exe"),
+            Path::new(r"C:\Users\test\AppData\Local\Microsoft\WinGet\Packages\Foo"),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_source_identifier_maps_winget_catalog_to_canonical_id() {
+        let query = PackageQuery {
+            source: Some("winget".to_owned()),
+            ..PackageQuery::default()
+        };
+        assert_eq!(
+            portable_source_identifier(&query),
+            "Microsoft.Winget.Source_8wekyb3d8bbwe"
+        );
+        // Case-insensitive — manifests/catalog may report differently.
+        let query = PackageQuery {
+            source: Some("WINGET".to_owned()),
+            ..PackageQuery::default()
+        };
+        assert_eq!(
+            portable_source_identifier(&query),
+            "Microsoft.Winget.Source_8wekyb3d8bbwe"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_source_identifier_passes_through_custom_sources() {
+        let query = PackageQuery {
+            source: Some("internal-feed".to_owned()),
+            ..PackageQuery::default()
+        };
+        assert_eq!(portable_source_identifier(&query), "internal-feed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_source_identifier_defaults_for_missing_or_empty_source() {
+        let query = PackageQuery {
+            source: None,
+            ..PackageQuery::default()
+        };
+        assert_eq!(
+            portable_source_identifier(&query),
+            "Microsoft.Winget.Source_8wekyb3d8bbwe"
+        );
+        let query = PackageQuery {
+            source: Some(String::new()),
+            ..PackageQuery::default()
+        };
+        assert_eq!(
+            portable_source_identifier(&query),
+            "Microsoft.Winget.Source_8wekyb3d8bbwe"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_subkey_name_matches_winget_format() {
+        assert_eq!(
+            portable_subkey_name("BurntSushi.ripgrep.MSVC", "Microsoft.Winget.Source_8wekyb3d8bbwe"),
+            "BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn determine_portable_alias_prefers_nested_installer_alias() {
+        let installer = Installer {
+            nested_installer_files: vec![NestedInstallerFile {
+                relative_file_path: "ripgrep/rg.exe".to_owned(),
+                portable_command_alias: Some("rg".to_owned()),
+            }],
+            commands: vec!["other-name".to_owned()],
+            ..Installer::default()
+        };
+        assert_eq!(determine_portable_alias(&installer).as_deref(), Some("rg"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn determine_portable_alias_falls_back_to_commands() {
+        let installer = Installer {
+            // No nested files at all (standalone portable case).
+            commands: vec!["nuget".to_owned()],
+            ..Installer::default()
+        };
+        assert_eq!(determine_portable_alias(&installer).as_deref(), Some("nuget"));
+
+        // Nested files exist but none declare PortableCommandAlias.
+        let installer = Installer {
+            nested_installer_files: vec![NestedInstallerFile {
+                relative_file_path: "subdir/bin.exe".to_owned(),
+                portable_command_alias: None,
+            }],
+            commands: vec!["bin".to_owned()],
+            ..Installer::default()
+        };
+        assert_eq!(determine_portable_alias(&installer).as_deref(), Some("bin"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn determine_portable_alias_returns_none_without_alias_or_commands() {
+        let installer = Installer::default();
+        assert!(determine_portable_alias(&installer).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_portable_install_location_prefers_request_override() {
+        let result = resolve_portable_install_location_pure(
+            Some(r"D:\Tools\rg"),
+            Some(r"C:\Software\rg-test"),
+            "Sub_Source",
+            Path::new(r"C:\default"),
+        );
+        assert_eq!(result, PathBuf::from(r"D:\Tools\rg"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_portable_install_location_preserves_existing_location_for_upgrades() {
+        // The #4823 scenario: pinget upgrade with no explicit --location must
+        // resolve to the install_location the prior install recorded, not the
+        // default portable root.
+        let result = resolve_portable_install_location_pure(
+            None,
+            Some(r"C:\Software\rg-test"),
+            "Sub_Source",
+            Path::new(r"C:\default"),
+        );
+        assert_eq!(result, PathBuf::from(r"C:\Software\rg-test"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_portable_install_location_falls_back_to_default_root() {
+        let result = resolve_portable_install_location_pure(
+            None,
+            None,
+            "Sub_Source",
+            Path::new(r"C:\default"),
+        );
+        assert_eq!(result, PathBuf::from(r"C:\default\Sub_Source"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_portable_install_location_treats_empty_strings_as_unset() {
+        // Defensive: PackageQuery / registry reads can yield "" instead of
+        // None for missing values.
+        let result = resolve_portable_install_location_pure(
+            Some(""),
+            Some(""),
+            "Sub_Source",
+            Path::new(r"C:\default"),
+        );
+        assert_eq!(result, PathBuf::from(r"C:\default\Sub_Source"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clean_directory_contents_removes_files_and_subdirs_but_keeps_root() {
+        let root = std::env::temp_dir().join(format!(
+            "pinget-clean-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(root.join("a.txt"), b"hello").expect("write a.txt");
+        fs::create_dir_all(root.join("nested")).expect("create nested dir");
+        fs::write(root.join("nested").join("b.txt"), b"world").expect("write nested/b.txt");
+
+        clean_directory_contents(&root).expect("clean root contents");
+
+        assert!(root.is_dir(), "root dir itself must survive");
+        assert_eq!(
+            fs::read_dir(&root).expect("read root").count(),
+            0,
+            "root must be empty after clean"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clean_directory_contents_is_a_noop_on_nonexistent_dir() {
+        let bogus = std::env::temp_dir().join(format!(
+            "pinget-clean-test-bogus-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        assert!(!bogus.exists());
+        clean_directory_contents(&bogus).expect("clean nonexistent dir");
+        // Should not have created the dir.
+        assert!(!bogus.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_prefix_check_handles_mixed_separators() {
+        // NestedInstallerFiles RelativeFilePath uses '/' in manifests, so the
+        // path we joined can end up mixed-separator on Windows.
+        assert!(path_starts_with_case_insensitive(
+            Path::new(r"C:\Foo\sub/bin.exe"),
+            Path::new(r"C:\Foo"),
+        ));
     }
 
     #[test]

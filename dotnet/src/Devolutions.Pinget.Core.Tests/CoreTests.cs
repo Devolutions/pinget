@@ -2178,6 +2178,184 @@ Installers:
     }
 
     [Fact]
+    public void PathStartsWith_RejectsStringPrefixCollisions()
+    {
+        // Regression: a naive string.StartsWith would falsely consider
+        // C:\Foobar a child of C:\Foo and let the Links\ sweep delete unrelated
+        // symlinks.
+        Assert.False(InstallerDispatch.PathStartsWithCaseInsensitive(
+            @"C:\Foobar\bin.exe", @"C:\Foo"));
+        Assert.False(InstallerDispatch.PathStartsWithCaseInsensitive(
+            @"C:\Foo\bin.exe.bak", @"C:\Foo\bin.exe"));
+    }
+
+    [Fact]
+    public void PathStartsWith_AcceptsRealChildrenAndSelf()
+    {
+        // Dir install: target lives inside the install dir.
+        Assert.True(InstallerDispatch.PathStartsWithCaseInsensitive(
+            @"C:\Foo\sub\bin.exe", @"C:\Foo"));
+        // File install: target is the same file we removed.
+        Assert.True(InstallerDispatch.PathStartsWithCaseInsensitive(
+            @"C:\Foo\bin.exe", @"C:\Foo\bin.exe"));
+    }
+
+    [Fact]
+    public void PathStartsWith_IsCaseInsensitive()
+    {
+        Assert.True(InstallerDispatch.PathStartsWithCaseInsensitive(
+            @"c:\users\test\appdata\local\microsoft\winget\packages\foo\bin.exe",
+            @"C:\Users\test\AppData\Local\Microsoft\WinGet\Packages\Foo"));
+    }
+
+    [Fact]
+    public void PathStartsWith_HandlesMixedSeparators()
+    {
+        // NestedInstallerFiles RelativeFilePath uses '/' in manifests, so the
+        // path we joined can end up mixed-separator on Windows.
+        Assert.True(InstallerDispatch.PathStartsWithCaseInsensitive(
+            @"C:\Foo\sub/bin.exe", @"C:\Foo"));
+    }
+
+    [Fact]
+    public void PortableSourceIdentifier_MapsWingetCatalogToCanonicalId()
+    {
+        Assert.Equal(
+            "Microsoft.Winget.Source_8wekyb3d8bbwe",
+            InstallerDispatch.PortableSourceIdentifier(new PackageQuery { Source = "winget" }));
+        Assert.Equal(
+            "Microsoft.Winget.Source_8wekyb3d8bbwe",
+            InstallerDispatch.PortableSourceIdentifier(new PackageQuery { Source = "WINGET" }));
+    }
+
+    [Fact]
+    public void PortableSourceIdentifier_PassesThroughCustomSources()
+    {
+        Assert.Equal(
+            "internal-feed",
+            InstallerDispatch.PortableSourceIdentifier(new PackageQuery { Source = "internal-feed" }));
+    }
+
+    [Fact]
+    public void PortableSourceIdentifier_DefaultsForMissingOrEmptySource()
+    {
+        Assert.Equal(
+            "Microsoft.Winget.Source_8wekyb3d8bbwe",
+            InstallerDispatch.PortableSourceIdentifier(new PackageQuery()));
+        Assert.Equal(
+            "Microsoft.Winget.Source_8wekyb3d8bbwe",
+            InstallerDispatch.PortableSourceIdentifier(new PackageQuery { Source = "" }));
+    }
+
+    [Fact]
+    public void PortableSubkeyName_MatchesWingetFormat()
+    {
+        Assert.Equal(
+            "BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe",
+            InstallerDispatch.PortableSubkeyName("BurntSushi.ripgrep.MSVC", "Microsoft.Winget.Source_8wekyb3d8bbwe"));
+    }
+
+    [Fact]
+    public void DeterminePortableAlias_PrefersNestedInstallerAlias()
+    {
+        var installer = new Installer
+        {
+            NestedInstallerFiles = new List<NestedInstallerFile>
+            {
+                new() { RelativeFilePath = "ripgrep/rg.exe", PortableCommandAlias = "rg" }
+            },
+            Commands = new List<string> { "other-name" }
+        };
+        Assert.Equal("rg", InstallerDispatch.DeterminePortableAlias(installer));
+    }
+
+    [Fact]
+    public void DeterminePortableAlias_FallsBackToCommands()
+    {
+        var installer = new Installer
+        {
+            Commands = new List<string> { "nuget" }
+        };
+        Assert.Equal("nuget", InstallerDispatch.DeterminePortableAlias(installer));
+
+        // Nested files exist but none declare PortableCommandAlias.
+        installer = new Installer
+        {
+            NestedInstallerFiles = new List<NestedInstallerFile>
+            {
+                new() { RelativeFilePath = "subdir/bin.exe" }
+            },
+            Commands = new List<string> { "bin" }
+        };
+        Assert.Equal("bin", InstallerDispatch.DeterminePortableAlias(installer));
+    }
+
+    [Fact]
+    public void DeterminePortableAlias_ReturnsNullWithoutAliasOrCommands()
+    {
+        Assert.Null(InstallerDispatch.DeterminePortableAlias(new Installer()));
+    }
+
+    [Fact]
+    public void ResolvePortableInstallLocation_PrefersRequestOverride()
+    {
+        var result = InstallerDispatch.ResolvePortableInstallLocationPure(
+            @"D:\Tools\rg", @"C:\Software\rg-test", "Sub_Source", @"C:\default");
+        Assert.Equal(@"D:\Tools\rg", result);
+    }
+
+    [Fact]
+    public void ResolvePortableInstallLocation_PreservesExistingLocationForUpgrades()
+    {
+        // #4823 scenario: upgrade with no --location must resolve to the
+        // install_location the prior install recorded, not the default root.
+        var result = InstallerDispatch.ResolvePortableInstallLocationPure(
+            null, @"C:\Software\rg-test", "Sub_Source", @"C:\default");
+        Assert.Equal(@"C:\Software\rg-test", result);
+    }
+
+    [Fact]
+    public void ResolvePortableInstallLocation_FallsBackToDefaultRoot()
+    {
+        var result = InstallerDispatch.ResolvePortableInstallLocationPure(
+            null, null, "Sub_Source", @"C:\default");
+        Assert.Equal(Path.Combine(@"C:\default", "Sub_Source"), result);
+    }
+
+    [Fact]
+    public void ResolvePortableInstallLocation_TreatsEmptyStringsAsUnset()
+    {
+        var result = InstallerDispatch.ResolvePortableInstallLocationPure(
+            "", "", "Sub_Source", @"C:\default");
+        Assert.Equal(Path.Combine(@"C:\default", "Sub_Source"), result);
+    }
+
+    [Fact]
+    public void CleanDirectoryContents_RemovesFilesAndSubdirsButKeepsRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"pinget-clean-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        File.WriteAllText(Path.Combine(root, "a.txt"), "hello");
+        Directory.CreateDirectory(Path.Combine(root, "nested"));
+        File.WriteAllText(Path.Combine(root, "nested", "b.txt"), "world");
+
+        InstallerDispatch.CleanDirectoryContents(root);
+
+        Assert.True(Directory.Exists(root), "root dir itself must survive");
+        Assert.Empty(Directory.EnumerateFileSystemEntries(root));
+        Directory.Delete(root, recursive: true);
+    }
+
+    [Fact]
+    public void CleanDirectoryContents_IsNoOpOnNonexistentDir()
+    {
+        var bogus = Path.Combine(Path.GetTempPath(), $"pinget-clean-test-bogus-{Guid.NewGuid():N}");
+        Assert.False(Directory.Exists(bogus));
+        InstallerDispatch.CleanDirectoryContents(bogus);
+        Assert.False(Directory.Exists(bogus));
+    }
+
+    [Fact]
     public void CreateRepairListQuery_IncludesInstalledSelectors()
     {
         var request = new RepairRequest

@@ -283,7 +283,7 @@ internal static class InstallerDispatch
     /// declare a command — the package still installs, just without a Links\
     /// shim.
     /// </summary>
-    private static string? DeterminePortableAlias(Installer installer)
+    internal static string? DeterminePortableAlias(Installer installer)
     {
         foreach (var file in installer.NestedInstallerFiles)
         {
@@ -392,6 +392,32 @@ internal static class InstallerDispatch
         catch { /* broadcast best-effort */ }
     }
 
+    /// <summary>
+    /// Case-insensitive, component-aware path-prefix check for Windows. A raw
+    /// <c>string.StartsWith</c> on the path strings would let <c>C:\Foo</c>
+    /// falsely match <c>C:\Foobar</c>; iterating path components avoids that.
+    /// Used by the Links\ sweep so an uninstall of one portable can't
+    /// accidentally delete shims that belong to a different portable whose
+    /// install dir happens to share a string prefix.
+    /// </summary>
+    internal static bool PathStartsWithCaseInsensitive(string child, string parent)
+    {
+        static string[] Components(string path) =>
+            path.Split(['\\', '/'], StringSplitOptions.RemoveEmptyEntries)
+                .Select(p => p.ToLowerInvariant())
+                .ToArray();
+        var parentParts = Components(parent);
+        var childParts = Components(child);
+        if (parentParts.Length == 0 || parentParts.Length > childParts.Length)
+            return false;
+        for (int i = 0; i < parentParts.Length; i++)
+        {
+            if (!string.Equals(parentParts[i], childParts[i], StringComparison.Ordinal))
+                return false;
+        }
+        return true;
+    }
+
     private static class NativeMethods
     {
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
@@ -411,7 +437,7 @@ internal static class InstallerDispatch
     /// and <c>winget list</c> still finds the package; everything else uses
     /// the source name verbatim.
     /// </summary>
-    private static string PortableSourceIdentifier(PackageQuery query)
+    internal static string PortableSourceIdentifier(PackageQuery query)
     {
         var source = query.Source;
         if (string.IsNullOrEmpty(source) || string.Equals(source, "winget", StringComparison.OrdinalIgnoreCase))
@@ -419,7 +445,7 @@ internal static class InstallerDispatch
         return source;
     }
 
-    private static string PortableSubkeyName(string packageId, string sourceIdentifier) =>
+    internal static string PortableSubkeyName(string packageId, string sourceIdentifier) =>
         $"{packageId}_{sourceIdentifier}";
 
     private sealed record ExistingPortableEntry(string SubkeyName, string? InstallLocation, int? InstallDirectoryCreated);
@@ -454,20 +480,37 @@ internal static class InstallerDispatch
         return null;
     }
 
-    private static string ResolvePortableInstallLocation(InstallRequest request, ExistingPortableEntry? existing, string subkeyName)
+    private static string ResolvePortableInstallLocation(InstallRequest request, ExistingPortableEntry? existing, string subkeyName) =>
+        ResolvePortableInstallLocationPure(
+            request.InstallLocation,
+            existing?.InstallLocation,
+            subkeyName,
+            DefaultUserPortableRoot());
+
+    /// <summary>
+    /// Pure resolution rule for the portable install directory. Priority:
+    /// <c>requestLocation</c> (CLI override) → <c>existingLocation</c> (so
+    /// upgrades preserve a winget-installed location) → default user portable
+    /// root joined with the package's ARP subkey name.
+    /// </summary>
+    internal static string ResolvePortableInstallLocationPure(
+        string? requestLocation,
+        string? existingLocation,
+        string subkeyName,
+        string defaultUserPortableRoot)
     {
-        if (!string.IsNullOrWhiteSpace(request.InstallLocation))
-            return request.InstallLocation!;
-        if (!string.IsNullOrWhiteSpace(existing?.InstallLocation))
-            return existing!.InstallLocation!;
-        return Path.Combine(DefaultUserPortableRoot(), subkeyName);
+        if (!string.IsNullOrWhiteSpace(requestLocation))
+            return requestLocation!;
+        if (!string.IsNullOrWhiteSpace(existingLocation))
+            return existingLocation!;
+        return Path.Combine(defaultUserPortableRoot, subkeyName);
     }
 
     private static string DefaultUserPortableRoot() => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Microsoft", "WinGet", "Packages");
 
-    private static void CleanDirectoryContents(string dir)
+    internal static void CleanDirectoryContents(string dir)
     {
         if (!Directory.Exists(dir)) return;
         foreach (var entry in Directory.EnumerateFileSystemEntries(dir))
@@ -807,7 +850,6 @@ internal static class InstallerDispatch
                 "Microsoft", "WinGet", "Links");
             if (!Directory.Exists(linksRoot))
                 return;
-            var installPrefix = installLocation.ToLowerInvariant();
             foreach (var entry in Directory.EnumerateFiles(linksRoot))
             {
                 try
@@ -815,7 +857,7 @@ internal static class InstallerDispatch
                     var info = new FileInfo(entry);
                     var target = info.LinkTarget;
                     if (target is null) continue;
-                    if (target.ToLowerInvariant().StartsWith(installPrefix, StringComparison.Ordinal))
+                    if (PathStartsWithCaseInsensitive(target, installLocation))
                     {
                         try { File.Delete(entry); } catch { }
                     }
