@@ -305,10 +305,12 @@ pub struct PackageAgreement {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Installer {
     pub architecture: Option<String>,
     pub installer_type: Option<String>,
+    pub nested_installer_type: Option<String>,
+    pub nested_installer_files: Vec<NestedInstallerFile>,
     pub url: Option<String>,
     pub sha256: Option<String>,
     pub product_code: Option<String>,
@@ -323,6 +325,15 @@ pub struct Installer {
     pub commands: Vec<String>,
     pub package_dependencies: Vec<String>,
     pub require_explicit_upgrade: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct NestedInstallerFile {
+    /// Path to the executable within the extracted archive.
+    pub relative_file_path: String,
+    /// Optional alias winget exposes for portable invocation. Pinget records it
+    /// for parity but doesn't yet create symlinks / PATH entries.
+    pub portable_command_alias: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -5772,6 +5783,9 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
     let installer_switch_defaults = json_installer_switches(selected);
     let top_platforms = json_string_list(selected, "Platform");
     let top_minimum_os_version = json_string(selected, "MinimumOSVersion");
+    let top_installer_type = json_string(selected, "InstallerType");
+    let top_nested_installer_type = json_string(selected, "NestedInstallerType");
+    let top_nested_installer_files = json_nested_installer_files(selected);
 
     let installers = selected
         .get("Installers")
@@ -5791,7 +5805,18 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
                     minimum_os_version: json_string(item, "MinimumOSVersion")
                         .or_else(|| top_minimum_os_version.clone()),
                     architecture: json_string(item, "Architecture"),
-                    installer_type: json_string(item, "InstallerType"),
+                    installer_type: json_string(item, "InstallerType")
+                        .or_else(|| top_installer_type.clone()),
+                    nested_installer_type: json_string(item, "NestedInstallerType")
+                        .or_else(|| top_nested_installer_type.clone()),
+                    nested_installer_files: {
+                        let files = json_nested_installer_files(item);
+                        if files.is_empty() {
+                            top_nested_installer_files.clone()
+                        } else {
+                            files
+                        }
+                    },
                     url: json_string(item, "InstallerUrl"),
                     sha256: json_string(item, "InstallerSha256"),
                     product_code: json_string(item, "ProductCode"),
@@ -6173,6 +6198,8 @@ fn installer_defaults(root: &YamlMapping) -> YamlMapping {
     let keys = [
         "Architecture",
         "InstallerType",
+        "NestedInstallerType",
+        "NestedInstallerFiles",
         "InstallerUrl",
         "InstallerSha256",
         "ProductCode",
@@ -6198,6 +6225,8 @@ fn installer_from_yaml(root: &YamlMapping, switches: InstallerSwitches) -> Insta
     Installer {
         architecture: yaml_string(root, "Architecture"),
         installer_type: yaml_string(root, "InstallerType"),
+        nested_installer_type: yaml_string(root, "NestedInstallerType"),
+        nested_installer_files: yaml_nested_installer_files(root),
         url: yaml_string(root, "InstallerUrl"),
         sha256: yaml_string(root, "InstallerSha256"),
         product_code: yaml_string(root, "ProductCode"),
@@ -6342,6 +6371,25 @@ fn yaml_package_dependencies(root: &YamlMapping) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn yaml_nested_installer_files(root: &YamlMapping) -> Vec<NestedInstallerFile> {
+    root.get(YamlValue::from("NestedInstallerFiles"))
+        .and_then(YamlValue::as_sequence)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(YamlValue::as_mapping)
+                .filter_map(|item| {
+                    let relative = yaml_string(item, "RelativeFilePath")?;
+                    Some(NestedInstallerFile {
+                        relative_file_path: relative,
+                        portable_command_alias: yaml_string(item, "PortableCommandAlias"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn json_string(value: &JsonValue, key: &str) -> Option<String> {
     value.get(key).and_then(JsonValue::as_str).map(str::to_owned)
 }
@@ -6400,6 +6448,25 @@ fn json_package_dependencies(value: &JsonValue) -> Vec<String> {
             items
                 .iter()
                 .filter_map(|item| json_string(item, "PackageIdentifier"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_nested_installer_files(value: &JsonValue) -> Vec<NestedInstallerFile> {
+    value
+        .get("NestedInstallerFiles")
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let relative = json_string(item, "RelativeFilePath")?;
+                    Some(NestedInstallerFile {
+                        relative_file_path: relative,
+                        portable_command_alias: json_string(item, "PortableCommandAlias"),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -7040,6 +7107,18 @@ fn dispatch_installer(
             Ok(status.code().unwrap_or(-1))
         }
         "zip" => {
+            // A `zip` at the top-level installer position is treated as portable when
+            // `NestedInstallerType=portable` is specified — that's the shape every
+            // portable in the winget catalog uses (e.g. BurntSushi.ripgrep.MSVC).
+            // Anything else still falls through to the historical extract-to-Programs
+            // behavior, which isn't really correct but at least doesn't regress.
+            if installer
+                .nested_installer_type
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("portable"))
+            {
+                return install_portable(installer_path, request, manifest, installer);
+            }
             let target = dirs::data_local_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("Programs");
@@ -7049,6 +7128,7 @@ fn dispatch_installer(
             archive.extract(&target)?;
             Ok(0)
         }
+        "portable" => install_portable(installer_path, request, manifest, installer),
         // exe, inno, nullsoft, burn, etc.
         _ => {
             let mut cmd = Command::new(installer_path);
@@ -7628,6 +7708,262 @@ fn uninstall_package(_installed: &ListMatch, _request: &UninstallRequest) -> Res
     bail!("Uninstalling packages is only supported on Windows")
 }
 
+/// Installs (or upgrades) a portable WinGet package.
+///
+/// Handles both `InstallerType: portable` (single binary download) and
+/// `InstallerType: zip` with `NestedInstallerType: portable` (zip containing
+/// the binary at a relative path), which is the shape every portable in the
+/// community winget catalog uses today.
+///
+/// Behavior matches winget's portable workflow closely enough that the resulting
+/// HKCU ARP entry is recognized by `winget list` and by pinget's own list view:
+/// - Resolves the target install directory in this priority order:
+///   1. `request.install_location` if provided (passed for upgrades)
+///   2. Existing `InstallLocation` from the registry ARP entry (so upgrades
+///      with no explicit location still preserve the user's custom path)
+///   3. WinGet's default user portable root, `%LOCALAPPDATA%\Microsoft\WinGet
+///      \Packages\<PackageId>_<SourceId>`
+/// - If an existing pinget-owned install lives in that directory
+///   (`InstallDirectoryCreated=1`), cleans its contents before extracting the
+///   new version so leftover files from older versions don't pile up.
+/// - Extracts the zip (or copies the standalone binary), then writes the ARP
+///   registry entry that `winget list` and pinget's `collect_uninstall_view`
+///   both read from.
+#[cfg(windows)]
+fn install_portable(
+    installer_path: &Path,
+    request: &InstallRequest,
+    manifest: &Manifest,
+    installer: &Installer,
+) -> Result<i32> {
+    let source_identifier = portable_source_identifier(&request.query);
+    let existing_entry = read_existing_portable_entry(&manifest.id);
+    // Reuse the existing subkey name on upgrade so we don't orphan the prior
+    // entry by writing to a different one.
+    let subkey_name = existing_entry
+        .as_ref()
+        .map(|entry| entry.subkey_name.clone())
+        .unwrap_or_else(|| portable_subkey_name(&manifest.id, &source_identifier));
+
+    let target_dir = resolve_portable_install_location(request, &existing_entry, &subkey_name);
+
+    // If we created this directory on a previous install, wipe it clean so the
+    // new version doesn't co-exist with leftovers from the previous one. We do
+    // not touch a directory we don't own (InstallDirectoryCreated != 1), to
+    // avoid stomping user data.
+    let prev_dir_created = existing_entry
+        .as_ref()
+        .and_then(|entry| entry.install_directory_created)
+        == Some(1);
+    let dir_existed = target_dir.is_dir();
+    if prev_dir_created && dir_existed {
+        clean_directory_contents(&target_dir).with_context(|| {
+            format!(
+                "failed to clean existing portable install directory: {}",
+                target_dir.display()
+            )
+        })?;
+    }
+
+    fs::create_dir_all(&target_dir).with_context(|| {
+        format!("failed to create portable install directory: {}", target_dir.display())
+    })?;
+    // The "we created it" flag stays sticky across upgrades — if a previous
+    // install marked it created, it still counts as created by us even when
+    // the dir already existed this round.
+    let install_directory_created = !dir_existed || prev_dir_created;
+
+    let installer_type = installer.installer_type.as_deref().unwrap_or("");
+    if installer_type.eq_ignore_ascii_case("zip") {
+        let file = fs::File::open(installer_path)
+            .with_context(|| format!("failed to open installer zip: {}", installer_path.display()))?;
+        let mut archive = ZipArchive::new(file).context("failed to read installer zip")?;
+        archive
+            .extract(&target_dir)
+            .with_context(|| format!("failed to extract zip into: {}", target_dir.display()))?;
+    } else {
+        // Standalone portable: copy the downloaded file into target_dir using
+        // its original filename. winget would optionally rename to the
+        // PortableCommandAlias; pinget keeps the original name for now.
+        let basename = installer_path
+            .file_name()
+            .ok_or_else(|| anyhow!("portable installer has no filename"))?;
+        fs::copy(installer_path, target_dir.join(basename))
+            .with_context(|| format!("failed to copy portable binary into: {}", target_dir.display()))?;
+    }
+
+    write_portable_arp_entry(
+        &subkey_name,
+        &target_dir,
+        install_directory_created,
+        &source_identifier,
+        manifest,
+    )?;
+
+    Ok(0)
+}
+
+/// Source identifier embedded in the ARP subkey name. We mirror winget for
+/// the community repo so winget's UninstallString can resolve the subkey and
+/// `winget list` still finds the package; everything else uses the source
+/// name verbatim.
+#[cfg(windows)]
+fn portable_source_identifier(query: &PackageQuery) -> String {
+    match query.source.as_deref() {
+        Some(name) if name.eq_ignore_ascii_case("winget") => {
+            "Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned()
+        }
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ => "Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned(),
+    }
+}
+
+#[cfg(windows)]
+fn portable_subkey_name(package_id: &str, source_identifier: &str) -> String {
+    format!("{package_id}_{source_identifier}")
+}
+
+#[cfg(windows)]
+struct ExistingPortableEntry {
+    install_location: Option<PathBuf>,
+    install_directory_created: Option<u32>,
+    subkey_name: String,
+}
+
+#[cfg(windows)]
+fn read_existing_portable_entry(package_id: &str) -> Option<ExistingPortableEntry> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let uninstall = hkcu
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
+        .ok()?;
+    for name in uninstall.enum_keys().flatten() {
+        let Ok(subkey) = uninstall.open_subkey(&name) else { continue };
+        if read_reg_string(&subkey, "WinGetPackageIdentifier").as_deref() != Some(package_id) {
+            continue;
+        }
+        if !read_reg_string(&subkey, "WinGetInstallerType")
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("portable"))
+        {
+            continue;
+        }
+        return Some(ExistingPortableEntry {
+            install_location: read_reg_string(&subkey, "InstallLocation").map(PathBuf::from),
+            install_directory_created: read_reg_dword(&subkey, "InstallDirectoryCreated"),
+            subkey_name: name,
+        });
+    }
+    None
+}
+
+#[cfg(windows)]
+fn resolve_portable_install_location(
+    request: &InstallRequest,
+    existing: &Option<ExistingPortableEntry>,
+    subkey_name: &str,
+) -> PathBuf {
+    if let Some(custom) = request.install_location.as_deref()
+        && !custom.is_empty()
+    {
+        return PathBuf::from(custom);
+    }
+    if let Some(entry) = existing
+        && let Some(loc) = entry.install_location.clone()
+    {
+        return loc;
+    }
+    default_user_portable_root().join(subkey_name)
+}
+
+#[cfg(windows)]
+fn default_user_portable_root() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Microsoft")
+        .join("WinGet")
+        .join("Packages")
+}
+
+#[cfg(windows)]
+fn clean_directory_contents(dir: &Path) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes the HKCU ARP entry winget would normally write for a portable
+/// install. Only the subset that winget's portable list view and pinget's
+/// `collect_uninstall_view` actually read.
+#[cfg(windows)]
+fn write_portable_arp_entry(
+    subkey_name: &str,
+    install_location: &Path,
+    install_directory_created: bool,
+    source_identifier: &str,
+    manifest: &Manifest,
+) -> Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let uninstall_path = format!(
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"
+    );
+    let (subkey, _) = hkcu
+        .create_subkey(&uninstall_path)
+        .context("failed to create portable ARP registry subkey")?;
+
+    let install_location_str = install_location.to_string_lossy().to_string();
+    subkey.set_value("WinGetPackageIdentifier", &manifest.id)?;
+    subkey.set_value("WinGetSourceIdentifier", &source_identifier.to_owned())?;
+    subkey.set_value("WinGetInstallerType", &"portable".to_owned())?;
+    subkey.set_value("InstallLocation", &install_location_str)?;
+    subkey.set_value(
+        "InstallDirectoryCreated",
+        &(if install_directory_created { 1u32 } else { 0u32 }),
+    )?;
+    subkey.set_value(
+        "DisplayName",
+        &if manifest.name.is_empty() {
+            manifest.id.clone()
+        } else {
+            manifest.name.clone()
+        },
+    )?;
+    subkey.set_value("DisplayVersion", &manifest.version)?;
+    if let Some(publisher) = manifest.publisher.as_ref() {
+        subkey.set_value("Publisher", publisher)?;
+    }
+    subkey.set_value(
+        "UninstallString",
+        &format!("winget uninstall --product-code {subkey_name}"),
+    )?;
+    let today = Utc::now().format("%Y%m%d").to_string();
+    subkey.set_value("InstallDate", &today)?;
+    if let Some(url) = manifest.package_url.as_ref() {
+        subkey.set_value("URLInfoAbout", url)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn install_portable(
+    _installer_path: &Path,
+    _request: &InstallRequest,
+    _manifest: &Manifest,
+    _installer: &Installer,
+) -> Result<i32> {
+    bail!("Portable installs are only supported on Windows")
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -8091,6 +8427,8 @@ mod tests {
                     commands: vec!["testpkg".to_owned()],
                     package_dependencies: vec!["Microsoft.UI.Xaml.2.8".to_owned()],
                     require_explicit_upgrade: false,
+                    nested_installer_type: None,
+                    nested_installer_files: Vec::new(),
                 }],
                 require_explicit_upgrade: false,
             },
@@ -8114,6 +8452,8 @@ mod tests {
                 commands: vec!["testpkg".to_owned()],
                 package_dependencies: vec!["Microsoft.UI.Xaml.2.8".to_owned()],
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             }),
             cached_files: vec![PathBuf::from(r"C:\temp\cache\Test.Package.yaml")],
             warnings: vec!["cache warmed".to_owned()],
@@ -8382,6 +8722,8 @@ Installers:
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             })
             .collect();
         Manifest {
@@ -8874,6 +9216,8 @@ Installers:
             commands: Vec::new(),
             package_dependencies: Vec::new(),
             require_explicit_upgrade: false,
+            nested_installer_type: None,
+            nested_installer_files: Vec::new(),
         };
         let manifest = Manifest {
             id: "Test.Package".to_owned(),
@@ -8959,6 +9303,8 @@ Installers:
             commands: Vec::new(),
             package_dependencies: Vec::new(),
             require_explicit_upgrade: false,
+            nested_installer_type: None,
+            nested_installer_files: Vec::new(),
         };
         let manifest = Manifest {
             id: "Test.Package".to_owned(),
@@ -9047,6 +9393,8 @@ Installers:
             commands: Vec::new(),
             package_dependencies: Vec::new(),
             require_explicit_upgrade: false,
+            nested_installer_type: None,
+            nested_installer_files: Vec::new(),
         };
         let manifest = Manifest {
             id: "ShareX.ShareX".to_owned(),
@@ -9233,6 +9581,8 @@ Installers:
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             },
             Installer {
                 architecture: Some("x64".to_owned()),
@@ -9251,6 +9601,8 @@ Installers:
                 commands: vec!["demo".to_owned()],
                 package_dependencies: Vec::new(),
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             },
         ];
         let query = PackageQuery {
@@ -9286,6 +9638,8 @@ Installers:
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             },
             Installer {
                 architecture: Some("x64".to_owned()),
@@ -9304,6 +9658,8 @@ Installers:
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             },
         ];
 
@@ -9331,6 +9687,8 @@ Installers:
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             },
             Installer {
                 architecture: Some("x64".to_owned()),
@@ -9349,6 +9707,8 @@ Installers:
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             },
         ];
         let query = PackageQuery {
@@ -9381,6 +9741,8 @@ Installers:
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             },
             Installer {
                 architecture: Some("x64".to_owned()),
@@ -9399,6 +9761,8 @@ Installers:
                 commands: Vec::new(),
                 package_dependencies: Vec::new(),
                 require_explicit_upgrade: false,
+                nested_installer_type: None,
+                nested_installer_files: Vec::new(),
             },
         ];
         let query = PackageQuery {
