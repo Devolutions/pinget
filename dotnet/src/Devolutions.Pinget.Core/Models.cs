@@ -189,6 +189,7 @@ public record Installer
     public string? Architecture { get; init; }
     public string? InstallerType { get; init; }
     public string? NestedInstallerType { get; init; }
+    public List<NestedInstallerFile> NestedInstallerFiles { get; init; } = [];
     public string? Url { get; init; }
     public string? Sha256 { get; init; }
     public string? ProductCode { get; init; }
@@ -203,6 +204,17 @@ public record Installer
     public List<string> Commands { get; init; } = [];
     public List<string> PackageDependencies { get; init; } = [];
     public bool RequireExplicitUpgrade { get; init; }
+}
+
+public record NestedInstallerFile
+{
+    /// <summary>Path to the executable within the extracted archive.</summary>
+    public required string RelativeFilePath { get; init; }
+    /// <summary>
+    /// Optional alias winget exposes for portable invocation. Pinget records
+    /// it for parity but doesn't yet create symlinks / PATH entries.
+    /// </summary>
+    public string? PortableCommandAlias { get; init; }
 }
 
 public record InstallerSwitches
@@ -413,6 +425,7 @@ public record SerializableInstaller
     public string? Architecture { get; init; }
     public string? InstallerType { get; init; }
     public string? NestedInstallerType { get; init; }
+    public List<NestedInstallerFile> NestedInstallerFiles { get; init; } = [];
     public string? InstallerUrl { get; init; }
     public string? InstallerSha256 { get; init; }
     public string? ProductCode { get; init; }
@@ -432,6 +445,7 @@ public record SerializableInstaller
         Architecture = installer.Architecture,
         InstallerType = installer.InstallerType,
         NestedInstallerType = installer.NestedInstallerType,
+        NestedInstallerFiles = installer.NestedInstallerFiles,
         InstallerUrl = installer.Url,
         InstallerSha256 = installer.Sha256,
         ProductCode = installer.ProductCode,

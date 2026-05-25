@@ -315,6 +315,7 @@ upgradeCommand.SetHandler((ctx) =>
         var upgradeable = result.Matches.Where(m => m.AvailableVersion is not null).ToList();
         var pins = repo.ListPins();
         var upgradedCount = 0;
+        var failureCount = 0;
         if (upgradeable.Count == 0)
         {
             Console.WriteLine("No applicable upgrade found.");
@@ -330,6 +331,7 @@ upgradeCommand.SetHandler((ctx) =>
                     if (pin?.PinType == PinType.Blocking)
                     {
                         Console.WriteLine($"  Package is blocked by pin {pin.Version}; remove the pin before upgrading.");
+                        failureCount++;
                         continue;
                     }
 
@@ -358,13 +360,23 @@ upgradeCommand.SetHandler((ctx) =>
                             : $"  Failed to upgrade {m.Id} (exit code: {r.ExitCode})");
                     if (r.Success && !r.NoOp)
                         upgradedCount++;
+                    else if (!r.Success)
+                        failureCount++;
                 }
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine($"  Error upgrading {m.Id}: {ex.Message}");
+                    failureCount++;
                 }
             }
-            Console.WriteLine($"{upgradedCount} package(s) upgraded.");
+            Console.WriteLine($"{upgradedCount} of {upgradeable.Count} package(s) upgraded.");
+            if (failureCount > 0)
+            {
+                // Surface the failure to the caller (UniGetUI, scripts, etc.) so
+                // they don't treat a partial failure as success.
+                Console.Error.WriteLine($"{failureCount} package(s) failed to upgrade during upgrade --all");
+                ctx.ExitCode = 1;
+            }
         }
     }
 });

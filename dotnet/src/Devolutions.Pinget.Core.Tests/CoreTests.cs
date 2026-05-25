@@ -2155,72 +2155,26 @@ Installers:
     }
 
     [Fact]
-    public void BuildWingetPortableInstallArguments_PreservesWingetCoherenceFlags()
+    public void IsPortableZipInstaller_DetectsNestedPortableZip()
     {
-        var manifest = new Manifest
-        {
-            Id = "JesseDuffield.lazygit",
-            Name = "lazygit",
-            Version = "0.61.1",
-        };
-
-        var request = new InstallRequest
-        {
-            Query = new PackageQuery
-            {
-                Id = "JesseDuffield.lazygit",
-                Source = "winget",
-                InstallScope = "user",
-            },
-            Mode = InstallerMode.Silent,
-            AcceptPackageAgreements = true,
-        };
-
-        Assert.Equal(
-            new[]
-            {
-                "install",
-                "--id",
-                "JesseDuffield.lazygit",
-                "--exact",
-                "--accept-source-agreements",
-                "--disable-interactivity",
-                "--source",
-                "winget",
-                "--scope",
-                "user",
-                "--accept-package-agreements",
-                "--silent",
-            },
-            InstallerDispatch.BuildWingetPortableInstallArguments(request, manifest));
-    }
-
-    [Fact]
-    public void ShouldDelegatePortableZipInstall_ForNestedPortableZip()
-    {
-        var manifest = new Manifest
-        {
-            Id = "JesseDuffield.lazygit",
-            Name = "lazygit",
-            Version = "0.61.1",
-        };
-
-        var request = new InstallRequest
-        {
-            Query = new PackageQuery
-            {
-                Id = "JesseDuffield.lazygit",
-                Source = "winget",
-            },
-        };
-
         var installer = new Installer
         {
             InstallerType = "zip",
             NestedInstallerType = "portable",
         };
 
-        Assert.True(InstallerDispatch.ShouldDelegatePortableZipInstall(request, manifest, installer));
+        Assert.True(InstallerDispatch.IsPortableZipInstaller(installer));
+    }
+
+    [Fact]
+    public void IsPortableZipInstaller_RejectsPlainZipWithoutNestedPortable()
+    {
+        var installer = new Installer
+        {
+            InstallerType = "zip",
+        };
+
+        Assert.False(InstallerDispatch.IsPortableZipInstaller(installer));
     }
 
     [Fact]

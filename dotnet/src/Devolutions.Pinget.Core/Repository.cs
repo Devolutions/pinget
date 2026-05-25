@@ -1516,6 +1516,9 @@ public class Repository : IDisposable
         // Top-level installer defaults (merged manifest format)
         string? topInstallerType = GetOptStr("InstallerType");
         string? topNestedInstallerType = GetOptStr("NestedInstallerType");
+        var topNestedInstallerFiles = dict.TryGetValue("NestedInstallerFiles", out var topNestedFilesValue)
+            ? ReadNestedInstallerFiles(topNestedFilesValue)
+            : [];
         string? topScope = GetOptStr("Scope");
         string? topProductCode = GetOptStr("ProductCode");
         string? topLocale = GetOptStr("InstallerLocale");
@@ -1548,11 +1551,15 @@ public class Repository : IDisposable
                         ? ReadStringList(platformValue)
                         : [];
 
+                    var nestedFiles = instDict.TryGetValue("NestedInstallerFiles", out var nestedFilesValue)
+                        ? ReadNestedInstallerFiles(nestedFilesValue)
+                        : [];
                     installers.Add(new Installer
                     {
                         Architecture = InstStr("Architecture"),
                         InstallerType = InstStr("InstallerType") ?? topInstallerType,
                         NestedInstallerType = InstStr("NestedInstallerType") ?? topNestedInstallerType,
+                        NestedInstallerFiles = nestedFiles.Count > 0 ? nestedFiles : [.. topNestedInstallerFiles],
                         Url = InstStr("InstallerUrl"),
                         Sha256 = InstStr("InstallerSha256"),
                         ProductCode = InstStr("ProductCode") ?? topProductCode,
@@ -1841,6 +1848,30 @@ public class Repository : IDisposable
 
     private static string? GetDocumentString(Dictionary<string, object?> source, string key) =>
         source.TryGetValue(key, out var value) ? value?.ToString() : null;
+
+    private static List<NestedInstallerFile> ReadNestedInstallerFiles(object? value)
+    {
+        if (value is not IList<object> list)
+            return [];
+
+        var files = new List<NestedInstallerFile>();
+        foreach (var entry in list)
+        {
+            if (entry is not IDictionary<object, object> dict)
+                continue;
+
+            var relative = dict.TryGetValue("RelativeFilePath", out var rel) ? rel?.ToString() : null;
+            if (string.IsNullOrWhiteSpace(relative))
+                continue;
+
+            files.Add(new NestedInstallerFile
+            {
+                RelativeFilePath = relative!,
+                PortableCommandAlias = dict.TryGetValue("PortableCommandAlias", out var alias) ? alias?.ToString() : null,
+            });
+        }
+        return files;
+    }
 
     private static List<PackageAgreement> ReadAgreements(IDictionary<string, object?> values)
     {
