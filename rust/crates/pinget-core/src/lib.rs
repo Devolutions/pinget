@@ -3675,7 +3675,17 @@ fn collect_uninstall_view(
             }
         }
         let installer_category =
-            if local_id.starts_with("ARP\\") && read_reg_dword(&subkey, "WindowsInstaller") == Some(1) {
+            if read_reg_string(&subkey, "WinGetInstallerType")
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("portable"))
+            {
+                // Honor the WinGet ARP signal so uninstall flows through
+                // uninstall_portable (clean dir + registry removal) instead of
+                // delegating the WinGet portable UninstallString to a winget
+                // subprocess that only fully cleans up entries winget itself
+                // installed.
+                Some("portable".to_owned())
+            } else if local_id.starts_with("ARP\\") && read_reg_dword(&subkey, "WindowsInstaller") == Some(1) {
                 Some("msi".to_owned())
             } else if key_name.starts_with("MSIX\\") {
                 Some("msix".to_owned())
@@ -7670,6 +7680,7 @@ fn try_run_msi_uninstall(
 fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest) -> Result<i32> {
     let Some(location) = installed.install_location.as_deref() else {
         if request.force {
+            try_remove_portable_registry_entry(installed);
             return Ok(0);
         }
         bail!(
@@ -7683,19 +7694,76 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest) -> Resu
     }
 
     let path = Path::new(location);
-    if path.is_dir() {
+    let removed = if path.is_dir() {
         fs::remove_dir_all(path)?;
-        return Ok(0);
-    }
-    if path.is_file() {
+        true
+    } else if path.is_file() {
         fs::remove_file(path)?;
-        return Ok(0);
-    }
-    if request.force {
+        true
+    } else {
+        false
+    };
+
+    if removed || request.force {
+        // Once the files are gone (or the user forced past missing files), drop
+        // the ARP entry too so the package no longer shows in installed lists.
+        try_remove_portable_registry_entry(installed);
         return Ok(0);
     }
 
     bail!("Portable package location not found: {location}")
+}
+
+/// Best-effort removal of the HKCU/HKLM ARP subkey backing a portable entry.
+/// We match on local_id (`ARP\<scope>\<arch>\<subkey>`) when present so we
+/// delete the exact key the list view surfaced; otherwise we walk the standard
+/// Uninstall path and match on WinGetPackageIdentifier. Failures are logged via
+/// the returned warning chain in callers — we never bubble a registry-cleanup
+/// failure as a hard error because the file deletion already succeeded.
+#[cfg(windows)]
+fn try_remove_portable_registry_entry(installed: &ListMatch) {
+    // Collect (is_hkcu, subkey_path) pairs so we can re-open hives at delete
+    // time instead of holding clones of RegKey (which doesn't implement Clone).
+    let candidates: Vec<(bool, String)> = if let Some(rest) = installed.local_id.strip_prefix(r"ARP\") {
+        // local_id format is `ARP\<scope>\<arch>\<subkey>` — pick the right hive/path.
+        let mut parts = rest.splitn(3, '\\');
+        let scope = parts.next().unwrap_or("");
+        let _arch = parts.next();
+        let subkey_name = parts.next().unwrap_or("");
+        if subkey_name.is_empty() {
+            return;
+        }
+        let is_hkcu = scope.eq_ignore_ascii_case("User");
+        vec![(is_hkcu, format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"))]
+    } else {
+        // Fall back to scanning by WinGetPackageIdentifier.
+        let mut found = Vec::new();
+        for (is_hkcu, hive) in [
+            (true, RegKey::predef(HKEY_CURRENT_USER)),
+            (false, RegKey::predef(HKEY_LOCAL_MACHINE)),
+        ] {
+            let Ok(uninstall) = hive.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall") else { continue };
+            for name in uninstall.enum_keys().flatten() {
+                let Ok(subkey) = uninstall.open_subkey(&name) else { continue };
+                if read_reg_string(&subkey, "WinGetPackageIdentifier").as_deref() == Some(installed.id.as_str()) {
+                    found.push((
+                        is_hkcu,
+                        format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{name}"),
+                    ));
+                }
+            }
+        }
+        found
+    };
+
+    for (is_hkcu, path) in candidates {
+        let hive = if is_hkcu {
+            RegKey::predef(HKEY_CURRENT_USER)
+        } else {
+            RegKey::predef(HKEY_LOCAL_MACHINE)
+        };
+        let _ = hive.delete_subkey_all(&path);
+    }
 }
 
 #[cfg(windows)]

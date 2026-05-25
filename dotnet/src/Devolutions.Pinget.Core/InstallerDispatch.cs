@@ -542,34 +542,91 @@ internal static class InstallerDispatch
         return args;
     }
 
+    [SupportedOSPlatform("windows")]
     private static int UninstallPortable(ListMatch installed, UninstallRequest request)
     {
         if (string.IsNullOrWhiteSpace(installed.InstallLocation))
         {
             if (request.Force)
+            {
+                TryRemovePortableRegistryEntry(installed);
                 return 0;
+            }
             throw new InvalidOperationException($"Portable package '{installed.Name}' does not expose an install location.");
         }
 
         if (request.Preserve)
             return 0;
 
+        var removed = false;
         if (Directory.Exists(installed.InstallLocation))
         {
             Directory.Delete(installed.InstallLocation, recursive: true);
-            return 0;
+            removed = true;
         }
-
-        if (File.Exists(installed.InstallLocation))
+        else if (File.Exists(installed.InstallLocation))
         {
             File.Delete(installed.InstallLocation);
+            removed = true;
+        }
+
+        if (removed || request.Force)
+        {
+            // Once the files are gone (or the user forced past missing files),
+            // drop the ARP entry too so the package no longer shows in lists.
+            TryRemovePortableRegistryEntry(installed);
             return 0;
         }
 
-        if (request.Force)
-            return 0;
-
         throw new InvalidOperationException($"Portable package location not found: {installed.InstallLocation}");
+    }
+
+    /// <summary>
+    /// Best-effort removal of the HKCU/HKLM ARP subkey backing a portable
+    /// entry. We match on LocalId (<c>ARP\&lt;scope&gt;\&lt;arch&gt;\&lt;subkey&gt;</c>) when
+    /// present so we delete the exact key the list view surfaced; otherwise we
+    /// walk the standard Uninstall path and match on WinGetPackageIdentifier.
+    /// Failures are swallowed because the file deletion already succeeded.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void TryRemovePortableRegistryEntry(ListMatch installed)
+    {
+        try
+        {
+            const string ArpPrefix = @"ARP\";
+            if (installed.LocalId.StartsWith(ArpPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                var rest = installed.LocalId[ArpPrefix.Length..];
+                var parts = rest.Split('\\', 3);
+                if (parts.Length == 3 && !string.IsNullOrWhiteSpace(parts[2]))
+                {
+                    var hive = parts[0].Equals("User", StringComparison.OrdinalIgnoreCase)
+                        ? Microsoft.Win32.Registry.CurrentUser
+                        : Microsoft.Win32.Registry.LocalMachine;
+                    hive.DeleteSubKeyTree(
+                        $@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{parts[2]}",
+                        throwOnMissingSubKey: false);
+                    return;
+                }
+            }
+
+            // Fall back: scan ARP by WinGetPackageIdentifier.
+            foreach (var hive in new[] { Microsoft.Win32.Registry.CurrentUser, Microsoft.Win32.Registry.LocalMachine })
+            {
+                using var uninstall = hive.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall", writable: true);
+                if (uninstall is null) continue;
+                foreach (var name in uninstall.GetSubKeyNames())
+                {
+                    using var subkey = uninstall.OpenSubKey(name);
+                    if (subkey is null) continue;
+                    if (string.Equals(subkey.GetValue("WinGetPackageIdentifier") as string, installed.Id, StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { uninstall.DeleteSubKeyTree(name, throwOnMissingSubKey: false); } catch { }
+                    }
+                }
+            }
+        }
+        catch { /* best-effort: file removal already succeeded */ }
     }
 
     private static string? DefaultExperienceSwitch(string installerType, InstallerMode mode) => mode switch
