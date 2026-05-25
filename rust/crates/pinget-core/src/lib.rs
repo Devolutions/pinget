@@ -7774,13 +7774,21 @@ fn install_portable(
     let install_directory_created = !dir_existed || prev_dir_created;
 
     let installer_type = installer.installer_type.as_deref().unwrap_or("");
-    if installer_type.eq_ignore_ascii_case("zip") {
+    let portable_target_full_path: PathBuf = if installer_type.eq_ignore_ascii_case("zip") {
         let file = fs::File::open(installer_path)
             .with_context(|| format!("failed to open installer zip: {}", installer_path.display()))?;
         let mut archive = ZipArchive::new(file).context("failed to read installer zip")?;
         archive
             .extract(&target_dir)
             .with_context(|| format!("failed to extract zip into: {}", target_dir.display()))?;
+        // For nested-portable zips the binary lives at the RelativeFilePath the
+        // manifest declares. We record the first one as PortableTargetFullPath so
+        // winget's portable uninstall workflow can identify which file to remove.
+        installer
+            .nested_installer_files
+            .first()
+            .map(|file| target_dir.join(&file.relative_file_path))
+            .unwrap_or_else(|| target_dir.clone())
     } else {
         // Standalone portable: copy the downloaded file into target_dir using
         // its original filename. winget would optionally rename to the
@@ -7788,13 +7796,16 @@ fn install_portable(
         let basename = installer_path
             .file_name()
             .ok_or_else(|| anyhow!("portable installer has no filename"))?;
-        fs::copy(installer_path, target_dir.join(basename))
+        let copied = target_dir.join(basename);
+        fs::copy(installer_path, &copied)
             .with_context(|| format!("failed to copy portable binary into: {}", target_dir.display()))?;
-    }
+        copied
+    };
 
     write_portable_arp_entry(
         &subkey_name,
         &target_dir,
+        &portable_target_full_path,
         install_directory_created,
         &source_identifier,
         manifest,
@@ -7908,6 +7919,7 @@ fn clean_directory_contents(dir: &Path) -> Result<()> {
 fn write_portable_arp_entry(
     subkey_name: &str,
     install_location: &Path,
+    portable_target_full_path: &Path,
     install_directory_created: bool,
     source_identifier: &str,
     manifest: &Manifest,
@@ -7925,6 +7937,10 @@ fn write_portable_arp_entry(
     subkey.set_value("WinGetSourceIdentifier", &source_identifier.to_owned())?;
     subkey.set_value("WinGetInstallerType", &"portable".to_owned())?;
     subkey.set_value("InstallLocation", &install_location_str)?;
+    subkey.set_value(
+        "PortableTargetFullPath",
+        &portable_target_full_path.to_string_lossy().to_string(),
+    )?;
     subkey.set_value(
         "InstallDirectoryCreated",
         &(if install_directory_created { 1u32 } else { 0u32 }),

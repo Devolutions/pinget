@@ -214,9 +214,17 @@ internal static class InstallerDispatch
         var installDirectoryCreated = !dirExisted || prevDirCreated;
 
         var installerType = installer.InstallerType ?? "";
+        string portableTargetFullPath;
         if (string.Equals(installerType, "zip", StringComparison.OrdinalIgnoreCase))
         {
             ZipFile.ExtractToDirectory(installerPath, targetDir, overwriteFiles: true);
+            // For nested-portable zips the binary lives at the RelativeFilePath
+            // the manifest declares. Record the first one as
+            // PortableTargetFullPath so winget's portable uninstall workflow can
+            // identify which file to remove.
+            portableTargetFullPath = installer.NestedInstallerFiles.Count > 0
+                ? Path.Combine(targetDir, installer.NestedInstallerFiles[0].RelativeFilePath)
+                : targetDir;
         }
         else
         {
@@ -226,10 +234,11 @@ internal static class InstallerDispatch
             var basename = Path.GetFileName(installerPath);
             if (string.IsNullOrWhiteSpace(basename))
                 throw new InvalidOperationException("portable installer has no filename");
-            File.Copy(installerPath, Path.Combine(targetDir, basename), overwrite: true);
+            portableTargetFullPath = Path.Combine(targetDir, basename);
+            File.Copy(installerPath, portableTargetFullPath, overwrite: true);
         }
 
-        WritePortableArpEntry(subkeyName, targetDir, installDirectoryCreated, sourceIdentifier, manifest);
+        WritePortableArpEntry(subkeyName, targetDir, portableTargetFullPath, installDirectoryCreated, sourceIdentifier, manifest);
         return 0;
     }
 
@@ -316,6 +325,7 @@ internal static class InstallerDispatch
     private static void WritePortableArpEntry(
         string subkeyName,
         string installLocation,
+        string portableTargetFullPath,
         bool installDirectoryCreated,
         string sourceIdentifier,
         Manifest manifest)
@@ -328,6 +338,7 @@ internal static class InstallerDispatch
         subkey.SetValue("WinGetSourceIdentifier", sourceIdentifier);
         subkey.SetValue("WinGetInstallerType", "portable");
         subkey.SetValue("InstallLocation", installLocation);
+        subkey.SetValue("PortableTargetFullPath", portableTargetFullPath);
         subkey.SetValue("InstallDirectoryCreated", installDirectoryCreated ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
         subkey.SetValue("DisplayName", string.IsNullOrEmpty(manifest.Name) ? manifest.Id : manifest.Name);
         subkey.SetValue("DisplayVersion", manifest.Version);

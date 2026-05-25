@@ -681,12 +681,26 @@ internal static class StructuredOutput
         return document;
     }
 
+    public static Dictionary<string, object?> NestedInstallerFileDocument(NestedInstallerFile file)
+    {
+        var document = new Dictionary<string, object?>
+        {
+            ["RelativeFilePath"] = file.RelativeFilePath,
+        };
+        AddString(document, "PortableCommandAlias", file.PortableCommandAlias);
+        return document;
+    }
+
     public static Dictionary<string, object?> InstallerDocument(Installer installer)
     {
         var document = new Dictionary<string, object?>();
         AddString(document, "Architecture", installer.Architecture);
         AddString(document, "InstallerType", installer.InstallerType);
         AddString(document, "NestedInstallerType", installer.NestedInstallerType);
+        if (installer.NestedInstallerFiles.Count > 0)
+            document["NestedInstallerFiles"] = installer.NestedInstallerFiles
+                .Select(NestedInstallerFileDocument)
+                .ToList();
         AddString(document, "InstallerUrl", installer.Url);
         AddString(document, "InstallerSha256", installer.Sha256);
         AddString(document, "ProductCode", installer.ProductCode);
