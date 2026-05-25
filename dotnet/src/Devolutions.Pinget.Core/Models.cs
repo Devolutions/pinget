@@ -211,8 +211,7 @@ public record NestedInstallerFile
     /// <summary>Path to the executable within the extracted archive.</summary>
     public required string RelativeFilePath { get; init; }
     /// <summary>
-    /// Optional alias winget exposes for portable invocation. Pinget records
-    /// it for parity but doesn't yet create symlinks / PATH entries.
+    /// Optional alias exposed for portable invocation.
     /// </summary>
     public string? PortableCommandAlias { get; init; }
 }
