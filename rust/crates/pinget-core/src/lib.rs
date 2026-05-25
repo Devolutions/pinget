@@ -332,7 +332,8 @@ pub struct NestedInstallerFile {
     /// Path to the executable within the extracted archive.
     pub relative_file_path: String,
     /// Optional alias winget exposes for portable invocation. Pinget records it
-    /// for parity but doesn't yet create symlinks / PATH entries.
+    /// for parity and uses it during portable installation to create a
+    /// `Links\\<alias>.exe` symlink; `Links\\` may also be added to the user PATH.
     pub portable_command_alias: Option<String>,
 }
 
