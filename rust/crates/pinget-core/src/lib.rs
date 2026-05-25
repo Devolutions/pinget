@@ -7678,8 +7678,16 @@ fn try_run_msi_uninstall(
 
 #[cfg(windows)]
 fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest) -> Result<i32> {
+    // Read PortableSymlinkFullPath from the ARP entry *before* we touch the
+    // registry, so we can remove winget-created shims in Links\ if any. Without
+    // this, a portable that winget originally installed (with a
+    // PortableCommandAlias set in its manifest) would leave a dangling symlink
+    // in %LOCALAPPDATA%\Microsoft\WinGet\Links\ once pinget uninstalls it.
+    let known_symlink = read_portable_symlink_full_path(installed);
+
     let Some(location) = installed.install_location.as_deref() else {
         if request.force {
+            try_remove_portable_symlinks(installed, &known_symlink, None);
             try_remove_portable_registry_entry(installed);
             return Ok(0);
         }
@@ -7706,12 +7714,78 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest) -> Resu
 
     if removed || request.force {
         // Once the files are gone (or the user forced past missing files), drop
-        // the ARP entry too so the package no longer shows in installed lists.
+        // the symlink shim and ARP entry too so the package fully disappears.
+        try_remove_portable_symlinks(installed, &known_symlink, Some(path));
         try_remove_portable_registry_entry(installed);
         return Ok(0);
     }
 
     bail!("Portable package location not found: {location}")
+}
+
+/// Reads `PortableSymlinkFullPath` from the ARP subkey backing `installed`
+/// when present. winget writes this when it created a `Links\<alias>.exe`
+/// shim for a portable; pinget's own install_portable doesn't currently
+/// create shims, so for pinget-installed entries this returns None.
+#[cfg(windows)]
+fn read_portable_symlink_full_path(installed: &ListMatch) -> Option<String> {
+    const ARP_PREFIX: &str = r"ARP\";
+    if let Some(rest) = installed.local_id.strip_prefix(ARP_PREFIX) {
+        let mut parts = rest.splitn(3, '\\');
+        let scope = parts.next().unwrap_or("");
+        let _arch = parts.next();
+        let subkey_name = parts.next().unwrap_or("");
+        if subkey_name.is_empty() {
+            return None;
+        }
+        let hive = if scope.eq_ignore_ascii_case("User") {
+            RegKey::predef(HKEY_CURRENT_USER)
+        } else {
+            RegKey::predef(HKEY_LOCAL_MACHINE)
+        };
+        let subkey = hive
+            .open_subkey(format!(
+                r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"
+            ))
+            .ok()?;
+        return read_reg_string(&subkey, "PortableSymlinkFullPath");
+    }
+    None
+}
+
+/// Removes the symlink shims winget would have created for this portable.
+/// Tries (1) the exact path from `PortableSymlinkFullPath` if known, and
+/// (2) any symlink in `%LOCALAPPDATA%\Microsoft\WinGet\Links\` whose target
+/// resolves under `install_location` (defensive sweep for shims winget made
+/// but didn't surface in the registry). Best-effort: failures are swallowed.
+#[cfg(windows)]
+fn try_remove_portable_symlinks(
+    _installed: &ListMatch,
+    known_symlink: &Option<String>,
+    install_location: Option<&Path>,
+) {
+    if let Some(path) = known_symlink.as_deref() {
+        let _ = fs::remove_file(path);
+    }
+
+    // Defensive sweep: walk Links\ and remove shims whose stored target path
+    // was inside install_location. By this point install_location is already
+    // deleted, so we compare the symlink's stored target string (which the
+    // filesystem retains even after the target itself is gone).
+    let Some(install_dir) = install_location else { return };
+    let install_prefix = install_dir.to_string_lossy().to_ascii_lowercase();
+
+    let Some(local) = dirs::data_local_dir() else { return };
+    let links_root = local.join("Microsoft").join("WinGet").join("Links");
+    let Ok(entries) = fs::read_dir(&links_root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(target) = fs::read_link(&path) else { continue };
+        let target_str = target.to_string_lossy().to_ascii_lowercase();
+        if target_str.starts_with(&install_prefix) {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 /// Best-effort removal of the HKCU/HKLM ARP subkey backing a portable entry.
@@ -7870,16 +7944,168 @@ fn install_portable(
         copied
     };
 
-    write_portable_arp_entry(
-        &subkey_name,
-        &target_dir,
-        &portable_target_full_path,
+    // Create the Links\<alias>.exe shim so users can invoke the portable from
+    // any shell, matching winget's portable workflow. Failures are non-fatal —
+    // when the user lacks SeCreateSymbolicLink (no Developer Mode, not admin)
+    // we still leave the package installed at install_location.
+    let alias = determine_portable_alias(installer);
+    let symlink_full_path = match alias.as_deref() {
+        Some(alias) if !alias.is_empty() => {
+            try_create_portable_symlink(&portable_target_full_path, alias)
+        }
+        _ => None,
+    };
+
+    // Ensure %LOCALAPPDATA%\Microsoft\WinGet\Links is on user PATH so the
+    // symlink we just created is resolvable from new shells. Tracks whether we
+    // added it this round so uninstall can decide whether to take it back out.
+    let added_to_path = if symlink_full_path.is_some() {
+        try_add_links_dir_to_user_path()
+    } else {
+        false
+    };
+
+    write_portable_arp_entry(&PortableArpEntry {
+        subkey_name: &subkey_name,
+        install_location: &target_dir,
+        portable_target_full_path: &portable_target_full_path,
+        portable_symlink_full_path: symlink_full_path.as_deref(),
         install_directory_created,
-        &source_identifier,
+        added_to_path,
+        source_identifier: &source_identifier,
         manifest,
-    )?;
+    })?;
 
     Ok(0)
+}
+
+#[cfg(windows)]
+struct PortableArpEntry<'a> {
+    subkey_name: &'a str,
+    install_location: &'a Path,
+    portable_target_full_path: &'a Path,
+    portable_symlink_full_path: Option<&'a Path>,
+    install_directory_created: bool,
+    added_to_path: bool,
+    source_identifier: &'a str,
+    manifest: &'a Manifest,
+}
+
+/// Picks the portable command alias from the manifest. Mirrors winget's
+/// resolution: nested-installer files first (used by zip+portable manifests),
+/// then the top-level `Commands` field (used by standalone portable manifests).
+/// Returns None when the manifest doesn't declare a command — the package
+/// still installs, just without a Links\ shim.
+#[cfg(windows)]
+fn determine_portable_alias(installer: &Installer) -> Option<String> {
+    installer
+        .nested_installer_files
+        .iter()
+        .find_map(|file| file.portable_command_alias.clone())
+        .or_else(|| installer.commands.first().cloned())
+}
+
+#[cfg(windows)]
+fn winget_links_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Microsoft")
+        .join("WinGet")
+        .join("Links")
+}
+
+/// Creates (or replaces) `Links\<alias>.exe` as a file symlink pointing at the
+/// portable's binary. Returns the link path on success. Returns None and logs
+/// a warning if the user can't create symlinks (no Developer Mode, not admin)
+/// so the install can still complete without the shim.
+#[cfg(windows)]
+fn try_create_portable_symlink(target: &Path, alias: &str) -> Option<PathBuf> {
+    use std::os::windows::fs::symlink_file;
+    let links_dir = winget_links_dir();
+    if fs::create_dir_all(&links_dir).is_err() {
+        return None;
+    }
+    let link_path = links_dir.join(format!("{alias}.exe"));
+
+    // Replace any prior link/file at the path so upgrades repoint to the new
+    // binary instead of leaving a stale symlink behind.
+    if link_path.symlink_metadata().is_ok() {
+        let _ = fs::remove_file(&link_path);
+    }
+
+    // Symlink creation fails with ERROR_PRIVILEGE_NOT_HELD (1314) when the
+    // process lacks SeCreateSymbolicLink (no Developer Mode, not admin). Treat
+    // that — and any other I/O failure — as non-fatal: the package files are
+    // already in place, just without a Links\ shim.
+    symlink_file(target, &link_path).ok().map(|()| link_path)
+}
+
+/// Adds `Links\` to the user's HKCU\Environment\Path if not already present,
+/// then broadcasts WM_SETTINGCHANGE so explorer-spawned shells pick up the
+/// new PATH without a logoff. Returns true if we actually appended PATH this
+/// call — callers should write `InstallDirectoryAddedToPath` accordingly so a
+/// follow-up uninstall doesn't take PATH back out for other portables.
+#[cfg(windows)]
+fn try_add_links_dir_to_user_path() -> bool {
+    let links_dir = winget_links_dir();
+    let links_str = links_dir.to_string_lossy().to_string();
+    let normalized_links = links_str.to_ascii_lowercase();
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(env_key) = hkcu.open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE) else {
+        return false;
+    };
+    let existing: String = env_key.get_value("Path").unwrap_or_default();
+    let already_present = existing
+        .split(';')
+        .any(|component| component.trim().to_ascii_lowercase() == normalized_links);
+    if already_present {
+        return false;
+    }
+
+    let new_path = if existing.is_empty() {
+        links_str
+    } else if existing.ends_with(';') {
+        format!("{existing}{links_str}")
+    } else {
+        format!("{existing};{links_str}")
+    };
+
+    if env_key.set_value("Path", &new_path).is_err() {
+        return false;
+    }
+
+    broadcast_environment_change();
+    true
+}
+
+#[cfg(windows)]
+fn broadcast_environment_change() {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+    };
+
+    let param: Vec<u16> = OsStr::new("Environment")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: SendMessageTimeoutW only reads `param` for the duration of the
+    // call (it copies the string before returning), and `result` is a stack
+    // local we provide. No aliasing or lifetime issues.
+    unsafe {
+        let mut result: usize = 0;
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0usize,
+            param.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            5000,
+            &mut result,
+        );
+    }
 }
 
 /// Source identifier embedded in the ARP subkey name. We mirror winget for
@@ -7984,34 +8210,39 @@ fn clean_directory_contents(dir: &Path) -> Result<()> {
 /// install. Only the subset that winget's portable list view and pinget's
 /// `collect_uninstall_view` actually read.
 #[cfg(windows)]
-fn write_portable_arp_entry(
-    subkey_name: &str,
-    install_location: &Path,
-    portable_target_full_path: &Path,
-    install_directory_created: bool,
-    source_identifier: &str,
-    manifest: &Manifest,
-) -> Result<()> {
+fn write_portable_arp_entry(entry: &PortableArpEntry<'_>) -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let uninstall_path = format!(
-        r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{}",
+        entry.subkey_name
     );
     let (subkey, _) = hkcu
         .create_subkey(&uninstall_path)
         .context("failed to create portable ARP registry subkey")?;
 
-    let install_location_str = install_location.to_string_lossy().to_string();
+    let manifest = entry.manifest;
+    let install_location_str = entry.install_location.to_string_lossy().to_string();
     subkey.set_value("WinGetPackageIdentifier", &manifest.id)?;
-    subkey.set_value("WinGetSourceIdentifier", &source_identifier.to_owned())?;
+    subkey.set_value("WinGetSourceIdentifier", &entry.source_identifier.to_owned())?;
     subkey.set_value("WinGetInstallerType", &"portable".to_owned())?;
     subkey.set_value("InstallLocation", &install_location_str)?;
     subkey.set_value(
         "PortableTargetFullPath",
-        &portable_target_full_path.to_string_lossy().to_string(),
+        &entry.portable_target_full_path.to_string_lossy().to_string(),
+    )?;
+    if let Some(symlink_path) = entry.portable_symlink_full_path {
+        subkey.set_value(
+            "PortableSymlinkFullPath",
+            &symlink_path.to_string_lossy().to_string(),
+        )?;
+    }
+    subkey.set_value(
+        "InstallDirectoryAddedToPath",
+        &(if entry.added_to_path { 1u32 } else { 0u32 }),
     )?;
     subkey.set_value(
         "InstallDirectoryCreated",
-        &(if install_directory_created { 1u32 } else { 0u32 }),
+        &(if entry.install_directory_created { 1u32 } else { 0u32 }),
     )?;
     subkey.set_value(
         "DisplayName",
@@ -8027,7 +8258,7 @@ fn write_portable_arp_entry(
     }
     subkey.set_value(
         "UninstallString",
-        &format!("winget uninstall --product-code {subkey_name}"),
+        &format!("winget uninstall --product-code {}", entry.subkey_name),
     )?;
     let today = Utc::now().format("%Y%m%d").to_string();
     subkey.set_value("InstallDate", &today)?;
