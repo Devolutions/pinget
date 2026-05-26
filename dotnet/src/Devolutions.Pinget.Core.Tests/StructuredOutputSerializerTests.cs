@@ -2,7 +2,6 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Devolutions.Pinget.Cli;
 using Xunit;
-using YamlDotNet.Serialization;
 
 namespace Devolutions.Pinget.Core.Tests;
 
@@ -120,85 +119,5 @@ public class StructuredOutputSerializerTests
 
         source["Name"] = "changed";
         Assert.Equal("winget", (string?)cloned["Name"]);
-    }
-
-    [Fact]
-    public void JsonNodeToDynamic_Null_ReturnsNull()
-    {
-        Assert.Null(StructuredOutputSerializer.JsonNodeToDynamic(null));
-    }
-
-    [Fact]
-    public void JsonNodeToDynamic_JsonObject_ProducesStringDictionary()
-    {
-        var node = new JsonObject
-        {
-            ["Name"] = "winget",
-            ["Priority"] = 7,
-            ["Explicit"] = false,
-            ["LastUpdate"] = (JsonNode?)null,
-        };
-
-        var result = StructuredOutputSerializer.JsonNodeToDynamic(node);
-
-        var dict = Assert.IsType<Dictionary<string, object?>>(result);
-        Assert.Equal("winget", dict["Name"]);
-        Assert.Equal(7L, dict["Priority"]);
-        Assert.Equal(false, dict["Explicit"]);
-        Assert.Null(dict["LastUpdate"]);
-    }
-
-    [Fact]
-    public void JsonNodeToDynamic_JsonArray_ProducesObjectList()
-    {
-        var node = new JsonArray("a", 1, true);
-
-        var result = StructuredOutputSerializer.JsonNodeToDynamic(node);
-
-        var list = Assert.IsType<List<object?>>(result);
-        Assert.Equal(new object?[] { "a", 1L, true }, list);
-    }
-
-    [Fact]
-    public void JsonNodeToDynamic_Number_PrefersInt64WhenIntegral()
-    {
-        var node = JsonNode.Parse("42")!;
-        Assert.Equal(42L, StructuredOutputSerializer.JsonNodeToDynamic(node));
-    }
-
-    [Fact]
-    public void JsonNodeToDynamic_Number_FallsBackToDoubleWhenFractional()
-    {
-        var node = JsonNode.Parse("3.14")!;
-        Assert.Equal(3.14, (double)StructuredOutputSerializer.JsonNodeToDynamic(node)!, precision: 10);
-    }
-
-    [Fact]
-    public void JsonNodeToDynamic_OutputIsAcceptedByYamlDotNet()
-    {
-        // Regression: the settings YAML branch (WriteJsonNode in Program.cs)
-        // feeds the dynamic tree directly into YamlDotNet's serializer. Make
-        // sure the shape we produce is one YamlDotNet can render without
-        // throwing or emitting opaque CLR type names.
-        var input = new JsonObject
-        {
-            ["telemetry"] = new JsonObject { ["disable"] = true },
-            ["network"] = new JsonObject
-            {
-                ["downloader"] = "wininet",
-                ["doProgressTimeoutInSeconds"] = 60,
-            },
-            ["tags"] = new JsonArray("a", "b"),
-        };
-
-        var dynamic = StructuredOutputSerializer.JsonNodeToDynamic(input);
-        var yaml = new SerializerBuilder().Build().Serialize(dynamic!);
-
-        Assert.Contains("telemetry:", yaml);
-        Assert.Contains("disable: true", yaml);
-        Assert.Contains("doProgressTimeoutInSeconds: 60", yaml);
-        Assert.Contains("- a", yaml);
-        Assert.DoesNotContain("JsonElement", yaml);
-        Assert.DoesNotContain("System.", yaml);
     }
 }

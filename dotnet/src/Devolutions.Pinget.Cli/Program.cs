@@ -5,7 +5,6 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization.Metadata;
 using Devolutions.Pinget.Cli;
 using Devolutions.Pinget.Core;
-using YamlDotNet.Serialization;
 
 const string Version = "0.7.0";
 const string UpgradeUnsupportedWarning = "Upgrading packages is not supported on this platform; no changes were made.";
@@ -1275,7 +1274,7 @@ void WriteStructuredOutput<T>(T value, OutputFormat output, JsonTypeInfo<T> type
             Console.WriteLine(StructuredOutputSerializer.SerializeJson(value, typeInfo));
             break;
         case OutputFormat.Yaml:
-            Console.Write(StructuredOutputSerializer.SerializeYaml(value!));
+            Console.Write(StructuredOutputSerializer.SerializeYaml(value, typeInfo));
             break;
         default:
             throw new InvalidOperationException("Text output should be handled separately.");
@@ -1792,8 +1791,7 @@ void WriteJsonNode(JsonNode value, OutputFormat output)
     switch (output)
     {
         case OutputFormat.Yaml:
-            var structured = StructuredOutputSerializer.JsonNodeToDynamic(value) ?? new object();
-            Console.Write(new SerializerBuilder().Build().Serialize(structured));
+            Console.Write(StructuredOutputSerializer.SerializeYaml(value));
             break;
         default:
             Console.WriteLine(value.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
