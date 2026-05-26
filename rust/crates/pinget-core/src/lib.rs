@@ -8315,16 +8315,6 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn install_portable(
-    _installer_path: &Path,
-    _request: &InstallRequest,
-    _manifest: &Manifest,
-    _installer: &Installer,
-) -> Result<i32> {
-    bail!("Portable installs are only supported on Windows")
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Write;
