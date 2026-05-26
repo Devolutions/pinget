@@ -16,7 +16,8 @@ internal static class InstallerDispatch
         {
             "msi" or "wix" => RunMsi(installerPath, request, manifest, installer),
             "msix" or "appx" => RunMsix(installerPath),
-            "zip" when ShouldDelegatePortableZipInstall(request, manifest, installer) => InstallPortableWithWinget(request, manifest),
+            "zip" when IsPortableZipInstaller(installer) => InstallPortable(installerPath, request, manifest, installer),
+            "portable" => InstallPortable(installerPath, request, manifest, installer),
             "zip" => ExtractZip(installerPath),
             _ => RunExe(installerPath, installerType, request, manifest, installer)
         };
@@ -160,63 +161,397 @@ internal static class InstallerDispatch
         return 0;
     }
 
-    internal static bool ShouldDelegatePortableZipInstall(InstallRequest request, Manifest manifest, Installer installer) =>
-        IsPortableZipInstaller(installer) &&
-        !string.IsNullOrWhiteSpace(request.Query.Id ?? manifest.Id);
-
     internal static bool IsPortableZipInstaller(Installer installer) =>
-        installer.Commands.Count > 0 ||
         string.Equals(installer.NestedInstallerType, "portable", StringComparison.OrdinalIgnoreCase);
 
-    internal static List<string> BuildWingetPortableInstallArguments(InstallRequest request, Manifest manifest)
+    /// <summary>
+    /// Installs (or upgrades) a portable WinGet package natively. Mirrors the
+    /// Rust install_portable behavior so the C# and Rust pinget implementations
+    /// stay aligned (see AGENTS.md).
+    ///
+    /// Handles both <c>InstallerType: portable</c> (standalone binary) and
+    /// <c>InstallerType: zip</c> with <c>NestedInstallerType: portable</c> (the
+    /// shape every portable in the community winget catalog uses).
+    ///
+    /// Behavior follows winget's portable workflow closely enough that the
+    /// resulting HKCU ARP entry is recognized by <c>winget list</c> and by
+    /// pinget's own list view:
+    /// <list type="bullet">
+    ///   <item>Resolves the target install directory in this priority order:
+    ///   <c>request.InstallLocation</c>, existing <c>InstallLocation</c> from
+    ///   the registry ARP entry (so upgrades preserve a user's custom path),
+    ///   then WinGet's default user portable root.</item>
+    ///   <item>If an existing pinget-owned install lives in that directory
+    ///   (<c>InstallDirectoryCreated=1</c>), cleans its contents before
+    ///   extracting the new version.</item>
+    ///   <item>Extracts the zip (or copies the standalone binary), then writes
+    ///   the ARP registry entry both <c>winget list</c> and pinget read from.</item>
+    /// </list>
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static int InstallPortable(string installerPath, InstallRequest request, Manifest manifest, Installer installer)
     {
-        var packageId = request.Query.Id ?? manifest.Id;
-        var args = new List<string>
-        {
-            "install",
-            "--id",
-            packageId,
-            "--exact",
-            "--accept-source-agreements",
-            "--disable-interactivity",
-        };
+        var sourceIdentifier = PortableSourceIdentifier(request.Query);
+        var existingEntry = ReadExistingPortableEntry(manifest.Id);
+        // Reuse the existing subkey name on upgrade so we don't orphan the prior
+        // entry by writing to a different one.
+        var subkeyName = existingEntry?.SubkeyName ?? PortableSubkeyName(manifest.Id, sourceIdentifier);
 
-        if (!string.IsNullOrWhiteSpace(request.Query.Source))
+        var targetDir = ResolvePortableInstallLocation(request, existingEntry, subkeyName);
+
+        // If we created this directory on a previous install, wipe it clean so the
+        // new version doesn't co-exist with leftovers from the previous one. We
+        // do not touch a directory we don't own (InstallDirectoryCreated != 1).
+        var prevDirCreated = existingEntry?.InstallDirectoryCreated == 1;
+        var dirExisted = Directory.Exists(targetDir);
+        if (prevDirCreated && dirExisted)
+            CleanDirectoryContents(targetDir);
+
+        Directory.CreateDirectory(targetDir);
+        // "We created it" is sticky across upgrades: if a previous install
+        // marked it created, it still counts as created by us even when the
+        // dir already existed this round.
+        var installDirectoryCreated = !dirExisted || prevDirCreated;
+
+        var installerType = installer.InstallerType ?? "";
+        string portableTargetFullPath;
+        if (string.Equals(installerType, "zip", StringComparison.OrdinalIgnoreCase))
         {
-            args.Add("--source");
-            args.Add(request.Query.Source!);
+            ZipFile.ExtractToDirectory(installerPath, targetDir, overwriteFiles: true);
+            // For nested-portable zips the binary lives at the RelativeFilePath
+            // the manifest declares. Record the first one as
+            // PortableTargetFullPath so winget's portable uninstall workflow can
+            // identify which file to remove.
+            portableTargetFullPath = installer.NestedInstallerFiles.Count > 0
+                ? Path.Combine(targetDir, installer.NestedInstallerFiles[0].RelativeFilePath)
+                : targetDir;
+        }
+        else
+        {
+            // Standalone portable: copy the downloaded file into targetDir using
+            // its original filename. winget would optionally rename to the
+            // PortableCommandAlias; pinget keeps the original name for now.
+            var basename = Path.GetFileName(installerPath);
+            if (string.IsNullOrWhiteSpace(basename))
+                throw new InvalidOperationException("portable installer has no filename");
+            portableTargetFullPath = Path.Combine(targetDir, basename);
+            File.Copy(installerPath, portableTargetFullPath, overwrite: true);
         }
 
-        if (!string.IsNullOrWhiteSpace(request.Query.Version))
-        {
-            args.Add("--version");
-            args.Add(request.Query.Version!);
-        }
+        // Create the Links\<alias>.exe shim so users can invoke the portable from
+        // any shell, matching winget's portable workflow. Failures are non-fatal —
+        // when the user lacks SeCreateSymbolicLink (no Developer Mode, not admin)
+        // we still leave the package installed at install_location.
+        var alias = DeterminePortableAlias(installer);
+        var symlinkFullPath = string.IsNullOrEmpty(alias)
+            ? null
+            : TryCreatePortableSymlink(portableTargetFullPath, alias!);
 
-        if (!string.IsNullOrWhiteSpace(request.Query.InstallScope))
-        {
-            args.Add("--scope");
-            args.Add(request.Query.InstallScope!);
-        }
+        // Ensure %LOCALAPPDATA%\Microsoft\WinGet\Links is on user PATH so the
+        // symlink we just created is resolvable from new shells. Tracks whether
+        // we added it this round so uninstall can decide whether to take it
+        // back out.
+        var addedToPath = symlinkFullPath is not null && TryAddLinksDirToUserPath();
 
-        if (request.AcceptPackageAgreements)
-            args.Add("--accept-package-agreements");
-
-        if (request.Mode == InstallerMode.Silent || request.Mode == InstallerMode.SilentWithProgress)
-            args.Add("--silent");
-
-        return args;
+        WritePortableArpEntry(new PortableArpEntry(
+            SubkeyName: subkeyName,
+            InstallLocation: targetDir,
+            PortableTargetFullPath: portableTargetFullPath,
+            PortableSymlinkFullPath: symlinkFullPath,
+            InstallDirectoryCreated: installDirectoryCreated,
+            AddedToPath: addedToPath,
+            SourceIdentifier: sourceIdentifier,
+            Manifest: manifest));
+        return 0;
     }
 
-    private static int InstallPortableWithWinget(InstallRequest request, Manifest manifest)
-    {
-        var psi = new ProcessStartInfo("winget") { UseShellExecute = false };
-        foreach (var arg in BuildWingetPortableInstallArguments(request, manifest))
-            psi.ArgumentList.Add(arg);
+    private sealed record PortableArpEntry(
+        string SubkeyName,
+        string InstallLocation,
+        string PortableTargetFullPath,
+        string? PortableSymlinkFullPath,
+        bool InstallDirectoryCreated,
+        bool AddedToPath,
+        string SourceIdentifier,
+        Manifest Manifest);
 
-        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start winget for portable install");
-        proc.WaitForExit();
-        return proc.ExitCode;
+    /// <summary>
+    /// Picks the portable command alias from the manifest. Mirrors winget's
+    /// resolution: nested-installer files first (used by zip+portable
+    /// manifests), then the top-level <c>Commands</c> field (used by
+    /// standalone portable manifests). Returns null when the manifest doesn't
+    /// declare a command — the package still installs, just without a Links\
+    /// shim.
+    /// </summary>
+    internal static string? DeterminePortableAlias(Installer installer)
+    {
+        foreach (var file in installer.NestedInstallerFiles)
+        {
+            if (!string.IsNullOrEmpty(file.PortableCommandAlias))
+                return file.PortableCommandAlias;
+        }
+        return installer.Commands.Count > 0 ? installer.Commands[0] : null;
+    }
+
+    private static string WingetLinksDir() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Microsoft", "WinGet", "Links");
+
+    /// <summary>
+    /// Creates (or replaces) <c>Links\&lt;alias&gt;.exe</c> as a symlink
+    /// pointing at the portable's binary. Returns the link path on success.
+    /// Returns null on any I/O failure (notably ERROR_PRIVILEGE_NOT_HELD when
+    /// the user lacks SeCreateSymbolicLink) so the install can still
+    /// complete without the shim.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static string? TryCreatePortableSymlink(string target, string alias)
+    {
+        try
+        {
+            var linksDir = WingetLinksDir();
+            Directory.CreateDirectory(linksDir);
+            var linkPath = Path.Combine(linksDir, $"{alias}.exe");
+
+            // Replace any prior link/file at the path so upgrades repoint to
+            // the new binary instead of leaving a stale symlink behind.
+            if (File.Exists(linkPath) || new FileInfo(linkPath).LinkTarget is not null)
+            {
+                try { File.Delete(linkPath); } catch { /* ignore */ }
+            }
+
+            File.CreateSymbolicLink(linkPath, target);
+            return linkPath;
+        }
+        catch
+        {
+            // Symlink creation requires Developer Mode or admin elevation.
+            // Treat any failure as non-fatal — the package files are already in
+            // place, just without a Links\ shim.
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Adds <c>Links\</c> to the user's <c>HKCU\Environment\Path</c> if not
+    /// already present, then broadcasts WM_SETTINGCHANGE so explorer-spawned
+    /// shells pick up the new PATH without a logoff. Returns true if PATH was
+    /// actually appended this call.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static bool TryAddLinksDirToUserPath()
+    {
+        try
+        {
+            var linksDir = WingetLinksDir();
+            using var envKey = Microsoft.Win32.Registry.CurrentUser.OpenSubKey("Environment", writable: true);
+            if (envKey is null) return false;
+
+            var existing = envKey.GetValue("Path") as string ?? "";
+            var normalizedLinks = linksDir.ToLowerInvariant();
+            var alreadyPresent = existing
+                .Split(';')
+                .Any(c => c.Trim().Equals(normalizedLinks, StringComparison.OrdinalIgnoreCase));
+            if (alreadyPresent) return false;
+
+            string newPath;
+            if (existing.Length == 0)
+                newPath = linksDir;
+            else if (existing.EndsWith(';'))
+                newPath = existing + linksDir;
+            else
+                newPath = existing + ";" + linksDir;
+
+            envKey.SetValue("Path", newPath, Microsoft.Win32.RegistryValueKind.ExpandString);
+            BroadcastEnvironmentChange();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void BroadcastEnvironmentChange()
+    {
+        try
+        {
+            const uint HWND_BROADCAST = 0xFFFF;
+            const uint WM_SETTINGCHANGE = 0x001A;
+            const uint SMTO_ABORTIFHUNG = 0x0002;
+            _ = NativeMethods.SendMessageTimeoutW(
+                new IntPtr(unchecked((int)HWND_BROADCAST)),
+                WM_SETTINGCHANGE,
+                IntPtr.Zero,
+                "Environment",
+                SMTO_ABORTIFHUNG,
+                5000,
+                out _);
+        }
+        catch { /* broadcast best-effort */ }
+    }
+
+    /// <summary>
+    /// Case-insensitive, component-aware path-prefix check for Windows. A raw
+    /// <c>string.StartsWith</c> on the path strings would let <c>C:\Foo</c>
+    /// falsely match <c>C:\Foobar</c>; iterating path components avoids that.
+    /// Used by the Links\ sweep so an uninstall of one portable can't
+    /// accidentally delete shims that belong to a different portable whose
+    /// install dir happens to share a string prefix.
+    /// </summary>
+    internal static bool PathStartsWithCaseInsensitive(string child, string parent)
+    {
+        static string[] Components(string path) =>
+            path.Split(['\\', '/'], StringSplitOptions.RemoveEmptyEntries)
+                .Select(p => p.ToLowerInvariant())
+                .ToArray();
+        var parentParts = Components(parent);
+        var childParts = Components(child);
+        if (parentParts.Length == 0 || parentParts.Length > childParts.Length)
+            return false;
+        for (int i = 0; i < parentParts.Length; i++)
+        {
+            if (!string.Equals(parentParts[i], childParts[i], StringComparison.Ordinal))
+                return false;
+        }
+        return true;
+    }
+
+    private static class NativeMethods
+    {
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr SendMessageTimeoutW(
+            IntPtr hWnd,
+            uint Msg,
+            IntPtr wParam,
+            string lParam,
+            uint fuFlags,
+            uint uTimeout,
+            out IntPtr lpdwResult);
+    }
+
+    /// <summary>
+    /// Source identifier embedded in the ARP subkey name. We mirror winget for
+    /// the community repo so winget's UninstallString can resolve the subkey
+    /// and <c>winget list</c> still finds the package; everything else uses
+    /// the source name verbatim.
+    /// </summary>
+    internal static string PortableSourceIdentifier(PackageQuery query)
+    {
+        var source = query.Source;
+        if (string.IsNullOrEmpty(source) || string.Equals(source, "winget", StringComparison.OrdinalIgnoreCase))
+            return "Microsoft.Winget.Source_8wekyb3d8bbwe";
+        return source;
+    }
+
+    internal static string PortableSubkeyName(string packageId, string sourceIdentifier) =>
+        $"{packageId}_{sourceIdentifier}";
+
+    private sealed record ExistingPortableEntry(string SubkeyName, string? InstallLocation, int? InstallDirectoryCreated);
+
+    [SupportedOSPlatform("windows")]
+    private static ExistingPortableEntry? ReadExistingPortableEntry(string packageId)
+    {
+        using var uninstall = Microsoft.Win32.Registry.CurrentUser
+            .OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall");
+        if (uninstall is null) return null;
+
+        foreach (var name in uninstall.GetSubKeyNames())
+        {
+            using var subkey = uninstall.OpenSubKey(name);
+            if (subkey is null) continue;
+
+            if (!string.Equals(subkey.GetValue("WinGetPackageIdentifier") as string, packageId, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.Equals(subkey.GetValue("WinGetInstallerType") as string, "portable", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            int? installDirectoryCreated = subkey.GetValue("InstallDirectoryCreated") switch
+            {
+                int i => i,
+                _ => null,
+            };
+            return new ExistingPortableEntry(
+                SubkeyName: name,
+                InstallLocation: subkey.GetValue("InstallLocation") as string,
+                InstallDirectoryCreated: installDirectoryCreated);
+        }
+        return null;
+    }
+
+    private static string ResolvePortableInstallLocation(InstallRequest request, ExistingPortableEntry? existing, string subkeyName) =>
+        ResolvePortableInstallLocationPure(
+            request.InstallLocation,
+            existing?.InstallLocation,
+            subkeyName,
+            DefaultUserPortableRoot());
+
+    /// <summary>
+    /// Pure resolution rule for the portable install directory. Priority:
+    /// <c>requestLocation</c> (CLI override) → <c>existingLocation</c> (so
+    /// upgrades preserve a winget-installed location) → default user portable
+    /// root joined with the package's ARP subkey name.
+    /// </summary>
+    internal static string ResolvePortableInstallLocationPure(
+        string? requestLocation,
+        string? existingLocation,
+        string subkeyName,
+        string defaultUserPortableRoot)
+    {
+        if (!string.IsNullOrWhiteSpace(requestLocation))
+            return requestLocation!;
+        if (!string.IsNullOrWhiteSpace(existingLocation))
+            return existingLocation!;
+        return Path.Combine(defaultUserPortableRoot, subkeyName);
+    }
+
+    private static string DefaultUserPortableRoot() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Microsoft", "WinGet", "Packages");
+
+    internal static void CleanDirectoryContents(string dir)
+    {
+        if (!Directory.Exists(dir)) return;
+        foreach (var entry in Directory.EnumerateFileSystemEntries(dir))
+        {
+            if (Directory.Exists(entry))
+                Directory.Delete(entry, recursive: true);
+            else
+                File.Delete(entry);
+        }
+    }
+
+    /// <summary>
+    /// Writes the HKCU ARP entry winget would normally write for a portable
+    /// install. Only the subset that winget's portable list view and pinget's
+    /// installed-package discovery actually read.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void WritePortableArpEntry(PortableArpEntry entry)
+    {
+        using var subkey = Microsoft.Win32.Registry.CurrentUser
+            .CreateSubKey($@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{entry.SubkeyName}")
+            ?? throw new InvalidOperationException("failed to create portable ARP registry subkey");
+
+        var manifest = entry.Manifest;
+        subkey.SetValue("WinGetPackageIdentifier", manifest.Id);
+        subkey.SetValue("WinGetSourceIdentifier", entry.SourceIdentifier);
+        subkey.SetValue("WinGetInstallerType", "portable");
+        subkey.SetValue("InstallLocation", entry.InstallLocation);
+        subkey.SetValue("PortableTargetFullPath", entry.PortableTargetFullPath);
+        if (!string.IsNullOrEmpty(entry.PortableSymlinkFullPath))
+            subkey.SetValue("PortableSymlinkFullPath", entry.PortableSymlinkFullPath);
+        subkey.SetValue("InstallDirectoryAddedToPath", entry.AddedToPath ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+        subkey.SetValue("InstallDirectoryCreated", entry.InstallDirectoryCreated ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+        subkey.SetValue("DisplayName", string.IsNullOrEmpty(manifest.Name) ? manifest.Id : manifest.Name);
+        subkey.SetValue("DisplayVersion", manifest.Version);
+        if (!string.IsNullOrEmpty(manifest.Publisher))
+            subkey.SetValue("Publisher", manifest.Publisher);
+        subkey.SetValue("UninstallString", $"winget uninstall --product-code {entry.SubkeyName}");
+        subkey.SetValue("InstallDate", DateTime.UtcNow.ToString("yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture));
+        if (!string.IsNullOrEmpty(manifest.PackageUrl))
+            subkey.SetValue("URLInfoAbout", manifest.PackageUrl);
     }
 
     private static int RunExe(string path, string installerType, InstallRequest request, Manifest manifest, Installer installer)
@@ -411,34 +746,174 @@ internal static class InstallerDispatch
         return args;
     }
 
+    [SupportedOSPlatform("windows")]
     private static int UninstallPortable(ListMatch installed, UninstallRequest request)
     {
+        // Read PortableSymlinkFullPath from the ARP entry *before* we touch the
+        // registry, so we can clean up winget-created shims in Links\. Without
+        // this, a portable that winget originally installed (with a
+        // PortableCommandAlias set in its manifest) would leave a dangling
+        // symlink in %LOCALAPPDATA%\Microsoft\WinGet\Links\ once pinget
+        // uninstalls it.
+        var knownSymlink = ReadPortableSymlinkFullPath(installed);
+
         if (string.IsNullOrWhiteSpace(installed.InstallLocation))
         {
             if (request.Force)
+            {
+                TryRemovePortableSymlinks(knownSymlink, null);
+                TryRemovePortableRegistryEntry(installed);
                 return 0;
+            }
             throw new InvalidOperationException($"Portable package '{installed.Name}' does not expose an install location.");
         }
 
         if (request.Preserve)
             return 0;
 
+        var removed = false;
         if (Directory.Exists(installed.InstallLocation))
         {
             Directory.Delete(installed.InstallLocation, recursive: true);
-            return 0;
+            removed = true;
         }
-
-        if (File.Exists(installed.InstallLocation))
+        else if (File.Exists(installed.InstallLocation))
         {
             File.Delete(installed.InstallLocation);
+            removed = true;
+        }
+
+        if (removed || request.Force)
+        {
+            // Once the files are gone (or the user forced past missing files),
+            // drop the symlink shim and ARP entry too so the package fully
+            // disappears.
+            TryRemovePortableSymlinks(knownSymlink, installed.InstallLocation);
+            TryRemovePortableRegistryEntry(installed);
             return 0;
         }
 
-        if (request.Force)
-            return 0;
-
         throw new InvalidOperationException($"Portable package location not found: {installed.InstallLocation}");
+    }
+
+    /// <summary>
+    /// Reads <c>PortableSymlinkFullPath</c> from the ARP subkey backing
+    /// <paramref name="installed"/> when present. winget writes this when it
+    /// created a <c>Links\&lt;alias&gt;.exe</c> shim for a portable; pinget's
+    /// own install_portable doesn't currently create shims, so for
+    /// pinget-installed entries this returns null.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static string? ReadPortableSymlinkFullPath(ListMatch installed)
+    {
+        const string ArpPrefix = @"ARP\";
+        if (!installed.LocalId.StartsWith(ArpPrefix, StringComparison.OrdinalIgnoreCase))
+            return null;
+        var rest = installed.LocalId[ArpPrefix.Length..];
+        var parts = rest.Split('\\', 3);
+        if (parts.Length != 3 || string.IsNullOrWhiteSpace(parts[2]))
+            return null;
+        var hive = parts[0].Equals("User", StringComparison.OrdinalIgnoreCase)
+            ? Microsoft.Win32.Registry.CurrentUser
+            : Microsoft.Win32.Registry.LocalMachine;
+        try
+        {
+            using var subkey = hive.OpenSubKey(
+                $@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{parts[2]}");
+            return subkey?.GetValue("PortableSymlinkFullPath") as string;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Removes the symlink shims winget would have created for this portable.
+    /// Tries (1) the exact path from <c>PortableSymlinkFullPath</c> if known,
+    /// and (2) any symlink in <c>%LOCALAPPDATA%\Microsoft\WinGet\Links\</c>
+    /// whose stored target resolves under the install location. Best-effort:
+    /// failures are swallowed.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void TryRemovePortableSymlinks(string? knownSymlink, string? installLocation)
+    {
+        if (!string.IsNullOrWhiteSpace(knownSymlink))
+        {
+            try { File.Delete(knownSymlink!); } catch { }
+        }
+
+        if (string.IsNullOrWhiteSpace(installLocation))
+            return;
+
+        try
+        {
+            var linksRoot = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Microsoft", "WinGet", "Links");
+            if (!Directory.Exists(linksRoot))
+                return;
+            foreach (var entry in Directory.EnumerateFiles(linksRoot))
+            {
+                try
+                {
+                    var info = new FileInfo(entry);
+                    var target = info.LinkTarget;
+                    if (target is null) continue;
+                    if (PathStartsWithCaseInsensitive(target, installLocation))
+                    {
+                        try { File.Delete(entry); } catch { }
+                    }
+                }
+                catch { /* skip unreadable entry */ }
+            }
+        }
+        catch { /* best-effort */ }
+    }
+
+    /// <summary>
+    /// Best-effort removal of the HKCU/HKLM ARP subkey backing a portable
+    /// entry. We match on LocalId (<c>ARP\&lt;scope&gt;\&lt;arch&gt;\&lt;subkey&gt;</c>) when
+    /// present so we delete the exact key the list view surfaced; otherwise we
+    /// walk the standard Uninstall path and match on WinGetPackageIdentifier.
+    /// Failures are swallowed because the file deletion already succeeded.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private static void TryRemovePortableRegistryEntry(ListMatch installed)
+    {
+        try
+        {
+            const string ArpPrefix = @"ARP\";
+            if (installed.LocalId.StartsWith(ArpPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                var rest = installed.LocalId[ArpPrefix.Length..];
+                var parts = rest.Split('\\', 3);
+                if (parts.Length == 3 && !string.IsNullOrWhiteSpace(parts[2]))
+                {
+                    var hive = parts[0].Equals("User", StringComparison.OrdinalIgnoreCase)
+                        ? Microsoft.Win32.Registry.CurrentUser
+                        : Microsoft.Win32.Registry.LocalMachine;
+                    hive.DeleteSubKeyTree(
+                        $@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{parts[2]}",
+                        throwOnMissingSubKey: false);
+                    return;
+                }
+            }
+
+            // Fall back: scan ARP by WinGetPackageIdentifier.
+            foreach (var hive in new[] { Microsoft.Win32.Registry.CurrentUser, Microsoft.Win32.Registry.LocalMachine })
+            {
+                using var uninstall = hive.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall", writable: true);
+                if (uninstall is null) continue;
+                foreach (var name in uninstall.GetSubKeyNames())
+                {
+                    using var subkey = uninstall.OpenSubKey(name);
+                    if (subkey is null) continue;
+                    if (string.Equals(subkey.GetValue("WinGetPackageIdentifier") as string, installed.Id, StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { uninstall.DeleteSubKeyTree(name, throwOnMissingSubKey: false); } catch { }
+                    }
+                }
+            }
+        }
+        catch { /* best-effort: file removal already succeeded */ }
     }
 
     private static string? DefaultExperienceSwitch(string installerType, InstallerMode mode) => mode switch

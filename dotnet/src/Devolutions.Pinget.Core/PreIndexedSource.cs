@@ -1,5 +1,7 @@
 using System.IO.Compression;
 using Microsoft.Data.Sqlite;
+using YamlDotNet.Core;
+using YamlDotNet.Core.Events;
 
 namespace Devolutions.Pinget.Core;
 
@@ -220,14 +222,151 @@ internal static class PreIndexedSource
         var bytes = GetCachedSourceFile(client, "V2_PVD", source, relativePath, packageHash);
         var yaml = DecompressMszyml(bytes);
 
-        var deserializer = new YamlDotNet.Serialization.DeserializerBuilder()
-            .IgnoreUnmatchedProperties()
-            .Build();
-        var doc = deserializer.Deserialize<V2VersionDataDocument>(yaml)
+        var doc = ParseV2VersionDataDocument(yaml)
             ?? throw new InvalidOperationException("Failed to parse versionData.mszyml");
 
         var cacheDir = TempCachePath("V2_PVD", source.Identifier);
         return (doc.Versions, Path.Combine(cacheDir, relativePath.Replace('/', '\\')));
+    }
+
+    // Hand-rolled YAML parser for versionData.mszyml. Replaces the
+    // reflection-based DeserializerBuilder path, which trips IL3050 under
+    // NativeAOT. The schema is fully known (top-level mapping with a single
+    // `vD` sequence of entries, each with v/rP/s256H/aMiV/aMaV keys), so we
+    // walk it with the low-level Parser. Unknown keys are silently skipped
+    // — same behavior as the prior `.IgnoreUnmatchedProperties()` setting.
+    internal static V2VersionDataDocument? ParseV2VersionDataDocument(string yaml)
+    {
+        var parser = new Parser(new StringReader(yaml));
+        if (!parser.Accept<StreamStart>(out _))
+            return null;
+        parser.Consume<StreamStart>();
+        if (!parser.Accept<DocumentStart>(out _))
+            return null;
+        parser.Consume<DocumentStart>();
+
+        var document = new V2VersionDataDocument();
+        if (parser.Current is MappingStart)
+        {
+            parser.MoveNext();
+            while (parser.Current is not MappingEnd)
+            {
+                var key = ConsumeScalar(parser);
+                if (string.Equals(key, "vD", StringComparison.Ordinal))
+                    document.Versions = ReadV2VersionEntries(parser);
+                else
+                    SkipNode(parser);
+            }
+            parser.MoveNext();
+        }
+        else
+        {
+            SkipNode(parser);
+        }
+
+        return document;
+    }
+
+    private static List<V2VersionDataEntry> ReadV2VersionEntries(IParser parser)
+    {
+        var entries = new List<V2VersionDataEntry>();
+        if (parser.Current is not SequenceStart)
+        {
+            SkipNode(parser);
+            return entries;
+        }
+
+        parser.MoveNext();
+        while (parser.Current is not SequenceEnd)
+        {
+            if (parser.Current is MappingStart)
+                entries.Add(ReadV2VersionEntry(parser));
+            else
+                SkipNode(parser);
+        }
+        parser.MoveNext();
+        return entries;
+    }
+
+    private static V2VersionDataEntry ReadV2VersionEntry(IParser parser)
+    {
+        var entry = new V2VersionDataEntry();
+        parser.Consume<MappingStart>();
+        while (parser.Current is not MappingEnd)
+        {
+            var key = ConsumeScalar(parser);
+            var value = parser.Current is Scalar s ? ScalarValueOrNull(s) : null;
+            if (parser.Current is Scalar)
+            {
+                parser.MoveNext();
+            }
+            else
+            {
+                SkipNode(parser);
+                continue;
+            }
+
+            switch (key)
+            {
+                case "v": entry.Version = value ?? ""; break;
+                case "rP": entry.ManifestRelativePath = value ?? ""; break;
+                case "s256H": entry.ManifestHash = value ?? ""; break;
+                case "aMiV": entry.ArpMinVersion = value; break;
+                case "aMaV": entry.ArpMaxVersion = value; break;
+                default: break;
+            }
+        }
+        parser.MoveNext();
+        return entry;
+    }
+
+    private static string ConsumeScalar(IParser parser)
+    {
+        var scalar = parser.Consume<Scalar>();
+        return scalar.Value;
+    }
+
+    private static string? ScalarValueOrNull(Scalar scalar)
+    {
+        if (scalar.Tag.IsEmpty && scalar.Style == ScalarStyle.Plain)
+        {
+            var v = scalar.Value;
+            if (v.Length == 0 || v == "~" ||
+                v.Equals("null", StringComparison.OrdinalIgnoreCase) ||
+                v.Equals("Null", StringComparison.Ordinal))
+            {
+                return null;
+            }
+        }
+        return scalar.Value;
+    }
+
+    private static void SkipNode(IParser parser)
+    {
+        switch (parser.Current)
+        {
+            case Scalar:
+                parser.MoveNext();
+                return;
+            case MappingStart:
+                parser.MoveNext();
+                while (parser.Current is not MappingEnd)
+                {
+                    SkipNode(parser); // key
+                    SkipNode(parser); // value
+                }
+                parser.MoveNext();
+                return;
+            case SequenceStart:
+                parser.MoveNext();
+                while (parser.Current is not SequenceEnd)
+                    SkipNode(parser);
+                parser.MoveNext();
+                return;
+            default:
+                parser.MoveNext();
+                return;
+        }
     }
 
     public static byte[] GetCachedSourceFile(

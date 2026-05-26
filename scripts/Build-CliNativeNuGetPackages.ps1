@@ -443,7 +443,23 @@ if ($buildRust) {
         New-Item -Path $stageDir -ItemType Directory -Force | Out-Null
 
         if (-not $NoBuild) {
-            Invoke-NativeCommand -FilePath rustup -ArgumentList @('target', 'add', $target['CargoTarget'])
+            # Only call `rustup target add` when the target isn't already
+            # installed. CI typically pre-installs the target in a separate
+            # workflow step, and a redundant `target add` here would hit
+            # static.rust-lang.org again — that download has flaked in the past
+            # (e.g. osx-x64 on macos-14), failing the build for a network
+            # transient. `rustup target list --installed` is local-only.
+            $installedTargets = & rustup target list --installed 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                throw "rustup target list --installed failed with exit code $LASTEXITCODE"
+            }
+            $cargoTarget = $target['CargoTarget']
+            $alreadyInstalled = $installedTargets | Where-Object { $_.Trim() -eq $cargoTarget }
+            if (-not $alreadyInstalled) {
+                Invoke-NativeCommand -FilePath rustup -ArgumentList @('target', 'add', $cargoTarget)
+            } else {
+                Write-Host ">> rustup target '$cargoTarget' already installed; skipping target add"
+            }
             $previousRustFlags = $env:RUSTFLAGS
             try {
                 if ($target['CargoTarget'] -like '*-windows-msvc') {

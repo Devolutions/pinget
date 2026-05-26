@@ -187,12 +187,20 @@ internal static class InstalledPackages
                         var upgradeCode = subkey.GetValue("UpgradeCode") as string;
 
                         var localId = $@"ARP\{scopeLabel}\{effectiveArch}\{subkeyName}";
-                        var installerCategory = localId.StartsWith(@"ARP\", StringComparison.OrdinalIgnoreCase) &&
-                            subkey.GetValue("WindowsInstaller") is int windowsInstaller && windowsInstaller == 1
-                                ? "msi"
-                                : subkeyName.StartsWith("MSIX\\", StringComparison.OrdinalIgnoreCase)
-                                    ? "msix"
-                                    : "exe";
+                        // Honor the WinGet ARP signal so uninstall flows through the
+                        // portable uninstall path (clean dir + registry removal) instead
+                        // of delegating the UninstallString to a winget subprocess that
+                        // only fully cleans up entries winget itself installed.
+                        var wingetInstallerType = subkey.GetValue("WinGetInstallerType") as string;
+                        var installerCategory =
+                            wingetInstallerType is { } wit && wit.Equals("portable", StringComparison.OrdinalIgnoreCase)
+                                ? "portable"
+                                : localId.StartsWith(@"ARP\", StringComparison.OrdinalIgnoreCase) &&
+                                    subkey.GetValue("WindowsInstaller") is int windowsInstaller && windowsInstaller == 1
+                                    ? "msi"
+                                    : subkeyName.StartsWith("MSIX\\", StringComparison.OrdinalIgnoreCase)
+                                        ? "msix"
+                                        : "exe";
 
                         var dedupKey =
                             $"{localId}|{displayName.ToLowerInvariant()}|{version.ToLowerInvariant()}|{(publisher ?? "").ToLowerInvariant()}";

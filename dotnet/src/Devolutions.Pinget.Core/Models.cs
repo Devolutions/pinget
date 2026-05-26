@@ -189,6 +189,7 @@ public record Installer
     public string? Architecture { get; init; }
     public string? InstallerType { get; init; }
     public string? NestedInstallerType { get; init; }
+    public List<NestedInstallerFile> NestedInstallerFiles { get; init; } = [];
     public string? Url { get; init; }
     public string? Sha256 { get; init; }
     public string? ProductCode { get; init; }
@@ -203,6 +204,16 @@ public record Installer
     public List<string> Commands { get; init; } = [];
     public List<string> PackageDependencies { get; init; } = [];
     public bool RequireExplicitUpgrade { get; init; }
+}
+
+public record NestedInstallerFile
+{
+    /// <summary>Path to the executable within the extracted archive.</summary>
+    public required string RelativeFilePath { get; init; }
+    /// <summary>
+    /// Optional alias exposed for portable invocation.
+    /// </summary>
+    public string? PortableCommandAlias { get; init; }
 }
 
 public record InstallerSwitches
@@ -413,6 +424,7 @@ public record SerializableInstaller
     public string? Architecture { get; init; }
     public string? InstallerType { get; init; }
     public string? NestedInstallerType { get; init; }
+    public List<NestedInstallerFile> NestedInstallerFiles { get; init; } = [];
     public string? InstallerUrl { get; init; }
     public string? InstallerSha256 { get; init; }
     public string? ProductCode { get; init; }
@@ -432,6 +444,7 @@ public record SerializableInstaller
         Architecture = installer.Architecture,
         InstallerType = installer.InstallerType,
         NestedInstallerType = installer.NestedInstallerType,
+        NestedInstallerFiles = installer.NestedInstallerFiles,
         InstallerUrl = installer.Url,
         InstallerSha256 = installer.Sha256,
         ProductCode = installer.ProductCode,
@@ -452,6 +465,10 @@ public record SerializableInstaller
 [JsonSerializable(typeof(List<SerializableShowManifest>))]
 [JsonSerializable(typeof(RepositoryWarning))]
 [JsonSerializable(typeof(List<RepositoryWarning>))]
+[JsonSerializable(typeof(SearchResponse))]
+[JsonSerializable(typeof(ListResponse))]
+[JsonSerializable(typeof(VersionsResult))]
+[JsonSerializable(typeof(CacheWarmResult))]
 [JsonSourceGenerationOptions(WriteIndented = true)]
 public partial class PingetJsonContext : JsonSerializerContext;
 
@@ -667,12 +684,26 @@ internal static class StructuredOutput
         return document;
     }
 
+    public static Dictionary<string, object?> NestedInstallerFileDocument(NestedInstallerFile file)
+    {
+        var document = new Dictionary<string, object?>
+        {
+            ["RelativeFilePath"] = file.RelativeFilePath,
+        };
+        AddString(document, "PortableCommandAlias", file.PortableCommandAlias);
+        return document;
+    }
+
     public static Dictionary<string, object?> InstallerDocument(Installer installer)
     {
         var document = new Dictionary<string, object?>();
         AddString(document, "Architecture", installer.Architecture);
         AddString(document, "InstallerType", installer.InstallerType);
         AddString(document, "NestedInstallerType", installer.NestedInstallerType);
+        if (installer.NestedInstallerFiles.Count > 0)
+            document["NestedInstallerFiles"] = installer.NestedInstallerFiles
+                .Select(NestedInstallerFileDocument)
+                .ToList();
         AddString(document, "InstallerUrl", installer.Url);
         AddString(document, "InstallerSha256", installer.Sha256);
         AddString(document, "ProductCode", installer.ProductCode);

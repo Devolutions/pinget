@@ -634,6 +634,8 @@ fn run() -> Result<()> {
                     println!("No applicable upgrade found.");
                 } else {
                     let pins = repository.list_pins(None)?;
+                    let mut success_count = 0usize;
+                    let mut failure_count = 0usize;
                     for m in &upgradeable {
                         println!(
                             "Upgrading {} from {} to {} ...",
@@ -648,6 +650,7 @@ fn run() -> Result<()> {
                                 "  Package is blocked by pin {}; remove the pin before upgrading.",
                                 pin.version
                             );
+                            failure_count += 1;
                             continue;
                         }
                         let query = PackageQuery {
@@ -682,19 +685,27 @@ fn run() -> Result<()> {
                         }) {
                             Ok(r) if r.success => {
                                 println!("  Successfully upgraded {}", m.id);
+                                success_count += 1;
                             }
                             Ok(r) => {
                                 write_stderr_line(format_args!(
                                     "  Failed to upgrade {} (exit code: {})",
                                     m.id, r.exit_code
                                 ));
+                                failure_count += 1;
                             }
                             Err(e) => {
                                 write_stderr_line(format_args!("  Error upgrading {}: {e}", m.id));
+                                failure_count += 1;
                             }
                         }
                     }
-                    println!("{} package(s) upgraded.", upgradeable.len());
+                    println!("{} of {} package(s) upgraded.", success_count, upgradeable.len());
+                    if failure_count > 0 {
+                        // Surface the failure to the caller (UniGetUI, scripts, etc.)
+                        // so they don't treat a partial failure as success.
+                        bail!("{failure_count} package(s) failed to upgrade during upgrade --all");
+                    }
                 }
             }
         }

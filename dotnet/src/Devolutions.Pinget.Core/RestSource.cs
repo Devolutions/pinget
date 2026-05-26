@@ -164,7 +164,7 @@ internal static class RestSource
         var filters = new JsonArray();
         void AddFilter(string field, string value, string matchType)
         {
-            filters.Add(new JsonObject
+            filters.Add((JsonNode?)new JsonObject
             {
                 ["PackageMatchField"] = field,
                 ["RequestMatch"] = new JsonObject
@@ -210,7 +210,7 @@ internal static class RestSource
         if (info.RequiredPackageMatchFields.Any(f => f.Equals("market", StringComparison.OrdinalIgnoreCase)))
         {
             var market = Environment.GetEnvironmentVariable("WINGET_DOTNET_MARKET") ?? "US";
-            filters.Add(new JsonObject
+            filters.Add((JsonNode?)new JsonObject
             {
                 ["PackageMatchField"] = "Market",
                 ["RequestMatch"] = new JsonObject
@@ -281,6 +281,26 @@ internal static class RestSource
             return v.EnumerateArray().Select(x => x.GetString() ?? "").Where(s => s != "").ToList();
         }
 
+        List<NestedInstallerFile> ReadNestedInstallerFilesJson(JsonElement el)
+        {
+            if (!el.TryGetProperty("NestedInstallerFiles", out var v) || v.ValueKind != JsonValueKind.Array)
+                return [];
+
+            var result = new List<NestedInstallerFile>();
+            foreach (var entry in v.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object) continue;
+                var relative = GetOptStr(entry, "RelativeFilePath");
+                if (string.IsNullOrWhiteSpace(relative)) continue;
+                result.Add(new NestedInstallerFile
+                {
+                    RelativeFilePath = relative!,
+                    PortableCommandAlias = GetOptStr(entry, "PortableCommandAlias"),
+                });
+            }
+            return result;
+        }
+
         List<string> GetPackageDependencies(JsonElement el)
         {
             var direct = GetStrArray(el, "PackageDependencies");
@@ -338,11 +358,15 @@ internal static class RestSource
         {
             foreach (var inst in instArr.EnumerateArray())
             {
+                var nestedFiles = ReadNestedInstallerFilesJson(inst);
+                if (nestedFiles.Count == 0)
+                    nestedFiles = ReadNestedInstallerFilesJson(data);
                 installers.Add(new Installer
                 {
                     Architecture = GetOptStr(inst, "Architecture"),
                     InstallerType = GetOptStr(inst, "InstallerType"),
                     NestedInstallerType = GetOptStr(inst, "NestedInstallerType") ?? GetOptStr(data, "NestedInstallerType"),
+                    NestedInstallerFiles = nestedFiles,
                     Url = GetOptStr(inst, "InstallerUrl"),
                     Sha256 = GetOptStr(inst, "InstallerSha256"),
                     ProductCode = GetOptStr(inst, "ProductCode"),

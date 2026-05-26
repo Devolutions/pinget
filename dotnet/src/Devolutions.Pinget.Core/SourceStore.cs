@@ -2,8 +2,6 @@ using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using YamlDotNet.Serialization;
-using YamlDotNet.Serialization.NamingConventions;
 
 namespace Devolutions.Pinget.Core;
 
@@ -262,10 +260,6 @@ internal static class SourceStoreManager
 
     private static void SavePackagedStore(string root, SourceStore store)
     {
-        var serializer = new SerializerBuilder()
-            .WithNamingConvention(CamelCaseNamingConvention.Instance)
-            .Build();
-
         var sourceDocument = new Dictionary<string, object?>
         {
             ["Sources"] = store.Sources.Select(source => new Dictionary<string, object?>
@@ -297,9 +291,9 @@ internal static class SourceStoreManager
         var userSourcesDirectory = Path.GetDirectoryName(userSourcesPath);
         if (!string.IsNullOrWhiteSpace(userSourcesDirectory))
             Directory.CreateDirectory(userSourcesDirectory);
-        File.WriteAllText(userSourcesPath, serializer.Serialize(sourceDocument));
+        File.WriteAllText(userSourcesPath, YamlEmitter.EmitDocument(sourceDocument));
 
-        File.WriteAllText(Path.Combine(root, PackagedMetadataFileName), serializer.Serialize(metadataDocument));
+        File.WriteAllText(Path.Combine(root, PackagedMetadataFileName), YamlEmitter.EmitDocument(metadataDocument));
     }
 
     private static bool TryGetPackagedLocalStateRoot(string root, out string localStateRoot)
