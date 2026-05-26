@@ -6,7 +6,7 @@ using Devolutions.Pinget.Cli;
 using Devolutions.Pinget.Core;
 using YamlDotNet.Serialization;
 
-const string Version = "0.6.0";
+const string Version = "0.7.0";
 const string UpgradeUnsupportedWarning = "Upgrading packages is not supported on this platform; no changes were made.";
 
 if (args.Length == 1 && (string.Equals(args[0], "--version", StringComparison.OrdinalIgnoreCase) || string.Equals(args[0], "-v", StringComparison.OrdinalIgnoreCase)))
