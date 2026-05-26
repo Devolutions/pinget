@@ -465,6 +465,10 @@ public record SerializableInstaller
 [JsonSerializable(typeof(List<SerializableShowManifest>))]
 [JsonSerializable(typeof(RepositoryWarning))]
 [JsonSerializable(typeof(List<RepositoryWarning>))]
+[JsonSerializable(typeof(SearchResponse))]
+[JsonSerializable(typeof(ListResponse))]
+[JsonSerializable(typeof(VersionsResult))]
+[JsonSerializable(typeof(CacheWarmResult))]
 [JsonSourceGenerationOptions(WriteIndented = true)]
 public partial class PingetJsonContext : JsonSerializerContext;
 

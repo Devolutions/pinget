@@ -2,6 +2,7 @@ using System.CommandLine;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization.Metadata;
 using Devolutions.Pinget.Cli;
 using Devolutions.Pinget.Core;
 using YamlDotNet.Serialization;
@@ -77,18 +78,18 @@ searchCommand.SetHandler((ctx) =>
         if (ctx.ParseResult.GetValueForOption(sVersionsOpt))
             throw new InvalidOperationException("--manifests cannot be combined with --versions");
 
-        WriteStructuredOutput(repo.SearchManifests(query), output);
+        WriteDynamicStructuredOutput(repo.SearchManifests(query), output);
     }
     else if (ctx.ParseResult.GetValueForOption(sVersionsOpt))
     {
         var result = repo.SearchVersions(query);
-        if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
+        if (output != OutputFormat.Text) WriteStructuredOutput(result, output, PingetJsonContext.Default.VersionsResult);
         else PrintVersions(result);
     }
     else
     {
         var result = repo.Search(query);
-        if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
+        if (output != OutputFormat.Text) WriteStructuredOutput(result, output, PingetJsonContext.Default.SearchResponse);
         else PrintSearch(result);
     }
 });
@@ -129,7 +130,7 @@ showCommand.SetHandler((ctx) =>
     if (ctx.ParseResult.GetValueForOption(shVerOpt))
     {
         var result = repo.ShowVersions(query);
-        if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
+        if (output != OutputFormat.Text) WriteStructuredOutput(result, output, PingetJsonContext.Default.VersionsResult);
         else PrintVersions(result);
     }
     else
@@ -181,7 +182,7 @@ listCommand.SetHandler((ctx) =>
 
     using var repo = Repository.Open();
     var result = repo.List(query);
-    if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
+    if (output != OutputFormat.Text) WriteStructuredOutput(result, output, PingetJsonContext.Default.ListResponse);
     else PrintListResult(result, details, upgrade);
 });
 
@@ -302,7 +303,7 @@ upgradeCommand.SetHandler((ctx) =>
 
     if (!doInstall)
     {
-        if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
+        if (output != OutputFormat.Text) WriteStructuredOutput(result, output, PingetJsonContext.Default.ListResponse);
         else PrintListResult(result, false, true);
     }
     else if (!string.IsNullOrWhiteSpace(manifestPath))
@@ -437,18 +438,16 @@ sourceUpdateCmd.SetHandler((source) =>
 sourceExportCmd.SetHandler(() =>
 {
     using var repo = Repository.Open();
-    var sources = repo.ListSources().Select(s => new
-    {
-        Name = s.Name,
-        Type = FormatSourceType(s.Kind),
-        Arg = s.Arg,
-        Data = s.Identifier,
-        Identifier = s.Identifier,
-        TrustLevel = s.TrustLevel,
-        Explicit = s.Explicit,
-        Priority = s.Priority,
-    });
-    Console.WriteLine(StructuredOutputSerializer.SerializeJson(new { Sources = sources }));
+    var sources = repo.ListSources().Select(s => new SourceExportEntry(
+        Name: s.Name,
+        Type: FormatSourceType(s.Kind),
+        Arg: s.Arg,
+        Data: s.Identifier,
+        Identifier: s.Identifier,
+        TrustLevel: s.TrustLevel,
+        Explicit: s.Explicit,
+        Priority: s.Priority)).ToList();
+    Console.WriteLine(StructuredOutputSerializer.SerializeJson(new SourceExportPayload(sources), CliJsonContext.Default.SourceExportPayload));
 });
 
 sourceAddCmd.SetHandler((ctx) =>
@@ -523,7 +522,7 @@ cacheWarmCmd.SetHandler((ctx) =>
     };
     using var repo = Repository.Open();
     var result = repo.WarmCache(query);
-    if (output != OutputFormat.Text) WriteStructuredOutput(result, output);
+    if (output != OutputFormat.Text) WriteStructuredOutput(result, output, PingetJsonContext.Default.CacheWarmResult);
     else
     {
         Console.WriteLine($"Warmed cache for {result.Package.Name} [{result.Package.Id}]");
@@ -572,26 +571,22 @@ exportCommand.SetHandler((output, source, includeVersions) =>
 {
     using var repo = Repository.Open();
     var listResult = repo.List(new ListQuery { Source = source is not null ? source : null, Query = source is not null ? " " : null });
-    var packages = listResult.Matches.Select(m =>
-    {
-        var pkg = new Dictionary<string, object> { ["PackageIdentifier"] = m.Id };
-        if (includeVersions && m.InstalledVersion is not null) pkg["Version"] = m.InstalledVersion;
-        return pkg;
-    }).ToList();
+    var packages = listResult.Matches.Select(m => new PackageExportEntry(
+        PackageIdentifier: m.Id,
+        Version: includeVersions ? m.InstalledVersion : null)).ToList();
 
-    var export = new
-    {
-        Schema = "https://aka.ms/winget-packages.schema.2.0.json",
-        Sources = new[]
-        {
-            new
-            {
-                SourceDetails = new { Name = source ?? "winget", Argument = "https://cdn.winget.microsoft.com/cache", Type = "Microsoft.PreIndexed" },
-                Packages = packages
-            }
-        }
-    };
-    File.WriteAllText(output, StructuredOutputSerializer.SerializeJson(export));
+    var export = new PackagesExportPayload(
+        Schema: "https://aka.ms/winget-packages.schema.2.0.json",
+        Sources:
+        [
+            new PackageExportSource(
+                SourceDetails: new PackageExportSourceDetails(
+                    Name: source ?? "winget",
+                    Argument: "https://cdn.winget.microsoft.com/cache",
+                    Type: "Microsoft.PreIndexed"),
+                Packages: packages)
+        ]);
+    File.WriteAllText(output, StructuredOutputSerializer.SerializeJson(export, CliJsonContext.Default.PackagesExportPayload));
     Console.WriteLine($"Exported {packages.Count} packages to {output}");
 }, exOutputOpt, exSourceOpt, exVersionsOpt);
 
@@ -1140,8 +1135,8 @@ importCommand.SetHandler((ctx) =>
 
     if (!File.Exists(file)) { Console.Error.WriteLine($"error: File not found: {file}"); return; }
     var jsonText = File.ReadAllText(file);
-    var doc = JsonSerializer.Deserialize<JsonElement>(jsonText);
-    var sources = doc.GetProperty("Sources").EnumerateArray().ToList();
+    using var doc = JsonDocument.Parse(jsonText);
+    var sources = doc.RootElement.GetProperty("Sources").EnumerateArray().ToList();
 
     using var repo = Repository.Open();
     int total = 0;
@@ -1272,12 +1267,27 @@ static OutputFormat GetOutputFormat(string? value) =>
         _ => OutputFormat.Text,
     };
 
-void WriteStructuredOutput(object value, OutputFormat output)
+void WriteStructuredOutput<T>(T value, OutputFormat output, JsonTypeInfo<T> typeInfo)
 {
     switch (output)
     {
         case OutputFormat.Json:
-            Console.WriteLine(StructuredOutputSerializer.SerializeJson(value));
+            Console.WriteLine(StructuredOutputSerializer.SerializeJson(value, typeInfo));
+            break;
+        case OutputFormat.Yaml:
+            Console.Write(StructuredOutputSerializer.SerializeYaml(value!));
+            break;
+        default:
+            throw new InvalidOperationException("Text output should be handled separately.");
+    }
+}
+
+void WriteDynamicStructuredOutput(object value, OutputFormat output)
+{
+    switch (output)
+    {
+        case OutputFormat.Json:
+            Console.WriteLine(StructuredOutputSerializer.SerializeJson(StructuredOutputSerializer.DynamicToJsonNode(value)));
             break;
         case OutputFormat.Yaml:
             Console.Write(StructuredOutputSerializer.SerializeYaml(value));
@@ -1287,20 +1297,9 @@ void WriteStructuredOutput(object value, OutputFormat output)
     }
 }
 
-void WriteManifestStructuredOutput(object value, OutputFormat output)
+void WriteManifestStructuredOutput(SerializableShowManifest value, OutputFormat output)
 {
-    if (output == OutputFormat.Yaml && value is List<Dictionary<string, object?>> documents)
-    {
-        var serializer = new SerializerBuilder().Build();
-        foreach (var document in documents)
-        {
-            Console.Write("---\n");
-            Console.Write(serializer.Serialize(document));
-        }
-        return;
-    }
-
-    WriteStructuredOutput(value, output);
+    WriteStructuredOutput(value, output, PingetJsonContext.Default.SerializableShowManifest);
 }
 
 static void PrintSearch(SearchResponse result)
@@ -1793,7 +1792,7 @@ void WriteJsonNode(JsonNode value, OutputFormat output)
     switch (output)
     {
         case OutputFormat.Yaml:
-            var structured = JsonSerializer.Deserialize<object>(value.ToJsonString()) ?? new object();
+            var structured = StructuredOutputSerializer.JsonNodeToDynamic(value) ?? new object();
             Console.Write(new SerializerBuilder().Build().Serialize(structured));
             break;
         default:

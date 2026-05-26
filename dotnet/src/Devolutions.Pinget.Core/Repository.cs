@@ -71,6 +71,10 @@ public class Repository : IDisposable
         yield return Path.Combine(assemblyDirectory, "runtimes", rid, "native", "e_sqlite3.dll");
     }
 
+    [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage(
+        "SingleFile",
+        "IL3000:Assembly.Location returns an empty string for assemblies embedded in a single-file app",
+        Justification = "We fall back to AppContext.BaseDirectory when Assembly.Location is empty. The Assembly.Location probe is needed for the PowerShell-module deployment, where Core.dll sits next to runtimes/<rid>/native/e_sqlite3.dll inside the module while the host process (pwsh.exe) has a different base directory.")]
     private static void EnsureSqliteNativeLibraryLoaded()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -80,6 +84,8 @@ public class Repository : IDisposable
             return;
 
         var assemblyDirectory = Path.GetDirectoryName(typeof(Repository).Assembly.Location);
+        if (string.IsNullOrWhiteSpace(assemblyDirectory))
+            assemblyDirectory = AppContext.BaseDirectory;
         if (string.IsNullOrWhiteSpace(assemblyDirectory))
             return;
 

@@ -164,7 +164,7 @@ internal static class RestSource
         var filters = new JsonArray();
         void AddFilter(string field, string value, string matchType)
         {
-            filters.Add(new JsonObject
+            filters.Add((JsonNode?)new JsonObject
             {
                 ["PackageMatchField"] = field,
                 ["RequestMatch"] = new JsonObject
@@ -210,7 +210,7 @@ internal static class RestSource
         if (info.RequiredPackageMatchFields.Any(f => f.Equals("market", StringComparison.OrdinalIgnoreCase)))
         {
             var market = Environment.GetEnvironmentVariable("WINGET_DOTNET_MARKET") ?? "US";
-            filters.Add(new JsonObject
+            filters.Add((JsonNode?)new JsonObject
             {
                 ["PackageMatchField"] = "Market",
                 ["RequestMatch"] = new JsonObject

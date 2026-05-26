@@ -29,7 +29,7 @@ public class CliJsonCompatibilityTests
             Truncated = false,
         };
 
-        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(response));
+        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(response, PingetJsonContext.Default.ListResponse));
         var match = document.RootElement.GetProperty("Matches")[0];
 
         Assert.Equal("Microsoft.PowerToys", match.GetProperty("Id").GetString());
@@ -64,7 +64,7 @@ public class CliJsonCompatibilityTests
             Truncated = false,
         };
 
-        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(response));
+        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(response, PingetJsonContext.Default.SearchResponse));
         var match = document.RootElement.GetProperty("Matches")[0];
 
         Assert.Equal("winget", match.GetProperty("SourceName").GetString());
@@ -103,7 +103,7 @@ public class CliJsonCompatibilityTests
             ],
         };
 
-        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(manifest));
+        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(manifest, PingetJsonContext.Default.SerializableShowManifest));
         var root = document.RootElement;
 
         Assert.Equal("Microsoft.PowerToys", root.GetProperty(nameof(SerializableShowManifest.PackageIdentifier)).GetString());
@@ -133,25 +133,20 @@ public class CliJsonCompatibilityTests
     [Fact]
     public void StructuredJsonSerializer_PreservesSourceExportPascalCaseShape()
     {
-        var export = new
-        {
-            Sources = new[]
-            {
-                new
-                {
-                    Name = "winget",
-                    Type = "Microsoft.PreIndexed.Package",
-                    Arg = "https://cdn.winget.microsoft.com/cache",
-                    Data = "Microsoft.Winget.Source_8wekyb3d8bbwe",
-                    Identifier = "Microsoft.Winget.Source_8wekyb3d8bbwe",
-                    TrustLevel = "Trusted",
-                    Explicit = false,
-                    Priority = 0,
-                }
-            }
-        };
+        var export = new SourceExportPayload(
+        [
+            new SourceExportEntry(
+                Name: "winget",
+                Type: "Microsoft.PreIndexed.Package",
+                Arg: "https://cdn.winget.microsoft.com/cache",
+                Data: "Microsoft.Winget.Source_8wekyb3d8bbwe",
+                Identifier: "Microsoft.Winget.Source_8wekyb3d8bbwe",
+                TrustLevel: "Trusted",
+                Explicit: false,
+                Priority: 0)
+        ]);
 
-        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(export));
+        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(export, CliJsonContext.Default.SourceExportPayload));
         var source = document.RootElement.GetProperty("Sources")[0];
 
         Assert.Equal("winget", source.GetProperty("Name").GetString());
@@ -185,7 +180,7 @@ public class CliJsonCompatibilityTests
             ],
         };
 
-        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(result));
+        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(result, PingetJsonContext.Default.VersionsResult));
         var versions = document.RootElement.GetProperty("Versions");
 
         Assert.Equal("0.99.0", versions[0].GetProperty("Version").GetString());
@@ -220,7 +215,7 @@ public class CliJsonCompatibilityTests
             Truncated = false,
         };
 
-        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(response));
+        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(response, PingetJsonContext.Default.ListResponse));
         var match = document.RootElement.GetProperty("Matches")[0];
 
         Assert.Equal(JsonValueKind.Null, match.GetProperty("AvailableVersion").ValueKind);
@@ -251,7 +246,7 @@ public class CliJsonCompatibilityTests
             Truncated = false,
         };
 
-        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(response));
+        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(response, PingetJsonContext.Default.SearchResponse));
         var match = document.RootElement.GetProperty("Matches")[0];
 
         Assert.Equal("Microsoft To Do", match.GetProperty("Name").GetString());
