@@ -700,17 +700,11 @@ fn run() -> Result<()> {
                             }
                         }
                     }
-                    println!(
-                        "{} of {} package(s) upgraded.",
-                        success_count,
-                        upgradeable.len()
-                    );
+                    println!("{} of {} package(s) upgraded.", success_count, upgradeable.len());
                     if failure_count > 0 {
                         // Surface the failure to the caller (UniGetUI, scripts, etc.)
                         // so they don't treat a partial failure as success.
-                        bail!(
-                            "{failure_count} package(s) failed to upgrade during upgrade --all"
-                        );
+                        bail!("{failure_count} package(s) failed to upgrade during upgrade --all");
                     }
                 }
             }

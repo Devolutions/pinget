@@ -3675,24 +3675,23 @@ fn collect_uninstall_view(
                 }
             }
         }
-        let installer_category =
-            if read_reg_string(&subkey, "WinGetInstallerType")
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case("portable"))
-            {
-                // Honor the WinGet ARP signal so uninstall flows through
-                // uninstall_portable (clean dir + registry removal) instead of
-                // delegating the WinGet portable UninstallString to a winget
-                // subprocess that only fully cleans up entries winget itself
-                // installed.
-                Some("portable".to_owned())
-            } else if local_id.starts_with("ARP\\") && read_reg_dword(&subkey, "WindowsInstaller") == Some(1) {
-                Some("msi".to_owned())
-            } else if key_name.starts_with("MSIX\\") {
-                Some("msix".to_owned())
-            } else {
-                Some("exe".to_owned())
-            };
+        let installer_category = if read_reg_string(&subkey, "WinGetInstallerType")
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("portable"))
+        {
+            // Honor the WinGet ARP signal so uninstall flows through
+            // uninstall_portable (clean dir + registry removal) instead of
+            // delegating the WinGet portable UninstallString to a winget
+            // subprocess that only fully cleans up entries winget itself
+            // installed.
+            Some("portable".to_owned())
+        } else if local_id.starts_with("ARP\\") && read_reg_dword(&subkey, "WindowsInstaller") == Some(1) {
+            Some("msi".to_owned())
+        } else if key_name.starts_with("MSIX\\") {
+            Some("msix".to_owned())
+        } else {
+            Some("exe".to_owned())
+        };
 
         let dedupe_key = format!(
             "{}|{}|{}|{}",
@@ -5816,8 +5815,7 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
                     minimum_os_version: json_string(item, "MinimumOSVersion")
                         .or_else(|| top_minimum_os_version.clone()),
                     architecture: json_string(item, "Architecture"),
-                    installer_type: json_string(item, "InstallerType")
-                        .or_else(|| top_installer_type.clone()),
+                    installer_type: json_string(item, "InstallerType").or_else(|| top_installer_type.clone()),
                     nested_installer_type: json_string(item, "NestedInstallerType")
                         .or_else(|| top_nested_installer_type.clone()),
                     nested_installer_files: {
@@ -7832,7 +7830,10 @@ fn try_remove_portable_registry_entry(installed: &ListMatch) {
             return;
         }
         let is_hkcu = scope.eq_ignore_ascii_case("User");
-        vec![(is_hkcu, format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"))]
+        vec![(
+            is_hkcu,
+            format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"),
+        )]
     } else {
         // Fall back to scanning by WinGetPackageIdentifier.
         let mut found = Vec::new();
@@ -7840,9 +7841,13 @@ fn try_remove_portable_registry_entry(installed: &ListMatch) {
             (true, RegKey::predef(HKEY_CURRENT_USER)),
             (false, RegKey::predef(HKEY_LOCAL_MACHINE)),
         ] {
-            let Ok(uninstall) = hive.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall") else { continue };
+            let Ok(uninstall) = hive.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall") else {
+                continue;
+            };
             for name in uninstall.enum_keys().flatten() {
-                let Ok(subkey) = uninstall.open_subkey(&name) else { continue };
+                let Ok(subkey) = uninstall.open_subkey(&name) else {
+                    continue;
+                };
                 if read_reg_string(&subkey, "WinGetPackageIdentifier").as_deref() == Some(installed.id.as_str()) {
                     found.push((
                         is_hkcu,
@@ -7931,9 +7936,8 @@ fn install_portable(
         })?;
     }
 
-    fs::create_dir_all(&target_dir).with_context(|| {
-        format!("failed to create portable install directory: {}", target_dir.display())
-    })?;
+    fs::create_dir_all(&target_dir)
+        .with_context(|| format!("failed to create portable install directory: {}", target_dir.display()))?;
     // The "we created it" flag stays sticky across upgrades — if a previous
     // install marked it created, it still counts as created by us even when
     // the dir already existed this round.
@@ -7974,9 +7978,7 @@ fn install_portable(
     // we still leave the package installed at install_location.
     let alias = determine_portable_alias(installer);
     let symlink_full_path = match alias.as_deref() {
-        Some(alias) if !alias.is_empty() => {
-            try_create_portable_symlink(&portable_target_full_path, alias)
-        }
+        Some(alias) if !alias.is_empty() => try_create_portable_symlink(&portable_target_full_path, alias),
         _ => None,
     };
 
@@ -8107,6 +8109,7 @@ fn try_add_links_dir_to_user_path() -> bool {
 fn broadcast_environment_change() {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
     };
@@ -8139,9 +8142,7 @@ fn broadcast_environment_change() {
 #[cfg(windows)]
 fn portable_source_identifier(query: &PackageQuery) -> String {
     match query.source.as_deref() {
-        Some(name) if name.eq_ignore_ascii_case("winget") => {
-            "Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned()
-        }
+        Some(name) if name.eq_ignore_ascii_case("winget") => "Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned(),
         Some(name) if !name.is_empty() => name.to_owned(),
         _ => "Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned(),
     }
@@ -8166,7 +8167,9 @@ fn read_existing_portable_entry(package_id: &str) -> Option<ExistingPortableEntr
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
         .ok()?;
     for name in uninstall.enum_keys().flatten() {
-        let Ok(subkey) = uninstall.open_subkey(&name) else { continue };
+        let Ok(subkey) = uninstall.open_subkey(&name) else {
+            continue;
+        };
         if read_reg_string(&subkey, "WinGetPackageIdentifier").as_deref() != Some(package_id) {
             continue;
         }
@@ -8277,10 +8280,7 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>) -> Result<()> {
         &entry.portable_target_full_path.to_string_lossy().to_string(),
     )?;
     if let Some(symlink_path) = entry.portable_symlink_full_path {
-        subkey.set_value(
-            "PortableSymlinkFullPath",
-            &symlink_path.to_string_lossy().to_string(),
-        )?;
+        subkey.set_value("PortableSymlinkFullPath", &symlink_path.to_string_lossy().to_string())?;
     }
     subkey.set_value(
         "InstallDirectoryAddedToPath",
@@ -8519,12 +8519,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resolve_portable_install_location_falls_back_to_default_root() {
-        let result = resolve_portable_install_location_pure(
-            None,
-            None,
-            "Sub_Source",
-            Path::new(r"C:\default"),
-        );
+        let result = resolve_portable_install_location_pure(None, None, "Sub_Source", Path::new(r"C:\default"));
         assert_eq!(result, PathBuf::from(r"C:\default\Sub_Source"));
     }
 
@@ -8533,12 +8528,7 @@ mod tests {
     fn resolve_portable_install_location_treats_empty_strings_as_unset() {
         // Defensive: PackageQuery / registry reads can yield "" instead of
         // None for missing values.
-        let result = resolve_portable_install_location_pure(
-            Some(""),
-            Some(""),
-            "Sub_Source",
-            Path::new(r"C:\default"),
-        );
+        let result = resolve_portable_install_location_pure(Some(""), Some(""), "Sub_Source", Path::new(r"C:\default"));
         assert_eq!(result, PathBuf::from(r"C:\default\Sub_Source"));
     }
 
