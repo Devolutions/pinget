@@ -515,6 +515,18 @@ public record InstallResult
     public List<string> Warnings { get; init; } = [];
 }
 
+/// <summary>
+/// Result of a <c>download</c> operation. Mirrors <c>winget download</c> by
+/// returning both the installer file written to disk and a flattened YAML
+/// manifest emitted next to it.
+/// </summary>
+public record DownloadResult
+{
+    public required Manifest Manifest { get; init; }
+    public required string InstallerPath { get; init; }
+    public required string ManifestPath { get; init; }
+}
+
 // Internal type for installed package tracking
 internal record InstalledPackage
 {

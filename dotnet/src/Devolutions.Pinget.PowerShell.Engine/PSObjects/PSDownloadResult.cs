@@ -20,6 +20,8 @@ public sealed class PSDownloadResult
 
     public required string DownloadedInstallerPath { get; init; }
 
+    public string? DownloadedManifestPath { get; init; }
+
     public bool Succeeded() => string.Equals(Status, "Ok", StringComparison.OrdinalIgnoreCase);
 
     public string ErrorMessage() =>

@@ -2234,9 +2234,10 @@ fn do_download(repository: &mut Repository, request: &InstallRequest, download_d
         None => std::env::current_dir()?,
     };
 
-    let (manifest, path) = repository.download_installer_for_request(request, &dir)?;
-    println!("Downloaded {} v{}", manifest.name, manifest.version);
-    println!("  Path: {}", path.display());
+    let output = repository.download_installer_for_request(request, &dir)?;
+    println!("Downloaded {} v{}", output.manifest.name, output.manifest.version);
+    println!("  Installer: {}", output.installer_path.display());
+    println!("  Manifest: {}", output.manifest_path.display());
     Ok(())
 }
 
