@@ -15,12 +15,11 @@ use std::sync::RwLock;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::blocking::{Client, Response};
-use rusqlite::types::{Value as SqlValue, ValueRef};
-use rusqlite::{Connection, OpenFlags, Row as SqlRow, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
+use turso::{Builder as SqlBuilder, Connection, Row as SqlRow, Value as SqlValue, params_from_iter};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
 #[cfg(windows)]
@@ -1552,7 +1551,7 @@ impl Repository {
         if !db_path.exists() {
             return Ok(Vec::new());
         }
-        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Self::open_sqlite_connection(db_path)?;
         let pin_type_column = match resolve_pin_type_column(&conn)? {
             Some(column) => column,
             None => return Ok(Vec::new()),
@@ -1562,39 +1561,27 @@ impl Repository {
         } else {
             format!("SELECT package_id, version, source_id, {pin_type_column} FROM pin")
         };
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = if let Some(source_id) = source_id {
-            stmt.query_map([source_id], |row| {
-                let pin_type_int: i64 = row.get(3)?;
-                Ok(PinRecord {
-                    package_id: row.get(0)?,
-                    version: row.get(1)?,
-                    source_id: row.get(2)?,
-                    pin_type: decode_pin_type(pin_type_int),
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect()
+        let params = if let Some(source_id) = source_id {
+            vec![SqlValue::Text(source_id.to_owned())]
         } else {
-            stmt.query_map([], |row| {
-                let pin_type_int: i64 = row.get(3)?;
-                Ok(PinRecord {
-                    package_id: row.get(0)?,
-                    version: row.get(1)?,
-                    source_id: row.get(2)?,
-                    pin_type: decode_pin_type(pin_type_int),
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect()
+            Vec::new()
         };
-        Ok(rows)
+        query_rows(&conn, &sql, params, |row| {
+            let pin_type_int = row_i64(row, 3)?;
+            Ok(PinRecord {
+                package_id: row_string(row, 0)?,
+                version: row_string(row, 1)?,
+                source_id: row_string(row, 2)?,
+                pin_type: decode_pin_type(pin_type_int),
+            })
+        })
     }
 
     pub fn add_pin(&self, package_id: &str, version: &str, source_id: &str, pin_type: PinType) -> Result<()> {
         let db_path = pins_db_path(&self.app_root);
-        let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
+        let conn = Self::open_sqlite_connection(db_path)?;
+        execute_batch_sql(
+            &conn,
             "CREATE TABLE IF NOT EXISTS pin (
                 package_id TEXT NOT NULL,
                 version TEXT NOT NULL DEFAULT '*',
@@ -1609,12 +1596,19 @@ impl Repository {
             PinType::Blocking => 4,
             PinType::Gating => 3,
         };
-        conn.execute(
+        execute_sql(
+            &conn,
             &format!(
                 "INSERT OR REPLACE INTO pin (package_id, version, source_id, {pin_type_column}) VALUES (?1, ?2, ?3, ?4)"
             ),
-            rusqlite::params![package_id, version, source_id, type_int],
+            vec![
+                SqlValue::Text(package_id.to_owned()),
+                SqlValue::Text(version.to_owned()),
+                SqlValue::Text(source_id.to_owned()),
+                SqlValue::Integer(type_int),
+            ],
         )?;
+        conn.cacheflush().context("failed to flush pin database")?;
         Ok(())
     }
 
@@ -1623,15 +1617,24 @@ impl Repository {
         if !db_path.exists() {
             return Ok(false);
         }
-        let conn = Connection::open(&db_path)?;
+        let conn = Self::open_sqlite_connection(db_path)?;
         let count = if let Some(source_id) = source_id {
-            conn.execute(
+            execute_sql(
+                &conn,
                 "DELETE FROM pin WHERE package_id = ?1 AND source_id = ?2",
-                rusqlite::params![package_id, source_id],
+                vec![
+                    SqlValue::Text(package_id.to_owned()),
+                    SqlValue::Text(source_id.to_owned()),
+                ],
             )?
         } else {
-            conn.execute("DELETE FROM pin WHERE package_id = ?1", rusqlite::params![package_id])?
+            execute_sql(
+                &conn,
+                "DELETE FROM pin WHERE package_id = ?1",
+                vec![SqlValue::Text(package_id.to_owned())],
+            )?
         };
+        conn.cacheflush().context("failed to flush pin database")?;
         Ok(count > 0)
     }
 
@@ -1642,8 +1645,13 @@ impl Repository {
         }
 
         if let Some(source_id) = source_id {
-            let conn = Connection::open(&db_path)?;
-            conn.execute("DELETE FROM pin WHERE source_id = ?1", rusqlite::params![source_id])?;
+            let conn = Self::open_sqlite_connection(db_path)?;
+            execute_sql(
+                &conn,
+                "DELETE FROM pin WHERE source_id = ?1",
+                vec![SqlValue::Text(source_id.to_owned())],
+            )?;
+            conn.cacheflush().context("failed to flush pin database")?;
         } else {
             fs::remove_file(&db_path)?;
         }
@@ -2498,8 +2506,11 @@ impl Repository {
 
     fn open_sqlite_connection(path: PathBuf) -> Result<Connection> {
         let path_text = path.to_string_lossy().into_owned();
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)
-            .with_context(|| format!("failed to open SQLite database at {path_text}"))
+        let database = pollster::block_on(SqlBuilder::new_local(&path_text).build())
+            .with_context(|| format!("failed to open SQLite database at {path_text}"))?;
+        database
+            .connect()
+            .with_context(|| format!("failed to connect to SQLite database at {path_text}"))
     }
 
     fn update_preindexed(&mut self, source_index: usize) -> Result<String> {
@@ -4854,18 +4865,14 @@ fn default_source_trust_level() -> String {
 
 fn query_rows<T, F>(connection: &Connection, sql: &str, params: Vec<SqlValue>, mut map: F) -> Result<Vec<T>>
 where
-    F: FnMut(&SqlRow<'_>) -> Result<T>,
+    F: FnMut(&SqlRow) -> Result<T>,
 {
-    let mut statement = connection
-        .prepare(sql)
-        .with_context(|| format!("failed to prepare SQL query: {sql}"))?;
-    let mut rows = statement
-        .query(params_from_iter(params))
+    let mut rows = pollster::block_on(connection.query(sql, params_from_iter(params)))
         .with_context(|| format!("failed to execute SQL query: {sql}"))?;
     let mut result = Vec::new();
 
-    while let Some(row) = rows.next().context("failed to read SQL row")? {
-        result.push(map(row)?);
+    while let Some(row) = pollster::block_on(rows.next()).context("failed to read SQL row")? {
+        result.push(map(&row)?);
     }
 
     Ok(result)
@@ -4873,90 +4880,82 @@ where
 
 fn query_optional_value<T, F>(connection: &Connection, sql: &str, params: Vec<SqlValue>, map: F) -> Result<Option<T>>
 where
-    F: FnOnce(&SqlRow<'_>) -> Result<T>,
+    F: FnOnce(&SqlRow) -> Result<T>,
 {
-    let mut statement = connection
-        .prepare(sql)
-        .with_context(|| format!("failed to prepare SQL query: {sql}"))?;
-    let mut rows = statement
-        .query(params_from_iter(params))
+    let mut rows = pollster::block_on(connection.query(sql, params_from_iter(params)))
         .with_context(|| format!("failed to execute SQL query: {sql}"))?;
 
-    match rows.next().context("failed to read SQL row")? {
-        Some(row) => Ok(Some(map(row)?)),
+    match pollster::block_on(rows.next()).context("failed to read SQL row")? {
+        Some(row) => Ok(Some(map(&row)?)),
         None => Ok(None),
     }
 }
 
-fn row_ref<'a>(row: &'a SqlRow<'_>, index: usize) -> Result<ValueRef<'a>> {
-    row.get_ref(index)
+fn execute_sql(connection: &Connection, sql: &str, params: Vec<SqlValue>) -> Result<u64> {
+    pollster::block_on(connection.execute(sql, params_from_iter(params)))
+        .with_context(|| format!("failed to execute SQL statement: {sql}"))
+}
+
+fn execute_batch_sql(connection: &Connection, sql: &str) -> Result<()> {
+    pollster::block_on(connection.execute_batch(sql)).with_context(|| format!("failed to execute SQL batch: {sql}"))
+}
+
+fn row_value(row: &SqlRow, index: usize) -> Result<SqlValue> {
+    row.get_value(index)
         .with_context(|| format!("failed to read SQL column {index}"))
 }
 
-fn row_string(row: &SqlRow<'_>, index: usize) -> Result<String> {
-    match row_ref(row, index)? {
-        ValueRef::Text(value) => std::str::from_utf8(value)
-            .context("SQL text column was not valid UTF-8")
-            .map(str::to_owned),
-        ValueRef::Integer(value) => Ok(value.to_string()),
-        ValueRef::Real(value) => Ok(value.to_string()),
-        ValueRef::Blob(value) => String::from_utf8(value.to_vec()).context("SQL blob column was not valid UTF-8"),
-        ValueRef::Null => bail!("SQL column {index} was unexpectedly NULL"),
+fn row_string(row: &SqlRow, index: usize) -> Result<String> {
+    match row_value(row, index)? {
+        SqlValue::Text(value) => Ok(value),
+        SqlValue::Integer(value) => Ok(value.to_string()),
+        SqlValue::Real(value) => Ok(value.to_string()),
+        SqlValue::Blob(value) => String::from_utf8(value).context("SQL blob column was not valid UTF-8"),
+        SqlValue::Null => bail!("SQL column {index} was unexpectedly NULL"),
     }
 }
 
-fn row_opt_string(row: &SqlRow<'_>, index: usize) -> Result<Option<String>> {
-    match row_ref(row, index)? {
-        ValueRef::Null => Ok(None),
-        ValueRef::Text(value) => Ok(Some(
-            std::str::from_utf8(value)
-                .context("SQL text column was not valid UTF-8")?
-                .to_owned(),
-        )),
-        ValueRef::Integer(value) => Ok(Some(value.to_string())),
-        ValueRef::Real(value) => Ok(Some(value.to_string())),
-        ValueRef::Blob(value) => Ok(Some(
-            String::from_utf8(value.to_vec()).context("SQL blob column was not valid UTF-8")?,
+fn row_opt_string(row: &SqlRow, index: usize) -> Result<Option<String>> {
+    match row_value(row, index)? {
+        SqlValue::Null => Ok(None),
+        SqlValue::Text(value) => Ok(Some(value)),
+        SqlValue::Integer(value) => Ok(Some(value.to_string())),
+        SqlValue::Real(value) => Ok(Some(value.to_string())),
+        SqlValue::Blob(value) => Ok(Some(
+            String::from_utf8(value).context("SQL blob column was not valid UTF-8")?,
         )),
     }
 }
 
-fn row_i64(row: &SqlRow<'_>, index: usize) -> Result<i64> {
-    match row_ref(row, index)? {
-        ValueRef::Integer(value) => Ok(value),
-        ValueRef::Text(value) => std::str::from_utf8(value)
-            .context("SQL text column was not valid UTF-8")?
+fn row_i64(row: &SqlRow, index: usize) -> Result<i64> {
+    match row_value(row, index)? {
+        SqlValue::Integer(value) => Ok(value),
+        SqlValue::Text(value) => value
             .parse::<i64>()
             .with_context(|| format!("failed to parse integer from SQL text column {index}")),
-        ValueRef::Real(value) => f64_to_i64_checked(value, index),
-        ValueRef::Null => bail!("SQL column {index} was unexpectedly NULL"),
-        ValueRef::Blob(_) => bail!("SQL column {index} was unexpectedly a blob"),
+        SqlValue::Real(value) => f64_to_i64_checked(value, index),
+        SqlValue::Null => bail!("SQL column {index} was unexpectedly NULL"),
+        SqlValue::Blob(_) => bail!("SQL column {index} was unexpectedly a blob"),
     }
 }
 
-fn row_hex_string(row: &SqlRow<'_>, index: usize) -> Result<String> {
-    match row_ref(row, index)? {
-        ValueRef::Blob(value) => Ok(bytes_to_hex(value)),
-        ValueRef::Text(value) => Ok(std::str::from_utf8(value)
-            .context("SQL text column was not valid UTF-8")?
-            .to_ascii_lowercase()),
-        ValueRef::Null => bail!("SQL column {index} was unexpectedly NULL"),
-        ValueRef::Integer(value) => Ok(format!("{value:x}")),
-        ValueRef::Real(value) => Ok(format!("{:x}", f64_to_i64_checked(value, index)?)),
+fn row_hex_string(row: &SqlRow, index: usize) -> Result<String> {
+    match row_value(row, index)? {
+        SqlValue::Blob(value) => Ok(bytes_to_hex(&value)),
+        SqlValue::Text(value) => Ok(value.to_ascii_lowercase()),
+        SqlValue::Null => bail!("SQL column {index} was unexpectedly NULL"),
+        SqlValue::Integer(value) => Ok(format!("{value:x}")),
+        SqlValue::Real(value) => Ok(format!("{:x}", f64_to_i64_checked(value, index)?)),
     }
 }
 
-fn row_opt_hex_string(row: &SqlRow<'_>, index: usize) -> Result<Option<String>> {
-    match row_ref(row, index)? {
-        ValueRef::Null => Ok(None),
-        ValueRef::Blob(value) => Ok(Some(bytes_to_hex(value))),
-        ValueRef::Text(value) => Ok(Some(
-            std::str::from_utf8(value)
-                .context("SQL text column was not valid UTF-8")?
-                .to_ascii_lowercase(),
-        )),
-        ValueRef::Integer(value) => Ok(Some(format!("{value:x}"))),
-        ValueRef::Real(value) => Ok(Some(format!("{:x}", f64_to_i64_checked(value, index)?))),
+fn row_opt_hex_string(row: &SqlRow, index: usize) -> Result<Option<String>> {
+    match row_value(row, index)? {
+        SqlValue::Null => Ok(None),
+        SqlValue::Blob(value) => Ok(Some(bytes_to_hex(&value))),
+        SqlValue::Text(value) => Ok(Some(value.to_ascii_lowercase())),
+        SqlValue::Integer(value) => Ok(Some(format!("{value:x}"))),
+        SqlValue::Real(value) => Ok(Some(format!("{:x}", f64_to_i64_checked(value, index)?))),
     }
 }
 
@@ -7054,13 +7053,11 @@ fn pins_db_path(app_root: &Path) -> PathBuf {
 }
 
 fn resolve_pin_type_column(conn: &Connection) -> Result<Option<&'static str>> {
-    let mut stmt = conn.prepare("PRAGMA table_info(pin)")?;
     let mut has_current_column = false;
     let mut has_legacy_column = false;
 
-    let column_names = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for column_name in column_names {
-        match column_name?.as_str() {
+    for column_name in query_rows(conn, "PRAGMA table_info(pin)", Vec::new(), |row| row_string(row, 1))? {
+        match column_name.as_str() {
             "type" => has_current_column = true,
             "pin_type" => has_legacy_column = true,
             _ => {}
@@ -9378,15 +9375,15 @@ Installers:
     #[test]
     fn lookup_unique_normalized_identity_returns_unique_match() {
         // Single (norm_name, norm_publisher) intersection — happy path.
-        let connection = Connection::open_in_memory().expect("open in-memory db");
-        connection
-            .execute_batch(
-                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
-                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
-                 INSERT INTO norm_names2 VALUES ('microsoftedge', 100);\n\
-                 INSERT INTO norm_publishers2 VALUES ('microsoft', 100);",
-            )
-            .expect("seed schema");
+        let connection = Repository::open_sqlite_connection(PathBuf::from(":memory:")).expect("open in-memory db");
+        execute_batch_sql(
+            &connection,
+            "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+             CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+             INSERT INTO norm_names2 VALUES ('microsoftedge', 100);\n\
+             INSERT INTO norm_publishers2 VALUES ('microsoft', 100);",
+        )
+        .expect("seed schema");
 
         let rowid = lookup_unique_normalized_identity(&connection, "microsoftedge", "microsoft")
             .expect("query")
@@ -9400,15 +9397,15 @@ Installers:
         // — the Git case where both `Git.Git` and a hypothetical sibling
         // normalize identically. winget refuses to correlate when it can't
         // disambiguate; pinget must do the same.
-        let connection = Connection::open_in_memory().expect("open in-memory db");
-        connection
-            .execute_batch(
-                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
-                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
-                 INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
-                 INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('thegitdevelopmentcommunity', 200);",
-            )
-            .expect("seed schema");
+        let connection = Repository::open_sqlite_connection(PathBuf::from(":memory:")).expect("open in-memory db");
+        execute_batch_sql(
+            &connection,
+            "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+             CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+             INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
+             INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('thegitdevelopmentcommunity', 200);",
+        )
+        .expect("seed schema");
 
         let rowid = lookup_unique_normalized_identity(&connection, "git", "thegitdevelopmentcommunity").expect("query");
         assert!(rowid.is_none(), "ambiguous match must not correlate");
@@ -9419,15 +9416,15 @@ Installers:
         // norm_name has multiple matches but only one shares its
         // norm_publisher with the installed package. Winget's intersect
         // logic still picks the right one — verify.
-        let connection = Connection::open_in_memory().expect("open in-memory db");
-        connection
-            .execute_batch(
-                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
-                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
-                 INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
-                 INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('microsoft', 200);",
-            )
-            .expect("seed schema");
+        let connection = Repository::open_sqlite_connection(PathBuf::from(":memory:")).expect("open in-memory db");
+        execute_batch_sql(
+            &connection,
+            "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+             CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+             INSERT INTO norm_names2 VALUES ('git', 100), ('git', 200);\n\
+             INSERT INTO norm_publishers2 VALUES ('thegitdevelopmentcommunity', 100), ('microsoft', 200);",
+        )
+        .expect("seed schema");
 
         let rowid = lookup_unique_normalized_identity(&connection, "git", "thegitdevelopmentcommunity").expect("query");
         assert_eq!(rowid, Some(100));
@@ -9437,15 +9434,15 @@ Installers:
     fn lookup_unique_normalized_identity_misses_when_publisher_does_not_match() {
         // Name matches but no publisher row for that package id —
         // intersection is empty so we don't correlate.
-        let connection = Connection::open_in_memory().expect("open in-memory db");
-        connection
-            .execute_batch(
-                "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
-                 CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
-                 INSERT INTO norm_names2 VALUES ('foo', 100);\n\
-                 INSERT INTO norm_publishers2 VALUES ('bar', 200);",
-            )
-            .expect("seed schema");
+        let connection = Repository::open_sqlite_connection(PathBuf::from(":memory:")).expect("open in-memory db");
+        execute_batch_sql(
+            &connection,
+            "CREATE TABLE norm_names2 (norm_name TEXT, package INT64);\n\
+             CREATE TABLE norm_publishers2 (norm_publisher TEXT, package INT64);\n\
+             INSERT INTO norm_names2 VALUES ('foo', 100);\n\
+             INSERT INTO norm_publishers2 VALUES ('bar', 200);",
+        )
+        .expect("seed schema");
 
         let rowid = lookup_unique_normalized_identity(&connection, "foo", "bar").expect("query");
         assert!(
@@ -10916,8 +10913,9 @@ Installers:
                 fs::create_dir_all(parent)?;
             }
 
-            let conn = Connection::open(&db_path)?;
-            conn.execute_batch(
+            let conn = Repository::open_sqlite_connection(db_path.clone())?;
+            execute_batch_sql(
+                &conn,
                 "CREATE TABLE pin (
                     package_id TEXT NOT NULL,
                     source_id TEXT NOT NULL,
@@ -10926,6 +10924,7 @@ Installers:
                     PRIMARY KEY (package_id, source_id)
                 )",
             )?;
+            conn.cacheflush().context("failed to flush pin database")?;
             drop(conn);
 
             let repository = Repository::open_with_options(RepositoryOptions::new(app_root.clone()))?;
@@ -10938,12 +10937,17 @@ Installers:
             assert_eq!(pins[0].source_id, "winget");
             assert_eq!(pins[0].pin_type, PinType::Gating);
 
-            let conn = Connection::open(&db_path)?;
-            let stored_pin = conn.query_row(
+            let conn = Repository::open_sqlite_connection(db_path)?;
+            let stored_pin = query_optional_value(
+                &conn,
                 "SELECT type, version FROM pin WHERE package_id = ?1 AND source_id = ?2",
-                rusqlite::params!["Contoso.Tool", "winget"],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )?;
+                vec![
+                    SqlValue::Text("Contoso.Tool".to_owned()),
+                    SqlValue::Text("winget".to_owned()),
+                ],
+                |row| Ok((row_i64(row, 0)?, row_string(row, 1)?)),
+            )?
+            .ok_or_else(|| anyhow!("expected stored pin"))?;
             assert_eq!(stored_pin.0, 3);
             assert_eq!(stored_pin.1, "1.2.*");
 
