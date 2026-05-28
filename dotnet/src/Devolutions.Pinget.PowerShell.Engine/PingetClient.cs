@@ -183,18 +183,19 @@ public sealed class PingetClient : IDisposable
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads")
             : downloadDirectory;
 
-        var (manifest, installerPath) = _repository.DownloadInstaller(request, outputDirectory);
+        var downloadResult = _repository.DownloadInstaller(request, outputDirectory);
         return new CommandResult<PSDownloadResult>(
             new PSDownloadResult
             {
-                Id = manifest.Id,
-                Name = manifest.Name,
+                Id = downloadResult.Manifest.Id,
+                Name = downloadResult.Manifest.Name,
                 Source = request.Query.Source ?? inputObject?.Source ?? string.Empty,
-                CorrelationData = installerPath,
+                CorrelationData = downloadResult.InstallerPath,
                 Status = "Ok",
-                Version = manifest.Version,
+                Version = downloadResult.Manifest.Version,
                 DownloadDirectory = outputDirectory,
-                DownloadedInstallerPath = installerPath,
+                DownloadedInstallerPath = downloadResult.InstallerPath,
+                DownloadedManifestPath = downloadResult.ManifestPath,
             },
             warnings);
     }

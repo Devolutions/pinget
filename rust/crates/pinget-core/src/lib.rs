@@ -469,6 +469,27 @@ impl ShowResult {
     }
 }
 
+/// Result of a `download` operation. In addition to the resolved installer
+/// file on disk, pinget mirrors `winget download` by writing a flattened YAML
+/// manifest next to the installer so users get a self-contained snapshot of
+/// the package version they downloaded.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DownloadOutput {
+    pub manifest: Manifest,
+    pub installer_path: PathBuf,
+    pub manifest_path: PathBuf,
+}
+
+/// Internal result of fetching only the installer file. Used by the install
+/// flow which downloads into a temp dir and intentionally skips the manifest
+/// YAML side effect.
+struct FetchedInstaller {
+    manifest: Manifest,
+    manifest_documents: JsonValue,
+    installer: Installer,
+    installer_path: PathBuf,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct VersionsResult {
@@ -1668,7 +1689,7 @@ impl Repository {
 
     // ── Install / download ──
 
-    pub fn download_installer(&mut self, query: &PackageQuery, download_dir: &Path) -> Result<(Manifest, PathBuf)> {
+    pub fn download_installer(&mut self, query: &PackageQuery, download_dir: &Path) -> Result<DownloadOutput> {
         self.download_installer_for_request(&InstallRequest::new(query.clone()), download_dir)
     }
 
@@ -1676,8 +1697,33 @@ impl Repository {
         &mut self,
         request: &InstallRequest,
         download_dir: &Path,
-    ) -> Result<(Manifest, PathBuf)> {
-        let manifest = self.resolve_manifest_for_install(request)?;
+    ) -> Result<DownloadOutput> {
+        let fetched = self.fetch_installer_for_request(request, download_dir)?;
+        let manifest_yaml =
+            build_download_manifest_yaml(&fetched.manifest, &fetched.manifest_documents, &fetched.installer)
+                .context("failed to render manifest YAML")?;
+        let manifest_filename = derive_download_manifest_filename(&fetched.manifest, &fetched.installer);
+        let manifest_path = download_dir.join(&manifest_filename);
+        fs::write(&manifest_path, manifest_yaml.as_bytes())
+            .with_context(|| format!("failed to write manifest to {}", manifest_path.display()))?;
+
+        Ok(DownloadOutput {
+            manifest: fetched.manifest,
+            installer_path: fetched.installer_path,
+            manifest_path,
+        })
+    }
+
+    /// Fetches the installer file without emitting the YAML manifest. Used by
+    /// the install flow, which downloads into a temp dir and only needs the
+    /// installer path — emitting a manifest there would litter the temp dir
+    /// and turn a benign YAML-write failure into an installation failure.
+    fn fetch_installer_for_request(
+        &mut self,
+        request: &InstallRequest,
+        download_dir: &Path,
+    ) -> Result<FetchedInstaller> {
+        let (manifest, manifest_documents) = self.resolve_manifest_and_documents_for_install(request)?;
         let installer = select_installer(&manifest.installers, &request.query)
             .ok_or_else(|| anyhow!("No applicable installer found for the current system"))?;
         let url = installer
@@ -1708,7 +1754,12 @@ impl Repository {
             return Err(error);
         }
 
-        Ok((manifest, dest))
+        Ok(FetchedInstaller {
+            manifest,
+            manifest_documents,
+            installer,
+            installer_path: dest,
+        })
     }
 
     pub fn install(&mut self, query: &PackageQuery, silent: bool) -> Result<InstallResult> {
@@ -1783,7 +1834,7 @@ impl Repository {
         }
 
         let temp_dir = std::env::temp_dir().join("pinget-install");
-        let (_, installer_path) = self.download_installer_for_request(request, &temp_dir)?;
+        let installer_path = self.fetch_installer_for_request(request, &temp_dir)?.installer_path;
 
         let installer_type = installer.installer_type.as_deref().unwrap_or("exe").to_lowercase();
 
@@ -1976,13 +2027,21 @@ impl Repository {
     }
 
     fn resolve_manifest_for_install(&mut self, request: &InstallRequest) -> Result<Manifest> {
+        self.resolve_manifest_and_documents_for_install(request)
+            .map(|(manifest, _)| manifest)
+    }
+
+    fn resolve_manifest_and_documents_for_install(
+        &mut self,
+        request: &InstallRequest,
+    ) -> Result<(Manifest, JsonValue)> {
         if let Some(path) = &request.manifest_path {
-            return Self::load_manifest_from_path(path);
+            return Self::load_manifest_from_path_with_documents(path);
         }
 
         let (located, _warnings) = self.find_single_match(&request.query)?;
-        let (manifest, _, _cached_files) = self.manifest_for_match(&located, &request.query)?;
-        Ok(manifest)
+        let (manifest, documents, _cached_files) = self.manifest_for_match(&located, &request.query)?;
+        Ok((manifest, documents))
     }
 
     fn ensure_package_agreements_accepted(manifest: &Manifest, request: &InstallRequest) -> Result<()> {
@@ -2172,10 +2231,14 @@ impl Repository {
     }
 
     fn load_manifest_from_path(manifest_path: &Path) -> Result<Manifest> {
+        Self::load_manifest_from_path_with_documents(manifest_path).map(|(manifest, _)| manifest)
+    }
+
+    fn load_manifest_from_path_with_documents(manifest_path: &Path) -> Result<(Manifest, JsonValue)> {
         let resolved = resolve_manifest_path(manifest_path)?;
         let bytes =
             fs::read(&resolved).with_context(|| format!("failed to read manifest from {}", resolved.display()))?;
-        parse_yaml_manifest(&bytes)
+        parse_yaml_manifest_bundle(&bytes)
     }
 
     fn find_single_match(&mut self, query: &PackageQuery) -> Result<(LocatedMatch, Vec<String>)> {
@@ -5619,6 +5682,138 @@ fn search_match_has_unknown_version(candidate: &SearchMatch) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("Unknown"))
 }
 
+/// Builds the YAML manifest emitted next to the installer by `winget download`.
+///
+/// `documents` is the merged singleton JSON the source provided; we narrow the
+/// `Installers` array down to just the resolved installer so the file describes
+/// exactly the binary that was written, mirroring native winget behavior. The
+/// typed `manifest` overrides identity fields (id, version, name, channel) on
+/// the JSON because callers like `manifest_for_match` correct those after the
+/// initial YAML parse.
+fn build_download_manifest_yaml(manifest: &Manifest, documents: &JsonValue, installer: &Installer) -> Result<String> {
+    let mut document = match documents {
+        JsonValue::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+
+    document.insert("PackageIdentifier".to_owned(), JsonValue::String(manifest.id.clone()));
+    document.insert("PackageVersion".to_owned(), JsonValue::String(manifest.version.clone()));
+    document.insert("PackageName".to_owned(), JsonValue::String(manifest.name.clone()));
+    if !manifest.channel.is_empty() {
+        document.insert("Channel".to_owned(), JsonValue::String(manifest.channel.clone()));
+    } else {
+        document.remove("Channel");
+    }
+
+    // Replace the multi-installer array with the single resolved installer so
+    // the emitted manifest describes the file the user actually downloaded.
+    let mut single_installer = serde_json::Map::new();
+    if let Some(arch) = installer.architecture.as_ref() {
+        single_installer.insert("Architecture".to_owned(), JsonValue::String(arch.clone()));
+    }
+    if let Some(installer_type) = installer.installer_type.as_ref() {
+        single_installer.insert("InstallerType".to_owned(), JsonValue::String(installer_type.clone()));
+    }
+    if let Some(url) = installer.url.as_ref() {
+        single_installer.insert("InstallerUrl".to_owned(), JsonValue::String(url.clone()));
+    }
+    if let Some(sha) = installer.sha256.as_ref() {
+        single_installer.insert("InstallerSha256".to_owned(), JsonValue::String(sha.clone()));
+    }
+    if let Some(scope) = installer.scope.as_ref() {
+        single_installer.insert("Scope".to_owned(), JsonValue::String(scope.clone()));
+    }
+    if let Some(locale) = installer.locale.as_ref() {
+        single_installer.insert("InstallerLocale".to_owned(), JsonValue::String(locale.clone()));
+    }
+    if let Some(product_code) = installer.product_code.as_ref() {
+        single_installer.insert("ProductCode".to_owned(), JsonValue::String(product_code.clone()));
+    }
+    if let Some(release_date) = installer.release_date.as_ref() {
+        single_installer.insert("ReleaseDate".to_owned(), JsonValue::String(release_date.clone()));
+    }
+
+    document.insert(
+        "Installers".to_owned(),
+        JsonValue::Array(vec![JsonValue::Object(single_installer)]),
+    );
+    document.insert("ManifestType".to_owned(), JsonValue::String("merged".to_owned()));
+
+    let value = JsonValue::Object(document);
+    serde_yaml::to_string(&value).context("failed to serialize manifest YAML")
+}
+
+/// Computes the file name `winget download` uses for the YAML manifest
+/// emitted next to the installer:
+/// `{PackageName}_{Version?}_{Scope?}_{Architecture}_{InstallerType}_{Locale?}.yaml`.
+/// Mirrors `GetInstallerDownloadOnlyFileName` in winget-cli's DownloadFlow.
+fn derive_download_manifest_filename(manifest: &Manifest, installer: &Installer) -> String {
+    let mut filename = derive_download_filename_stem(manifest, installer);
+    filename.push_str(".yaml");
+    filename
+}
+
+fn derive_download_filename_stem(manifest: &Manifest, installer: &Installer) -> String {
+    let mut stem = sanitize_filename_component(&manifest.name);
+    if !manifest.version.is_empty() && !manifest.version.eq_ignore_ascii_case("Unknown") {
+        stem.push('_');
+        stem.push_str(&sanitize_filename_component(&manifest.version));
+    }
+    if let Some(scope) = installer.scope.as_deref() {
+        stem.push('_');
+        stem.push_str(&sanitize_filename_component(&capitalize_first(scope)));
+    }
+    let architecture = installer.architecture.as_deref().unwrap_or("neutral");
+    stem.push('_');
+    stem.push_str(&sanitize_filename_component(&format_architecture(architecture)));
+
+    let installer_type = installer.installer_type.as_deref().unwrap_or("");
+    if !installer_type.is_empty() {
+        stem.push('_');
+        stem.push_str(&sanitize_filename_component(&installer_type.to_ascii_lowercase()));
+    }
+    if let Some(locale) = installer.locale.as_deref().filter(|value| !value.is_empty()) {
+        stem.push('_');
+        stem.push_str(&sanitize_filename_component(locale));
+    }
+
+    stem
+}
+
+fn capitalize_first(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out = first.to_ascii_uppercase().to_string();
+            out.push_str(&chars.as_str().to_ascii_lowercase());
+            out
+        }
+        None => String::new(),
+    }
+}
+
+fn format_architecture(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "x64" => "X64".to_owned(),
+        "x86" => "X86".to_owned(),
+        "arm" => "Arm".to_owned(),
+        "arm64" => "Arm64".to_owned(),
+        "neutral" => "Neutral".to_owned(),
+        other => capitalize_first(other),
+    }
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect()
+}
+
 fn resolve_manifest_path(manifest_path: &Path) -> Result<PathBuf> {
     if manifest_path.is_file() {
         return Ok(manifest_path.to_path_buf());
@@ -8321,6 +8516,143 @@ mod tests {
     use flate2::write::DeflateEncoder;
 
     use super::*;
+
+    fn sample_manifest(id: &str, version: &str, name: &str) -> Manifest {
+        Manifest {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+            channel: String::new(),
+            publisher: Some("Acme".to_owned()),
+            description: Some("desc".to_owned()),
+            moniker: None,
+            package_url: None,
+            publisher_url: None,
+            publisher_support_url: None,
+            license: None,
+            license_url: None,
+            privacy_url: None,
+            author: None,
+            copyright: None,
+            copyright_url: None,
+            release_notes: None,
+            release_notes_url: None,
+            tags: Vec::new(),
+            agreements: Vec::new(),
+            package_dependencies: Vec::new(),
+            documentation: Vec::new(),
+            installers: Vec::new(),
+            require_explicit_upgrade: false,
+        }
+    }
+
+    #[test]
+    fn derive_download_filename_matches_winget_pattern() {
+        let manifest = sample_manifest("Spotify.Spotify", "1.2.90.451.gb094aab0", "Spotify");
+        let installer = Installer {
+            architecture: Some("arm64".to_owned()),
+            installer_type: Some("exe".to_owned()),
+            scope: Some("user".to_owned()),
+            locale: Some("en-US".to_owned()),
+            ..Installer::default()
+        };
+        assert_eq!(
+            derive_download_manifest_filename(&manifest, &installer),
+            "Spotify_1.2.90.451.gb094aab0_User_Arm64_exe_en-US.yaml"
+        );
+    }
+
+    #[test]
+    fn derive_download_filename_omits_optional_components() {
+        let manifest = sample_manifest("7zip.7zip", "26.01", "7-Zip");
+        let installer = Installer {
+            architecture: Some("x64".to_owned()),
+            installer_type: Some("exe".to_owned()),
+            ..Installer::default()
+        };
+        // No scope, no locale → both omitted; architecture remains PascalCase.
+        assert_eq!(
+            derive_download_manifest_filename(&manifest, &installer),
+            "7-Zip_26.01_X64_exe.yaml"
+        );
+    }
+
+    #[test]
+    fn derive_download_filename_skips_unknown_version() {
+        let manifest = sample_manifest("Test.Package", "Unknown", "Test");
+        let installer = Installer {
+            architecture: Some("neutral".to_owned()),
+            installer_type: Some("msi".to_owned()),
+            ..Installer::default()
+        };
+        assert_eq!(
+            derive_download_manifest_filename(&manifest, &installer),
+            "Test_Neutral_msi.yaml"
+        );
+    }
+
+    #[test]
+    fn derive_download_filename_sanitizes_illegal_chars() {
+        let manifest = sample_manifest("Vendor.App", "1.0", "Some/Bad:Name");
+        let installer = Installer {
+            architecture: Some("x64".to_owned()),
+            installer_type: Some("exe".to_owned()),
+            ..Installer::default()
+        };
+        // `/` and `:` are illegal in Windows filenames; both must be replaced.
+        let filename = derive_download_manifest_filename(&manifest, &installer);
+        assert!(!filename.contains('/') && !filename.contains(':'));
+        assert!(filename.starts_with("Some_Bad_Name_1.0"));
+    }
+
+    #[test]
+    fn build_download_manifest_yaml_overrides_identity_fields() {
+        let manifest = sample_manifest("App.Id", "2.0.0", "App Name");
+        // Documents contain a stale PackageVersion (e.g. empty) — the typed
+        // manifest's corrected version must win.
+        let documents = serde_json::json!({
+            "PackageIdentifier": "stale-id",
+            "PackageVersion": "",
+            "PackageName": "Old Name",
+            "Channel": "preview",
+            "Installers": [
+                { "Architecture": "x64", "InstallerType": "exe", "InstallerUrl": "https://example.com/a" },
+                { "Architecture": "x86", "InstallerType": "exe", "InstallerUrl": "https://example.com/b" },
+            ],
+        });
+        let installer = Installer {
+            architecture: Some("x64".to_owned()),
+            installer_type: Some("exe".to_owned()),
+            url: Some("https://example.com/a".to_owned()),
+            ..Installer::default()
+        };
+        let yaml = build_download_manifest_yaml(&manifest, &documents, &installer).expect("yaml");
+        assert!(yaml.contains("PackageIdentifier: App.Id"));
+        assert!(yaml.contains("PackageVersion: 2.0.0"));
+        assert!(yaml.contains("PackageName: App Name"));
+        assert!(yaml.contains("ManifestType: merged"));
+        // Channel had a value in docs but the typed manifest's channel is empty
+        // → expect it stripped, since winget download manifests don't carry it.
+        assert!(!yaml.contains("Channel: preview"));
+        // Installers array narrows to the single selected installer.
+        assert_eq!(yaml.matches("InstallerUrl").count(), 1);
+        assert!(yaml.contains("https://example.com/a"));
+        assert!(!yaml.contains("https://example.com/b"));
+    }
+
+    #[test]
+    fn build_download_manifest_yaml_preserves_typed_channel() {
+        let mut manifest = sample_manifest("App.Id", "2.0.0", "App Name");
+        manifest.channel = "beta".to_owned();
+        let documents = serde_json::json!({
+            "PackageIdentifier": "App.Id",
+            "PackageVersion": "2.0.0",
+            "Installers": [],
+        });
+        let installer = Installer::default();
+        let yaml = build_download_manifest_yaml(&manifest, &documents, &installer).expect("yaml");
+        assert!(yaml.contains("Channel: beta"));
+    }
 
     fn temp_app_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

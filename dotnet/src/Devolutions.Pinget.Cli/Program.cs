@@ -765,9 +765,10 @@ downloadCommand.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(dlIgnoreSecurityHashOpt),
         null,
         false);
-    var (manifest, path) = repo.DownloadInstaller(request, dir);
-    Console.WriteLine($"Downloaded {manifest.Name} v{manifest.Version}");
-    Console.WriteLine($"  Path: {path}");
+    var result = repo.DownloadInstaller(request, dir);
+    Console.WriteLine($"Downloaded {result.Manifest.Name} v{result.Manifest.Version}");
+    Console.WriteLine($"  Installer: {result.InstallerPath}");
+    Console.WriteLine($"  Manifest: {result.ManifestPath}");
 });
 
 // ── Pin commands ──

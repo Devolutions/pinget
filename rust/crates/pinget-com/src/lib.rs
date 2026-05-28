@@ -684,11 +684,11 @@ unsafe extern "system" fn package_manager_download_installer_json(
         let request = install_request_from_json(&json_from_bstr(request)?)?;
         let download_dir =
             required_bstr(download_dir).map_err(|_| anyhow::anyhow!("download directory is required"))?;
-        let (manifest, installer_path) =
-            repository.download_installer_for_request(&request, Path::new(&download_dir))?;
+        let output = repository.download_installer_for_request(&request, Path::new(&download_dir))?;
         Ok(json!({
-            "manifest": manifest,
-            "installer_path": installer_path,
+            "manifest": output.manifest,
+            "installer_path": output.installer_path,
+            "manifest_path": output.manifest_path,
         }))
     })
 }

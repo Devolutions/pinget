@@ -1137,9 +1137,10 @@ public class RepositoryParityTests
                 IgnoreSecurityHash = true,
             };
 
-            var (_, installerPath) = repo.DownloadInstaller(request, Path.Combine(appRoot, "downloads"));
-            Assert.True(File.Exists(installerPath));
-            Assert.Equal(payload, File.ReadAllBytes(installerPath));
+            var downloadResult = repo.DownloadInstaller(request, Path.Combine(appRoot, "downloads"));
+            Assert.True(File.Exists(downloadResult.InstallerPath));
+            Assert.Equal(payload, File.ReadAllBytes(downloadResult.InstallerPath));
+            Assert.True(File.Exists(downloadResult.ManifestPath));
         }
         finally
         {
@@ -1179,9 +1180,57 @@ public class RepositoryParityTests
                 ManifestPath = manifestPath,
             };
 
-            var (_, installerPath) = repo.DownloadInstaller(request, Path.Combine(appRoot, "downloads"));
-            Assert.True(File.Exists(installerPath));
+            var downloadResult = repo.DownloadInstaller(request, Path.Combine(appRoot, "downloads"));
+            Assert.True(File.Exists(downloadResult.InstallerPath));
             Assert.Equal("Bearer test-token", authorizationHeader);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void DownloadInstaller_WritesManifestYamlAlongsideInstaller()
+    {
+        var payload = "pinget-test-payload"u8.ToArray();
+        using var server = new TestHttpServer(payload);
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            var manifestPath = TestPaths.WriteManifest(appRoot, $$"""
+                PackageIdentifier: Vendor.App
+                PackageVersion: 3.4.5
+                PackageName: Vendor App
+                Publisher: Vendor
+                ManifestType: merged
+                ManifestVersion: 1.10.0
+                Installers:
+                  - Architecture: x64
+                    InstallerType: exe
+                    Scope: user
+                    InstallerLocale: en-US
+                    InstallerUrl: {{server.Url}}
+                """);
+
+            using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            var request = new InstallRequest
+            {
+                Query = new PackageQuery(),
+                ManifestPath = manifestPath,
+                IgnoreSecurityHash = true,
+            };
+
+            var result = repo.DownloadInstaller(request, Path.Combine(appRoot, "downloads"));
+            Assert.True(File.Exists(result.ManifestPath));
+
+            // Filename follows winget's `{Name}_{Version}_{Scope}_{Arch}_{Type}_{Locale}.yaml`.
+            Assert.EndsWith("Vendor App_3.4.5_User_X64_exe_en-US.yaml", result.ManifestPath);
+
+            var yaml = File.ReadAllText(result.ManifestPath);
+            Assert.Contains("PackageIdentifier: Vendor.App", yaml);
+            Assert.Contains("PackageVersion: 3.4.5", yaml);
+            Assert.Contains("ManifestType: merged", yaml);
         }
         finally
         {

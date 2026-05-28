@@ -591,12 +591,34 @@ public class Repository : IDisposable
 
     // ── Install / Uninstall ──
 
-    public (Manifest Manifest, string InstallerPath) DownloadInstaller(PackageQuery query, string downloadDir)
+    public DownloadResult DownloadInstaller(PackageQuery query, string downloadDir)
         => DownloadInstaller(new InstallRequest { Query = query }, downloadDir);
 
-    public (Manifest Manifest, string InstallerPath) DownloadInstaller(InstallRequest request, string downloadDir)
+    public DownloadResult DownloadInstaller(InstallRequest request, string downloadDir)
     {
-        var manifest = ResolveManifestForInstall(request);
+        var fetched = FetchInstaller(request, downloadDir);
+        var manifestYaml = BuildDownloadManifestYaml(fetched.Manifest, fetched.ManifestDocuments, fetched.Installer);
+        var manifestFileName = DeriveDownloadManifestFilename(fetched.Manifest, fetched.Installer);
+        var manifestPath = Path.Combine(downloadDir, manifestFileName);
+        File.WriteAllText(manifestPath, manifestYaml);
+
+        return new DownloadResult
+        {
+            Manifest = fetched.Manifest,
+            InstallerPath = fetched.InstallerPath,
+            ManifestPath = manifestPath,
+        };
+    }
+
+    /// <summary>
+    /// Fetches the installer file without emitting the YAML manifest. Used by
+    /// the install flow, which downloads into a temp dir and only needs the
+    /// installer path — emitting a manifest there would litter the temp dir
+    /// and turn a benign YAML-write failure into an installation failure.
+    /// </summary>
+    private FetchedInstaller FetchInstaller(InstallRequest request, string downloadDir)
+    {
+        var (manifest, manifestDocuments) = ResolveManifestAndDocumentsForInstall(request);
         var installer = SelectInstaller(manifest.Installers, request.Query)
             ?? throw new InvalidOperationException("No applicable installer found for the current system");
         var url = installer.Url ?? throw new InvalidOperationException("Installer has no URL");
@@ -611,7 +633,6 @@ public class Repository : IDisposable
         var bytes = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
         File.WriteAllBytes(dest, bytes);
 
-        // Verify hash
         if (installer.Sha256 is not null)
         {
             var actual = Sha256Hex(bytes);
@@ -623,8 +644,10 @@ public class Repository : IDisposable
             }
         }
 
-        return (manifest, dest);
+        return new FetchedInstaller(manifest, manifestDocuments, installer, dest);
     }
+
+    private sealed record FetchedInstaller(Manifest Manifest, object ManifestDocuments, Installer Installer, string InstallerPath);
 
     public InstallResult Install(PackageQuery query, bool silent)
     {
@@ -697,7 +720,7 @@ public class Repository : IDisposable
         }
 
         var tempDir = Path.Combine(Path.GetTempPath(), "pinget-install");
-        var (_, installerPath) = DownloadInstaller(request, tempDir);
+        var installerPath = FetchInstaller(request, tempDir).InstallerPath;
 
         var installerType = (selectedInstaller.InstallerType ?? "exe").ToLowerInvariant();
         var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller);
@@ -787,13 +810,16 @@ public class Repository : IDisposable
     }
 
     private Manifest ResolveManifestForInstall(InstallRequest request)
+        => ResolveManifestAndDocumentsForInstall(request).Manifest;
+
+    private (Manifest Manifest, object Documents) ResolveManifestAndDocumentsForInstall(InstallRequest request)
     {
         if (!string.IsNullOrWhiteSpace(request.ManifestPath))
-            return LoadManifestFromPath(request.ManifestPath!);
+            return LoadManifestFromPathWithDocuments(request.ManifestPath!);
 
         var (located, _, _) = FindSingleMatch(request.Query);
-        var (manifest, _, _) = ManifestForMatch(located, request.Query);
-        return manifest;
+        var (manifest, documents, _) = ManifestForMatch(located, request.Query);
+        return (manifest, documents);
     }
 
     private ListMatch? FindInstalledPackageForInstall(InstallRequest request, Manifest manifest)
@@ -1008,9 +1034,119 @@ public class Repository : IDisposable
     }
 
     private static Manifest LoadManifestFromPath(string manifestPath)
+        => LoadManifestFromPathWithDocuments(manifestPath).Manifest;
+
+    private static (Manifest Manifest, object Documents) LoadManifestFromPathWithDocuments(string manifestPath)
     {
         var resolved = ResolveManifestPath(manifestPath);
-        return ParseYamlManifest(File.ReadAllBytes(resolved));
+        var bytes = File.ReadAllBytes(resolved);
+        return (ParseYamlManifest(bytes), ParseYamlManifestDocuments(bytes));
+    }
+
+    /// <summary>
+    /// Builds the YAML manifest emitted next to the installer by
+    /// <c>winget download</c>. The structured document is the merged singleton
+    /// the source provided; we narrow the <c>Installers</c> array to the
+    /// resolved installer so the file describes exactly the binary written.
+    /// Identity fields are overridden from the typed manifest because
+    /// <see cref="ManifestForMatch"/> corrects them after the initial YAML
+    /// parse.
+    /// </summary>
+    internal static string BuildDownloadManifestYaml(Manifest manifest, object documents, Installer installer)
+    {
+        var document = StructuredOutput.CollapseManifestDocuments(documents);
+
+        document["PackageIdentifier"] = manifest.Id;
+        document["PackageVersion"] = manifest.Version;
+        document["PackageName"] = manifest.Name;
+        if (!string.IsNullOrEmpty(manifest.Channel))
+            document["Channel"] = manifest.Channel;
+        else
+            document.Remove("Channel");
+
+        var singleInstaller = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrEmpty(installer.Architecture)) singleInstaller["Architecture"] = installer.Architecture;
+        if (!string.IsNullOrEmpty(installer.InstallerType)) singleInstaller["InstallerType"] = installer.InstallerType;
+        if (!string.IsNullOrEmpty(installer.Url)) singleInstaller["InstallerUrl"] = installer.Url;
+        if (!string.IsNullOrEmpty(installer.Sha256)) singleInstaller["InstallerSha256"] = installer.Sha256;
+        if (!string.IsNullOrEmpty(installer.Scope)) singleInstaller["Scope"] = installer.Scope;
+        if (!string.IsNullOrEmpty(installer.Locale)) singleInstaller["InstallerLocale"] = installer.Locale;
+        if (!string.IsNullOrEmpty(installer.ProductCode)) singleInstaller["ProductCode"] = installer.ProductCode;
+        if (!string.IsNullOrEmpty(installer.ReleaseDate)) singleInstaller["ReleaseDate"] = installer.ReleaseDate;
+
+        document["Installers"] = new List<object?> { singleInstaller };
+        document["ManifestType"] = "merged";
+
+        return YamlEmitter.EmitDocument(document);
+    }
+
+    /// <summary>
+    /// Computes the file name <c>winget download</c> uses for the YAML
+    /// manifest emitted next to the installer:
+    /// <c>{PackageName}_{Version?}_{Scope?}_{Architecture}_{InstallerType}_{Locale?}.yaml</c>.
+    /// Mirrors <c>GetInstallerDownloadOnlyFileName</c> in winget-cli's
+    /// DownloadFlow.
+    /// </summary>
+    internal static string DeriveDownloadManifestFilename(Manifest manifest, Installer installer)
+        => DeriveDownloadFilenameStem(manifest, installer) + ".yaml";
+
+    internal static string DeriveDownloadFilenameStem(Manifest manifest, Installer installer)
+    {
+        var stem = new System.Text.StringBuilder();
+        stem.Append(SanitizeFilenameComponent(manifest.Name));
+        if (!string.IsNullOrEmpty(manifest.Version) &&
+            !string.Equals(manifest.Version, "Unknown", StringComparison.OrdinalIgnoreCase))
+        {
+            stem.Append('_');
+            stem.Append(SanitizeFilenameComponent(manifest.Version));
+        }
+        if (!string.IsNullOrEmpty(installer.Scope))
+        {
+            stem.Append('_');
+            stem.Append(SanitizeFilenameComponent(CapitalizeFirst(installer.Scope)));
+        }
+
+        var architecture = string.IsNullOrEmpty(installer.Architecture) ? "neutral" : installer.Architecture;
+        stem.Append('_');
+        stem.Append(SanitizeFilenameComponent(FormatArchitecture(architecture)));
+
+        if (!string.IsNullOrEmpty(installer.InstallerType))
+        {
+            stem.Append('_');
+            stem.Append(SanitizeFilenameComponent(installer.InstallerType.ToLowerInvariant()));
+        }
+        if (!string.IsNullOrEmpty(installer.Locale))
+        {
+            stem.Append('_');
+            stem.Append(SanitizeFilenameComponent(installer.Locale));
+        }
+
+        return stem.ToString();
+    }
+
+    private static string CapitalizeFirst(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return string.Empty;
+        return char.ToUpperInvariant(value[0]) + value[1..].ToLowerInvariant();
+    }
+
+    private static string FormatArchitecture(string value) => value.ToLowerInvariant() switch
+    {
+        "x64" => "X64",
+        "x86" => "X86",
+        "arm" => "Arm",
+        "arm64" => "Arm64",
+        "neutral" => "Neutral",
+        _ => CapitalizeFirst(value),
+    };
+
+    private static string SanitizeFilenameComponent(string value)
+    {
+        var invalid = new HashSet<char>(Path.GetInvalidFileNameChars());
+        var builder = new System.Text.StringBuilder(value.Length);
+        foreach (var ch in value)
+            builder.Append(invalid.Contains(ch) || char.IsControl(ch) ? '_' : ch);
+        return builder.ToString();
     }
 
     private static string ResolveManifestPath(string manifestPath)
@@ -1678,29 +1814,29 @@ public class Repository : IDisposable
                 parser.MoveNext();
                 return ScalarToValue(scalar);
             case YamlDotNet.Core.Events.MappingStart:
-            {
-                parser.MoveNext();
-                var dict = new Dictionary<object, object?>();
-                while (parser.Current is not YamlDotNet.Core.Events.MappingEnd)
                 {
-                    var key = ReadYamlNode(parser);
-                    var value = ReadYamlNode(parser);
-                    if (key is not null) dict[key] = value;
+                    parser.MoveNext();
+                    var dict = new Dictionary<object, object?>();
+                    while (parser.Current is not YamlDotNet.Core.Events.MappingEnd)
+                    {
+                        var key = ReadYamlNode(parser);
+                        var value = ReadYamlNode(parser);
+                        if (key is not null) dict[key] = value;
+                    }
+                    parser.MoveNext();
+                    return dict;
                 }
-                parser.MoveNext();
-                return dict;
-            }
             case YamlDotNet.Core.Events.SequenceStart:
-            {
-                parser.MoveNext();
-                var list = new List<object?>();
-                while (parser.Current is not YamlDotNet.Core.Events.SequenceEnd)
                 {
-                    list.Add(ReadYamlNode(parser));
+                    parser.MoveNext();
+                    var list = new List<object?>();
+                    while (parser.Current is not YamlDotNet.Core.Events.SequenceEnd)
+                    {
+                        list.Add(ReadYamlNode(parser));
+                    }
+                    parser.MoveNext();
+                    return list;
                 }
-                parser.MoveNext();
-                return list;
-            }
             default:
                 parser.MoveNext();
                 return null;

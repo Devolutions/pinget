@@ -183,6 +183,7 @@ public sealed class PingetClient : IDisposable
         var response = RequiredObject(_packageManager.DownloadInstallerJson(ToJsonString(request), outputDirectory));
         var manifest = RequiredObject(response, "manifest");
         var installerPath = RequiredString(response, "installer_path");
+        var manifestPath = OptionalString(response, "manifest_path");
         return new CommandResult<PSDownloadResult>(
             new PSDownloadResult
             {
@@ -194,6 +195,7 @@ public sealed class PingetClient : IDisposable
                 Version = RequiredString(manifest, "version"),
                 DownloadDirectory = outputDirectory,
                 DownloadedInstallerPath = installerPath,
+                DownloadedManifestPath = manifestPath,
             },
             warnings);
     }
