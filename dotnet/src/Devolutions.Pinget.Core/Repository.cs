@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -24,20 +25,27 @@ public class Repository : IDisposable
     private readonly HttpClient _client;
     private readonly bool _useSystemWingetSources;
     private readonly Action<RepositoryWarning>? _diagnostics;
+    private readonly TimeSpan? _preIndexedSourceAutoUpdateInterval;
     private SourceStore _store;
+    private static readonly ConcurrentDictionary<string, object> s_preIndexedRefreshLocks = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan s_preIndexedRefreshRetryInterval = TimeSpan.FromMinutes(5);
+    private readonly object _preIndexedRefreshAttemptGate = new();
+    private readonly Dictionary<string, (DateTime AttemptedAt, Exception? Exception, PreIndexedRefreshKind Kind)> _preIndexedRefreshAttempts = new(StringComparer.OrdinalIgnoreCase);
 
     private Repository(
         string appRoot,
         HttpClient client,
         SourceStore store,
         bool useSystemWingetSources,
-        Action<RepositoryWarning>? diagnostics)
+        Action<RepositoryWarning>? diagnostics,
+        TimeSpan? preIndexedSourceAutoUpdateInterval)
     {
         _appRoot = appRoot;
         _client = client;
         _store = store;
         _useSystemWingetSources = useSystemWingetSources;
         _diagnostics = diagnostics;
+        _preIndexedSourceAutoUpdateInterval = preIndexedSourceAutoUpdateInterval;
     }
 
     /// <summary>
@@ -53,7 +61,7 @@ public class Repository : IDisposable
         var store = SourceStoreManager.Load(appRoot);
         var client = new HttpClient();
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
-        return new Repository(appRoot, client, store, useSystemWingetSources, options.Diagnostics);
+        return new Repository(appRoot, client, store, useSystemWingetSources, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
     }
 
     internal static IEnumerable<string> GetSqliteNativeLibraryCandidates(string assemblyDirectory)
@@ -1227,7 +1235,7 @@ public class Repository : IDisposable
     private (List<LocatedMatch> Matches, bool Truncated) SearchPreindexed(
         int sourceIndex, PackageQuery query, SearchSemantics semantics)
     {
-        var conn = OpenPreindexedConnection(sourceIndex);
+        using var conn = OpenPreindexedConnection(sourceIndex);
         var source = _store.Sources[sourceIndex];
 
         // Try V2 first, fall back to V1
@@ -1366,22 +1374,152 @@ public class Repository : IDisposable
     private static Exception UnwrapSourceOperationException(Exception exception) =>
         exception is SourceOperationException { InnerException: { } innerException } ? innerException : exception;
 
-    private SqliteConnection OpenPreindexedConnection(int sourceIndex)
+    private enum PreIndexedRefreshKind
+    {
+        Auto,
+        Explicit
+    }
+
+    private sealed record PreIndexedRefreshOutcome(bool Attempted, bool Succeeded, Exception? Exception, bool ReusedRecentAttempt)
+    {
+        public static readonly PreIndexedRefreshOutcome NotAttempted = new(false, false, null, false);
+    }
+
+    private SqliteConnection OpenPreindexedConnection(int sourceIndex) =>
+        OpenPreindexedConnection(sourceIndex, out _);
+
+    private SqliteConnection OpenPreindexedConnection(int sourceIndex, out PreIndexedRefreshOutcome refreshOutcome)
     {
         var source = _store.Sources[sourceIndex];
         var indexPath = PreIndexedSource.IndexPath(source, _appRoot);
-        if (!File.Exists(indexPath))
-        {
-            PreIndexedSource.Update(_client, source, _appRoot);
-            source.LastUpdate = DateTime.UtcNow;
-            if (!_useSystemWingetSources)
-                SourceStoreManager.Save(_store, _appRoot);
-        }
+        refreshOutcome = EnsurePreindexedIndex(sourceIndex, indexPath);
 
-        var conn = new SqliteConnection($"Data Source={indexPath};Mode=ReadOnly");
+        var conn = new SqliteConnection($"Data Source={indexPath};Mode=ReadOnly;Pooling=False");
         conn.Open();
         return conn;
     }
+
+    private PreIndexedRefreshOutcome EnsurePreindexedIndex(int sourceIndex, string indexPath)
+    {
+        var indexExists = File.Exists(indexPath);
+        if (!indexExists)
+        {
+            RefreshPreindexedSource(sourceIndex, force: true, PreIndexedRefreshKind.Auto);
+            return new PreIndexedRefreshOutcome(true, true, null, false);
+        }
+
+        var source = _store.Sources[sourceIndex];
+        if (!IsPreindexedIndexStale(source, indexPath))
+            return PreIndexedRefreshOutcome.NotAttempted;
+
+        var lockKey = PreindexedRefreshLockKey(source);
+        if (TryGetRecentPreindexedRefreshAttempt(lockKey, out var recentOutcome))
+            return recentOutcome;
+
+        try
+        {
+            RefreshPreindexedSource(sourceIndex, force: false, PreIndexedRefreshKind.Auto);
+            return new PreIndexedRefreshOutcome(true, true, null, false);
+        }
+        catch (Exception ex)
+        {
+            var warning = CreateSourceWarning(sourceIndex, "source-refresh", ex);
+            EmitDiagnostic(warning);
+            return new PreIndexedRefreshOutcome(true, false, ex, false);
+        }
+    }
+
+    private bool IsPreindexedIndexStale(SourceRecord source, string indexPath)
+    {
+        if (_preIndexedSourceAutoUpdateInterval is null)
+            return false;
+
+        var lastUpdate = source.LastUpdate;
+        if (lastUpdate is null && File.Exists(indexPath))
+            lastUpdate = File.GetLastWriteTimeUtc(indexPath);
+
+        if (lastUpdate is null)
+            return true;
+
+        return DateTime.UtcNow - lastUpdate.Value.ToUniversalTime() >= _preIndexedSourceAutoUpdateInterval.Value;
+    }
+
+    private string RefreshPreindexedSource(int sourceIndex, bool force, PreIndexedRefreshKind kind)
+    {
+        var source = _store.Sources[sourceIndex];
+        var indexPath = PreIndexedSource.IndexPath(source, _appRoot);
+        var lockKey = PreindexedRefreshLockKey(source);
+        var refreshLock = s_preIndexedRefreshLocks.GetOrAdd(lockKey, _ => new object());
+
+        lock (refreshLock)
+        {
+            if (!force && File.Exists(indexPath) && !IsPreindexedIndexStale(source, indexPath))
+                return "Source already refreshed";
+
+            try
+            {
+                var detail = PreIndexedSource.Update(_client, source, _appRoot);
+                source.LastUpdate = DateTime.UtcNow;
+                if (!_useSystemWingetSources)
+                    SourceStoreManager.Save(_store, _appRoot);
+                RecordPreindexedRefreshAttempt(lockKey, null, kind);
+                return detail;
+            }
+            catch (Exception ex)
+            {
+                RecordPreindexedRefreshAttempt(lockKey, ex, kind);
+                throw;
+            }
+        }
+    }
+
+    private string PreindexedRefreshLockKey(SourceRecord source) =>
+        $"{_appRoot}|{source.Identifier}|{source.Name}";
+
+    private bool TryGetRecentPreindexedRefreshAttempt(string lockKey, out PreIndexedRefreshOutcome outcome)
+    {
+        lock (_preIndexedRefreshAttemptGate)
+        {
+            if (_preIndexedRefreshAttempts.TryGetValue(lockKey, out var attempt) &&
+                DateTime.UtcNow - attempt.AttemptedAt < s_preIndexedRefreshRetryInterval)
+            {
+                outcome = new PreIndexedRefreshOutcome(true, attempt.Exception is null, attempt.Exception, attempt.Kind == PreIndexedRefreshKind.Auto);
+                return true;
+            }
+        }
+
+        outcome = PreIndexedRefreshOutcome.NotAttempted;
+        return false;
+    }
+
+    private bool HasRecentSuccessfulPreindexedRefreshAttempt(SourceRecord source) =>
+        TryGetRecentPreindexedRefreshAttempt(PreindexedRefreshLockKey(source), out var outcome) && outcome.Succeeded;
+
+    private void RecordPreindexedRefreshAttempt(string lockKey, Exception? exception, PreIndexedRefreshKind kind)
+    {
+        lock (_preIndexedRefreshAttemptGate)
+            _preIndexedRefreshAttempts[lockKey] = (DateTime.UtcNow, exception, kind);
+    }
+
+    private void EmitPreindexedRefreshDiagnostic(int sourceIndex, string packageId, string requestedVersion, string? requestedChannel)
+    {
+        var source = _store.Sources[sourceIndex];
+        var channelPart = string.IsNullOrWhiteSpace(requestedChannel) ? "" : $" channel '{requestedChannel}'";
+        EmitDiagnostic(new RepositoryWarning
+        {
+            Operation = "manifest-refresh",
+            SourceName = source.Name,
+            SourceKind = source.Kind,
+            SourceArg = source.Arg,
+            SourceIdentifier = source.Identifier,
+            RequestUri = SourceRequestUri(source, "source-refresh"),
+            CachePath = SourceDiagnosticCachePath(source),
+            Message = $"Package '{packageId}' version '{requestedVersion}'{channelPart} was missing from the local pre-indexed source cache; refreshing source '{source.Name}'.",
+        });
+    }
+
+    private static MissingPackageVersionException WithRefreshFailure(MissingPackageVersionException exception, Exception refreshException) =>
+        new(exception.PackageId, exception.SourceName, exception.RequestedVersion, exception.RequestedChannel, refreshException);
 
     private (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) FindSingleMatch(PackageQuery query)
         => FindSingleMatchWithSemantics(query, SearchSemantics.Single);
@@ -1421,7 +1559,7 @@ public class Repository : IDisposable
 
     private List<VersionKey> VersionsFromV1(int sourceIndex, long packageRowid)
     {
-        var conn = OpenPreindexedConnection(sourceIndex);
+        using var conn = OpenPreindexedConnection(sourceIndex);
         var rows = PreIndexedSource.QueryV1Versions(conn, packageRowid);
         return rows.Select(r => new VersionKey { Version = r.Version, Channel = r.Channel }).ToList();
     }
@@ -1429,28 +1567,65 @@ public class Repository : IDisposable
     private List<VersionKey> VersionsFromV2(int sourceIndex, long packageRowid, string packageHash)
     {
         var source = _store.Sources[sourceIndex];
-        var conn = OpenPreindexedConnection(sourceIndex);
+        using var conn = OpenPreindexedConnection(sourceIndex);
         var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn, source, packageRowid, packageHash, _appRoot);
         return entries.Select(e => new VersionKey { Version = e.Version, Channel = "" }).ToList();
     }
 
-    private (Manifest Manifest, object StructuredDocument, List<string> CachedFiles) ManifestForMatch(LocatedMatch located, PackageQuery query)
+    private (Manifest Manifest, object StructuredDocument, List<string> CachedFiles) ManifestForMatch(
+        LocatedMatch located,
+        PackageQuery query,
+        bool allowExplicitVersionRefresh = true)
     {
         return located.Locator switch
         {
-            PreIndexedV1Locator v1 => ManifestFromV1(located.SourceIndex, v1.PackageRowId, query),
-            PreIndexedV2Locator v2 => ManifestFromV2(located.SourceIndex, v2.PackageRowId, v2.PackageHash, query),
-            RestLocator rest => ManifestFromRest(located.SourceIndex, rest.PackageId, rest.Versions, query),
+            PreIndexedV1Locator v1 => ManifestFromV1(located.SourceIndex, v1.PackageRowId, located.Display, query, allowExplicitVersionRefresh),
+            PreIndexedV2Locator v2 => ManifestFromV2(located.SourceIndex, v2.PackageRowId, v2.PackageHash, located.Display, query, allowExplicitVersionRefresh),
+            RestLocator rest => ManifestFromRest(located.SourceIndex, rest.PackageId, rest.Versions, located.Display, query),
             _ => throw new InvalidOperationException("Unknown locator type")
         };
     }
 
-    private (Manifest, object, List<string>) ManifestFromV1(int sourceIndex, long packageRowid, PackageQuery query)
+    private (Manifest, object, List<string>) ManifestFromV1(
+        int sourceIndex,
+        long packageRowid,
+        SearchMatch display,
+        PackageQuery query,
+        bool allowExplicitVersionRefresh)
     {
-        var conn = OpenPreindexedConnection(sourceIndex);
+        PreIndexedRefreshOutcome openRefresh;
+        SqliteConnection? conn = OpenPreindexedConnection(sourceIndex, out openRefresh);
+        try
+        {
+            return ManifestFromV1Connection(sourceIndex, conn, packageRowid, display, query);
+        }
+        catch (MissingPackageVersionException ex) when (allowExplicitVersionRefresh && query.Version is not null)
+        {
+            conn.Dispose();
+            conn = null;
+            if (openRefresh.Attempted && !openRefresh.ReusedRecentAttempt)
+                throw openRefresh.Exception is null ? ex : WithRefreshFailure(ex, openRefresh.Exception);
+            if (HasRecentSuccessfulPreindexedRefreshAttempt(_store.Sources[sourceIndex]))
+                throw;
+
+            return RefreshPreindexedAndRetryManifest(sourceIndex, display, query, ex);
+        }
+        finally
+        {
+            conn?.Dispose();
+        }
+    }
+
+    private (Manifest, object, List<string>) ManifestFromV1Connection(
+        int sourceIndex,
+        SqliteConnection conn,
+        long packageRowid,
+        SearchMatch display,
+        PackageQuery query)
+    {
         var source = _store.Sources[sourceIndex];
         var versions = PreIndexedSource.QueryV1Versions(conn, packageRowid);
-        var selected = SelectV1Version(versions, query.Version, query.Channel);
+        var selected = SelectV1Version(versions, query.Version, query.Channel, display.Id, source.Name);
         var relativePath = PreIndexedSource.ResolveV1RelativePath(conn, selected.PathPart);
         var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V1_M", source, relativePath, selected.ManifestHash);
         var manifest = ParseYamlManifest(bytes);
@@ -1459,12 +1634,48 @@ public class Repository : IDisposable
         return (manifest, structuredDocument, []);
     }
 
-    private (Manifest, object, List<string>) ManifestFromV2(int sourceIndex, long packageRowid, string packageHash, PackageQuery query)
+    private (Manifest, object, List<string>) ManifestFromV2(
+        int sourceIndex,
+        long packageRowid,
+        string packageHash,
+        SearchMatch display,
+        PackageQuery query,
+        bool allowExplicitVersionRefresh)
+    {
+        PreIndexedRefreshOutcome openRefresh;
+        SqliteConnection? conn = OpenPreindexedConnection(sourceIndex, out openRefresh);
+        try
+        {
+            return ManifestFromV2Connection(sourceIndex, conn, packageRowid, packageHash, display, query);
+        }
+        catch (MissingPackageVersionException ex) when (allowExplicitVersionRefresh && query.Version is not null)
+        {
+            conn.Dispose();
+            conn = null;
+            if (openRefresh.Attempted && !openRefresh.ReusedRecentAttempt)
+                throw openRefresh.Exception is null ? ex : WithRefreshFailure(ex, openRefresh.Exception);
+            if (HasRecentSuccessfulPreindexedRefreshAttempt(_store.Sources[sourceIndex]))
+                throw;
+
+            return RefreshPreindexedAndRetryManifest(sourceIndex, display, query, ex);
+        }
+        finally
+        {
+            conn?.Dispose();
+        }
+    }
+
+    private (Manifest, object, List<string>) ManifestFromV2Connection(
+        int sourceIndex,
+        SqliteConnection conn,
+        long packageRowid,
+        string packageHash,
+        SearchMatch display,
+        PackageQuery query)
     {
         var source = _store.Sources[sourceIndex];
-        var conn = OpenPreindexedConnection(sourceIndex);
         var (entries, vdFile) = PreIndexedSource.LoadV2VersionData(_client, conn, source, packageRowid, packageHash, _appRoot);
-        var selected = SelectV2Version(entries, query.Version);
+        var selected = SelectV2Version(entries, query.Version, query.Channel, display.Id, source.Name);
         var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V2_M", source, selected.ManifestRelativePath, selected.ManifestHash);
         var manifest = ParseYamlManifest(bytes);
         var structuredDocument = ParseYamlManifestDocuments(bytes);
@@ -1472,64 +1683,140 @@ public class Repository : IDisposable
         return (manifest, structuredDocument, [vdFile]);
     }
 
-    private (Manifest, object, List<string>) ManifestFromRest(int sourceIndex, string packageId, List<VersionKey> versions, PackageQuery query)
+    private (Manifest, object, List<string>) ManifestFromRest(
+        int sourceIndex,
+        string packageId,
+        List<VersionKey> versions,
+        SearchMatch display,
+        PackageQuery query)
     {
         var source = _store.Sources[sourceIndex];
         var info = RestSource.LoadInformation(_client, source, _appRoot);
-        var selected = SelectRestVersion(versions, query.Version, query.Channel);
+        var selected = SelectRestVersion(versions, query.Version, query.Channel, display.Id, source.Name);
         var (manifest, structuredDocument) = RestSource.FetchManifestWithDocuments(_client, source, info, packageId, selected.Version, selected.Channel);
         return (manifest, structuredDocument, []);
+    }
+
+    private (Manifest, object, List<string>) RefreshPreindexedAndRetryManifest(
+        int sourceIndex,
+        SearchMatch display,
+        PackageQuery query,
+        MissingPackageVersionException missingVersion)
+    {
+        EmitPreindexedRefreshDiagnostic(sourceIndex, display.Id, missingVersion.RequestedVersion, missingVersion.RequestedChannel);
+        try
+        {
+            RefreshPreindexedSource(sourceIndex, force: true, PreIndexedRefreshKind.Explicit);
+        }
+        catch (Exception ex)
+        {
+            throw WithRefreshFailure(missingVersion, ex);
+        }
+
+        var refreshed = FindRefreshedPreindexedMatch(sourceIndex, display, query);
+        return ManifestForMatch(refreshed, query, allowExplicitVersionRefresh: false);
+    }
+
+    private LocatedMatch FindRefreshedPreindexedMatch(int sourceIndex, SearchMatch previousDisplay, PackageQuery query)
+    {
+        var sourceQuery = query with { Source = _store.Sources[sourceIndex].Name };
+        var (matches, _) = SearchPreindexed(sourceIndex, sourceQuery, SearchSemantics.Single);
+        var refreshed = matches.FirstOrDefault(match =>
+            string.Equals(match.Display.Id, previousDisplay.Id, StringComparison.OrdinalIgnoreCase));
+
+        if (refreshed is not null)
+            return refreshed;
+
+        if (matches.Count == 1)
+            return matches[0];
+
+        throw new InvalidOperationException($"Package '{previousDisplay.Id}' was not found in source '{_store.Sources[sourceIndex].Name}' after refreshing the pre-indexed source.");
     }
 
     // ── Version selection ──
 
     private static PreIndexedSource.V1VersionRow SelectV1Version(
-        List<PreIndexedSource.V1VersionRow> versions, string? requestedVersion, string? requestedChannel)
+        List<PreIndexedSource.V1VersionRow> versions,
+        string? requestedVersion,
+        string? requestedChannel,
+        string packageId,
+        string sourceName)
     {
         if (versions.Count == 0)
             throw new InvalidOperationException("No versions found");
 
-        if (requestedVersion is not null)
+        if (requestedVersion is null)
         {
-            var match = versions.FirstOrDefault(v => v.Version == requestedVersion
-                && (requestedChannel is null || v.Channel == requestedChannel));
-            if (match is not null) return match;
+            if (requestedChannel is null)
+                return versions[0]; // latest
+
+            var channelMatch = versions.FirstOrDefault(v => v.Channel == requestedChannel);
+            return channelMatch ?? throw new InvalidOperationException(
+                $"Channel '{requestedChannel}' was not found for package '{packageId}' in source '{sourceName}'.");
         }
 
-        return versions[0]; // latest
+        var match = versions.FirstOrDefault(v => v.Version == requestedVersion
+            && (requestedChannel is null || v.Channel == requestedChannel));
+        if (match is not null)
+            return match;
+
+        throw new MissingPackageVersionException(packageId, sourceName, requestedVersion, requestedChannel);
     }
 
     private static PreIndexedSource.V2VersionDataEntry SelectV2Version(
-        List<PreIndexedSource.V2VersionDataEntry> entries, string? requestedVersion)
+        List<PreIndexedSource.V2VersionDataEntry> entries,
+        string? requestedVersion,
+        string? requestedChannel,
+        string packageId,
+        string sourceName)
     {
         if (entries.Count == 0)
             throw new InvalidOperationException("No versions found");
 
+        if (requestedChannel is not null)
+            throw new InvalidOperationException(
+                $"Channel '{requestedChannel}' cannot be matched for package '{packageId}' in pre-indexed V2 source '{sourceName}' because the local source index does not include channel metadata.");
+
         if (requestedVersion is not null)
         {
             var match = entries.FirstOrDefault(e => e.Version == requestedVersion);
-            if (match is not null) return match;
+            if (match is not null)
+                return match;
+
+            throw new MissingPackageVersionException(packageId, sourceName, requestedVersion);
         }
 
-        // Sort and return latest
         var sorted = entries.OrderByDescending(e => e.Version, new VersionComparer()).ToList();
         return sorted[0];
     }
 
-    private static VersionKey SelectRestVersion(List<VersionKey> versions, string? requestedVersion, string? requestedChannel)
+    private static VersionKey SelectRestVersion(
+        List<VersionKey> versions,
+        string? requestedVersion,
+        string? requestedChannel,
+        string packageId,
+        string sourceName)
     {
         if (versions.Count == 0)
             throw new InvalidOperationException("No versions found");
 
-        if (requestedVersion is not null)
+        if (requestedVersion is null)
         {
-            var match = versions.FirstOrDefault(v => v.Version == requestedVersion
-                && (requestedChannel is null || v.Channel == requestedChannel));
-            if (match is not null) return match;
+            var sorted = versions.OrderByDescending(v => v.Version, new VersionComparer()).ToList();
+            if (requestedChannel is null)
+                return sorted[0];
+
+            var channelMatch = sorted.FirstOrDefault(v => v.Channel == requestedChannel);
+            return channelMatch ?? throw new InvalidOperationException(
+                $"Channel '{requestedChannel}' was not found for package '{packageId}' in source '{sourceName}'.");
         }
 
-        var sorted = versions.OrderByDescending(v => v.Version, new VersionComparer()).ToList();
-        return sorted[0];
+        var match = versions.FirstOrDefault(v => v.Version == requestedVersion
+            && (requestedChannel is null || v.Channel == requestedChannel));
+        if (match is not null)
+            return match;
+
+        throw new MissingPackageVersionException(packageId, sourceName, requestedVersion, requestedChannel);
     }
 
     // ── Installer selection ──
@@ -2475,6 +2762,24 @@ public class Repository : IDisposable
 
     internal static bool InstalledPackageMatchesUpgradeFilterForTesting(InstalledPackage pkg, ListQuery query)
         => InstalledPackageMatchesUpgradeFilter(pkg, query);
+
+    internal static PreIndexedSource.V1VersionRow SelectV1VersionForTesting(
+        List<PreIndexedSource.V1VersionRow> versions,
+        string? requestedVersion,
+        string? requestedChannel = null)
+        => SelectV1Version(versions, requestedVersion, requestedChannel, "Test.Package", "test");
+
+    internal static PreIndexedSource.V2VersionDataEntry SelectV2VersionForTesting(
+        List<PreIndexedSource.V2VersionDataEntry> entries,
+        string? requestedVersion,
+        string? requestedChannel = null)
+        => SelectV2Version(entries, requestedVersion, requestedChannel, "Test.Package", "test");
+
+    internal static VersionKey SelectRestVersionForTesting(
+        List<VersionKey> versions,
+        string? requestedVersion,
+        string? requestedChannel = null)
+        => SelectRestVersion(versions, requestedVersion, requestedChannel, "Test.Package", "test");
 
     private static long? LookupUniqueNormalizedIdentity(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
     {

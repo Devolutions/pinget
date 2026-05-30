@@ -1,7 +1,7 @@
 mod name_normalization;
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{Cursor, Read};
@@ -10,7 +10,7 @@ use std::mem::{MaybeUninit, size_of};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -39,6 +39,8 @@ const DEFAULT_MAX_RESULTS: usize = 50;
 const LIST_LOOKUP_MAX_RESULTS: usize = 500;
 const PREINDEXED_CANDIDATES: &[&str] = &["source2.msix", "source.msix"];
 const DEFAULT_USER_AGENT: &str = "pinget-rs/0.1";
+const DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES: i64 = 5;
+const PREINDEXED_REFRESH_RETRY_MINUTES: i64 = 5;
 #[cfg(windows)]
 const PACKAGED_FAMILY_NAME: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
 #[cfg(windows)]
@@ -141,6 +143,7 @@ impl Default for SourceStore {
 pub struct RepositoryOptions {
     pub app_root: PathBuf,
     pub user_agent: String,
+    pub pre_indexed_source_auto_update_interval: Option<Duration>,
 }
 
 impl RepositoryOptions {
@@ -149,6 +152,7 @@ impl RepositoryOptions {
         Self {
             app_root: app_root.into(),
             user_agent: DEFAULT_USER_AGENT.to_owned(),
+            pre_indexed_source_auto_update_interval: Some(Duration::minutes(DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES)),
         }
     }
 
@@ -161,6 +165,13 @@ impl RepositoryOptions {
     #[must_use]
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
+        self
+    }
+
+    /// Overrides automatic freshness checks for existing pre-indexed source indexes.
+    #[must_use]
+    pub fn with_pre_indexed_source_auto_update_interval(mut self, interval: Option<Duration>) -> Self {
+        self.pre_indexed_source_auto_update_interval = interval;
         self
     }
 }
@@ -713,6 +724,57 @@ pub struct Repository {
     client: Client,
     store: SourceStore,
     use_system_winget_sources: bool,
+    pre_indexed_source_auto_update_interval: Option<Duration>,
+    preindexed_refresh_attempts: HashMap<String, PreindexedRefreshAttempt>,
+}
+
+#[derive(Debug, Clone)]
+struct PreindexedRefreshAttempt {
+    attempted_at: DateTime<Utc>,
+    succeeded: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PreindexedRefreshOutcome {
+    attempted: bool,
+    reused_recent_attempt: bool,
+    error: Option<String>,
+}
+
+struct PreindexedOpenConnection {
+    connection: Connection,
+    refresh: PreindexedRefreshOutcome,
+}
+
+#[derive(Debug)]
+struct MissingPackageVersionError {
+    package_id: String,
+    source_name: String,
+    requested_version: String,
+    requested_channel: Option<String>,
+}
+
+impl Display for MissingPackageVersionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let channel = self
+            .requested_channel
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| format!(" with channel '{value}'"))
+            .unwrap_or_default();
+        write!(
+            f,
+            "Version '{}'{} was not found for package '{}' in source '{}'.",
+            self.requested_version, channel, self.package_id, self.source_name
+        )
+    }
+}
+
+impl std::error::Error for MissingPackageVersionError {}
+
+fn preindexed_refresh_locks() -> &'static RwLock<HashMap<String, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<RwLock<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 impl Repository {
@@ -735,6 +797,8 @@ impl Repository {
             client,
             store,
             use_system_winget_sources,
+            pre_indexed_source_auto_update_interval: options.pre_indexed_source_auto_update_interval,
+            preindexed_refresh_attempts: HashMap::new(),
         })
     }
 
@@ -2371,13 +2435,53 @@ impl Repository {
         located: &LocatedMatch,
         query: &PackageQuery,
     ) -> Result<(Manifest, JsonValue, Vec<PathBuf>)> {
+        self.manifest_for_match_with_refresh(located, query, true)
+    }
+
+    fn manifest_for_match_with_refresh(
+        &mut self,
+        located: &LocatedMatch,
+        query: &PackageQuery,
+        allow_explicit_version_refresh: bool,
+    ) -> Result<(Manifest, JsonValue, Vec<PathBuf>)> {
         match &located.locator {
             MatchLocator::PreIndexedV1 { package_rowid } => {
                 let source = self.source_clone(located.source_index);
-                let connection = self.open_preindexed_connection(located.source_index)?;
-                let versions = query_v1_versions(&connection, *package_rowid)?;
-                let selected = select_v1_version(&versions, query.version.as_deref(), query.channel.as_deref())?;
-                let relative_path = resolve_v1_relative_path(&connection, selected.pathpart_id)?;
+                let opened = self.open_preindexed_connection_with_refresh(located.source_index)?;
+                let versions = query_v1_versions(&opened.connection, *package_rowid)?;
+                let selected = match select_v1_version(
+                    &versions,
+                    query.version.as_deref(),
+                    query.channel.as_deref(),
+                    &located.display.id,
+                    &source.name,
+                ) {
+                    Ok(selected) => selected,
+                    Err(error)
+                        if allow_explicit_version_refresh
+                            && query.version.is_some()
+                            && error.downcast_ref::<MissingPackageVersionError>().is_some() =>
+                    {
+                        let open_refresh = opened.refresh.clone();
+                        if open_refresh.attempted && !open_refresh.reused_recent_attempt {
+                            return missing_error_after_open_refresh(error, &open_refresh);
+                        }
+                        if self.has_recent_successful_preindexed_refresh_attempt(
+                            &self.preindexed_refresh_lock_key(&source),
+                        ) {
+                            return Err(error);
+                        }
+                        drop(opened);
+                        return self.refresh_preindexed_and_retry_manifest(
+                            located.source_index,
+                            &located.display,
+                            query,
+                            error,
+                        );
+                    }
+                    Err(error) => return Err(error),
+                };
+                let relative_path = resolve_v1_relative_path(&opened.connection, selected.pathpart_id)?;
                 let bytes =
                     self.get_cached_source_file("V1_M", &source, &relative_path, selected.manifest_hash.as_deref())?;
                 let (mut manifest, manifest_documents) = parse_yaml_manifest_bundle(&bytes.bytes)?;
@@ -2390,9 +2494,41 @@ impl Repository {
                 package_hash,
             } => {
                 let source = self.source_clone(located.source_index);
+                let opened = self.open_preindexed_connection_with_refresh(located.source_index)?;
                 let (entries, version_data_file) =
                     self.load_v2_version_data(&source, *package_rowid, package_hash.as_str())?;
-                let selected = select_v2_version(&entries, query.version.as_deref())?;
+                let selected = match select_v2_version(
+                    &entries,
+                    query.version.as_deref(),
+                    query.channel.as_deref(),
+                    &located.display.id,
+                    &source.name,
+                ) {
+                    Ok(selected) => selected,
+                    Err(error)
+                        if allow_explicit_version_refresh
+                            && query.version.is_some()
+                            && error.downcast_ref::<MissingPackageVersionError>().is_some() =>
+                    {
+                        let open_refresh = opened.refresh.clone();
+                        if open_refresh.attempted && !open_refresh.reused_recent_attempt {
+                            return missing_error_after_open_refresh(error, &open_refresh);
+                        }
+                        if self.has_recent_successful_preindexed_refresh_attempt(
+                            &self.preindexed_refresh_lock_key(&source),
+                        ) {
+                            return Err(error);
+                        }
+                        drop(opened);
+                        return self.refresh_preindexed_and_retry_manifest(
+                            located.source_index,
+                            &located.display,
+                            query,
+                            error,
+                        );
+                    }
+                    Err(error) => return Err(error),
+                };
                 let manifest_bytes = self.get_cached_source_file(
                     "V2_M",
                     &source,
@@ -2409,7 +2545,13 @@ impl Repository {
             }
             MatchLocator::Rest { package_id, versions } => {
                 let source = self.source_clone(located.source_index);
-                let selected = select_rest_version(versions, query.version.as_deref(), query.channel.as_deref())?;
+                let selected = select_rest_version(
+                    versions,
+                    query.version.as_deref(),
+                    query.channel.as_deref(),
+                    &located.display.id,
+                    &source.name,
+                )?;
                 let (bytes, cache_path) =
                     self.get_or_fetch_rest_manifest(&source, package_id, &selected.version, &selected.channel)?;
                 let (manifest, manifest_documents) =
@@ -2417,6 +2559,47 @@ impl Repository {
                 Ok((manifest, manifest_documents, vec![cache_path]))
             }
         }
+    }
+
+    fn refresh_preindexed_and_retry_manifest(
+        &mut self,
+        source_index: usize,
+        previous_display: &SearchMatch,
+        query: &PackageQuery,
+        missing_error: anyhow::Error,
+    ) -> Result<(Manifest, JsonValue, Vec<PathBuf>)> {
+        self.refresh_preindexed_source(source_index, true)
+            .with_context(|| format!("{missing_error} The source refresh also failed"))?;
+        let refreshed = self.find_refreshed_preindexed_match(source_index, previous_display, query)?;
+        self.manifest_for_match_with_refresh(&refreshed, query, false)
+    }
+
+    fn find_refreshed_preindexed_match(
+        &mut self,
+        source_index: usize,
+        previous_display: &SearchMatch,
+        query: &PackageQuery,
+    ) -> Result<LocatedMatch> {
+        let source_name = self.store.sources[source_index].name.clone();
+        let mut source_query = query.clone();
+        source_query.source = Some(source_name.clone());
+        let matches = self
+            .search_preindexed(source_index, &source_query, SearchSemantics::Single)?
+            .matches;
+        if let Some(found) = matches
+            .iter()
+            .find(|candidate| candidate.display.id.eq_ignore_ascii_case(&previous_display.id))
+        {
+            return Ok(found.clone());
+        }
+        if matches.len() == 1 {
+            return Ok(matches.into_iter().next().expect("single match"));
+        }
+        bail!(
+            "Package '{}' was not found in source '{}' after refreshing the pre-indexed source.",
+            previous_display.id,
+            source_name
+        )
     }
 
     fn search_preindexed(
@@ -2555,16 +2738,119 @@ impl Repository {
     }
 
     fn open_preindexed_connection(&mut self, source_index: usize) -> Result<Connection> {
+        Ok(self.open_preindexed_connection_with_refresh(source_index)?.connection)
+    }
+
+    fn open_preindexed_connection_with_refresh(&mut self, source_index: usize) -> Result<PreindexedOpenConnection> {
         let source = self.source_clone(source_index);
         let index_path = preindexed_index_path(&self.app_root, &source);
+        let mut refresh = PreindexedRefreshOutcome::default();
         if !index_path.exists() {
-            let _ = self.update_preindexed(source_index)?;
-            if !self.use_system_winget_sources {
-                self.save_store()?;
+            let _ = self.refresh_preindexed_source(source_index, true)?;
+            refresh.attempted = true;
+        } else if self.is_preindexed_index_stale(&source, &index_path) {
+            let lock_key = self.preindexed_refresh_lock_key(&source);
+            if self.has_recent_preindexed_refresh_attempt(&lock_key) {
+                refresh.attempted = true;
+                refresh.reused_recent_attempt = true;
+            } else {
+                refresh.attempted = true;
+                if let Err(error) = self.refresh_preindexed_source(source_index, false) {
+                    refresh.error = Some(format!("{error:#}"));
+                }
             }
         }
 
-        Self::open_sqlite_connection(index_path).context("failed to open preindexed index")
+        Ok(PreindexedOpenConnection {
+            connection: Self::open_sqlite_connection(index_path).context("failed to open preindexed index")?,
+            refresh,
+        })
+    }
+
+    fn is_preindexed_index_stale(&self, source: &SourceRecord, index_path: &Path) -> bool {
+        let Some(interval) = self.pre_indexed_source_auto_update_interval else {
+            return false;
+        };
+
+        let last_update = source.last_update.or_else(|| {
+            fs::metadata(index_path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(DateTime::<Utc>::from)
+        });
+
+        match last_update {
+            Some(last_update) => Utc::now() - last_update >= interval,
+            None => true,
+        }
+    }
+
+    fn preindexed_refresh_lock_key(&self, source: &SourceRecord) -> String {
+        format!("{}|{}|{}", self.app_root.display(), source.identifier, source.name)
+    }
+
+    fn has_recent_preindexed_refresh_attempt(&self, lock_key: &str) -> bool {
+        self.preindexed_refresh_attempts.get(lock_key).is_some_and(|attempt| {
+            Utc::now() - attempt.attempted_at < Duration::minutes(PREINDEXED_REFRESH_RETRY_MINUTES)
+        })
+    }
+
+    fn has_recent_successful_preindexed_refresh_attempt(&self, lock_key: &str) -> bool {
+        self.preindexed_refresh_attempts.get(lock_key).is_some_and(|attempt| {
+            attempt.succeeded && Utc::now() - attempt.attempted_at < Duration::minutes(PREINDEXED_REFRESH_RETRY_MINUTES)
+        })
+    }
+
+    fn record_preindexed_refresh_attempt(&mut self, lock_key: String, succeeded: bool) {
+        self.preindexed_refresh_attempts.insert(
+            lock_key,
+            PreindexedRefreshAttempt {
+                attempted_at: Utc::now(),
+                succeeded,
+            },
+        );
+    }
+
+    fn preindexed_refresh_lock(lock_key: &str) -> Result<Arc<Mutex<()>>> {
+        {
+            let locks = preindexed_refresh_locks()
+                .read()
+                .map_err(|_| anyhow!("pre-indexed refresh lock registry was poisoned"))?;
+            if let Some(existing) = locks.get(lock_key) {
+                return Ok(Arc::clone(existing));
+            }
+        }
+
+        let mut locks = preindexed_refresh_locks()
+            .write()
+            .map_err(|_| anyhow!("pre-indexed refresh lock registry was poisoned"))?;
+        Ok(Arc::clone(
+            locks
+                .entry(lock_key.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
+    }
+
+    fn refresh_preindexed_source(&mut self, source_index: usize, force: bool) -> Result<String> {
+        let source = self.source_clone(source_index);
+        let index_path = preindexed_index_path(&self.app_root, &source);
+        let lock_key = self.preindexed_refresh_lock_key(&source);
+        let refresh_lock = Self::preindexed_refresh_lock(&lock_key)?;
+        let _guard = refresh_lock
+            .lock()
+            .map_err(|_| anyhow!("pre-indexed source refresh lock was poisoned"))?;
+
+        if !force && index_path.exists() && !self.is_preindexed_index_stale(&source, &index_path) {
+            return Ok("source already refreshed".to_owned());
+        }
+
+        let result = self.update_preindexed(source_index);
+        self.record_preindexed_refresh_attempt(lock_key, result.is_ok());
+        let detail = result?;
+        if !self.use_system_winget_sources {
+            self.save_store()?;
+        }
+        Ok(detail)
     }
 
     fn open_sqlite_connection(path: PathBuf) -> Result<Connection> {
@@ -2598,8 +2884,20 @@ impl Repository {
 
                     fs::write(preindexed_package_path(&self.app_root, source), &payload)
                         .context("failed to persist source package")?;
-                    fs::write(preindexed_index_path(&self.app_root, source), index_bytes)
-                        .context("failed to persist source index")?;
+                    let index_path = preindexed_index_path(&self.app_root, source);
+                    let temp_index_path = state_dir.join(format!(
+                        "index.{}.tmp",
+                        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    ));
+                    fs::write(&temp_index_path, index_bytes).context("failed to persist temporary source index")?;
+                    match fs::rename(&temp_index_path, &index_path) {
+                        Ok(()) => {}
+                        Err(_) if index_path.exists() => {
+                            fs::remove_file(&index_path).context("failed to replace existing source index")?;
+                            fs::rename(&temp_index_path, &index_path).context("failed to replace source index")?;
+                        }
+                        Err(error) => return Err(error).context("failed to persist source index"),
+                    }
                     source.last_update = Some(Utc::now());
                     source.source_version = header_version;
                     return Ok(format!("downloaded {}", candidate));
@@ -2990,7 +3288,6 @@ fn installed_package_matches_upgrade_filter(package: &InstalledPackage, query: &
 /// untouched; they can't appear in `upgrade` output anyway (the upgrade
 /// filter requires a correlation), so they're effectively a no-op here.
 fn dedupe_correlated_for_upgrade(packages: Vec<InstalledPackage>) -> Vec<InstalledPackage> {
-    use std::collections::HashMap;
     let mut by_id: HashMap<(String, String), InstalledPackage> = HashMap::new();
     let mut uncorrelated: Vec<InstalledPackage> = Vec::new();
 
@@ -3609,8 +3906,7 @@ fn collect_installed_packages(scope: Option<&str>) -> Result<Vec<InstalledPackag
 /// by the flipped UpgradeCode GUID, and each subkey's *value names* are the
 /// flipped ProductCodes registered under that UpgradeCode.
 #[cfg(windows)]
-fn collect_msi_upgrade_codes(include_machine: bool, include_user: bool) -> std::collections::HashMap<String, String> {
-    use std::collections::HashMap;
+fn collect_msi_upgrade_codes(include_machine: bool, include_user: bool) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if include_machine {
         collect_msi_upgrade_codes_from(
@@ -3632,12 +3928,7 @@ fn collect_msi_upgrade_codes(include_machine: bool, include_user: bool) -> std::
 }
 
 #[cfg(windows)]
-fn collect_msi_upgrade_codes_from(
-    root: RegKey,
-    path: &str,
-    flags: u32,
-    map: &mut std::collections::HashMap<String, String>,
-) {
+fn collect_msi_upgrade_codes_from(root: RegKey, path: &str, flags: u32, map: &mut HashMap<String, String>) {
     let Ok(upgrade_codes) = root.open_subkey_with_flags(path, flags) else {
         return;
     };
@@ -3699,7 +3990,7 @@ fn collect_installed_packages(_scope: Option<&str>) -> Result<Vec<InstalledPacka
 fn collect_uninstall_view(
     packages: &mut Vec<InstalledPackage>,
     seen: &mut BTreeSet<String>,
-    upgrade_code_map: &std::collections::HashMap<String, String>,
+    upgrade_code_map: &HashMap<String, String>,
     root: RegKey,
     scope: &str,
     arch: &str,
@@ -7059,6 +7350,8 @@ fn select_v1_version(
     versions: &[V1VersionRow],
     requested_version: Option<&str>,
     requested_channel: Option<&str>,
+    package_id: &str,
+    source_name: &str,
 ) -> Result<V1VersionRow> {
     let mut ordered = versions.to_vec();
     ordered.sort_by(|left, right| {
@@ -7074,7 +7367,17 @@ fn select_v1_version(
                     && (channel.is_empty() || candidate.channel.eq_ignore_ascii_case(channel))
             })
             .cloned()
-            .ok_or_else(|| anyhow!("requested version {version} was not found"));
+            .ok_or_else(|| missing_package_version(package_id, source_name, version, requested_channel));
+    }
+
+    if let Some(channel) = requested_channel {
+        return ordered
+            .iter()
+            .find(|candidate| candidate.channel.eq_ignore_ascii_case(channel))
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!("Channel '{channel}' was not found for package '{package_id}' in source '{source_name}'.")
+            });
     }
 
     ordered
@@ -7086,16 +7389,25 @@ fn select_v1_version(
 fn select_v2_version(
     versions: &[PackageVersionDataEntry],
     requested_version: Option<&str>,
+    requested_channel: Option<&str>,
+    package_id: &str,
+    source_name: &str,
 ) -> Result<PackageVersionDataEntry> {
     let mut ordered = versions.to_vec();
     ordered.sort_by(|left, right| compare_version(&right.version, &left.version));
+
+    if let Some(channel) = requested_channel {
+        bail!(
+            "Channel '{channel}' cannot be matched for package '{package_id}' in pre-indexed V2 source '{source_name}' because the local source index does not include channel metadata."
+        );
+    }
 
     if let Some(version) = requested_version {
         return ordered
             .iter()
             .find(|candidate| candidate.version.eq_ignore_ascii_case(version))
             .cloned()
-            .ok_or_else(|| anyhow!("requested version {version} was not found"));
+            .ok_or_else(|| missing_package_version(package_id, source_name, version, requested_channel));
     }
 
     ordered
@@ -7104,10 +7416,35 @@ fn select_v2_version(
         .ok_or_else(|| anyhow!("package had no V2 versions"))
 }
 
+fn missing_package_version(
+    package_id: &str,
+    source_name: &str,
+    requested_version: &str,
+    requested_channel: Option<&str>,
+) -> anyhow::Error {
+    anyhow!(MissingPackageVersionError {
+        package_id: package_id.to_owned(),
+        source_name: source_name.to_owned(),
+        requested_version: requested_version.to_owned(),
+        requested_channel: requested_channel.map(str::to_owned),
+    })
+}
+
+fn missing_error_after_open_refresh<T>(error: anyhow::Error, refresh: &PreindexedRefreshOutcome) -> Result<T> {
+    if let Some(refresh_error) = refresh.error.as_deref() {
+        let missing_error = error.to_string();
+        return Err(error).with_context(|| format!("{missing_error} The source refresh also failed: {refresh_error}"));
+    }
+
+    Err(error)
+}
+
 fn select_rest_version<'a>(
     versions: &'a [VersionKey],
     requested_version: Option<&str>,
     requested_channel: Option<&str>,
+    package_id: &str,
+    source_name: &str,
 ) -> Result<&'a VersionKey> {
     if let Some(version) = requested_version {
         let channel = requested_channel.unwrap_or_default();
@@ -7117,7 +7454,16 @@ fn select_rest_version<'a>(
                 candidate.version.eq_ignore_ascii_case(version)
                     && (channel.is_empty() || candidate.channel.eq_ignore_ascii_case(channel))
             })
-            .ok_or_else(|| anyhow!("requested version {version} was not found"));
+            .ok_or_else(|| missing_package_version(package_id, source_name, version, requested_channel));
+    }
+
+    if let Some(channel) = requested_channel {
+        return versions
+            .iter()
+            .find(|candidate| candidate.channel.eq_ignore_ascii_case(channel))
+            .ok_or_else(|| {
+                anyhow!("Channel '{channel}' was not found for package '{package_id}' in source '{source_name}'.")
+            });
     }
 
     versions.first().ok_or_else(|| anyhow!("package had no REST versions"))
@@ -8509,11 +8855,15 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Read as _, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+    use std::thread::{self, JoinHandle};
 
     use flate2::Compression;
     use flate2::write::DeflateEncoder;
+    use zip::write::SimpleFileOptions;
 
     use super::*;
 
@@ -8655,9 +9005,11 @@ mod tests {
     }
 
     fn temp_app_root(label: &str) -> PathBuf {
+        static TEMP_APP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "pinget-rs-tests-{label}-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            "pinget-rs-tests-{label}-{}-{}",
+            std::process::id(),
+            TEMP_APP_ROOT_COUNTER.fetch_add(1, AtomicOrdering::SeqCst)
         ))
     }
 
@@ -8900,11 +9252,13 @@ mod tests {
 
     #[test]
     fn repository_options_capture_custom_host_settings() {
-        let options =
-            RepositoryOptions::new(PathBuf::from(r"C:\temp\pinget-test")).with_user_agent("pinget-rs-tests/1.0");
+        let options = RepositoryOptions::new(PathBuf::from(r"C:\temp\pinget-test"))
+            .with_user_agent("pinget-rs-tests/1.0")
+            .with_pre_indexed_source_auto_update_interval(None);
 
         assert_eq!(options.app_root, PathBuf::from(r"C:\temp\pinget-test"));
         assert_eq!(options.user_agent, "pinget-rs-tests/1.0");
+        assert!(options.pre_indexed_source_auto_update_interval.is_none());
     }
 
     #[test]
@@ -11699,6 +12053,442 @@ Installers:
             arp_min_version: arp_min.map(str::to_owned),
             arp_max_version: arp_max.map(str::to_owned),
         }
+    }
+
+    fn v1_version(version: &str, channel: &str) -> V1VersionRow {
+        V1VersionRow {
+            version: version.to_owned(),
+            channel: channel.to_owned(),
+            pathpart_id: 0,
+            manifest_hash: None,
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestHttpResponse {
+        status: u16,
+        body: Vec<u8>,
+        source_version: Option<String>,
+    }
+
+    struct TestHttpServer {
+        addr: SocketAddr,
+        routes: Arc<Mutex<HashMap<String, TestHttpResponse>>>,
+        counts: Arc<Mutex<HashMap<String, usize>>>,
+        running: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    impl TestHttpServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
+            let addr = listener.local_addr().expect("test HTTP server address");
+            let routes = Arc::new(Mutex::new(HashMap::new()));
+            let counts = Arc::new(Mutex::new(HashMap::new()));
+            let running = Arc::new(AtomicBool::new(true));
+            let thread_routes = Arc::clone(&routes);
+            let thread_counts = Arc::clone(&counts);
+            let thread_running = Arc::clone(&running);
+            let handle = thread::spawn(move || {
+                while thread_running.load(AtomicOrdering::SeqCst) {
+                    let Ok((stream, _)) = listener.accept() else {
+                        continue;
+                    };
+                    handle_test_http_request(stream, &thread_routes, &thread_counts);
+                }
+            });
+
+            Self {
+                addr,
+                routes,
+                counts,
+                running,
+                handle: Some(handle),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn set_bytes(&self, path: &str, body: Vec<u8>) {
+            self.set_response(
+                path,
+                TestHttpResponse {
+                    status: 200,
+                    body,
+                    source_version: None,
+                },
+            );
+        }
+
+        fn set_source_package(&self, body: Vec<u8>, source_version: &str) {
+            self.set_response(
+                "/source.msix",
+                TestHttpResponse {
+                    status: 200,
+                    body,
+                    source_version: Some(source_version.to_owned()),
+                },
+            );
+        }
+
+        fn set_status(&self, path: &str, status: u16) {
+            self.set_response(
+                path,
+                TestHttpResponse {
+                    status,
+                    body: Vec::new(),
+                    source_version: None,
+                },
+            );
+        }
+
+        fn set_response(&self, path: &str, response: TestHttpResponse) {
+            self.routes
+                .lock()
+                .expect("test HTTP routes")
+                .insert(path.to_owned(), response);
+        }
+
+        fn request_count(&self, path: &str) -> usize {
+            self.counts
+                .lock()
+                .expect("test HTTP counts")
+                .get(path)
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl Drop for TestHttpServer {
+        fn drop(&mut self) {
+            self.running.store(false, AtomicOrdering::SeqCst);
+            let _ = TcpStream::connect(self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn handle_test_http_request(
+        mut stream: TcpStream,
+        routes: &Arc<Mutex<HashMap<String, TestHttpResponse>>>,
+        counts: &Arc<Mutex<HashMap<String, usize>>>,
+    ) {
+        let mut buffer = [0u8; 2048];
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+        *counts
+            .lock()
+            .expect("test HTTP counts")
+            .entry(path.to_owned())
+            .or_default() += 1;
+        let response = routes.lock().expect("test HTTP routes").get(path).cloned();
+        let response = response.unwrap_or(TestHttpResponse {
+            status: 404,
+            body: Vec::new(),
+            source_version: None,
+        });
+        let reason = if response.status == 200 { "OK" } else { "Not Found" };
+        let mut headers = format!(
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response.status,
+            reason,
+            response.body.len()
+        );
+        if let Some(source_version) = response.source_version {
+            headers.push_str(&format!("x-ms-meta-sourceversion: {source_version}\r\n"));
+        }
+        headers.push_str("\r\n");
+        stream.write_all(headers.as_bytes()).expect("write test HTTP headers");
+        stream.write_all(&response.body).expect("write test HTTP body");
+    }
+
+    fn test_source_record(source_url: String) -> SourceRecord {
+        SourceRecord {
+            name: "test-winget".to_owned(),
+            kind: SourceKind::PreIndexed,
+            arg: source_url,
+            identifier: "Test.Source".to_owned(),
+            trust_level: "Trusted".to_owned(),
+            explicit: false,
+            priority: 0,
+            last_update: Some(Utc::now()),
+            source_version: None,
+        }
+    }
+
+    fn open_test_preindexed_repository(
+        app_root: &Path,
+        source: &SourceRecord,
+        interval: Option<Duration>,
+    ) -> Repository {
+        fs::create_dir_all(app_root).expect("create app root");
+        save_store(
+            app_root,
+            &SourceStore {
+                sources: vec![source.clone()],
+            },
+        )
+        .expect("save source store");
+        Repository::open_with_options(
+            RepositoryOptions::new(app_root.to_path_buf()).with_pre_indexed_source_auto_update_interval(interval),
+        )
+        .expect("open repository")
+    }
+
+    fn write_test_preindexed_index(app_root: &Path, source: &SourceRecord, versions: &[&str]) {
+        let index_path = preindexed_index_path(app_root, source);
+        if let Some(parent) = index_path.parent() {
+            fs::create_dir_all(parent).expect("create source state directory");
+        }
+        fs::write(index_path, make_v1_index_bytes(versions)).expect("write preindexed index");
+    }
+
+    fn make_source_package(versions: &[&str]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(cursor);
+        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("Public/index.db", options)
+            .expect("start index entry");
+        archive
+            .write_all(&make_v1_index_bytes(versions))
+            .expect("write index entry");
+        archive.finish().expect("finish source package").into_inner()
+    }
+
+    fn make_v1_index_bytes(versions: &[&str]) -> Vec<u8> {
+        let root = temp_app_root("preindexed_index_bytes");
+        fs::create_dir_all(&root).expect("create index temp root");
+        let db_path = root.join("index.db");
+        let connection = Repository::open_sqlite_connection(db_path.clone()).expect("open index db");
+        let mut sql = String::from(
+            "CREATE TABLE ids (id TEXT);
+             CREATE TABLE names (name TEXT);
+             CREATE TABLE monikers (moniker TEXT);
+             CREATE TABLE versions (version TEXT);
+             CREATE TABLE channels (channel TEXT);
+             CREATE TABLE pathparts (parent INT64, pathpart TEXT);
+             CREATE TABLE manifest (
+                 id INT64,
+                 name INT64,
+                 moniker INT64,
+                 version INT64,
+                 channel INT64,
+                 pathpart INT64
+             );
+             INSERT INTO ids(rowid, id) VALUES (1, 'Test.Package');
+             INSERT INTO names(rowid, name) VALUES (1, 'Test Package');
+             INSERT INTO channels(rowid, channel) VALUES (1, '');
+             INSERT INTO pathparts(rowid, parent, pathpart) VALUES (1, NULL, 'manifests');
+             INSERT INTO pathparts(rowid, parent, pathpart) VALUES (2, 1, 'Test.Package.yaml');",
+        );
+        for (index, version) in versions.iter().enumerate() {
+            let rowid = index + 1;
+            sql.push_str(&format!(
+                "INSERT INTO versions(rowid, version) VALUES ({rowid}, '{version}');
+                 INSERT INTO manifest(id, name, moniker, version, channel, pathpart) VALUES (1, 1, NULL, {rowid}, 1, 2);"
+            ));
+        }
+        execute_batch_sql(&connection, &sql).expect("seed preindexed V1 database");
+        let _ = query_rows(&connection, "PRAGMA wal_checkpoint(TRUNCATE)", Vec::new(), |_| Ok(()))
+            .expect("checkpoint preindexed V1 database");
+        connection.cacheflush().expect("flush preindexed V1 database");
+        drop(connection);
+        let bytes = fs::read(&db_path).expect("read index bytes");
+        let _ = fs::remove_dir_all(root);
+        bytes
+    }
+
+    fn test_manifest_yaml(version: &str) -> Vec<u8> {
+        format!(
+            "PackageIdentifier: Test.Package\nPackageVersion: {version}\nPackageName: Test Package\nPublisher: Test\n"
+        )
+        .into_bytes()
+    }
+
+    fn show_test_package(version: Option<&str>) -> PackageQuery {
+        PackageQuery {
+            id: Some("Test.Package".to_owned()),
+            source: Some("test-winget".to_owned()),
+            exact: true,
+            version: version.map(str::to_owned),
+            ..PackageQuery::default()
+        }
+    }
+
+    #[test]
+    fn preindexed_explicit_missing_version_refreshes_once_and_returns_requested_version() {
+        let app_root = temp_app_root("preindexed_explicit_refresh");
+        let server = TestHttpServer::start();
+        server.set_status("/source2.msix", 404);
+        server.set_source_package(make_source_package(&["1.0.0", "2.0.0"]), "2");
+        server.set_bytes("/manifests/Test.Package.yaml", test_manifest_yaml("2.0.0"));
+        let source = test_source_record(server.url());
+        write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
+        let mut repository = open_test_preindexed_repository(&app_root, &source, None);
+
+        let result = repository
+            .show(&show_test_package(Some("2.0.0")))
+            .expect("show after refresh");
+
+        assert_eq!(result.manifest.version, "2.0.0");
+        assert_eq!(repository.list_sources()[0].source_version.as_deref(), Some("2"));
+        let _ = fs::remove_dir_all(app_root);
+    }
+
+    #[test]
+    fn preindexed_explicit_missing_version_fails_after_refresh_instead_of_returning_latest() {
+        let app_root = temp_app_root("preindexed_explicit_still_missing");
+        let server = TestHttpServer::start();
+        server.set_status("/source2.msix", 404);
+        server.set_source_package(make_source_package(&["1.0.0"]), "same");
+        let source = test_source_record(server.url());
+        write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
+        let mut repository = open_test_preindexed_repository(&app_root, &source, None);
+
+        let error = repository
+            .show(&show_test_package(Some("2.0.0")))
+            .expect_err("missing explicit version must fail");
+
+        assert!(format!("{error:#}").contains("2.0.0"));
+        let _ = fs::remove_dir_all(app_root);
+    }
+
+    #[test]
+    fn preindexed_stale_index_refreshes_for_latest_requests() {
+        let app_root = temp_app_root("preindexed_ttl_refresh");
+        let server = TestHttpServer::start();
+        server.set_status("/source2.msix", 404);
+        server.set_source_package(make_source_package(&["1.0.0", "2.0.0"]), "fresh");
+        server.set_bytes("/manifests/Test.Package.yaml", test_manifest_yaml("2.0.0"));
+        let mut source = test_source_record(server.url());
+        source.last_update = Some(Utc::now() - Duration::days(2));
+        write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
+        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::minutes(1)));
+
+        let result = repository
+            .show(&show_test_package(None))
+            .expect("show latest after TTL refresh");
+
+        assert_eq!(result.manifest.version, "2.0.0");
+        assert_eq!(repository.list_sources()[0].source_version.as_deref(), Some("fresh"));
+        let _ = fs::remove_dir_all(app_root);
+    }
+
+    #[test]
+    fn preindexed_stale_refresh_failure_falls_back_for_latest_requests() {
+        let app_root = temp_app_root("preindexed_ttl_fallback");
+        let server = TestHttpServer::start();
+        server.set_status("/source2.msix", 404);
+        server.set_status("/source.msix", 404);
+        server.set_bytes("/manifests/Test.Package.yaml", test_manifest_yaml("1.0.0"));
+        let mut source = test_source_record(server.url());
+        source.last_update = Some(Utc::now() - Duration::days(2));
+        write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
+        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::minutes(1)));
+
+        let result = repository
+            .show(&show_test_package(None))
+            .expect("show latest from stale cache after refresh failure");
+
+        assert_eq!(result.manifest.version, "1.0.0");
+        let _ = fs::remove_dir_all(app_root);
+    }
+
+    #[test]
+    fn preindexed_explicit_missing_version_does_not_refresh_twice_after_stale_refresh() {
+        let app_root = temp_app_root("preindexed_no_double_refresh");
+        let server = TestHttpServer::start();
+        server.set_status("/source2.msix", 404);
+        server.set_source_package(make_source_package(&["1.0.0", "2.0.0"]), "fresh");
+        let mut source = test_source_record(server.url());
+        source.last_update = Some(Utc::now() - Duration::days(2));
+        write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
+        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::minutes(1)));
+
+        let error = repository
+            .show(&show_test_package(Some("3.0.0")))
+            .expect_err("still-missing explicit version must fail after one stale refresh");
+
+        assert!(format!("{error:#}").contains("3.0.0"));
+        assert_eq!(server.request_count("/source.msix"), 1);
+        let _ = fs::remove_dir_all(app_root);
+    }
+
+    #[test]
+    fn select_v2_version_without_explicit_filters_returns_latest() {
+        let versions = vec![
+            version_entry("1.0.0", None, None),
+            version_entry("1.2.0", None, None),
+            version_entry("1.1.0", None, None),
+        ];
+
+        let selected = select_v2_version(&versions, None, None, "Test.Package", "test").expect("latest version");
+
+        assert_eq!(selected.version, "1.2.0");
+    }
+
+    #[test]
+    fn select_v2_version_with_missing_requested_version_throws() {
+        let versions = vec![version_entry("1.2.0", None, None), version_entry("1.1.0", None, None)];
+
+        let error = select_v2_version(&versions, Some("9.9.9"), None, "Test.Package", "test")
+            .expect_err("missing requested version");
+
+        assert!(error.downcast_ref::<MissingPackageVersionError>().is_some());
+        assert!(error.to_string().contains("9.9.9"));
+    }
+
+    #[test]
+    fn select_v2_version_with_requested_channel_throws_instead_of_ignoring_channel() {
+        let versions = vec![version_entry("1.2.0", None, None)];
+
+        let error = select_v2_version(&versions, Some("1.2.0"), Some("beta"), "Test.Package", "test")
+            .expect_err("unsupported channel request");
+
+        assert!(error.to_string().contains("beta"));
+        assert!(error.to_string().contains("channel metadata"));
+    }
+
+    #[test]
+    fn select_v1_version_channel_only_returns_latest_matching_channel() {
+        let versions = vec![
+            v1_version("1.2.0", "stable"),
+            v1_version("1.3.0", "stable"),
+            v1_version("2.0.0", "preview"),
+        ];
+
+        let selected =
+            select_v1_version(&versions, None, Some("stable"), "Test.Package", "test").expect("latest stable version");
+
+        assert_eq!(selected.version, "1.3.0");
+    }
+
+    #[test]
+    fn select_rest_version_channel_mismatch_throws() {
+        let versions = vec![
+            VersionKey {
+                version: "1.2.0".to_owned(),
+                channel: "stable".to_owned(),
+            },
+            VersionKey {
+                version: "1.1.0".to_owned(),
+                channel: "beta".to_owned(),
+            },
+        ];
+
+        let error = select_rest_version(&versions, Some("1.2.0"), Some("beta"), "Test.Package", "test")
+            .expect_err("missing version and channel pair");
+
+        assert!(error.downcast_ref::<MissingPackageVersionError>().is_some());
     }
 
     #[test]

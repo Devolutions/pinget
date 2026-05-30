@@ -42,7 +42,17 @@ internal static class PreIndexedSource
                     ?? throw new InvalidOperationException($"No Public/index.db in {candidate}");
 
                 var indexPath = IndexPath(source, appRoot);
-                indexEntry.ExtractToFile(indexPath, overwrite: true);
+                var tempIndexPath = Path.Combine(stateDir, $"index.{Guid.NewGuid():N}.tmp");
+                try
+                {
+                    indexEntry.ExtractToFile(tempIndexPath, overwrite: true);
+                    File.Move(tempIndexPath, indexPath, overwrite: true);
+                }
+                finally
+                {
+                    if (File.Exists(tempIndexPath))
+                        File.Delete(tempIndexPath);
+                }
 
                 source.SourceVersion = headerVersion;
                 return $"Updated from {candidate}" + (headerVersion != null ? $" (v{headerVersion})" : "");
