@@ -8,7 +8,7 @@ use std::io::{Cursor, Read};
 #[cfg(windows)]
 use std::mem::{MaybeUninit, size_of};
 #[cfg(windows)]
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -26,6 +26,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 #[cfg(windows)]
 use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 #[cfg(windows)]
@@ -2890,14 +2892,7 @@ impl Repository {
                         Utc::now().timestamp_nanos_opt().unwrap_or_default()
                     ));
                     fs::write(&temp_index_path, index_bytes).context("failed to persist temporary source index")?;
-                    match fs::rename(&temp_index_path, &index_path) {
-                        Ok(()) => {}
-                        Err(_) if index_path.exists() => {
-                            fs::remove_file(&index_path).context("failed to replace existing source index")?;
-                            fs::rename(&temp_index_path, &index_path).context("failed to replace source index")?;
-                        }
-                        Err(error) => return Err(error).context("failed to persist source index"),
-                    }
+                    replace_file(&temp_index_path, &index_path).context("failed to persist source index")?;
                     source.last_update = Some(Utc::now());
                     source.source_version = header_version;
                     return Ok(format!("downloaded {}", candidate));
@@ -4299,6 +4294,35 @@ fn preindexed_package_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
 
 fn preindexed_index_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
     source_state_dir(app_root, source).join("index.db")
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, target: &Path) -> Result<()> {
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target_wide = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    // SAFETY: Both paths are converted to null-terminated UTF-16 buffers that
+    // live for the duration of the call; MoveFileExW does not retain them.
+    let ok = unsafe { MoveFileExW(source_wide.as_ptr(), target_wide.as_ptr(), flags) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to replace {} with {}", target.display(), source.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, target: &Path) -> Result<()> {
+    fs::rename(source, target)
+        .with_context(|| format!("failed to replace {} with {}", target.display(), source.display()))
 }
 
 fn rest_information_cache_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
@@ -12249,6 +12273,21 @@ Installers:
             fs::create_dir_all(parent).expect("create source state directory");
         }
         fs::write(index_path, make_v1_index_bytes(versions)).expect("write preindexed index");
+    }
+
+    #[test]
+    fn replace_file_failure_keeps_existing_target() {
+        let root = temp_app_root("replace_file_failure");
+        fs::create_dir_all(&root).expect("create replace root");
+        let target = root.join("index.db");
+        let missing_source = root.join("missing.tmp");
+        fs::write(&target, b"old-index").expect("write existing target");
+
+        let error = replace_file(&missing_source, &target).expect_err("missing replacement should fail");
+
+        assert!(format!("{error:#}").contains("failed to replace"));
+        assert_eq!(fs::read(&target).expect("existing target remains"), b"old-index");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn make_source_package(versions: &[&str]) -> Vec<u8> {

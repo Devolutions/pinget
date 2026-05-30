@@ -2987,6 +2987,64 @@ public class RepositoryEmbeddingTests
     }
 
     [Fact]
+    public void Show_PreindexedDownloadedManifestHashMismatch_ThrowsInsteadOfCachingStaleBytes()
+    {
+        const string packageId = "Test.HashMismatchPackage";
+        const string version = "1.0.0";
+        var catalog = PreindexedCatalogFixture.Create(packageId, version);
+        var manifestPath = $"manifests/{packageId}/{version}.yaml";
+        var staleManifestBytes = Encoding.UTF8.GetBytes($$"""
+            PackageIdentifier: {{packageId}}
+            PackageVersion: 0.9.0
+            DefaultLocale: en-US
+            ManifestType: singleton
+            ManifestVersion: 1.10.0
+            PackageLocale: en-US
+            PackageName: {{packageId}}
+            Publisher: Example
+            License: MIT
+            ShortDescription: stale package
+            Installers:
+              - Architecture: x64
+                InstallerType: exe
+                InstallerUrl: https://example.test/{{packageId}}/0.9.0.exe
+                InstallerSha256: {{new string('B', 64)}}
+            """);
+        var files = catalog.Files.Select(file =>
+            string.Equals(file.Key, manifestPath, StringComparison.OrdinalIgnoreCase)
+                ? new KeyValuePair<string, byte[]>(file.Key, staleManifestBytes)
+                : file);
+
+        using var server = new TestPreindexedSourceServer(catalog.MsixBytes, files);
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = null,
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            WritePreindexedIndex(appRoot, repo, "test", catalog.IndexBytes);
+
+            var ex = Assert.Throws<SourceSearchException>(() => repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+                Version = version,
+            }));
+
+            Assert.Contains("Hash mismatch", ex.Message);
+            Assert.Contains(manifestPath, ex.Message);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
     public void Show_MultipleSourcesExposeStructuredMatches()
     {
         using var firstServer = new TestRestSourceServer();

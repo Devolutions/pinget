@@ -399,6 +399,9 @@ internal static class PreIndexedSource
         using var response = client.GetAsync(url).GetAwaiter().GetResult();
         response.EnsureSuccessStatusCode();
         var bytes = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+        if (!HashMatches(expectedHash, bytes))
+            throw new InvalidOperationException(
+                $"Hash mismatch for source file '{normalizedRelative}'. Expected: {expectedHash}.");
 
         // Persist to cache
         Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
@@ -448,7 +451,7 @@ internal static class PreIndexedSource
 
     private static bool HashMatches(string? expected, byte[] data)
     {
-        if (expected is null) return true;
+        if (string.IsNullOrWhiteSpace(expected)) return true;
         using var sha256 = System.Security.Cryptography.SHA256.Create();
         var hash = Convert.ToHexString(sha256.ComputeHash(data)).ToLowerInvariant();
         return hash.Equals(expected, StringComparison.OrdinalIgnoreCase);
