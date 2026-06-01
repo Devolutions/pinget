@@ -5638,11 +5638,17 @@ fn mapped_field_condition(
     };
     params.push(match_parameter(value, exact));
     let parameter = params.len();
+    // Use a non-correlated `rowid IN (...)` subquery rather than a correlated
+    // `EXISTS (... WHERE map.owner = packages.rowid ...)`. The correlated form
+    // re-scans the (un-indexed) map table once per candidate package row, which
+    // is quadratic: on the real winget index it takes ~19s under SQLite and
+    // effectively hangs under the Turso engine. The `IN` form evaluates the
+    // owner-id set a single time, collapsing the search back to milliseconds.
     format!(
-        "EXISTS (SELECT 1 FROM {map_table_name} JOIN {table_name} ON \
+        "{rowid_column} IN (SELECT {map_table_name}.{map_owner_column} \
+         FROM {map_table_name} JOIN {table_name} ON \
          {map_table_name}.{value_name} = {table_name}.rowid \
-         WHERE {map_table_name}.{map_owner_column} = {rowid_column} \
-         AND {table_name}.{map_value_column} LIKE ?{parameter})"
+         WHERE {table_name}.{map_value_column} LIKE ?{parameter})"
     )
 }
 
@@ -10805,6 +10811,26 @@ Installers:
         assert!(where_clause.contains("tags2"));
         assert!(where_clause.contains("commands2"));
         assert_eq!(params.len(), 5);
+    }
+
+    #[test]
+    fn tag_and_command_conditions_are_non_correlated() {
+        // The tag/command map lookups must be emitted as non-correlated
+        // `rowid IN (SELECT ...)` subqueries. A correlated `EXISTS (... WHERE
+        // map.owner = packages.rowid ...)` re-scans the un-indexed map tables
+        // per package row, which is quadratic (~19s on the real winget index
+        // under SQLite, and an effective hang under Turso). Guard against a
+        // regression back to the correlated form.
+        let query = PackageQuery {
+            query: Some("terminal".to_owned()),
+            ..PackageQuery::default()
+        };
+
+        let (where_clause, _params) = build_preindexed_where_clause(&query, true, SearchSemantics::Many);
+
+        assert!(where_clause.contains("packages.rowid IN (SELECT"));
+        assert!(!where_clause.contains("EXISTS"));
+        assert!(!where_clause.contains("= packages.rowid"));
     }
 
     #[test]

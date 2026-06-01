@@ -610,10 +610,15 @@ internal static class PreIndexedSource
         }
         parameters.Add(MatchParameter(value, exact));
         int paramNum = parameters.Count;
-        return $"EXISTS (SELECT 1 FROM {mapTableName} JOIN {tableName} ON " +
-               $"{mapTableName}.{valueName} = {tableName}.rowid " +
-               $"WHERE {mapTableName}.{mapOwnerColumn} = {rowidColumn} " +
-               $"AND {tableName}.{mapValueColumn} LIKE @p{paramNum})";
+        // Use a non-correlated `rowid IN (...)` subquery rather than a correlated
+        // `EXISTS (... WHERE map.owner = packages.rowid ...)`. The correlated form
+        // re-scans the (un-indexed) map table once per candidate package row, which
+        // is quadratic: on the real winget index it takes ~19s under SQLite and
+        // effectively hangs under the Turso engine. The `IN` form evaluates the
+        // owner-id set a single time, collapsing the search back to milliseconds.
+        return $"{rowidColumn} IN (SELECT {mapTableName}.{mapOwnerColumn} FROM {mapTableName} " +
+               $"JOIN {tableName} ON {mapTableName}.{valueName} = {tableName}.rowid " +
+               $"WHERE {tableName}.{mapValueColumn} LIKE @p{paramNum})";
     }
 
     private static string MatchParameter(string value, bool exact)
