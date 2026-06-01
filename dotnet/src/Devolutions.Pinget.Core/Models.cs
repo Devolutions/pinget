@@ -40,6 +40,12 @@ public record RepositoryOptions
     public string? AppRoot { get; init; }
     public string UserAgent { get; init; } = "pinget-dotnet/0.1";
     public Action<RepositoryWarning>? Diagnostics { get; init; }
+
+    /// <summary>
+    /// Maximum age for an existing pre-indexed source index before Pinget attempts a background refresh.
+    /// Set to null to disable automatic freshness checks.
+    /// </summary>
+    public TimeSpan? PreIndexedSourceAutoUpdateInterval { get; init; } = TimeSpan.FromMinutes(5);
 }
 
 public record RepositoryWarning
@@ -65,6 +71,44 @@ public class SourceSearchException : InvalidOperationException
     }
 
     public RepositoryWarning Warning { get; }
+}
+
+public class MissingPackageVersionException : InvalidOperationException
+{
+    public MissingPackageVersionException(
+        string packageId,
+        string sourceName,
+        string requestedVersion,
+        string? requestedChannel = null,
+        Exception? refreshException = null)
+        : base(BuildMessage(packageId, sourceName, requestedVersion, requestedChannel, refreshException))
+    {
+        PackageId = packageId;
+        SourceName = sourceName;
+        RequestedVersion = requestedVersion;
+        RequestedChannel = requestedChannel;
+        RefreshException = refreshException;
+    }
+
+    public string PackageId { get; }
+    public string SourceName { get; }
+    public string RequestedVersion { get; }
+    public string? RequestedChannel { get; }
+    public Exception? RefreshException { get; }
+
+    private static string BuildMessage(
+        string packageId,
+        string sourceName,
+        string requestedVersion,
+        string? requestedChannel,
+        Exception? refreshException)
+    {
+        var channelPart = string.IsNullOrWhiteSpace(requestedChannel) ? "" : $" with channel '{requestedChannel}'";
+        var message = $"Version '{requestedVersion}'{channelPart} was not found for package '{packageId}' in source '{sourceName}'.";
+        return refreshException is null
+            ? message
+            : $"{message} The source refresh also failed: {refreshException.Message}";
+    }
 }
 
 public class MultiplePackageMatchesException : InvalidOperationException

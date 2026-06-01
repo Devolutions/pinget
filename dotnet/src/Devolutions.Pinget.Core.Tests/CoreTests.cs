@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.IO.Compression;
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.Data.Sqlite;
 using System.Net;
 using System.Net.Sockets;
@@ -25,6 +28,85 @@ public class VersionCompareTests
     {
         var result = RestSource.CompareVersionStrings(a, b);
         Assert.Equal(expected, Math.Sign(result));
+    }
+
+    public class VersionSelectionTests
+    {
+        [Fact]
+        public void SelectV2Version_WithoutRequestedVersion_ReturnsLatest()
+        {
+            var selected = Repository.SelectV2VersionForTesting(
+            [
+                new PreIndexedSource.V2VersionDataEntry { Version = "1.0.0" },
+                new PreIndexedSource.V2VersionDataEntry { Version = "1.2.0" },
+                new PreIndexedSource.V2VersionDataEntry { Version = "1.1.0" },
+            ], requestedVersion: null);
+
+            Assert.Equal("1.2.0", selected.Version);
+        }
+
+        [Fact]
+        public void SelectV2Version_WithExistingRequestedVersion_ReturnsRequestedVersion()
+        {
+            var selected = Repository.SelectV2VersionForTesting(
+            [
+                new PreIndexedSource.V2VersionDataEntry { Version = "1.2.0" },
+                new PreIndexedSource.V2VersionDataEntry { Version = "1.1.0" },
+            ], "1.1.0");
+
+            Assert.Equal("1.1.0", selected.Version);
+        }
+
+        [Fact]
+        public void SelectV2Version_WithMissingRequestedVersion_Throws()
+        {
+            var ex = Assert.Throws<MissingPackageVersionException>(() => Repository.SelectV2VersionForTesting(
+            [
+                new PreIndexedSource.V2VersionDataEntry { Version = "1.2.0" },
+                new PreIndexedSource.V2VersionDataEntry { Version = "1.1.0" },
+            ], "9.9.9"));
+
+            Assert.Contains("9.9.9", ex.Message);
+        }
+
+        [Fact]
+        public void SelectV2Version_WithRequestedChannel_ThrowsInsteadOfIgnoringChannel()
+        {
+            var ex = Assert.Throws<InvalidOperationException>(() => Repository.SelectV2VersionForTesting(
+            [
+                new PreIndexedSource.V2VersionDataEntry { Version = "1.2.0" },
+                new PreIndexedSource.V2VersionDataEntry { Version = "1.1.0" },
+            ], "1.2.0", "beta"));
+
+            Assert.Contains("beta", ex.Message);
+            Assert.Contains("channel metadata", ex.Message);
+        }
+
+        [Fact]
+        public void SelectV1Version_WithRequestedChannelMismatch_Throws()
+        {
+            var ex = Assert.Throws<MissingPackageVersionException>(() => Repository.SelectV1VersionForTesting(
+            [
+                new PreIndexedSource.V1VersionRow { Version = "1.2.0", Channel = "stable" },
+                new PreIndexedSource.V1VersionRow { Version = "1.1.0", Channel = "beta" },
+            ], "1.2.0", "beta"));
+
+            Assert.Equal("1.2.0", ex.RequestedVersion);
+            Assert.Equal("beta", ex.RequestedChannel);
+        }
+
+        [Fact]
+        public void SelectRestVersion_WithRequestedChannelMismatch_Throws()
+        {
+            var ex = Assert.Throws<MissingPackageVersionException>(() => Repository.SelectRestVersionForTesting(
+            [
+                new VersionKey { Version = "1.2.0", Channel = "stable" },
+                new VersionKey { Version = "1.1.0", Channel = "beta" },
+            ], "1.2.0", "beta"));
+
+            Assert.Equal("1.2.0", ex.RequestedVersion);
+            Assert.Equal("beta", ex.RequestedChannel);
+        }
     }
 }
 
@@ -2600,6 +2682,369 @@ public class RepositoryEmbeddingTests
     }
 
     [Fact]
+    public void Show_RestExplicitMissingVersion_ThrowsInsteadOfReturningLatest()
+    {
+        using var server = new TestRestSourceServer();
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.Rest));
+
+            var ex = Assert.Throws<SourceSearchException>(() => repo.Show(new PackageQuery
+            {
+                Id = TesslPackageId,
+                Exact = true,
+                Source = "test",
+                Version = "9.9.9",
+            }));
+
+            var missing = Assert.IsType<MissingPackageVersionException>(ex.InnerException);
+            Assert.Equal("9.9.9", missing.RequestedVersion);
+            Assert.Contains("9.9.9", ex.Message);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_PreindexedExplicitMissingVersion_RefreshesOnceAndReturnsRequestedVersion()
+    {
+        const string packageId = "Test.RefreshPackage";
+        var initialCatalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+        var refreshedCatalog = PreindexedCatalogFixture.Create(packageId, "1.1.0", "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(refreshedCatalog.MsixBytes, initialCatalog.Files.Concat(refreshedCatalog.Files));
+        var diagnostics = new List<RepositoryWarning>();
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                Diagnostics = diagnostics.Add,
+                PreIndexedSourceAutoUpdateInterval = null,
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            WritePreindexedIndex(appRoot, repo, "test", initialCatalog.IndexBytes);
+
+            var result = repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+                Version = "1.1.0",
+            });
+
+            Assert.Equal("1.1.0", result.PackageVersion);
+            Assert.Equal(1, server.SourceUpdateRequests);
+            Assert.Contains(diagnostics, warning =>
+                warning.Operation == "manifest-refresh" &&
+                warning.Message.Contains(packageId, StringComparison.Ordinal) &&
+                warning.Message.Contains("1.1.0", StringComparison.Ordinal));
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_PreindexedExplicitMissingVersion_RefreshesAfterCachedAutoRefreshFailure()
+    {
+        const string packageId = "Test.RecoveredRefreshPackage";
+        var initialCatalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+        var refreshedCatalog = PreindexedCatalogFixture.Create(packageId, "1.1.0", "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(msixBytes: null, initialCatalog.Files.Concat(refreshedCatalog.Files));
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = TimeSpan.FromDays(1),
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            var indexPath = WritePreindexedIndex(appRoot, repo, "test", initialCatalog.IndexBytes);
+            File.SetLastWriteTimeUtc(indexPath, DateTime.UtcNow.AddDays(-1));
+
+            var localResult = repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+            });
+
+            Assert.Equal("1.0.0", localResult.PackageVersion);
+            Assert.Equal(1, server.SourceUpdateRequests);
+
+            server.SetMsixBytes(refreshedCatalog.MsixBytes);
+
+            var refreshedResult = repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+                Version = "1.1.0",
+            });
+
+            Assert.Equal("1.1.0", refreshedResult.PackageVersion);
+            Assert.Equal(2, server.SourceUpdateRequests);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_PreindexedExplicitMissingVersion_AfterRefreshStillThrows()
+    {
+        const string packageId = "Test.StillMissingPackage";
+        var initialCatalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+        var refreshedCatalog = PreindexedCatalogFixture.Create(packageId, "1.1.0", "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(refreshedCatalog.MsixBytes, initialCatalog.Files.Concat(refreshedCatalog.Files));
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = null,
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            WritePreindexedIndex(appRoot, repo, "test", initialCatalog.IndexBytes);
+
+            var ex = Assert.Throws<SourceSearchException>(() => repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+                Version = "2.0.0",
+            }));
+
+            var missing = Assert.IsType<MissingPackageVersionException>(ex.InnerException);
+            Assert.Equal("2.0.0", missing.RequestedVersion);
+            Assert.Equal(1, server.SourceUpdateRequests);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_PreindexedStaleIndex_RefreshesBeforeLatestSelection()
+    {
+        const string packageId = "Test.StalePackage";
+        var initialCatalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+        var refreshedCatalog = PreindexedCatalogFixture.Create(packageId, "1.1.0", "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(refreshedCatalog.MsixBytes, initialCatalog.Files.Concat(refreshedCatalog.Files));
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = TimeSpan.FromDays(1),
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            var indexPath = WritePreindexedIndex(appRoot, repo, "test", initialCatalog.IndexBytes);
+            File.SetLastWriteTimeUtc(indexPath, DateTime.UtcNow.AddDays(-1));
+
+            var result = repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+            });
+
+            Assert.Equal("1.1.0", result.PackageVersion);
+            Assert.Equal(1, server.SourceUpdateRequests);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_PreindexedExplicitMissingVersion_DoesNotRefreshTwiceAfterStaleRefresh()
+    {
+        const string packageId = "Test.NoDoubleRefreshPackage";
+        var initialCatalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+        var refreshedCatalog = PreindexedCatalogFixture.Create(packageId, "1.1.0", "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(refreshedCatalog.MsixBytes, initialCatalog.Files.Concat(refreshedCatalog.Files));
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = TimeSpan.FromDays(1),
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            var indexPath = WritePreindexedIndex(appRoot, repo, "test", initialCatalog.IndexBytes);
+            File.SetLastWriteTimeUtc(indexPath, DateTime.UtcNow.AddDays(-1));
+
+            var ex = Assert.Throws<SourceSearchException>(() => repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+                Version = "2.0.0",
+            }));
+
+            var missing = Assert.IsType<MissingPackageVersionException>(ex.InnerException);
+            Assert.Equal("2.0.0", missing.RequestedVersion);
+            Assert.Equal(1, server.SourceUpdateRequests);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_PreindexedStaleIndex_WhenRefreshFails_UsesLocalLatestWithoutExplicitVersion()
+    {
+        const string packageId = "Test.OfflinePackage";
+        var initialCatalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(msixBytes: null, initialCatalog.Files);
+        var diagnostics = new List<RepositoryWarning>();
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                Diagnostics = diagnostics.Add,
+                PreIndexedSourceAutoUpdateInterval = TimeSpan.FromDays(1),
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            var indexPath = WritePreindexedIndex(appRoot, repo, "test", initialCatalog.IndexBytes);
+            File.SetLastWriteTimeUtc(indexPath, DateTime.UtcNow.AddDays(-1));
+
+            var result = repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+            });
+
+            Assert.Equal("1.0.0", result.PackageVersion);
+            Assert.Equal(1, server.SourceUpdateRequests);
+            Assert.Contains(diagnostics, warning => warning.Operation == "source-refresh");
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_PreindexedV2RequestedChannel_ThrowsInsteadOfIgnoringChannel()
+    {
+        const string packageId = "Test.ChannelPackage";
+        var catalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(catalog.MsixBytes, catalog.Files);
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = null,
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            WritePreindexedIndex(appRoot, repo, "test", catalog.IndexBytes);
+
+            var ex = Assert.Throws<SourceSearchException>(() => repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+                Version = "1.0.0",
+                Channel = "beta",
+            }));
+
+            Assert.Contains("beta", ex.Message);
+            Assert.Contains("channel metadata", ex.Message);
+            Assert.Equal(0, server.SourceUpdateRequests);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void Show_PreindexedDownloadedManifestHashMismatch_ThrowsInsteadOfCachingStaleBytes()
+    {
+        const string packageId = "Test.HashMismatchPackage";
+        const string version = "1.0.0";
+        var catalog = PreindexedCatalogFixture.Create(packageId, version);
+        var manifestPath = $"manifests/{packageId}/{version}.yaml";
+        var staleManifestBytes = Encoding.UTF8.GetBytes($$"""
+            PackageIdentifier: {{packageId}}
+            PackageVersion: 0.9.0
+            DefaultLocale: en-US
+            ManifestType: singleton
+            ManifestVersion: 1.10.0
+            PackageLocale: en-US
+            PackageName: {{packageId}}
+            Publisher: Example
+            License: MIT
+            ShortDescription: stale package
+            Installers:
+              - Architecture: x64
+                InstallerType: exe
+                InstallerUrl: https://example.test/{{packageId}}/0.9.0.exe
+                InstallerSha256: {{new string('B', 64)}}
+            """);
+        var files = catalog.Files.Select(file =>
+            string.Equals(file.Key, manifestPath, StringComparison.OrdinalIgnoreCase)
+                ? new KeyValuePair<string, byte[]>(file.Key, staleManifestBytes)
+                : file);
+
+        using var server = new TestPreindexedSourceServer(catalog.MsixBytes, files);
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = null,
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            WritePreindexedIndex(appRoot, repo, "test", catalog.IndexBytes);
+
+            var ex = Assert.Throws<SourceSearchException>(() => repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+                Version = version,
+            }));
+
+            Assert.Contains("Hash mismatch", ex.Message);
+            Assert.Contains(manifestPath, ex.Message);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
     public void Show_MultipleSourcesExposeStructuredMatches()
     {
         using var firstServer = new TestRestSourceServer();
@@ -2716,6 +3161,16 @@ public class RepositoryEmbeddingTests
             repo.AddSource(source.Name, source.Arg, source.Kind, trustLevel: "trusted");
     }
 
+    private static string WritePreindexedIndex(string appRoot, Repository repo, string sourceName, byte[] indexBytes)
+    {
+        var source = repo.ListSources().Single(source => source.Name == sourceName);
+        var stateDir = SourceStoreManager.SourceStateDir(source, appRoot);
+        Directory.CreateDirectory(stateDir);
+        var indexPath = Path.Combine(stateDir, "index.db");
+        File.WriteAllBytes(indexPath, indexBytes);
+        return indexPath;
+    }
+
     private static JsonDocument RunCliShowJson(string appRoot)
     {
         var root = FindRepositoryRoot();
@@ -2791,12 +3246,236 @@ file static class TestPaths
 
     public static void DeleteAppRoot(string appRoot)
     {
+        SqliteConnection.ClearAllPools();
         if (Directory.Exists(appRoot))
             Directory.Delete(appRoot, recursive: true);
     }
 }
 
 file sealed record TestRestResponse(int StatusCode, string Body, string ContentType = "application/json");
+
+file sealed record PreindexedCatalogFixture(
+    byte[] IndexBytes,
+    byte[] MsixBytes,
+    IReadOnlyList<KeyValuePair<string, byte[]>> Files)
+{
+    public static PreindexedCatalogFixture Create(string packageId, params string[] versions)
+    {
+        if (versions.Length == 0)
+            throw new ArgumentException("At least one version is required.", nameof(versions));
+
+        var files = new List<KeyValuePair<string, byte[]>>();
+        var versionEntries = new StringBuilder();
+
+        foreach (var version in versions)
+        {
+            var manifestPath = $"manifests/{packageId}/{version}.yaml";
+            var manifestBytes = Encoding.UTF8.GetBytes($$"""
+                PackageIdentifier: {{packageId}}
+                PackageVersion: {{version}}
+                DefaultLocale: en-US
+                ManifestType: singleton
+                ManifestVersion: 1.10.0
+                PackageLocale: en-US
+                PackageName: {{packageId}}
+                Publisher: Example
+                License: MIT
+                ShortDescription: test package
+                Installers:
+                  - Architecture: x64
+                    InstallerType: exe
+                    InstallerUrl: https://example.test/{{packageId}}/{{version}}.exe
+                    InstallerSha256: {{new string('A', 64)}}
+                """);
+            files.Add(new KeyValuePair<string, byte[]>(manifestPath, manifestBytes));
+
+            versionEntries.AppendLine($"- v: {version}");
+            versionEntries.AppendLine($"  rP: {manifestPath}");
+            versionEntries.AppendLine($"  s256H: {Sha256Hex(manifestBytes)}");
+        }
+
+        var versionDataYaml = "vD:\n" + versionEntries;
+        var versionDataBytes = CompressMszyml(versionDataYaml);
+        var versionDataHash = SHA256.HashData(versionDataBytes);
+        var versionDataHashHex = Convert.ToHexString(versionDataHash).ToLowerInvariant();
+        var versionDataPath = $"packages/{packageId}/{versionDataHashHex[..8]}/versionData.mszyml";
+        files.Add(new KeyValuePair<string, byte[]>(versionDataPath, versionDataBytes));
+
+        var indexBytes = BuildIndex(packageId, versions[0], versionDataHash);
+        var msixBytes = BuildMsix(indexBytes);
+        return new PreindexedCatalogFixture(indexBytes, msixBytes, files);
+    }
+
+    private static byte[] BuildIndex(string packageId, string latestVersion, byte[] versionDataHash)
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"pinget-test-index-{Guid.NewGuid():N}.db");
+        try
+        {
+            using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+                    CREATE TABLE packages (
+                        id TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        moniker TEXT,
+                        latest_version TEXT,
+                        hash BLOB
+                    );
+                    INSERT INTO packages (id, name, moniker, latest_version, hash)
+                    VALUES (@id, @name, NULL, @version, @hash);";
+                cmd.Parameters.AddWithValue("@id", packageId);
+                cmd.Parameters.AddWithValue("@name", packageId);
+                cmd.Parameters.AddWithValue("@version", latestVersion);
+                cmd.Parameters.Add("@hash", SqliteType.Blob).Value = versionDataHash;
+                cmd.ExecuteNonQuery();
+            }
+
+            SqliteConnection.ClearAllPools();
+            return File.ReadAllBytes(dbPath);
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            if (File.Exists(dbPath))
+                File.Delete(dbPath);
+        }
+    }
+
+    private static byte[] BuildMsix(byte[] indexBytes)
+    {
+        using var stream = new MemoryStream();
+        using (var archive = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            var entry = archive.CreateEntry("Public/index.db");
+            using var entryStream = entry.Open();
+            entryStream.Write(indexBytes);
+        }
+
+        return stream.ToArray();
+    }
+
+    private static byte[] CompressMszyml(string yaml)
+    {
+        using var stream = new MemoryStream();
+        stream.WriteByte((byte)'C');
+        stream.WriteByte((byte)'K');
+        using (var deflate = new DeflateStream(stream, CompressionMode.Compress, leaveOpen: true))
+        {
+            var bytes = Encoding.UTF8.GetBytes(yaml);
+            deflate.Write(bytes);
+        }
+
+        return stream.ToArray();
+    }
+
+    private static string Sha256Hex(byte[] bytes) =>
+        Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+}
+
+file sealed class TestPreindexedSourceServer : IDisposable
+{
+    private readonly HttpListener _listener;
+    private readonly Task _loopTask;
+    private readonly CancellationTokenSource _cts = new();
+    private byte[]? _msixBytes;
+    private readonly Dictionary<string, byte[]> _files;
+
+    public TestPreindexedSourceServer(byte[]? msixBytes, IEnumerable<KeyValuePair<string, byte[]>> files)
+    {
+        _msixBytes = msixBytes;
+        _files = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in files)
+            _files[file.Key.Replace('\\', '/').TrimStart('/')] = file.Value;
+
+        var port = GetFreePort();
+        Url = $"http://127.0.0.1:{port}";
+        _listener = new HttpListener();
+        _listener.Prefixes.Add($"{Url}/");
+        _listener.Start();
+        _loopTask = Task.Run(HandleRequestsAsync, _cts.Token);
+    }
+
+    public string Url { get; }
+    public int SourceUpdateRequests { get; private set; }
+
+    public void SetMsixBytes(byte[]? msixBytes) => _msixBytes = msixBytes;
+
+    private async Task HandleRequestsAsync()
+    {
+        while (!_cts.IsCancellationRequested)
+        {
+            HttpListenerContext? context = null;
+            try
+            {
+                context = await _listener.GetContextAsync();
+                var path = context.Request.Url?.AbsolutePath.TrimStart('/') ?? "";
+                if (path.Equals("source2.msix", StringComparison.OrdinalIgnoreCase))
+                {
+                    SourceUpdateRequests++;
+                    if (_msixBytes is null)
+                    {
+                        context.Response.StatusCode = 503;
+                        continue;
+                    }
+
+                    context.Response.StatusCode = 200;
+                    context.Response.ContentType = "application/octet-stream";
+                    context.Response.Headers.Add("x-ms-meta-sourceversion", "test-source-version");
+                    context.Response.ContentLength64 = _msixBytes.Length;
+                    await context.Response.OutputStream.WriteAsync(_msixBytes, _cts.Token);
+                    continue;
+                }
+
+                if (_files.TryGetValue(path, out var bytes))
+                {
+                    context.Response.StatusCode = 200;
+                    context.Response.ContentType = "application/octet-stream";
+                    context.Response.ContentLength64 = bytes.Length;
+                    await context.Response.OutputStream.WriteAsync(bytes, _cts.Token);
+                    continue;
+                }
+
+                context.Response.StatusCode = 404;
+            }
+            catch (ObjectDisposedException) when (_cts.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (HttpListenerException) when (_cts.IsCancellationRequested)
+            {
+                break;
+            }
+            finally
+            {
+                context?.Response.OutputStream.Dispose();
+                context?.Response.Close();
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        _cts.Cancel();
+        _listener.Stop();
+        _listener.Close();
+        try
+        {
+            _loopTask.GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private static int GetFreePort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
+}
 
 file sealed class TestRestSourceServer : IDisposable
 {
