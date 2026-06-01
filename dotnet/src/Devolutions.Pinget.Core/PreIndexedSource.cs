@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Threading;
 using Microsoft.Data.Sqlite;
 using YamlDotNet.Core;
 using YamlDotNet.Core.Events;
@@ -46,7 +47,12 @@ internal static class PreIndexedSource
                 try
                 {
                     indexEntry.ExtractToFile(tempIndexPath, overwrite: true);
-                    File.Move(tempIndexPath, indexPath, overwrite: true);
+                    ReplaceIndexFile(tempIndexPath, indexPath);
+                    // The new index.db is a fresh database; any WAL/SHM sidecars
+                    // left from the previous one no longer match it and would make
+                    // SQLite recover against the wrong database. Drop them so the
+                    // next open starts clean.
+                    RemoveSqliteSidecars(indexPath);
                 }
                 finally
                 {
@@ -65,6 +71,76 @@ internal static class PreIndexedSource
 
         throw new InvalidOperationException(
             $"Failed to update preindexed source '{source.Name}': {lastError?.Message}");
+    }
+
+    private const int ReplaceRetryAttempts = 5;
+
+    /// <summary>
+    /// Replaces <paramref name="target"/> with <paramref name="source"/>, surviving the
+    /// case where another handle holds the target open. A plain overwriting move uses
+    /// MOVEFILE_REPLACE_EXISTING, which is denied while an on-access AV scan or a
+    /// concurrent reader has the index open; we retry briefly and then stage the existing
+    /// file aside (which succeeds because SQLite opens with FILE_SHARE_DELETE), restoring
+    /// it if the swap fails so a working index is never lost.
+    /// </summary>
+    private static void ReplaceIndexFile(string source, string target)
+    {
+        try
+        {
+            File.Move(source, target, overwrite: true);
+            return;
+        }
+        catch (Exception ex) when ((ex is IOException or UnauthorizedAccessException)
+                                   && File.Exists(source) && File.Exists(target))
+        {
+            // Fall through to the retry / stage-aside path.
+        }
+
+        for (var attempt = 1; attempt <= ReplaceRetryAttempts; attempt++)
+        {
+            Thread.Sleep(50 * attempt);
+            try
+            {
+                File.Move(source, target, overwrite: true);
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Keep retrying until the holder releases the file.
+            }
+        }
+
+        var staged = Path.ChangeExtension(target, "old.tmp");
+        File.Move(target, staged, overwrite: true);
+        try
+        {
+            File.Move(source, target, overwrite: true);
+            TryDelete(staged);
+        }
+        catch
+        {
+            File.Move(staged, target, overwrite: true);
+            throw;
+        }
+    }
+
+    private static void RemoveSqliteSidecars(string dbPath)
+    {
+        TryDelete(dbPath + "-wal");
+        TryDelete(dbPath + "-shm");
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            // Best-effort cleanup; a leftover sidecar is harmless on the next open.
+        }
     }
 
     // V2 search: flat `packages` table with id, name, moniker, latest_version, hash
