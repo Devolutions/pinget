@@ -779,6 +779,67 @@ public class ModelsTests
     }
 
     [Fact]
+    public void ParseYamlManifest_ReadsIconsAndSelectsBestIcon()
+    {
+        var yaml = """
+            PackageIdentifier: Test.Package
+            PackageVersion: 1.2.3
+            PackageName: Test Package
+            Icons:
+              - IconUrl: https://example.test/dark-512.png
+                IconFileType: png
+                IconResolution: 512x512
+                IconTheme: dark
+                IconSha256: DARK
+              - IconUrl: https://example.test/default-64.png
+                IconFileType: png
+                IconResolution: 64x64
+                IconTheme: default
+              - IconUrl: https://example.test/default-256.ico
+                IconFileType: ico
+                IconResolution: 256x256
+                IconTheme: default
+              - IconFileType: png
+                IconResolution: 1024x1024
+            Installers:
+              - Architecture: x64
+                InstallerType: exe
+                InstallerUrl: https://example.test/Test.Package.exe
+                InstallerSha256: ABC123
+            """;
+
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+
+        Assert.Equal(4, manifest.Icons.Count);
+        Assert.Equal("https://example.test/dark-512.png", manifest.Icons[0].IconUrl);
+        Assert.Equal("https://example.test/default-256.ico", manifest.IconUrl);
+        Assert.NotNull(manifest.Icon);
+        Assert.Equal("ico", manifest.Icon!.IconFileType);
+        Assert.Equal("256x256", manifest.Icon.IconResolution);
+    }
+
+    [Fact]
+    public void ParseYamlManifest_WithoutIconsReturnsEmptyIconListAndNoSelection()
+    {
+        var yaml = """
+            PackageIdentifier: Test.Package
+            PackageVersion: 1.2.3
+            PackageName: Test Package
+            Installers:
+              - Architecture: x64
+                InstallerType: exe
+                InstallerUrl: https://example.test/Test.Package.exe
+                InstallerSha256: ABC123
+            """;
+
+        var manifest = Repository.ParseYamlManifest(System.Text.Encoding.UTF8.GetBytes(yaml));
+
+        Assert.Empty(manifest.Icons);
+        Assert.Null(manifest.Icon);
+        Assert.Null(manifest.IconUrl);
+    }
+
+    [Fact]
     public void ParseYamlManifest_PreservesPlatformAndMinimumOsVersion()
     {
         var yaml = """
@@ -2606,6 +2667,12 @@ public class RepositoryEmbeddingTests
             Assert.Equal("Release notes", result.ReleaseNotes);
             Assert.Equal("https://example.test/release-notes", result.ReleaseNotesUrl);
             Assert.Equal(["ai", "cli"], result.Tags);
+            Assert.Equal("https://example.test/tessl-256.ico", result.IconUrl);
+            Assert.NotNull(result.Icon);
+            Assert.Equal("ico", result.Icon!.IconFileType);
+            Assert.Equal("256x256", result.Icon.IconResolution);
+            Assert.Equal(2, result.Icons.Count);
+            Assert.Equal("https://example.test/tessl-128.png", result.Icons[0].IconUrl);
             Assert.Equal(["Contoso.Dependency"], result.PackageDependencies);
             var installer = Assert.Single(result.Installers);
             Assert.Equal("https://example.test/tessl.exe", installer.InstallerUrl);
@@ -2627,10 +2694,17 @@ public class RepositoryEmbeddingTests
             });
 
             Assert.Equal("Tessl short description", typedResult.Manifest.ShortDescription);
+            Assert.Equal("https://example.test/tessl-256.ico", typedResult.Manifest.IconUrl);
 
             var json = JsonSerializer.Serialize(result, PingetJsonContext.Default.SerializableShowManifest);
             using var document = JsonDocument.Parse(json);
             Assert.Equal(TesslPackageId, document.RootElement.GetProperty(nameof(SerializableShowManifest.PackageIdentifier)).GetString());
+            Assert.Equal("https://example.test/tessl-256.ico",
+                document.RootElement.GetProperty(nameof(SerializableShowManifest.IconUrl)).GetString());
+            Assert.Equal("https://example.test/tessl-256.ico",
+                document.RootElement.GetProperty(nameof(SerializableShowManifest.Icon)).GetProperty(nameof(PackageIcon.IconUrl)).GetString());
+            Assert.Equal("https://example.test/tessl-128.png",
+                document.RootElement.GetProperty(nameof(SerializableShowManifest.Icons))[0].GetProperty(nameof(PackageIcon.IconUrl)).GetString());
             Assert.Equal("https://example.test/tessl.exe",
                 document.RootElement.GetProperty(nameof(SerializableShowManifest.SelectedInstaller)).GetProperty(nameof(SerializableInstaller.InstallerUrl)).GetString());
         }
@@ -3569,7 +3643,20 @@ file sealed class TestRestSourceServer : IDisposable
                       "LicenseUrl": "https://example.test/license",
                       "ReleaseNotes": "Release notes",
                       "ReleaseNotesUrl": "https://example.test/release-notes",
-                      "Tags": [ "ai", "cli" ]
+                      "Tags": [ "ai", "cli" ],
+                      "Icons": [
+                        {
+                          "IconUrl": "https://example.test/tessl-128.png",
+                          "IconFileType": "png",
+                          "IconResolution": "128x128",
+                          "IconTheme": "default"
+                        },
+                        {
+                          "IconUrl": "https://example.test/tessl-256.ico",
+                          "IconFileType": "ico",
+                          "IconResolution": "256x256"
+                        }
+                      ]
                     },
                     "Versions": [
                       {

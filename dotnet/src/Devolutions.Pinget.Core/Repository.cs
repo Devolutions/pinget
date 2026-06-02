@@ -1942,6 +1942,34 @@ public class Repository : IDisposable
 
         var agreements = ReadAgreements(dict);
 
+        var icons = new List<PackageIcon>();
+        if (dict.TryGetValue("Icons", out var iconsObj) && iconsObj is IList<object> iconList)
+        {
+            foreach (var iconObj in iconList)
+            {
+                if (iconObj is not IDictionary<object, object> iconDict)
+                    continue;
+
+                string? IconStr(string key) => iconDict.TryGetValue(key, out var value) ? value?.ToString() : null;
+                var icon = new PackageIcon
+                {
+                    IconUrl = IconStr("IconUrl"),
+                    IconFileType = IconStr("IconFileType"),
+                    IconResolution = IconStr("IconResolution"),
+                    IconTheme = IconStr("IconTheme"),
+                    IconSha256 = IconStr("IconSha256"),
+                };
+                if (!string.IsNullOrWhiteSpace(icon.IconUrl) ||
+                    !string.IsNullOrWhiteSpace(icon.IconFileType) ||
+                    !string.IsNullOrWhiteSpace(icon.IconResolution) ||
+                    !string.IsNullOrWhiteSpace(icon.IconTheme) ||
+                    !string.IsNullOrWhiteSpace(icon.IconSha256))
+                {
+                    icons.Add(icon);
+                }
+            }
+        }
+
         // Top-level installer defaults (merged manifest format)
         string? topInstallerType = GetOptStr("InstallerType");
         string? topNestedInstallerType = GetOptStr("NestedInstallerType");
@@ -2048,6 +2076,7 @@ public class Repository : IDisposable
             Tags = tags,
             Agreements = agreements,
             Documentation = docs,
+            Icons = icons,
             Installers = installers,
             PackageDependencies = dependencies,
             RequireExplicitUpgrade = topLevelRequireExplicit || anyInstallerRequireExplicit,

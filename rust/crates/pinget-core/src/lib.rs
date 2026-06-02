@@ -296,12 +296,102 @@ pub struct Manifest {
     pub agreements: Vec<PackageAgreement>,
     pub package_dependencies: Vec<String>,
     pub documentation: Vec<Documentation>,
+    pub icons: Vec<PackageIcon>,
     pub installers: Vec<Installer>,
     // `RequireExplicitUpgrade: true` opts a package out of bulk
     // `pinget upgrade` output (winget parity). Users can still upgrade by
     // explicit `id`. Set at top-level or per-installer; treated as true
     // when any installer asserts it.
     pub require_explicit_upgrade: bool,
+}
+
+impl Manifest {
+    pub fn icon(&self) -> Option<&PackageIcon> {
+        select_best_icon(&self.icons)
+    }
+
+    pub fn icon_url(&self) -> Option<&str> {
+        self.icon().and_then(|icon| icon.icon_url.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct PackageIcon {
+    pub icon_url: Option<String>,
+    pub icon_file_type: Option<String>,
+    pub icon_resolution: Option<String>,
+    pub icon_theme: Option<String>,
+    pub icon_sha256: Option<String>,
+}
+
+impl PackageIcon {
+    fn is_empty(&self) -> bool {
+        self.icon_url.as_deref().is_none_or(|value| value.trim().is_empty())
+            && self
+                .icon_file_type
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            && self
+                .icon_resolution
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            && self.icon_theme.as_deref().is_none_or(|value| value.trim().is_empty())
+            && self.icon_sha256.as_deref().is_none_or(|value| value.trim().is_empty())
+    }
+}
+
+fn select_best_icon(icons: &[PackageIcon]) -> Option<&PackageIcon> {
+    icons
+        .iter()
+        .enumerate()
+        .filter(|(_, icon)| icon.icon_url.as_deref().is_some_and(|url| !url.trim().is_empty()))
+        .max_by(|(left_index, left), (right_index, right)| {
+            icon_theme_score(left.icon_theme.as_deref())
+                .cmp(&icon_theme_score(right.icon_theme.as_deref()))
+                .then_with(|| {
+                    icon_resolution_score(left.icon_resolution.as_deref())
+                        .cmp(&icon_resolution_score(right.icon_resolution.as_deref()))
+                })
+                .then_with(|| {
+                    icon_file_type_score(left.icon_file_type.as_deref())
+                        .cmp(&icon_file_type_score(right.icon_file_type.as_deref()))
+                })
+                .then_with(|| right_index.cmp(left_index))
+        })
+        .map(|(_, icon)| icon)
+}
+
+fn icon_theme_score(theme: Option<&str>) -> usize {
+    match theme {
+        None => 1,
+        Some(value) if value.trim().is_empty() || value.eq_ignore_ascii_case("default") => 1,
+        Some(_) => 0,
+    }
+}
+
+fn icon_file_type_score(file_type: Option<&str>) -> usize {
+    match file_type {
+        Some(value) if value.eq_ignore_ascii_case("ico") => 2,
+        Some(value) if value.eq_ignore_ascii_case("png") => 1,
+        _ => 0,
+    }
+}
+
+fn icon_resolution_score(resolution: Option<&str>) -> usize {
+    let Some(resolution) = resolution else {
+        return 0;
+    };
+    let resolution = resolution.trim();
+    let Some(separator) = resolution.find(['x', 'X']) else {
+        return 0;
+    };
+    let (width, height) = resolution.split_at(separator);
+    let height = &height[1..];
+    let (Ok(width), Ok(height)) = (width.parse::<usize>(), height.parse::<usize>()) else {
+        return 0;
+    };
+    if width == height { width } else { 0 }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -478,7 +568,7 @@ pub struct ShowResult {
 
 impl ShowResult {
     pub fn structured_document(&self) -> JsonValue {
-        collapse_structured_document(&self.manifest_documents)
+        add_icon_fields_to_structured_document(collapse_structured_document(&self.manifest_documents), &self.manifest)
     }
 }
 
@@ -6345,6 +6435,7 @@ fn parse_yaml_manifest_bundle(bytes: &[u8]) -> Result<(Manifest, JsonValue)> {
             agreements: yaml_agreement_list(&merged),
             package_dependencies: yaml_package_dependencies(&merged),
             documentation: yaml_documentation_list(&merged),
+            icons: yaml_icon_list(&merged),
             installers,
             require_explicit_upgrade: top_level_require_explicit || any_installer_require_explicit,
         },
@@ -6377,6 +6468,7 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
     let default_locale = selected
         .get("DefaultLocale")
         .ok_or_else(|| anyhow!("REST manifest response missing DefaultLocale"))?;
+    let package_default_locale = data.get("DefaultLocale");
     let name = json_string(default_locale, "PackageName")
         .ok_or_else(|| anyhow!("REST manifest response missing PackageName"))?;
     let installer_switch_defaults = json_installer_switches(selected);
@@ -6433,6 +6525,10 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
         .unwrap_or_default();
     let top_level_require_explicit = json_bool(selected, "RequireExplicitUpgrade");
     let any_installer_require_explicit = installers.iter().any(|i| i.require_explicit_upgrade);
+    let mut icons = json_icon_list(default_locale);
+    if icons.is_empty() {
+        icons = package_default_locale.map(json_icon_list).unwrap_or_default();
+    }
 
     let manifest = Manifest {
         id: package_id.to_owned(),
@@ -6458,6 +6554,7 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
         agreements: json_agreement_list(default_locale),
         package_dependencies: json_package_dependencies(selected),
         documentation: json_documentation_list(default_locale),
+        icons,
         installers,
         require_explicit_upgrade: top_level_require_explicit || any_installer_require_explicit,
     };
@@ -6483,6 +6580,32 @@ fn collapse_structured_document(document: &JsonValue) -> JsonValue {
 
 fn collapse_structured_documents(documents: &[JsonValue]) -> Vec<JsonValue> {
     documents.iter().map(collapse_structured_document).collect()
+}
+
+fn add_icon_fields_to_structured_document(mut document: JsonValue, manifest: &Manifest) -> JsonValue {
+    let Some(root) = document.as_object_mut() else {
+        return document;
+    };
+
+    root.insert(
+        "IconUrl".to_owned(),
+        manifest
+            .icon_url()
+            .map(|url| JsonValue::String(url.to_owned()))
+            .unwrap_or(JsonValue::Null),
+    );
+    root.insert(
+        "Icon".to_owned(),
+        manifest.icon().map(icon_to_json_value).unwrap_or(JsonValue::Null),
+    );
+    root.entry("Icons".to_owned())
+        .or_insert_with(|| serde_json::to_value(&manifest.icons).expect("package icon serialization cannot fail"));
+
+    document
+}
+
+fn icon_to_json_value(icon: &PackageIcon) -> JsonValue {
+    serde_json::to_value(icon).expect("package icon serialization cannot fail")
 }
 
 fn merge_manifest_documents(documents: &[JsonValue]) -> JsonValue {
@@ -6937,6 +7060,28 @@ fn yaml_documentation_list(root: &YamlMapping) -> Vec<Documentation> {
         .unwrap_or_default()
 }
 
+fn yaml_icon_list(root: &YamlMapping) -> Vec<PackageIcon> {
+    root.get(YamlValue::from("Icons"))
+        .and_then(YamlValue::as_sequence)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(YamlValue::as_mapping)
+                .filter_map(|item| {
+                    let icon = PackageIcon {
+                        icon_url: yaml_string(item, "IconUrl"),
+                        icon_file_type: yaml_string(item, "IconFileType"),
+                        icon_resolution: yaml_string(item, "IconResolution"),
+                        icon_theme: yaml_string(item, "IconTheme"),
+                        icon_sha256: yaml_string(item, "IconSha256"),
+                    };
+                    (!icon.is_empty()).then_some(icon)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn yaml_agreement_list(root: &YamlMapping) -> Vec<PackageAgreement> {
     root.get(YamlValue::from("Agreements"))
         .and_then(YamlValue::as_sequence)
@@ -7013,6 +7158,28 @@ fn json_documentation_list(value: &JsonValue) -> Vec<Documentation> {
                         label: json_string(item, "DocumentLabel"),
                         url,
                     })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_icon_list(value: &JsonValue) -> Vec<PackageIcon> {
+    value
+        .get("Icons")
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let icon = PackageIcon {
+                        icon_url: json_string(item, "IconUrl"),
+                        icon_file_type: json_string(item, "IconFileType"),
+                        icon_resolution: json_string(item, "IconResolution"),
+                        icon_theme: json_string(item, "IconTheme"),
+                        icon_sha256: json_string(item, "IconSha256"),
+                    };
+                    (!icon.is_empty()).then_some(icon)
                 })
                 .collect()
         })
@@ -8995,6 +9162,7 @@ mod tests {
             agreements: Vec::new(),
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
+            icons: Vec::new(),
             installers: Vec::new(),
             require_explicit_upgrade: false,
         }
@@ -9782,6 +9950,13 @@ mod tests {
                     label: Some("Docs".to_owned()),
                     url: "https://example.test/docs".to_owned(),
                 }],
+                icons: vec![PackageIcon {
+                    icon_url: Some("https://example.test/default-256.ico".to_owned()),
+                    icon_file_type: Some("ico".to_owned()),
+                    icon_resolution: Some("256x256".to_owned()),
+                    icon_theme: Some("default".to_owned()),
+                    icon_sha256: Some("DEF456".to_owned()),
+                }],
                 installers: vec![Installer {
                     architecture: Some("x64".to_owned()),
                     installer_type: Some("msix".to_owned()),
@@ -9848,6 +10023,15 @@ mod tests {
                     "Publisher": "Example",
                     "License": "MIT",
                     "ShortDescription": "Structured output",
+                    "Icons": [
+                        {
+                            "IconUrl": "https://example.test/default-256.ico",
+                            "IconFileType": "ico",
+                            "IconResolution": "256x256",
+                            "IconTheme": "default",
+                            "IconSha256": "DEF456"
+                        }
+                    ],
                     "ManifestType": "defaultLocale",
                     "ManifestVersion": "1.10.0"
                 }),
@@ -9888,6 +10072,15 @@ mod tests {
         assert_eq!(
             document["Installers"][0]["InstallerSwitches"]["Silent"].as_str(),
             Some("/quiet")
+        );
+        assert_eq!(
+            document["IconUrl"].as_str(),
+            Some("https://example.test/default-256.ico")
+        );
+        assert_eq!(document["Icon"]["IconFileType"].as_str(), Some("ico"));
+        assert_eq!(
+            document["Icons"][0]["IconUrl"].as_str(),
+            Some("https://example.test/default-256.ico")
         );
     }
 
@@ -9973,6 +10166,132 @@ Installers:
 "#;
         let manifest = parse_yaml_manifest(yaml.as_bytes()).expect("parse");
         assert!(!manifest.require_explicit_upgrade);
+    }
+
+    #[test]
+    fn manifest_parses_icons_and_selects_best_icon_from_yaml() {
+        let yaml = r#"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: icon fixture
+Icons:
+  - IconUrl: https://example.test/dark-512.png
+    IconFileType: png
+    IconResolution: 512x512
+    IconTheme: dark
+    IconSha256: DARK
+  - IconUrl: https://example.test/default-64.png
+    IconFileType: png
+    IconResolution: 64x64
+    IconTheme: default
+  - IconUrl: https://example.test/default-256.ico
+    IconFileType: ico
+    IconResolution: 256x256
+    IconTheme: default
+  - IconFileType: png
+    IconResolution: 1024x1024
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.exe
+    InstallerSha256: ABC123
+"#;
+        let manifest = parse_yaml_manifest(yaml.as_bytes()).expect("parse");
+
+        assert_eq!(manifest.icons.len(), 4);
+        assert_eq!(
+            manifest.icons[0].icon_url.as_deref(),
+            Some("https://example.test/dark-512.png")
+        );
+        assert_eq!(manifest.icon_url(), Some("https://example.test/default-256.ico"));
+        let selected = manifest.icon().expect("selected icon");
+        assert_eq!(selected.icon_file_type.as_deref(), Some("ico"));
+        assert_eq!(selected.icon_resolution.as_deref(), Some("256x256"));
+    }
+
+    #[test]
+    fn manifest_without_icons_returns_empty_icon_list_and_no_selection() {
+        let yaml = r#"
+PackageIdentifier: Test.Package
+PackageVersion: 1.2.3
+DefaultLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.10.0
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+License: MIT
+ShortDescription: no-icon fixture
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.exe
+    InstallerSha256: ABC123
+"#;
+        let manifest = parse_yaml_manifest(yaml.as_bytes()).expect("parse");
+
+        assert!(manifest.icons.is_empty());
+        assert!(manifest.icon().is_none());
+        assert!(manifest.icon_url().is_none());
+    }
+
+    #[test]
+    fn rest_manifest_parses_icons_from_default_locale() {
+        let response = serde_json::json!({
+            "Data": {
+                "PackageIdentifier": "Test.Package",
+                "Versions": [
+                    {
+                        "PackageVersion": "1.2.3",
+                        "DefaultLocale": {
+                            "PackageName": "Test Package",
+                            "Publisher": "Example",
+                            "ShortDescription": "REST icon fixture",
+                            "Icons": [
+                                {
+                                    "IconUrl": "https://example.test/default-128.png",
+                                    "IconFileType": "png",
+                                    "IconResolution": "128x128",
+                                    "IconTheme": "default"
+                                },
+                                {
+                                    "IconUrl": "https://example.test/default-256.ico",
+                                    "IconFileType": "ico",
+                                    "IconResolution": "256x256"
+                                }
+                            ]
+                        },
+                        "Installers": [
+                            {
+                                "Architecture": "x64",
+                                "InstallerType": "exe",
+                                "InstallerUrl": "https://example.test/Test.Package.exe",
+                                "InstallerSha256": "ABC123"
+                            }
+                        ],
+                        "ManifestVersion": "1.10.0"
+                    }
+                ],
+                "ManifestVersion": "1.10.0"
+            }
+        });
+        let bytes = serde_json::to_vec(&response).expect("json");
+
+        let (manifest, document) = parse_rest_manifest(&bytes, "Test.Package", "1.2.3", "").expect("parse");
+
+        assert_eq!(manifest.icons.len(), 2);
+        assert_eq!(manifest.icon_url(), Some("https://example.test/default-256.ico"));
+        assert_eq!(
+            document["Icons"][0]["IconUrl"].as_str(),
+            Some("https://example.test/default-128.png")
+        );
     }
 
     #[test]
@@ -10124,6 +10443,7 @@ Installers:
             agreements: Vec::new(),
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
+            icons: Vec::new(),
             installers,
             require_explicit_upgrade: false,
         }
@@ -10371,6 +10691,7 @@ Installers:
             agreements: Vec::new(),
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
+            icons: Vec::new(),
             installers: Vec::new(),
             require_explicit_upgrade: false,
         };
@@ -10432,6 +10753,7 @@ Installers:
             agreements: Vec::new(),
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
+            icons: Vec::new(),
             installers: Vec::new(),
             require_explicit_upgrade: false,
         };
@@ -10617,6 +10939,7 @@ Installers:
             agreements: Vec::new(),
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
+            icons: Vec::new(),
             installers: Vec::new(),
             require_explicit_upgrade: false,
         };
@@ -10704,6 +11027,7 @@ Installers:
             agreements: Vec::new(),
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
+            icons: Vec::new(),
             installers: Vec::new(),
             require_explicit_upgrade: false,
         };
@@ -10794,6 +11118,7 @@ Installers:
             agreements: Vec::new(),
             package_dependencies: Vec::new(),
             documentation: Vec::new(),
+            icons: Vec::new(),
             installers: Vec::new(),
             require_explicit_upgrade: false,
         };

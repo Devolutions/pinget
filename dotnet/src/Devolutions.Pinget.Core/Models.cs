@@ -320,12 +320,67 @@ public record Manifest
     public List<PackageAgreement> Agreements { get; init; } = [];
     public List<string> PackageDependencies { get; init; } = [];
     public List<Documentation> Documentation { get; init; } = [];
+    public List<PackageIcon> Icons { get; init; } = [];
+    public PackageIcon? Icon => SelectBestIcon(Icons);
+    public string? IconUrl => Icon?.IconUrl;
     public List<Installer> Installers { get; init; } = [];
     // `RequireExplicitUpgrade: true` opts a package out of bulk
     // `pinget upgrade` output (winget parity). Users can still upgrade by
     // explicit id. Set at top-level or per-installer; treated as true
     // when any installer asserts it.
     public bool RequireExplicitUpgrade { get; init; }
+
+    internal static PackageIcon? SelectBestIcon(IReadOnlyList<PackageIcon> icons) =>
+        icons
+            .Select((icon, index) => (Icon: icon, Index: index))
+            .Where(item => !string.IsNullOrWhiteSpace(item.Icon.IconUrl))
+            .OrderByDescending(item => IconThemeScore(item.Icon.IconTheme))
+            .ThenByDescending(item => IconResolutionScore(item.Icon.IconResolution))
+            .ThenByDescending(item => IconFileTypeScore(item.Icon.IconFileType))
+            .ThenBy(item => item.Index)
+            .Select(item => item.Icon)
+            .FirstOrDefault();
+
+    private static int IconThemeScore(string? theme) =>
+        string.IsNullOrWhiteSpace(theme) || string.Equals(theme, "default", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+
+    private static int IconFileTypeScore(string? fileType)
+    {
+        if (string.Equals(fileType, "ico", StringComparison.OrdinalIgnoreCase))
+            return 2;
+        if (string.Equals(fileType, "png", StringComparison.OrdinalIgnoreCase))
+            return 1;
+        return 0;
+    }
+
+    private static int IconResolutionScore(string? resolution)
+    {
+        if (string.IsNullOrWhiteSpace(resolution))
+            return 0;
+
+        var normalized = resolution.Trim();
+        var separator = normalized.IndexOf('x', StringComparison.OrdinalIgnoreCase);
+        if (separator <= 0 || separator == normalized.Length - 1)
+            return 0;
+
+        if (!int.TryParse(normalized[..separator], out var width) ||
+            !int.TryParse(normalized[(separator + 1)..], out var height) ||
+            width <= 0 ||
+            height <= 0 ||
+            width != height)
+            return 0;
+
+        return width;
+    }
+}
+
+public record PackageIcon
+{
+    public string? IconUrl { get; init; }
+    public string? IconFileType { get; init; }
+    public string? IconResolution { get; init; }
+    public string? IconTheme { get; init; }
+    public string? IconSha256 { get; init; }
 }
 
 public record InstallRequest
@@ -420,6 +475,9 @@ public record ShowResult
             PackageDependencies = Manifest.PackageDependencies,
             Documentation = Manifest.Documentation,
             Agreements = Manifest.Agreements,
+            IconUrl = Manifest.IconUrl,
+            Icon = Manifest.Icon,
+            Icons = Manifest.Icons,
             Installers = Manifest.Installers.Select(SerializableInstaller.FromInstaller).ToList(),
             SelectedInstaller = SelectedInstaller is null ? null : SerializableInstaller.FromInstaller(SelectedInstaller),
             CachedFiles = CachedFiles,
@@ -456,6 +514,9 @@ public record SerializableShowManifest
     public List<string> PackageDependencies { get; init; } = [];
     public List<Documentation> Documentation { get; init; } = [];
     public List<PackageAgreement> Agreements { get; init; } = [];
+    public string? IconUrl { get; init; }
+    public PackageIcon? Icon { get; init; }
+    public List<PackageIcon> Icons { get; init; } = [];
     public List<SerializableInstaller> Installers { get; init; } = [];
     public SerializableInstaller? SelectedInstaller { get; init; }
     public List<string> CachedFiles { get; init; } = [];
