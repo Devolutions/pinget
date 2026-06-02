@@ -45,7 +45,7 @@ public record RepositoryOptions
     /// Maximum age for an existing pre-indexed source index before Pinget attempts a background refresh.
     /// Set to null to disable automatic freshness checks.
     /// </summary>
-    public TimeSpan? PreIndexedSourceAutoUpdateInterval { get; init; } = TimeSpan.FromMinutes(5);
+    public TimeSpan? PreIndexedSourceAutoUpdateInterval { get; init; } = TimeSpan.FromMinutes(15);
 }
 
 public record RepositoryWarning

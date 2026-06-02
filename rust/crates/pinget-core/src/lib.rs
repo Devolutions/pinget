@@ -41,7 +41,7 @@ const DEFAULT_MAX_RESULTS: usize = 50;
 const LIST_LOOKUP_MAX_RESULTS: usize = 500;
 const PREINDEXED_CANDIDATES: &[&str] = &["source2.msix", "source.msix"];
 const DEFAULT_USER_AGENT: &str = "pinget-rs/0.1";
-const DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES: i64 = 5;
+const DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES: i64 = 15;
 const PREINDEXED_REFRESH_RETRY_MINUTES: i64 = 5;
 #[cfg(windows)]
 const PACKAGED_FAMILY_NAME: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
@@ -2864,12 +2864,19 @@ impl Repository {
             return false;
         };
 
-        let last_update = source.last_update.or_else(|| {
+        let index_modified = || {
             fs::metadata(index_path)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())
                 .map(DateTime::<Utc>::from)
-        });
+        };
+
+        let last_update = match (source.last_update, index_modified()) {
+            (Some(source_last_update), Some(index_last_write)) => Some(source_last_update.max(index_last_write)),
+            (Some(source_last_update), None) => Some(source_last_update),
+            (None, Some(index_last_write)) => Some(index_last_write),
+            (None, None) => None,
+        };
 
         match last_update {
             Some(last_update) => Utc::now() - last_update >= interval,
@@ -2982,7 +2989,10 @@ impl Repository {
                         Utc::now().timestamp_nanos_opt().unwrap_or_default()
                     ));
                     fs::write(&temp_index_path, index_bytes).context("failed to persist temporary source index")?;
-                    replace_file(&temp_index_path, &index_path).context("failed to persist source index")?;
+                    if let Err(error) = replace_file(&temp_index_path, &index_path) {
+                        let _ = fs::remove_file(&temp_index_path);
+                        return Err(error).context("failed to persist source index");
+                    }
                     // The new index.db is a fresh database; any WAL/SHM sidecars
                     // left from the previous one no longer match it and would make
                     // SQLite recover against the wrong database. Drop them so the
@@ -12865,7 +12875,7 @@ Installers:
         let mut source = test_source_record(server.url());
         source.last_update = Some(Utc::now() - Duration::days(2));
         write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
-        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::minutes(1)));
+        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::zero()));
 
         let result = repository
             .show(&show_test_package(None))
@@ -12873,6 +12883,27 @@ Installers:
 
         assert_eq!(result.manifest.version, "2.0.0");
         assert_eq!(repository.list_sources()[0].source_version.as_deref(), Some("fresh"));
+        let _ = fs::remove_dir_all(app_root);
+    }
+
+    #[test]
+    fn preindexed_fresh_index_mtime_skips_refresh_when_metadata_is_stale() {
+        let app_root = temp_app_root("preindexed_fresh_mtime");
+        let server = TestHttpServer::start();
+        server.set_status("/source2.msix", 404);
+        server.set_source_package(make_source_package(&["1.0.0", "2.0.0"]), "fresh");
+        server.set_bytes("/manifests/Test.Package.yaml", test_manifest_yaml("1.0.0"));
+        let mut source = test_source_record(server.url());
+        source.last_update = Some(Utc::now() - Duration::days(2));
+        write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
+        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::minutes(1)));
+
+        let result = repository
+            .show(&show_test_package(None))
+            .expect("show latest from fresh index mtime");
+
+        assert_eq!(result.manifest.version, "1.0.0");
+        assert_eq!(server.request_count("/source.msix"), 0);
         let _ = fs::remove_dir_all(app_root);
     }
 
@@ -12886,7 +12917,7 @@ Installers:
         let mut source = test_source_record(server.url());
         source.last_update = Some(Utc::now() - Duration::days(2));
         write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
-        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::minutes(1)));
+        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::zero()));
 
         let result = repository
             .show(&show_test_package(None))
@@ -12905,7 +12936,7 @@ Installers:
         let mut source = test_source_record(server.url());
         source.last_update = Some(Utc::now() - Duration::days(2));
         write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
-        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::minutes(1)));
+        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::zero()));
 
         let error = repository
             .show(&show_test_package(Some("3.0.0")))

@@ -2948,6 +2948,42 @@ public class RepositoryEmbeddingTests
     }
 
     [Fact]
+    public void Show_PreindexedFreshIndexMtime_DoesNotRefreshForStaleSourceMetadata()
+    {
+        const string packageId = "Test.FreshIndexPackage";
+        var initialCatalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+        var refreshedCatalog = PreindexedCatalogFixture.Create(packageId, "1.1.0", "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(refreshedCatalog.MsixBytes, initialCatalog.Files.Concat(refreshedCatalog.Files));
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = TimeSpan.FromDays(1),
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            repo.ListSources().Single(source => source.Name == "test").LastUpdate = DateTime.UtcNow.AddDays(-2);
+            WritePreindexedIndex(appRoot, repo, "test", initialCatalog.IndexBytes);
+
+            var result = repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+            });
+
+            Assert.Equal("1.0.0", result.PackageVersion);
+            Assert.Equal(0, server.SourceUpdateRequests);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
     public void Show_PreindexedExplicitMissingVersion_DoesNotRefreshTwiceAfterStaleRefresh()
     {
         const string packageId = "Test.NoDoubleRefreshPackage";
