@@ -2893,6 +2893,11 @@ impl Repository {
                     ));
                     fs::write(&temp_index_path, index_bytes).context("failed to persist temporary source index")?;
                     replace_file(&temp_index_path, &index_path).context("failed to persist source index")?;
+                    // The new index.db is a fresh database; any WAL/SHM sidecars
+                    // left from the previous one no longer match it and would make
+                    // SQLite recover against the wrong database. Drop them so the
+                    // next open starts clean.
+                    remove_sqlite_sidecars(&index_path);
                     source.last_update = Some(Utc::now());
                     source.source_version = header_version;
                     return Ok(format!("downloaded {}", candidate));
@@ -4296,8 +4301,22 @@ fn preindexed_index_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
     source_state_dir(app_root, source).join("index.db")
 }
 
+/// Removes the `-wal` and `-shm` sidecars that SQLite/Turso leaves next to a
+/// database file. Used after replacing `index.db` so a stale write-ahead log
+/// from the previous database is not replayed against the new one.
+fn remove_sqlite_sidecars(db_path: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db_path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(sidecar));
+    }
+}
+
 #[cfg(windows)]
-fn replace_file(source: &Path, target: &Path) -> Result<()> {
+const REPLACE_FILE_RETRY_ATTEMPTS: u32 = 5;
+
+#[cfg(windows)]
+fn move_replace_existing(source: &Path, target: &Path) -> std::io::Result<()> {
     let source_wide = source
         .as_os_str()
         .encode_wide()
@@ -4313,10 +4332,65 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
     // live for the duration of the call; MoveFileExW does not retain them.
     let ok = unsafe { MoveFileExW(source_wide.as_ptr(), target_wide.as_ptr(), flags) };
     if ok == 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to replace {} with {}", target.display(), source.display()));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, target: &Path) -> Result<()> {
+    let to_err = |error: std::io::Error| -> anyhow::Error {
+        anyhow::Error::new(error).context(format!(
+            "failed to replace {} with {}",
+            target.display(),
+            source.display()
+        ))
+    };
+
+    // Fast path: atomic replace. Succeeds whenever nothing holds the target open.
+    let first = match move_replace_existing(source, target) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    // A missing source or absent target is not a transient lock — fail fast
+    // instead of spinning through the retry/stage-aside path.
+    if !source.exists() || !target.exists() {
+        return Err(to_err(first));
+    }
+
+    // MOVEFILE_REPLACE_EXISTING is denied while another handle holds the target
+    // open. In practice that handle is an on-access AV scan of the freshly
+    // written file or a concurrent pinget process reading the index; both are
+    // short-lived, so retry briefly with a small backoff before falling back.
+    let mut last = first;
+    for attempt in 1..=REPLACE_FILE_RETRY_ATTEMPTS {
+        std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+        match move_replace_existing(source, target) {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error,
+        }
+    }
+
+    // Persistent holder: stage the existing index aside, then move the new file
+    // into the freed name. Renaming the existing file succeeds even while a
+    // reader keeps its handle, because SQLite/Turso opens with FILE_SHARE_DELETE.
+    // The staged copy is only removed once the new file is in place, and restored
+    // if the swap fails, so a working file is never lost.
+    let staged = target.with_extension("old.tmp");
+    if move_replace_existing(target, &staged).is_err() {
+        return Err(to_err(last));
+    }
+    match move_replace_existing(source, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(&staged);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = move_replace_existing(&staged, target);
+            Err(to_err(error))
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -5638,11 +5712,17 @@ fn mapped_field_condition(
     };
     params.push(match_parameter(value, exact));
     let parameter = params.len();
+    // Use a non-correlated `rowid IN (...)` subquery rather than a correlated
+    // `EXISTS (... WHERE map.owner = packages.rowid ...)`. The correlated form
+    // re-scans the (un-indexed) map table once per candidate package row, which
+    // is quadratic: on the real winget index it takes ~19s under SQLite and
+    // effectively hangs under the Turso engine. The `IN` form evaluates the
+    // owner-id set a single time, collapsing the search back to milliseconds.
     format!(
-        "EXISTS (SELECT 1 FROM {map_table_name} JOIN {table_name} ON \
+        "{rowid_column} IN (SELECT {map_table_name}.{map_owner_column} \
+         FROM {map_table_name} JOIN {table_name} ON \
          {map_table_name}.{value_name} = {table_name}.rowid \
-         WHERE {map_table_name}.{map_owner_column} = {rowid_column} \
-         AND {table_name}.{map_value_column} LIKE ?{parameter})"
+         WHERE {table_name}.{map_value_column} LIKE ?{parameter})"
     )
 }
 
@@ -10808,6 +10888,26 @@ Installers:
     }
 
     #[test]
+    fn tag_and_command_conditions_are_non_correlated() {
+        // The tag/command map lookups must be emitted as non-correlated
+        // `rowid IN (SELECT ...)` subqueries. A correlated `EXISTS (... WHERE
+        // map.owner = packages.rowid ...)` re-scans the un-indexed map tables
+        // per package row, which is quadratic (~19s on the real winget index
+        // under SQLite, and an effective hang under Turso). Guard against a
+        // regression back to the correlated form.
+        let query = PackageQuery {
+            query: Some("terminal".to_owned()),
+            ..PackageQuery::default()
+        };
+
+        let (where_clause, _params) = build_preindexed_where_clause(&query, true, SearchSemantics::Many);
+
+        assert!(where_clause.contains("packages.rowid IN (SELECT"));
+        assert!(!where_clause.contains("EXISTS"));
+        assert!(!where_clause.contains("= packages.rowid"));
+    }
+
+    #[test]
     fn show_query_single_omits_tag_and_command_conditions() {
         let query = PackageQuery {
             query: Some("terminal".to_owned()),
@@ -12287,6 +12387,35 @@ Installers:
 
         assert!(format!("{error:#}").contains("failed to replace"));
         assert_eq!(fs::read(&target).expect("existing target remains"), b"old-index");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_succeeds_while_target_is_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE — the sharing
+        // mode SQLite/Turso uses. An atomic MOVEFILE_REPLACE_EXISTING is denied
+        // while this handle is open, so the stage-aside fallback must take over.
+        const SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+
+        let root = temp_app_root("replace_file_open_target");
+        fs::create_dir_all(&root).expect("create replace root");
+        let target = root.join("index.db");
+        let source = root.join("index.new.tmp");
+        fs::write(&target, b"old-index").expect("write existing target");
+        fs::write(&source, b"new-index").expect("write replacement");
+
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(SHARE_ALL)
+            .open(&target)
+            .expect("open target with share-delete");
+
+        replace_file(&source, &target).expect("stage-aside replace should succeed");
+
+        assert_eq!(fs::read(&target).expect("new index in place"), b"new-index");
+        drop(held);
         let _ = fs::remove_dir_all(root);
     }
 
