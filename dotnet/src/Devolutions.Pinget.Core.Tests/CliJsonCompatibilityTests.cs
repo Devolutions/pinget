@@ -91,6 +91,26 @@ public class CliJsonCompatibilityTests
             LicenseUrl = "https://example.test/license",
             ReleaseNotesUrl = "https://example.test/release-notes",
             Tags = ["utilities", "powertoys"],
+            IconUrl = "https://example.test/icon.ico",
+            Icon = new PackageIcon
+            {
+                IconUrl = "https://example.test/icon.ico",
+                IconFileType = "ico",
+                IconResolution = "256x256",
+                IconTheme = "default",
+                IconSha256 = "DEF456",
+            },
+            Icons =
+            [
+                new PackageIcon
+                {
+                    IconUrl = "https://example.test/icon.ico",
+                    IconFileType = "ico",
+                    IconResolution = "256x256",
+                    IconTheme = "default",
+                    IconSha256 = "DEF456",
+                },
+            ],
             Installers =
             [
                 new SerializableInstaller
@@ -117,6 +137,10 @@ public class CliJsonCompatibilityTests
         Assert.Equal("https://example.test/license", root.GetProperty(nameof(SerializableShowManifest.LicenseUrl)).GetString());
         Assert.Equal("https://example.test/release-notes", root.GetProperty(nameof(SerializableShowManifest.ReleaseNotesUrl)).GetString());
         Assert.Equal(["utilities", "powertoys"], root.GetProperty(nameof(SerializableShowManifest.Tags)).EnumerateArray().Select(item => item.GetString() ?? string.Empty).ToArray());
+        Assert.Equal("https://example.test/icon.ico", root.GetProperty(nameof(SerializableShowManifest.IconUrl)).GetString());
+        Assert.Equal("https://example.test/icon.ico", root.GetProperty(nameof(SerializableShowManifest.Icon)).GetProperty(nameof(PackageIcon.IconUrl)).GetString());
+        Assert.Equal("ico", root.GetProperty(nameof(SerializableShowManifest.Icon)).GetProperty(nameof(PackageIcon.IconFileType)).GetString());
+        Assert.Equal("https://example.test/icon.ico", root.GetProperty(nameof(SerializableShowManifest.Icons))[0].GetProperty(nameof(PackageIcon.IconUrl)).GetString());
         var installer = root.GetProperty(nameof(SerializableShowManifest.Installers))[0];
         Assert.Equal("https://example.test/installer.exe", installer.GetProperty(nameof(SerializableInstaller.InstallerUrl)).GetString());
         Assert.Equal("ABC123", installer.GetProperty(nameof(SerializableInstaller.InstallerSha256)).GetString());

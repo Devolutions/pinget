@@ -407,6 +407,42 @@ internal static class RestSource
             }
         }
 
+        List<PackageIcon> GetIcons(JsonElement locale)
+        {
+            var result = new List<PackageIcon>();
+            if (!locale.TryGetProperty("Icons", out var iconsArr) || iconsArr.ValueKind != JsonValueKind.Array)
+                return result;
+
+            foreach (var iconElement in iconsArr.EnumerateArray())
+            {
+                if (iconElement.ValueKind != JsonValueKind.Object)
+                    continue;
+
+                var icon = new PackageIcon
+                {
+                    IconUrl = GetOptStr(iconElement, "IconUrl"),
+                    IconFileType = GetOptStr(iconElement, "IconFileType"),
+                    IconResolution = GetOptStr(iconElement, "IconResolution"),
+                    IconTheme = GetOptStr(iconElement, "IconTheme"),
+                    IconSha256 = GetOptStr(iconElement, "IconSha256"),
+                };
+                if (!string.IsNullOrWhiteSpace(icon.IconUrl) ||
+                    !string.IsNullOrWhiteSpace(icon.IconFileType) ||
+                    !string.IsNullOrWhiteSpace(icon.IconResolution) ||
+                    !string.IsNullOrWhiteSpace(icon.IconTheme) ||
+                    !string.IsNullOrWhiteSpace(icon.IconSha256))
+                {
+                    result.Add(icon);
+                }
+            }
+
+            return result;
+        }
+
+        var icons = GetIcons(defaultLocale);
+        if (icons.Count == 0 && data.TryGetProperty("DefaultLocale", out var packageDefaultLocale))
+            icons = GetIcons(packageDefaultLocale);
+
         var manifest = new Manifest
         {
             Id = GetStr(data, "PackageIdentifier").Length > 0 ? GetStr(data, "PackageIdentifier") : packageId,
@@ -432,6 +468,7 @@ internal static class RestSource
             Agreements = agreements,
             PackageDependencies = GetPackageDependencies(installersSource),
             Documentation = docs,
+            Icons = icons,
             Installers = installers,
         };
 
