@@ -41,7 +41,7 @@ const DEFAULT_MAX_RESULTS: usize = 50;
 const LIST_LOOKUP_MAX_RESULTS: usize = 500;
 const PREINDEXED_CANDIDATES: &[&str] = &["source2.msix", "source.msix"];
 const DEFAULT_USER_AGENT: &str = "pinget-rs/0.1";
-const DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES: i64 = 5;
+const DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES: i64 = 15;
 const PREINDEXED_REFRESH_RETRY_MINUTES: i64 = 5;
 #[cfg(windows)]
 const PACKAGED_FAMILY_NAME: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
