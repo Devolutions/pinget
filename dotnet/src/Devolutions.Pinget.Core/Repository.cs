@@ -1434,14 +1434,18 @@ public class Repository : IDisposable
         if (_preIndexedSourceAutoUpdateInterval is null)
             return false;
 
-        var lastUpdate = source.LastUpdate;
-        if (lastUpdate is null && File.Exists(indexPath))
-            lastUpdate = File.GetLastWriteTimeUtc(indexPath);
+        var lastUpdate = source.LastUpdate?.ToUniversalTime();
+        if (File.Exists(indexPath))
+        {
+            var indexLastWrite = File.GetLastWriteTimeUtc(indexPath);
+            if (lastUpdate is null || indexLastWrite > lastUpdate.Value)
+                lastUpdate = indexLastWrite;
+        }
 
         if (lastUpdate is null)
             return true;
 
-        return DateTime.UtcNow - lastUpdate.Value.ToUniversalTime() >= _preIndexedSourceAutoUpdateInterval.Value;
+        return DateTime.UtcNow - lastUpdate.Value >= _preIndexedSourceAutoUpdateInterval.Value;
     }
 
     private string RefreshPreindexedSource(int sourceIndex, bool force, PreIndexedRefreshKind kind)
