@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
+use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
+use reqwest::header::{ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
@@ -102,6 +104,10 @@ pub struct SourceRecord {
     pub last_update: Option<DateTime<Utc>>,
     #[serde(default)]
     pub source_version: Option<String>,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +129,8 @@ impl Default for SourceStore {
                     priority: 0,
                     last_update: None,
                     source_version: None,
+                    etag: None,
+                    last_modified: None,
                 },
                 SourceRecord {
                     name: "msstore".to_owned(),
@@ -134,6 +142,8 @@ impl Default for SourceStore {
                     priority: 0,
                     last_update: None,
                     source_version: None,
+                    etag: None,
+                    last_modified: None,
                 },
             ],
         }
@@ -938,6 +948,8 @@ impl Repository {
             priority,
             last_update: None,
             source_version: None,
+            etag: None,
+            last_modified: None,
         });
         self.save_store()?;
         Ok(())
@@ -1019,6 +1031,8 @@ impl Repository {
         } else {
             self.store.sources[idx].last_update = None;
             self.store.sources[idx].source_version = None;
+            self.store.sources[idx].etag = None;
+            self.store.sources[idx].last_modified = None;
         }
 
         self.save_store()?;
@@ -2962,28 +2976,57 @@ impl Repository {
     }
 
     fn update_preindexed(&mut self, source_index: usize) -> Result<String> {
-        let source = &mut self.store.sources[source_index];
-        let state_dir = source_state_dir(&self.app_root, source);
+        let source_snapshot = self.store.sources[source_index].clone();
+        let state_dir = source_state_dir(&self.app_root, &source_snapshot);
         fs::create_dir_all(&state_dir).context("failed to create source state directory")?;
+        let index_path = preindexed_index_path(&self.app_root, &source_snapshot);
+        let has_local_index = index_path.exists();
 
         let mut last_error = None;
         for candidate in PREINDEXED_CANDIDATES {
-            let url = format!("{}/{}", source.arg.trim_end_matches('/'), candidate);
-            match self.client.get(&url).send() {
+            let url = format!("{}/{}", source_snapshot.arg.trim_end_matches('/'), candidate);
+            if has_local_index
+                && let Some(detail) =
+                    self.try_skip_unchanged_preindexed_by_source_version(source_index, &url, candidate)
+            {
+                return Ok(detail);
+            }
+
+            let mut request = self.client.get(&url);
+            if has_local_index {
+                if let Some(etag) = &source_snapshot.etag
+                    && let Ok(value) = HeaderValue::from_str(etag)
+                {
+                    request = request.header(IF_NONE_MATCH, value);
+                }
+                if let Some(last_modified) = &source_snapshot.last_modified
+                    && let Ok(value) = HeaderValue::from_str(last_modified)
+                {
+                    request = request.header(IF_MODIFIED_SINCE, value);
+                }
+            }
+
+            match request.send() {
+                Ok(response) if response.status() == StatusCode::NOT_MODIFIED && has_local_index => {
+                    let source = &mut self.store.sources[source_index];
+                    update_preindexed_http_validators(source, response.headers());
+                    source.last_update = Some(Utc::now());
+                    return Ok(format!("already up to date from {}", candidate));
+                }
                 Ok(response) if response.status().is_success() => {
                     let header_version = response
                         .headers()
                         .get("x-ms-meta-sourceversion")
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned);
+                    let headers = response.headers().clone();
                     let bytes = response.bytes().context("failed to read preindexed package bytes")?;
                     let payload = bytes.to_vec();
                     let index_bytes = extract_zip_member(&payload, "Public/index.db")
                         .context("preindexed package did not contain Public/index.db")?;
 
-                    fs::write(preindexed_package_path(&self.app_root, source), &payload)
+                    fs::write(preindexed_package_path(&self.app_root, &source_snapshot), &payload)
                         .context("failed to persist source package")?;
-                    let index_path = preindexed_index_path(&self.app_root, source);
                     let temp_index_path = state_dir.join(format!(
                         "index.{}.tmp",
                         Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2998,8 +3041,10 @@ impl Repository {
                     // SQLite recover against the wrong database. Drop them so the
                     // next open starts clean.
                     remove_sqlite_sidecars(&index_path);
+                    let source = &mut self.store.sources[source_index];
                     source.last_update = Some(Utc::now());
                     source.source_version = header_version;
+                    update_preindexed_http_validators(source, &headers);
                     return Ok(format!("downloaded {}", candidate));
                 }
                 Ok(response) => {
@@ -3012,6 +3057,32 @@ impl Repository {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("no preindexed source candidate succeeded")))
+    }
+
+    fn try_skip_unchanged_preindexed_by_source_version(
+        &mut self,
+        source_index: usize,
+        url: &str,
+        candidate: &str,
+    ) -> Option<String> {
+        let current_version = self.store.sources[source_index].source_version.as_deref()?;
+        let response = self.client.head(url).send().ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+
+        let header_version = response
+            .headers()
+            .get("x-ms-meta-sourceversion")
+            .and_then(|value| value.to_str().ok())?;
+        if !header_version.eq_ignore_ascii_case(current_version) {
+            return None;
+        }
+
+        let source = &mut self.store.sources[source_index];
+        update_preindexed_http_validators(source, response.headers());
+        source.last_update = Some(Utc::now());
+        Some(format!("already up to date from {} (v{})", candidate, header_version))
     }
 
     fn update_rest(&mut self, source_index: usize) -> Result<String> {
@@ -4401,6 +4472,16 @@ fn preindexed_index_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
     source_state_dir(app_root, source).join("index.db")
 }
 
+fn update_preindexed_http_validators(source: &mut SourceRecord, headers: &HeaderMap) {
+    if let Some(value) = headers.get(ETAG).and_then(|value| value.to_str().ok()) {
+        source.etag = Some(value.to_owned());
+    }
+
+    if let Some(value) = headers.get(LAST_MODIFIED).and_then(|value| value.to_str().ok()) {
+        source.last_modified = Some(value.to_owned());
+    }
+}
+
 /// Removes the `-wal` and `-shm` sidecars that SQLite/Turso leaves next to a
 /// database file. Used after replacing `index.db` so a stale write-ahead log
 /// from the previous database is not replayed against the new one.
@@ -4868,6 +4949,8 @@ fn parse_system_winget_source_record(value: &JsonValue) -> Result<SourceRecord> 
         priority: optional_json_i32(object, "Priority").unwrap_or_default(),
         last_update: None,
         source_version: None,
+        etag: None,
+        last_modified: None,
     })
 }
 
@@ -4993,6 +5076,18 @@ fn parse_packaged_source_store(user_sources_yaml: Option<&str>, metadata_yaml: O
         {
             source.source_version = Some(source_version);
         }
+
+        if let Some(etag) = entry.get("ETag").and_then(|value| value.clone())
+            && !etag.is_empty()
+        {
+            source.etag = Some(etag);
+        }
+
+        if let Some(last_modified) = entry.get("LastModified").and_then(|value| value.clone())
+            && !last_modified.is_empty()
+        {
+            source.last_modified = Some(last_modified);
+        }
     }
 
     Some(SourceStore { sources })
@@ -5083,6 +5178,8 @@ fn map_packaged_source_entry(entry: &BTreeMap<String, Option<String>>) -> Option
             .unwrap_or_default(),
         last_update: None,
         source_version: None,
+        etag: None,
+        last_modified: None,
     })
 }
 
@@ -5147,7 +5244,11 @@ fn render_packaged_sources_yaml(store: &SourceStore) -> String {
 fn render_packaged_metadata_yaml(store: &SourceStore) -> String {
     let mut lines = vec!["Sources:".to_owned()];
     for source in &store.sources {
-        if source.last_update.is_none() && source.source_version.is_none() {
+        if source.last_update.is_none()
+            && source.source_version.is_none()
+            && source.etag.is_none()
+            && source.last_modified.is_none()
+        {
             continue;
         }
 
@@ -5157,6 +5258,12 @@ fn render_packaged_metadata_yaml(store: &SourceStore) -> String {
         }
         if let Some(source_version) = &source.source_version {
             lines.push(format!("    SourceVersion: {}", yaml_scalar(source_version)));
+        }
+        if let Some(etag) = &source.etag {
+            lines.push(format!("    ETag: {}", yaml_scalar(etag)));
+        }
+        if let Some(last_modified) = &source.last_modified {
+            lines.push(format!("    LastModified: {}", yaml_scalar(last_modified)));
         }
     }
     lines.push(String::new());
@@ -9580,6 +9687,8 @@ mod tests {
             priority: 0,
             last_update: None,
             source_version: None,
+            etag: None,
+            last_modified: None,
         };
 
         assert_eq!(store_path(&app_root), app_root.join("sources.json"));
@@ -9648,7 +9757,7 @@ mod tests {
                 "Sources:\n  - Name: winget\n    Type: Microsoft.PreIndexed.Package\n    Arg: https://cdn.winget.microsoft.com/cache\n    Data: Microsoft.Winget.Source_8wekyb3d8bbwe\n    IsTombstone: true\n  - Name: corp\n    Type: Microsoft.Rest\n    Arg: https://packages.contoso.test/api\n    Data: Contoso.Rest\n    Explicit: true\n    Priority: 7\n    TrustLevel: 1\n    IsTombstone: false\n",
             ),
             Some(
-                "Sources:\n  - Name: corp\n    LastUpdate: 1700000000\n    SourceVersion: 1.2.3\n",
+                "Sources:\n  - Name: corp\n    LastUpdate: 1700000000\n    SourceVersion: 1.2.3\n    ETag: \"etag-v1\"\n    LastModified: \"Wed, 03 Jun 2026 12:00:00 GMT\"\n",
             ),
         )
         .expect("packaged store");
@@ -9665,6 +9774,8 @@ mod tests {
         assert!(corp.explicit);
         assert_eq!(corp.priority, 7);
         assert_eq!(corp.source_version.as_deref(), Some("1.2.3"));
+        assert_eq!(corp.etag.as_deref(), Some("etag-v1"));
+        assert_eq!(corp.last_modified.as_deref(), Some("Wed, 03 Jun 2026 12:00:00 GMT"));
         assert_eq!(corp.last_update, DateTime::<Utc>::from_timestamp(1_700_000_000, 0));
     }
 
@@ -12528,6 +12639,8 @@ Installers:
         status: u16,
         body: Vec<u8>,
         source_version: Option<String>,
+        etag: Option<String>,
+        last_modified: Option<String>,
     }
 
     struct TestHttpServer {
@@ -12577,17 +12690,31 @@ Installers:
                     status: 200,
                     body,
                     source_version: None,
+                    etag: None,
+                    last_modified: None,
                 },
             );
         }
 
         fn set_source_package(&self, body: Vec<u8>, source_version: &str) {
+            self.set_source_package_with_validators(body, source_version, None, None);
+        }
+
+        fn set_source_package_with_validators(
+            &self,
+            body: Vec<u8>,
+            source_version: &str,
+            etag: Option<&str>,
+            last_modified: Option<&str>,
+        ) {
             self.set_response(
                 "/source.msix",
                 TestHttpResponse {
                     status: 200,
                     body,
                     source_version: Some(source_version.to_owned()),
+                    etag: etag.map(str::to_owned),
+                    last_modified: last_modified.map(str::to_owned),
                 },
             );
         }
@@ -12599,6 +12726,8 @@ Installers:
                     status,
                     body: Vec::new(),
                     source_version: None,
+                    etag: None,
+                    last_modified: None,
                 },
             );
         }
@@ -12653,20 +12782,53 @@ Installers:
             status: 404,
             body: Vec::new(),
             source_version: None,
+            etag: None,
+            last_modified: None,
         });
-        let reason = if response.status == 200 { "OK" } else { "Not Found" };
+        let not_modified = response.status == 200
+            && (response.etag.as_deref().is_some_and(|etag| {
+                request_header_value(&request, "If-None-Match")
+                    .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+            }) || response.last_modified.as_deref().is_some_and(|last_modified| {
+                request_header_value(&request, "If-Modified-Since")
+                    .is_some_and(|value| value.eq_ignore_ascii_case(last_modified))
+            }));
+        let status = if not_modified { 304 } else { response.status };
+        let body = if not_modified {
+            &[][..]
+        } else {
+            response.body.as_slice()
+        };
+        let reason = match status {
+            200 => "OK",
+            304 => "Not Modified",
+            _ => "Not Found",
+        };
         let mut headers = format!(
             "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-            response.status,
+            status,
             reason,
-            response.body.len()
+            body.len()
         );
         if let Some(source_version) = response.source_version {
             headers.push_str(&format!("x-ms-meta-sourceversion: {source_version}\r\n"));
         }
+        if let Some(etag) = response.etag {
+            headers.push_str(&format!("ETag: {etag}\r\n"));
+        }
+        if let Some(last_modified) = response.last_modified {
+            headers.push_str(&format!("Last-Modified: {last_modified}\r\n"));
+        }
         headers.push_str("\r\n");
         stream.write_all(headers.as_bytes()).expect("write test HTTP headers");
-        stream.write_all(&response.body).expect("write test HTTP body");
+        stream.write_all(body).expect("write test HTTP body");
+    }
+
+    fn request_header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
     }
 
     fn test_source_record(source_url: String) -> SourceRecord {
@@ -12680,6 +12842,8 @@ Installers:
             priority: 0,
             last_update: Some(Utc::now()),
             source_version: None,
+            etag: None,
+            last_modified: None,
         }
     }
 
@@ -12883,6 +13047,40 @@ Installers:
 
         assert_eq!(result.manifest.version, "2.0.0");
         assert_eq!(repository.list_sources()[0].source_version.as_deref(), Some("fresh"));
+        let _ = fs::remove_dir_all(app_root);
+    }
+
+    #[test]
+    fn preindexed_stale_index_not_modified_keeps_local_index() {
+        let app_root = temp_app_root("preindexed_ttl_not_modified");
+        let server = TestHttpServer::start();
+        server.set_status("/source2.msix", 404);
+        server.set_source_package_with_validators(
+            make_source_package(&["1.0.0", "2.0.0"]),
+            "fresh",
+            Some("\"same-index\""),
+            Some("Wed, 03 Jun 2026 12:00:00 GMT"),
+        );
+        server.set_bytes("/manifests/Test.Package.yaml", test_manifest_yaml("1.0.0"));
+        let mut source = test_source_record(server.url());
+        source.last_update = Some(Utc::now() - Duration::days(2));
+        source.etag = Some("\"same-index\"".to_owned());
+        source.last_modified = Some("Wed, 03 Jun 2026 12:00:00 GMT".to_owned());
+        write_test_preindexed_index(&app_root, &source, &["1.0.0"]);
+        let mut repository = open_test_preindexed_repository(&app_root, &source, Some(Duration::zero()));
+
+        let result = repository
+            .show(&show_test_package(None))
+            .expect("show latest from not-modified stale index");
+
+        let refreshed_source = &repository.list_sources()[0];
+        assert_eq!(result.manifest.version, "1.0.0");
+        assert_eq!(server.request_count("/source.msix"), 1);
+        assert_eq!(refreshed_source.etag.as_deref(), Some("\"same-index\""));
+        assert_eq!(
+            refreshed_source.last_modified.as_deref(),
+            Some("Wed, 03 Jun 2026 12:00:00 GMT")
+        );
         let _ = fs::remove_dir_all(app_root);
     }
 

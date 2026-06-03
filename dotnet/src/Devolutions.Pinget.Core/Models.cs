@@ -27,6 +27,8 @@ public record SourceRecord
     public int Priority { get; set; }
     public DateTime? LastUpdate { get; set; }
     public string? SourceVersion { get; set; }
+    public string? ETag { get; set; }
+    public string? LastModified { get; set; }
 }
 
 /// <summary>

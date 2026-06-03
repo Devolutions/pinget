@@ -1,4 +1,6 @@
 using System.IO.Compression;
+using System.Net;
+using System.Net.Http.Headers;
 using System.Threading;
 using Microsoft.Data.Sqlite;
 using YamlDotNet.Core;
@@ -25,9 +27,24 @@ internal static class PreIndexedSource
         foreach (var candidate in MsixCandidates)
         {
             var url = $"{source.Arg.TrimEnd('/')}/{candidate}";
+            var hasLocalIndex = File.Exists(IndexPath(source, appRoot));
             try
             {
-                using var response = client.GetAsync(url).GetAwaiter().GetResult();
+                if (hasLocalIndex && TrySkipUnchangedBySourceVersion(client, url, source, candidate, out var detail))
+                    return detail;
+
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                if (hasLocalIndex)
+                    AddConditionalHeaders(request, source);
+
+                using var response = client.Send(request, HttpCompletionOption.ResponseHeadersRead);
+                if (response.StatusCode == HttpStatusCode.NotModified && hasLocalIndex)
+                {
+                    UpdateHttpValidators(source, response);
+                    source.LastUpdate = DateTime.UtcNow;
+                    return $"Already up to date from {candidate}";
+                }
+
                 if (!response.IsSuccessStatusCode) continue;
 
                 var headerVersion = response.Headers.TryGetValues("x-ms-meta-sourceversion", out var values)
@@ -61,6 +78,8 @@ internal static class PreIndexedSource
                 }
 
                 source.SourceVersion = headerVersion;
+                UpdateHttpValidators(source, response);
+                source.LastUpdate = DateTime.UtcNow;
                 return $"Updated from {candidate}" + (headerVersion != null ? $" (v{headerVersion})" : "");
             }
             catch (Exception ex)
@@ -74,6 +93,72 @@ internal static class PreIndexedSource
     }
 
     private const int ReplaceRetryAttempts = 5;
+
+    private static bool TrySkipUnchangedBySourceVersion(
+        HttpClient client,
+        string url,
+        SourceRecord source,
+        string candidate,
+        out string detail)
+    {
+        detail = string.Empty;
+        if (string.IsNullOrWhiteSpace(source.SourceVersion))
+            return false;
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Head, url);
+            using var response = client.Send(request, HttpCompletionOption.ResponseHeadersRead);
+            if (!response.IsSuccessStatusCode)
+                return false;
+
+            var headerVersion = response.Headers.TryGetValues("x-ms-meta-sourceversion", out var values)
+                ? values.FirstOrDefault()
+                : null;
+            if (string.IsNullOrWhiteSpace(headerVersion) ||
+                !string.Equals(headerVersion, source.SourceVersion, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            UpdateHttpValidators(source, response);
+            source.LastUpdate = DateTime.UtcNow;
+            detail = $"Already up to date from {candidate} (v{headerVersion})";
+            return true;
+        }
+        catch (HttpRequestException)
+        {
+            return false;
+        }
+        catch (TaskCanceledException)
+        {
+            return false;
+        }
+    }
+
+    private static void AddConditionalHeaders(HttpRequestMessage request, SourceRecord source)
+    {
+        if (!string.IsNullOrWhiteSpace(source.ETag) &&
+            EntityTagHeaderValue.TryParse(source.ETag, out var eTag))
+        {
+            request.Headers.IfNoneMatch.Add(eTag);
+        }
+
+        if (!string.IsNullOrWhiteSpace(source.LastModified) &&
+            DateTimeOffset.TryParse(source.LastModified, out var lastModified))
+        {
+            request.Headers.IfModifiedSince = lastModified;
+        }
+    }
+
+    private static void UpdateHttpValidators(SourceRecord source, HttpResponseMessage response)
+    {
+        if (response.Headers.ETag is not null)
+            source.ETag = response.Headers.ETag.ToString();
+
+        if (response.Content.Headers.LastModified is DateTimeOffset lastModified)
+            source.LastModified = lastModified.ToString("R");
+    }
 
     /// <summary>
     /// Replaces <paramref name="target"/> with <paramref name="source"/>, surviving the
