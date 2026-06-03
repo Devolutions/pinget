@@ -230,6 +230,14 @@ internal static class SourceStoreManager
             var sourceVersion = GetYamlScalar(sourceNode, "SourceVersion");
             if (!string.IsNullOrWhiteSpace(sourceVersion))
                 source.SourceVersion = sourceVersion;
+
+            var eTag = GetYamlScalar(sourceNode, "ETag");
+            if (!string.IsNullOrWhiteSpace(eTag))
+                source.ETag = eTag;
+
+            var lastModified = GetYamlScalar(sourceNode, "LastModified");
+            if (!string.IsNullOrWhiteSpace(lastModified))
+                source.LastModified = lastModified;
         }
 
         store.Sources = sources.Values
@@ -284,7 +292,12 @@ internal static class SourceStoreManager
                     ? new DateTimeOffset(source.LastUpdate.Value).ToUnixTimeSeconds()
                     : null,
                 ["SourceVersion"] = source.SourceVersion,
-            }).Where(entry => entry["LastUpdate"] is not null || entry["SourceVersion"] is not null).ToList(),
+                ["ETag"] = source.ETag,
+                ["LastModified"] = source.LastModified,
+            }).Where(entry => entry["LastUpdate"] is not null ||
+                              entry["SourceVersion"] is not null ||
+                              entry["ETag"] is not null ||
+                              entry["LastModified"] is not null).ToList(),
         };
 
         var userSourcesPath = GetPackagedUserSourcesPath(root);

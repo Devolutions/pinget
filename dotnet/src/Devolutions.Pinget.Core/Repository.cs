@@ -257,6 +257,8 @@ public class Repository : IDisposable
         {
             source.LastUpdate = null;
             source.SourceVersion = null;
+            source.ETag = null;
+            source.LastModified = null;
         }
 
         SourceStoreManager.Save(_store, _appRoot);

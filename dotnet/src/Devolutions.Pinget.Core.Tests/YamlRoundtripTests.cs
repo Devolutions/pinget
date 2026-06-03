@@ -39,6 +39,8 @@ public class YamlRoundtripTests
                     ["Name"] = "winget",
                     ["LastUpdate"] = 1700000000L,
                     ["SourceVersion"] = "v2.0",
+                    ["ETag"] = "\"etag-v2\"",
+                    ["LastModified"] = "Wed, 03 Jun 2026 12:00:00 GMT",
                 },
             },
         });
@@ -57,6 +59,8 @@ public class YamlRoundtripTests
         Assert.False(source.Explicit);
         Assert.Equal(0, source.Priority);
         Assert.Equal("v2.0", source.SourceVersion);
+        Assert.Equal("\"etag-v2\"", source.ETag);
+        Assert.Equal("Wed, 03 Jun 2026 12:00:00 GMT", source.LastModified);
         Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1700000000L).UtcDateTime, source.LastUpdate);
     }
 

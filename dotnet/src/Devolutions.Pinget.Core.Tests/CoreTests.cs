@@ -2948,6 +2948,51 @@ public class RepositoryEmbeddingTests
     }
 
     [Fact]
+    public void Show_PreindexedStaleIndex_NotModifiedKeepsLocalIndex()
+    {
+        const string packageId = "Test.NotModifiedPackage";
+        var initialCatalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+        var refreshedCatalog = PreindexedCatalogFixture.Create(packageId, "1.1.0", "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(refreshedCatalog.MsixBytes, initialCatalog.Files.Concat(refreshedCatalog.Files))
+        {
+            ETag = "\"same-index\"",
+            LastModified = "Wed, 03 Jun 2026 12:00:00 GMT",
+        };
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = TimeSpan.FromDays(1),
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            var source = repo.ListSources().Single(source => source.Name == "test");
+            source.ETag = server.ETag;
+            source.LastModified = server.LastModified;
+            var indexPath = WritePreindexedIndex(appRoot, repo, "test", initialCatalog.IndexBytes);
+            File.SetLastWriteTimeUtc(indexPath, DateTime.UtcNow.AddDays(-1));
+
+            var result = repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+            });
+
+            Assert.Equal("1.0.0", result.PackageVersion);
+            Assert.Equal(1, server.SourceUpdateRequests);
+            Assert.Equal(server.ETag, source.ETag);
+            Assert.Equal(server.LastModified, source.LastModified);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
     public void Show_PreindexedFreshIndexMtime_DoesNotRefreshForStaleSourceMetadata()
     {
         const string packageId = "Test.FreshIndexPackage";
@@ -3509,6 +3554,8 @@ file sealed class TestPreindexedSourceServer : IDisposable
 
     public string Url { get; }
     public int SourceUpdateRequests { get; private set; }
+    public string? ETag { get; init; }
+    public string? LastModified { get; init; }
 
     public void SetMsixBytes(byte[]? msixBytes) => _msixBytes = msixBytes;
 
@@ -3530,9 +3577,26 @@ file sealed class TestPreindexedSourceServer : IDisposable
                         continue;
                     }
 
+                    if (ETag is not null &&
+                        context.Request.Headers["If-None-Match"]?.Split(',').Select(value => value.Trim()).Contains(ETag) == true)
+                    {
+                        context.Response.StatusCode = 304;
+                        AddValidatorHeaders(context.Response);
+                        continue;
+                    }
+
+                    if (LastModified is not null &&
+                        string.Equals(context.Request.Headers["If-Modified-Since"], LastModified, StringComparison.OrdinalIgnoreCase))
+                    {
+                        context.Response.StatusCode = 304;
+                        AddValidatorHeaders(context.Response);
+                        continue;
+                    }
+
                     context.Response.StatusCode = 200;
                     context.Response.ContentType = "application/octet-stream";
                     context.Response.Headers.Add("x-ms-meta-sourceversion", "test-source-version");
+                    AddValidatorHeaders(context.Response);
                     context.Response.ContentLength64 = _msixBytes.Length;
                     await context.Response.OutputStream.WriteAsync(_msixBytes, _cts.Token);
                     continue;
@@ -3563,6 +3627,15 @@ file sealed class TestPreindexedSourceServer : IDisposable
                 context?.Response.Close();
             }
         }
+    }
+
+    private void AddValidatorHeaders(HttpListenerResponse response)
+    {
+        if (ETag is not null)
+            response.Headers.Add("ETag", ETag);
+
+        if (LastModified is not null)
+            response.Headers.Add("Last-Modified", LastModified);
     }
 
     public void Dispose()
