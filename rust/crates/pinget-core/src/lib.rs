@@ -12168,6 +12168,7 @@ Installers:
         assert_eq!(parsed.log_path.as_deref(), Some(r"C:\temp\node.log"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn machine_scope_silent_msi_uses_shell_execute_instead_of_direct_msi() {
         let mut request = InstallRequest::new(PackageQuery::default());
