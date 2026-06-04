@@ -796,7 +796,7 @@ public class Repository : IDisposable
         {
             try
             {
-                metadata = System.Text.Json.JsonSerializer.Deserialize<InstallerDownloadMetadata>(File.ReadAllBytes(metadataPath));
+                metadata = System.Text.Json.JsonSerializer.Deserialize(File.ReadAllBytes(metadataPath), InstallerDownloadMetadataContext.Default.InstallerDownloadMetadata);
             }
             catch (System.Text.Json.JsonException)
             {
@@ -833,7 +833,7 @@ public class Repository : IDisposable
     }
 
     private static void WriteInstallerDownloadMetadata(string metadataPath, InstallerDownloadMetadata metadata) =>
-        File.WriteAllBytes(metadataPath, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(metadata));
+        File.WriteAllBytes(metadataPath, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(metadata, InstallerDownloadMetadataContext.Default.InstallerDownloadMetadata));
 
     internal static string? InstallerDownloadIfRange(InstallerDownloadMetadata metadata) =>
         metadata.ETag is { Length: > 0 } etag && !etag.StartsWith("W/", StringComparison.OrdinalIgnoreCase)
@@ -3861,3 +3861,6 @@ public class Repository : IDisposable
                 _ => throw new InvalidOperationException($"Unsupported source trust level: {trustLevel}")
             };
 }
+
+[System.Text.Json.Serialization.JsonSerializable(typeof(Repository.InstallerDownloadMetadata))]
+internal partial class InstallerDownloadMetadataContext : System.Text.Json.Serialization.JsonSerializerContext;
