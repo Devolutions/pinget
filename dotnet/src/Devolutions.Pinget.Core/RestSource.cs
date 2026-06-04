@@ -578,6 +578,15 @@ internal static class RestSource
 
     internal static int CompareVersionStrings(string a, string b)
     {
+        var aLessThan = StripLessThanPrefix(a);
+        var bLessThan = StripLessThanPrefix(b);
+        if (aLessThan is not null && bLessThan is not null)
+            return CompareVersionStrings(aLessThan, bLessThan);
+        if (aLessThan is not null && CompareVersionStrings(aLessThan, b) == 0)
+            return -1;
+        if (bLessThan is not null && CompareVersionStrings(a, bLessThan) == 0)
+            return 1;
+
         var partsA = a.Split('.', '-');
         var partsB = b.Split('.', '-');
         int maxLen = Math.Max(partsA.Length, partsB.Length);
@@ -596,6 +605,12 @@ internal static class RestSource
             }
         }
         return 0;
+    }
+
+    private static string? StripLessThanPrefix(string value)
+    {
+        var trimmed = value.TrimStart();
+        return trimmed.StartsWith('<') ? trimmed[1..].TrimStart() : null;
     }
 
     internal record RestMatchResult

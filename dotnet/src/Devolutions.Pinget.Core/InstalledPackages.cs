@@ -213,7 +213,7 @@ internal static class InstalledPackages
                         var productCodes = new List<string>();
                         if (!string.IsNullOrWhiteSpace(productCode))
                             productCodes.Add(productCode);
-                        if (LooksLikeProductCode(subkeyName))
+                        if (!productCodes.Any(code => code.Equals(subkeyName, StringComparison.OrdinalIgnoreCase)))
                             productCodes.Add(subkeyName.ToLowerInvariant());
 
                         var upgradeCodes = new List<string>();
@@ -315,9 +315,6 @@ internal static class InstalledPackages
         if (string.IsNullOrWhiteSpace(path)) return false;
         return path.Trim().StartsWith(@"C:\Windows\", StringComparison.OrdinalIgnoreCase);
     }
-
-    private static bool LooksLikeProductCode(string value) =>
-        value.StartsWith('{') && value.EndsWith('}');
 
     private static (string Version, string FamilyName)? ParseMsixFullName(string fullName)
     {
