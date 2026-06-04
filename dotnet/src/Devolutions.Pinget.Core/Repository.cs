@@ -18,6 +18,11 @@ public class Repository : IDisposable
     internal const string UninstallUnsupportedWarning = "Uninstalling packages is not supported on this platform; no changes were made.";
     internal const string RepairUnsupportedWarning = "Repairing packages is not supported on this platform; no changes were made.";
     internal const string RepairReinstallWarning = "Pinget repair currently re-runs the package install flow for the selected package.";
+    private static readonly TimeSpan InstallerDownloadConnectTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan InstallerDownloadIdleTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan InstallerDownloadTotalTimeout = TimeSpan.FromMinutes(30);
+    private const int InstallerDownloadAttempts = 3;
+    private const long InstallerDownloadMetadataInterval = 4 * 1024 * 1024;
 
     private static int s_sqliteNativeLibraryInitialized;
 
@@ -59,7 +64,12 @@ public class Repository : IDisposable
         SourceStoreManager.EnsureAppDirs(appRoot);
         var useSystemWingetSources = SourceStoreManager.UsesSystemWingetSourceCommands(appRoot);
         var store = SourceStoreManager.Load(appRoot);
-        var client = new HttpClient();
+        var client = new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression = System.Net.DecompressionMethods.None,
+            ConnectTimeout = InstallerDownloadConnectTimeout,
+        });
+        client.Timeout = Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
         return new Repository(appRoot, client, store, useSystemWingetSources, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
     }
@@ -501,7 +511,7 @@ public class Repository : IDisposable
         if ((query.IncludeUnknown || query.IncludePinned) && !query.UpgradeOnly)
             throw new InvalidOperationException("--include-unknown and --include-pinned require --upgrade-available");
 
-        if (query.Source is not null && query.Query is null && query.Id is null &&
+        if (query.Source is not null && !query.UpgradeOnly && query.Query is null && query.Id is null &&
             query.Name is null && query.Moniker is null && query.Tag is null && query.Command is null)
             throw new InvalidOperationException("list --source currently requires a query or explicit filter");
 
@@ -532,7 +542,7 @@ public class Repository : IDisposable
                     pkg.Correlated = CorrelateInstalledPackage(pkg, candidates, AllowLooseListCorrelation(query));
                 }
             }
-            else
+            else if (!query.UpgradeOnly)
             {
                 warnings.AddRange(CorrelateAllInstalled(installed));
             }
@@ -638,24 +648,228 @@ public class Repository : IDisposable
         if (string.IsNullOrEmpty(filename)) filename = "installer";
         var dest = Path.Combine(downloadDir, filename);
 
-        using var response = _client.GetAsync(url).GetAwaiter().GetResult();
-        response.EnsureSuccessStatusCode();
-        var bytes = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-        File.WriteAllBytes(dest, bytes);
+        var actualHash = DownloadInstallerToFile(url, dest);
 
         if (installer.Sha256 is not null)
         {
-            var actual = Sha256Hex(bytes);
-            if (!actual.Equals(installer.Sha256, StringComparison.OrdinalIgnoreCase) &&
+            if (!actualHash.Equals(installer.Sha256, StringComparison.OrdinalIgnoreCase) &&
                 !request.IgnoreSecurityHash)
             {
                 File.Delete(dest);
-                throw new InvalidOperationException($"Installer hash mismatch. Expected: {installer.Sha256}, Got: {actual}");
+                throw new InvalidOperationException($"Installer hash mismatch. Expected: {installer.Sha256}, Got: {actualHash}");
             }
         }
 
         return new FetchedInstaller(manifest, manifestDocuments, installer, dest);
     }
+
+    private string DownloadInstallerToFile(string url, string dest)
+    {
+        var partPath = SidecarPath(dest, "part");
+        var metadataPath = SidecarPath(dest, "part.json");
+        var startedAt = DateTimeOffset.UtcNow;
+        Exception? lastError = null;
+
+        for (var attempt = 1; attempt <= InstallerDownloadAttempts; attempt++)
+        {
+            var elapsed = DateTimeOffset.UtcNow - startedAt;
+            if (elapsed >= InstallerDownloadTotalTimeout)
+                break;
+
+            try
+            {
+                TryDownloadInstallerToPartAsync(
+                    url,
+                    partPath,
+                    metadataPath,
+                    InstallerDownloadTotalTimeout - elapsed).GetAwaiter().GetResult();
+
+                var actualHash = Sha256FileHex(partPath);
+                File.Move(partPath, dest, overwrite: true);
+                if (File.Exists(metadataPath))
+                    File.Delete(metadataPath);
+                return actualHash;
+            }
+            catch (Exception ex) when (IsRetryableInstallerDownloadException(ex))
+            {
+                lastError = ex;
+            }
+        }
+
+        throw lastError ?? new TimeoutException("Installer download timed out.");
+    }
+
+    private async Task TryDownloadInstallerToPartAsync(string url, string partPath, string metadataPath, TimeSpan remaining)
+    {
+        var metadata = ReadInstallerDownloadMetadata(metadataPath, partPath, url);
+        var offset = metadata?.Offset ?? 0;
+        using var totalCts = new CancellationTokenSource(remaining);
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.AcceptEncoding.ParseAdd("identity");
+        if (offset > 0)
+        {
+            request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(offset, null);
+            var ifRange = InstallerDownloadIfRange(metadata!);
+            if (ifRange is not null)
+                request.Headers.TryAddWithoutValidation("If-Range", ifRange);
+        }
+
+        using var response = await _client
+            .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, totalCts.Token)
+            .ConfigureAwait(false);
+
+        long? totalLength;
+        if (response.StatusCode == System.Net.HttpStatusCode.PartialContent && offset > 0)
+        {
+            totalLength = ParseContentRange(response.Content.Headers.ContentRange, offset);
+        }
+        else if (response.StatusCode == System.Net.HttpStatusCode.OK)
+        {
+            offset = 0;
+            totalLength = response.Content.Headers.ContentLength;
+            if (File.Exists(partPath))
+                File.Delete(partPath);
+        }
+        else if (response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+        {
+            DeleteIfExists(partPath);
+            DeleteIfExists(metadataPath);
+            throw new InstallerDownloadRetryException("Installer partial download could not be resumed; retrying from the beginning.");
+        }
+        else if (!response.IsSuccessStatusCode)
+        {
+            throw new HttpRequestException($"Download failed: HTTP {(int)response.StatusCode} {response.ReasonPhrase}");
+        }
+        else
+        {
+            throw new InvalidOperationException($"Unexpected installer download HTTP status {(int)response.StatusCode}.");
+        }
+
+        await using var input = await response.Content.ReadAsStreamAsync(totalCts.Token).ConfigureAwait(false);
+        await using var output = offset == 0
+            ? File.Create(partPath)
+            : new FileStream(partPath, FileMode.Append, FileAccess.Write, FileShare.None);
+
+        var downloadMetadata = new InstallerDownloadMetadata(
+            url,
+            StrongETag(response),
+            response.Content.Headers.LastModified?.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            totalLength,
+            offset);
+        WriteInstallerDownloadMetadata(metadataPath, downloadMetadata);
+
+        var buffer = new byte[128 * 1024];
+        var nextMetadataOffset = offset + InstallerDownloadMetadataInterval;
+        while (true)
+        {
+            using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(totalCts.Token);
+            idleCts.CancelAfter(InstallerDownloadIdleTimeout);
+            var read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), idleCts.Token).ConfigureAwait(false);
+            if (read == 0)
+                break;
+
+            await output.WriteAsync(buffer.AsMemory(0, read), totalCts.Token).ConfigureAwait(false);
+            offset += read;
+
+            if (offset >= nextMetadataOffset)
+            {
+                await output.FlushAsync(totalCts.Token).ConfigureAwait(false);
+                downloadMetadata = downloadMetadata with { Offset = offset };
+                WriteInstallerDownloadMetadata(metadataPath, downloadMetadata);
+                nextMetadataOffset = offset + InstallerDownloadMetadataInterval;
+            }
+        }
+
+        await output.FlushAsync(totalCts.Token).ConfigureAwait(false);
+        if (totalLength is not null && offset != totalLength.Value)
+            throw new InstallerDownloadRetryException($"Installer download ended early: received {offset} of {totalLength.Value} bytes.");
+
+        WriteInstallerDownloadMetadata(metadataPath, downloadMetadata with { Offset = offset, TotalLength = totalLength });
+    }
+
+    internal sealed record InstallerDownloadMetadata(string Url, string? ETag, string? LastModified, long? TotalLength, long Offset);
+
+    private static InstallerDownloadMetadata? ReadInstallerDownloadMetadata(string metadataPath, string partPath, string url)
+    {
+        InstallerDownloadMetadata? metadata = null;
+        if (File.Exists(metadataPath))
+        {
+            try
+            {
+                metadata = System.Text.Json.JsonSerializer.Deserialize<InstallerDownloadMetadata>(File.ReadAllBytes(metadataPath));
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                metadata = null;
+            }
+            catch (IOException)
+            {
+                metadata = null;
+            }
+        }
+
+        if (metadata is null || metadata.Url != url || metadata.Offset <= 0 || !File.Exists(partPath))
+        {
+            DeleteIfExists(partPath);
+            DeleteIfExists(metadataPath);
+            return null;
+        }
+
+        var partLength = new FileInfo(partPath).Length;
+        var offset = Math.Min(metadata.Offset, partLength);
+        if (offset <= 0)
+        {
+            DeleteIfExists(partPath);
+            DeleteIfExists(metadataPath);
+            return null;
+        }
+
+        using (var stream = new FileStream(partPath, FileMode.Open, FileAccess.Write, FileShare.None))
+        {
+            stream.SetLength(offset);
+        }
+
+        return metadata with { Offset = offset };
+    }
+
+    private static void WriteInstallerDownloadMetadata(string metadataPath, InstallerDownloadMetadata metadata) =>
+        File.WriteAllBytes(metadataPath, System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(metadata));
+
+    internal static string? InstallerDownloadIfRange(InstallerDownloadMetadata metadata) =>
+        metadata.ETag is { Length: > 0 } etag && !etag.StartsWith("W/", StringComparison.OrdinalIgnoreCase)
+            ? etag
+            : metadata.LastModified;
+
+    internal static long? ParseContentRange(System.Net.Http.Headers.ContentRangeHeaderValue? value, long expectedStart)
+    {
+        if (value?.From is null)
+            throw new InvalidOperationException("Partial installer response missing Content-Range.");
+        if (value.From.Value != expectedStart)
+            throw new InvalidOperationException($"Partial installer response started at {value.From.Value}, expected {expectedStart}.");
+        return value.Length;
+    }
+
+    private static string? StrongETag(HttpResponseMessage response) =>
+        response.Headers.ETag is { IsWeak: false } etag ? etag.ToString() : null;
+
+    private static string Sha256FileHex(string path)
+    {
+        using var input = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(input));
+    }
+
+    internal static string SidecarPath(string path, string suffix) => path + "." + suffix;
+
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+            File.Delete(path);
+    }
+
+    private static bool IsRetryableInstallerDownloadException(Exception exception) =>
+        exception is InstallerDownloadRetryException or HttpRequestException or IOException or TaskCanceledException or OperationCanceledException;
+
+    private sealed class InstallerDownloadRetryException(string message) : Exception(message);
 
     private sealed record FetchedInstaller(Manifest Manifest, object ManifestDocuments, Installer Installer, string InstallerPath);
 
@@ -2585,6 +2799,46 @@ public class Repository : IDisposable
     }
 
     /// <summary>
+    /// Returns "&lt; latest&gt;" when ARP range metadata proves the installed
+    /// version is below the newest catalog version, but the raw DisplayVersion
+    /// is too coarse to map into a concrete aMiV/aMaV bucket.
+    /// </summary>
+    internal static string? LessThanLatestArpAnchoredVersion(
+        IReadOnlyList<PreIndexedSource.V2VersionDataEntry> entries,
+        string arpVersion)
+    {
+        if (string.IsNullOrEmpty(arpVersion) || arpVersion.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        PreIndexedSource.V2VersionDataEntry? latest = null;
+        foreach (var entry in entries)
+        {
+            if (entry.ArpMinVersion is null || entry.ArpMaxVersion is null) continue;
+            if (latest is null || RestSource.CompareVersionStrings(entry.Version, latest.Version) > 0)
+                latest = entry;
+        }
+        if (latest?.ArpMinVersion is null)
+            return null;
+        if (RestSource.CompareVersionStrings(arpVersion, latest.Version) != 0)
+            return null;
+        if (RestSource.CompareVersionStrings(arpVersion, latest.ArpMinVersion) >= 0)
+            return null;
+
+        string? previousMax = null;
+        foreach (var entry in entries)
+        {
+            if (entry.ArpMaxVersion is null) continue;
+            if (RestSource.CompareVersionStrings(entry.Version, latest.Version) >= 0) continue;
+            if (previousMax is null || RestSource.CompareVersionStrings(entry.ArpMaxVersion, previousMax) > 0)
+                previousMax = entry.ArpMaxVersion;
+        }
+        if (previousMax is not null && RestSource.CompareVersionStrings(arpVersion, previousMax) <= 0)
+            return null;
+
+        return $"< {latest.Version}";
+    }
+
+    /// <summary>
     /// Returns the latest catalog Version that carries ARP-range metadata.
     /// Packages like `Microsoft.WindowsAppRuntime.1.8` also publish "internal"
     /// version rows whose `v` is an MSI build number (`8000.836.2153.0`)
@@ -2652,7 +2906,8 @@ public class Repository : IDisposable
                 {
                     using var conn2 = OpenPreindexedConnection(sourceIndex);
                     var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
-                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion)
+                        ?? LessThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion);
                     anchoredLatest = LatestArpAnchoredVersion(entries);
                 }
                 catch { /* version data fetch is best-effort; fall back below */ }
@@ -3589,14 +3844,6 @@ public class Repository : IDisposable
 
     private static bool SearchMatchHasUnknownVersion(SearchMatch match) =>
         match.Version is not null && match.Version.Equals("Unknown", StringComparison.OrdinalIgnoreCase);
-
-    // ── Utilities ──
-
-    private static string Sha256Hex(byte[] data)
-    {
-        var hash = SHA256.HashData(data);
-        return Convert.ToHexString(hash).ToLowerInvariant();
-    }
 
     private class VersionComparer : IComparer<string>
     {

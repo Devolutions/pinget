@@ -26,9 +26,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
 sha2 = "0.11.0"
+tokio = { version = "1.48.0", features = ["rt", "time", "net"] }
 turso = { version = "0.7.0-pre.4", default-features = false }
 zip = "8.5.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55.0"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_System_ApplicationInstallationAndServicing", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

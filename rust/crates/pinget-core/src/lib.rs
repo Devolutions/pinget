@@ -3,20 +3,24 @@ mod name_normalization;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::fs;
-use std::io::{Cursor, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{Cursor, Read, Write};
 #[cfg(windows)]
 use std::mem::{MaybeUninit, size_of};
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use reqwest::header::{
+    ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    IF_RANGE, LAST_MODIFIED, RANGE,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
@@ -755,6 +759,20 @@ struct SearchSourceMatches {
 }
 
 #[derive(Debug, Clone)]
+struct SourceSearchFailure {
+    source_name: String,
+    message: String,
+}
+
+#[derive(Debug)]
+struct SearchLocatedResult {
+    matches: Vec<LocatedMatch>,
+    warnings: Vec<String>,
+    failures: Vec<SourceSearchFailure>,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
 enum MatchLocator {
     PreIndexedV1 {
         package_rowid: i64,
@@ -823,6 +841,7 @@ struct PackageVersionDataEntry {
 
 pub struct Repository {
     app_root: PathBuf,
+    user_agent: String,
     client: Client,
     store: SourceStore,
     use_system_winget_sources: bool,
@@ -892,10 +911,12 @@ impl Repository {
         let store = load_store(&options.app_root)?;
         let client = Client::builder()
             .user_agent(&options.user_agent)
+            .timeout(StdDuration::from_secs(30 * 60))
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {
             app_root: options.app_root,
+            user_agent: options.user_agent,
             client,
             store,
             use_system_winget_sources,
@@ -1179,18 +1200,18 @@ impl Repository {
     }
 
     pub fn search(&mut self, query: &PackageQuery) -> Result<SearchResponse> {
-        let (matches, warnings, truncated) = self.search_located(query, SearchSemantics::Many)?;
+        let located = self.search_located(query, SearchSemantics::Many)?;
         Ok(SearchResponse {
-            matches: matches.into_iter().map(|item| item.display).collect(),
-            warnings,
-            truncated,
+            matches: located.matches.into_iter().map(|item| item.display).collect(),
+            warnings: located.warnings,
+            truncated: located.truncated,
         })
     }
 
     pub fn search_manifests(&mut self, query: &PackageQuery) -> Result<Vec<JsonValue>> {
-        let (matches, _, _) = self.search_located(query, SearchSemantics::Many)?;
-        let mut structured_documents = Vec::with_capacity(matches.len());
-        for located in matches {
+        let located = self.search_located(query, SearchSemantics::Many)?;
+        let mut structured_documents = Vec::with_capacity(located.matches.len());
+        for located in located.matches {
             let (_, manifest_documents, _) = self.manifest_for_match(&located, query)?;
             structured_documents.push(manifest_documents);
         }
@@ -1203,6 +1224,7 @@ impl Repository {
             bail!("--include-unknown and --include-pinned require --upgrade-available");
         }
         if query.source.is_some()
+            && !query.upgrade_only
             && query.query.is_none()
             && query.id.is_none()
             && query.name.is_none()
@@ -1249,9 +1271,9 @@ impl Repository {
             // Filtered lookup: search sources with the user's query for any
             // installed package not already resolved by identity.
             let available_query = package_query_from_list_query(query);
-            let (matches, source_warnings, _) = self.search_located(&available_query, SearchSemantics::Many)?;
-            warnings.extend(source_warnings);
-            let candidates: Vec<SearchMatch> = matches.into_iter().map(|c| c.display).collect();
+            let located = self.search_located(&available_query, SearchSemantics::Many)?;
+            warnings.extend(located.warnings);
+            let candidates: Vec<SearchMatch> = located.matches.into_iter().map(|c| c.display).collect();
             for package in &mut installed {
                 if package.correlated.is_some() {
                     continue;
@@ -1259,8 +1281,11 @@ impl Repository {
                 package.correlated =
                     correlate_installed_package(package, &candidates, allow_loose_list_correlation(query));
             }
-        } else if needs_available {
-            // Unfiltered upgrade: look up each installed package by its correlation names
+        } else if needs_available && !query.upgrade_only {
+            // Plain unfiltered list: preserve legacy best-effort catalog
+            // display/source enrichment. Bulk upgrade avoids this loose
+            // name-only pass because winget only upgrades packages correlated
+            // through stronger identity/normalization paths.
             warnings.extend(self.correlate_all_installed(&mut installed)?);
         }
 
@@ -1354,8 +1379,8 @@ impl Repository {
             os_version: None,
             install_scope: None,
         };
-        let (matches, warnings, _) = self.search_located(&all_query, SearchSemantics::Many)?;
-        let candidates: Vec<SearchMatch> = matches.into_iter().map(|c| c.display).collect();
+        let located = self.search_located(&all_query, SearchSemantics::Many)?;
+        let candidates: Vec<SearchMatch> = located.matches.into_iter().map(|c| c.display).collect();
 
         for package in installed.iter_mut() {
             if package.correlated.is_some() {
@@ -1364,7 +1389,7 @@ impl Repository {
             package.correlated = correlate_installed_package(package, &candidates, true);
         }
 
-        Ok(warnings)
+        Ok(located.warnings)
     }
 
     /// Correlates installed packages against the v2 pre-indexed catalog using
@@ -1425,7 +1450,9 @@ impl Repository {
                 let (canonical_installed, anchored_latest) =
                     match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
                         Ok((entries, _)) => (
-                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version),
+                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version).or_else(|| {
+                                less_than_latest_arp_anchored_version(&entries, &installed[idx].installed_version)
+                            }),
                             latest_arp_anchored_version(&entries),
                         ),
                         Err(_) => (None, None),
@@ -1650,7 +1677,8 @@ impl Repository {
                 };
 
                 if !installed[idx].installed_version_canonical {
-                    let canonical_installed = map_arp_version_to_catalog(&entries, &installed[idx].installed_version);
+                    let canonical_installed = map_arp_version_to_catalog(&entries, &installed[idx].installed_version)
+                        .or_else(|| less_than_latest_arp_anchored_version(&entries, &installed[idx].installed_version));
                     let anchored_latest = latest_arp_anchored_version(&entries);
                     if let Some(canonical) = canonical_installed {
                         installed[idx].installed_version = canonical;
@@ -1912,14 +1940,11 @@ impl Repository {
         });
         let dest = download_dir.join(filename);
 
-        let response = self.client.get(url).send().context("failed to download installer")?;
-        if !response.status().is_success() {
-            bail!("Download failed: HTTP {}", response.status());
-        }
-        let bytes = response.bytes()?;
-        fs::write(&dest, &bytes)?;
+        let actual_hash = download_installer_to_file(&self.user_agent, url, &dest)?;
 
-        if let Err(error) = verify_installer_hash(installer.sha256.as_deref(), &bytes, request.ignore_security_hash) {
+        if let Err(error) =
+            verify_installer_hash_hex(installer.sha256.as_deref(), &actual_hash, request.ignore_security_hash)
+        {
             let _ = fs::remove_file(&dest);
             return Err(error);
         }
@@ -2420,14 +2445,20 @@ impl Repository {
         query: &PackageQuery,
         semantics: SearchSemantics,
     ) -> Result<(LocatedMatch, Vec<String>)> {
-        let (matches, warnings, _) = self.search_located(query, semantics)?;
+        let located = self.search_located(query, semantics)?;
 
-        if matches.is_empty() {
+        if located.matches.is_empty() {
+            if query.source.is_some()
+                && let Some(failure) = located.failures.first()
+            {
+                bail!("failed to search source '{}': {}", failure.source_name, failure.message);
+            }
             bail!("no package matched the supplied query");
         }
 
-        if matches.len() > 1 {
-            let choices = matches
+        if located.matches.len() > 1 {
+            let choices = located
+                .matches
                 .iter()
                 .take(10)
                 .map(|item| {
@@ -2441,17 +2472,14 @@ impl Repository {
             bail!("multiple packages matched: {choices}");
         }
 
-        Ok((matches.into_iter().next().expect("one match"), warnings))
+        Ok((located.matches.into_iter().next().expect("one match"), located.warnings))
     }
 
-    fn search_located(
-        &mut self,
-        query: &PackageQuery,
-        semantics: SearchSemantics,
-    ) -> Result<(Vec<LocatedMatch>, Vec<String>, bool)> {
+    fn search_located(&mut self, query: &PackageQuery, semantics: SearchSemantics) -> Result<SearchLocatedResult> {
         let indexes = self.resolve_source_indexes(query.source.as_deref())?;
         let mut matches = Vec::new();
         let mut warnings = Vec::new();
+        let mut failures = Vec::new();
         let mut truncated = false;
 
         for index in indexes {
@@ -2460,10 +2488,15 @@ impl Repository {
                     truncated |= source_matches.truncated;
                     matches.append(&mut source_matches.matches);
                 }
-                Err(_error) => warnings.push(format!(
-                    "Failed when searching source; results will not be included: {}",
-                    self.store.sources[index].name
-                )),
+                Err(error) => {
+                    let source_name = self.store.sources[index].name.clone();
+                    let message = format!("{error:#}");
+                    warnings.push(format!(
+                        "Failed when searching source '{}'; results will not be included: {}",
+                        source_name, message
+                    ));
+                    failures.push(SourceSearchFailure { source_name, message });
+                }
             }
         }
 
@@ -2478,7 +2511,12 @@ impl Repository {
             }
         }
 
-        Ok((matches, warnings, truncated))
+        Ok(SearchLocatedResult {
+            matches,
+            warnings,
+            failures,
+            truncated,
+        })
     }
 
     fn search_source(
@@ -3988,6 +4026,40 @@ fn map_arp_version_to_catalog(entries: &[PackageVersionDataEntry], arp_version: 
     None
 }
 
+/// Returns `< latest>` when ARP range metadata proves the installed version is
+/// below the newest catalog version, but the raw DisplayVersion is too coarse
+/// to map into a concrete aMiV/aMaV bucket. Snagit 2025 reports `25.4.1` while
+/// the catalog's latest ARP build is `25.4.1.10325`; winget renders that as
+/// installed `< 25.4.1` with available `25.4.1`.
+fn less_than_latest_arp_anchored_version(entries: &[PackageVersionDataEntry], arp_version: &str) -> Option<String> {
+    if arp_version.is_empty() || arp_version.eq_ignore_ascii_case("Unknown") {
+        return None;
+    }
+
+    let latest = entries
+        .iter()
+        .filter(|e| e.arp_min_version.is_some() && e.arp_max_version.is_some())
+        .max_by(|a, b| compare_version(&a.version, &b.version))?;
+    if compare_version(arp_version, &latest.version) != Ordering::Equal {
+        return None;
+    }
+    let latest_min = latest.arp_min_version.as_deref()?;
+    if compare_version(arp_version, latest_min) != Ordering::Less {
+        return None;
+    }
+
+    let previous_max = entries
+        .iter()
+        .filter(|entry| compare_version(&entry.version, &latest.version) == Ordering::Less)
+        .filter_map(|entry| entry.arp_max_version.as_deref())
+        .max_by(|left, right| compare_version(left, right));
+    if previous_max.is_some_and(|max| compare_version(arp_version, max) != Ordering::Greater) {
+        return None;
+    }
+
+    Some(format!("< {}", latest.version))
+}
+
 /// Returns the latest catalog Version that carries ARP-range metadata
 /// (`aMiV` / `aMaV`). Packages like `Microsoft.WindowsAppRuntime.1.8` also
 /// publish "internal" version rows whose `v` is an MSI build number
@@ -4196,7 +4268,7 @@ fn collect_uninstall_view(
             .into_iter()
             .collect::<Vec<_>>();
         let mut product_codes = read_reg_string(&subkey, "ProductCode").into_iter().collect::<Vec<_>>();
-        if product_codes.is_empty() && looks_like_product_code(&key_name) {
+        if !product_codes.iter().any(|code| code.eq_ignore_ascii_case(&key_name)) {
             product_codes.push(key_name.to_ascii_lowercase());
         }
         let mut upgrade_codes = read_reg_string(&subkey, "UpgradeCode").into_iter().collect::<Vec<_>>();
@@ -4380,11 +4452,6 @@ fn read_reg_string(key: &RegKey, value_name: &str) -> Option<String> {
 #[cfg(windows)]
 fn read_reg_dword(key: &RegKey, value_name: &str) -> Option<u32> {
     key.get_value::<u32, _>(value_name).ok()
-}
-
-#[cfg(windows)]
-fn looks_like_product_code(value: &str) -> bool {
-    value.starts_with('{') && value.ends_with('}')
 }
 
 fn ensure_app_dirs(app_root: &Path) -> Result<()> {
@@ -7877,6 +7944,15 @@ fn compare_version_and_channel(
 }
 
 fn compare_version(left: &str, right: &str) -> Ordering {
+    let left_less_than = left.trim().strip_prefix('<').map(str::trim);
+    let right_less_than = right.trim().strip_prefix('<').map(str::trim);
+    match (left_less_than, right_less_than) {
+        (Some(left_value), Some(right_value)) => return compare_version(left_value, right_value),
+        (Some(left_value), None) if compare_version(left_value, right) == Ordering::Equal => return Ordering::Less,
+        (None, Some(right_value)) if compare_version(left, right_value) == Ordering::Equal => return Ordering::Greater,
+        _ => {}
+    }
+
     let left_parts = tokenize_version(left);
     let right_parts = tokenize_version(right);
     let max_len = left_parts.len().max(right_parts.len());
@@ -7943,6 +8019,7 @@ fn verify_hash(expected_hash: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_installer_hash(expected_hash: Option<&str>, bytes: &[u8], ignore_security_hash: bool) -> Result<()> {
     let Some(expected_hash) = expected_hash else {
         return Ok(());
@@ -7958,6 +8035,289 @@ fn verify_installer_hash(expected_hash: Option<&str>, bytes: &[u8], ignore_secur
     Ok(())
 }
 
+fn verify_installer_hash_hex(expected_hash: Option<&str>, actual_hash: &str, ignore_security_hash: bool) -> Result<()> {
+    let Some(expected_hash) = expected_hash else {
+        return Ok(());
+    };
+    if ignore_security_hash {
+        return Ok(());
+    }
+
+    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+        bail!("Installer hash mismatch. Expected: {expected_hash}, Got: {actual_hash}");
+    }
+    Ok(())
+}
+
+const INSTALLER_DOWNLOAD_ATTEMPTS: usize = 3;
+const INSTALLER_DOWNLOAD_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const INSTALLER_DOWNLOAD_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+const INSTALLER_DOWNLOAD_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
+const INSTALLER_DOWNLOAD_METADATA_INTERVAL: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InstallerDownloadMetadata {
+    url: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    total_length: Option<u64>,
+    offset: u64,
+}
+
+#[derive(Debug)]
+struct DownloadAttempt {
+    total_length: Option<u64>,
+}
+
+fn download_installer_to_file(user_agent: &str, url: &str, dest: &Path) -> Result<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create installer download runtime")?;
+    runtime.block_on(download_installer_to_file_async(user_agent, url, dest))
+}
+
+async fn download_installer_to_file_async(user_agent: &str, url: &str, dest: &Path) -> Result<String> {
+    let part_path = sidecar_path(dest, "part");
+    let metadata_path = sidecar_path(dest, "part.json");
+    let started_at = Instant::now();
+    let mut last_error = None;
+
+    for _attempt in 1..=INSTALLER_DOWNLOAD_ATTEMPTS {
+        if started_at.elapsed() >= INSTALLER_DOWNLOAD_TOTAL_TIMEOUT {
+            break;
+        }
+
+        let remaining = INSTALLER_DOWNLOAD_TOTAL_TIMEOUT
+            .checked_sub(started_at.elapsed())
+            .unwrap_or_else(|| StdDuration::from_secs(1));
+        match try_download_installer_to_part(user_agent, url, &part_path, &metadata_path, remaining).await {
+            Ok(()) => {
+                let actual_hash = sha256_file_hex(&part_path)?;
+                replace_file(&part_path, dest)?;
+                let _ = fs::remove_file(&metadata_path);
+                return Ok(actual_hash);
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("installer download timed out")))
+}
+
+async fn try_download_installer_to_part(
+    user_agent: &str,
+    url: &str,
+    part_path: &Path,
+    metadata_path: &Path,
+    remaining: StdDuration,
+) -> Result<()> {
+    let metadata = read_installer_download_metadata(metadata_path, part_path, url)?;
+    let mut offset = metadata.as_ref().map_or(0, |metadata| metadata.offset);
+    let mut request = reqwest::Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(INSTALLER_DOWNLOAD_CONNECT_TIMEOUT)
+        .timeout(remaining)
+        .build()
+        .context("failed to build installer download client")?
+        .get(url)
+        .header(ACCEPT_ENCODING, "identity");
+
+    if offset > 0 {
+        request = request.header(RANGE, format!("bytes={offset}-"));
+        if let Some(if_range) = metadata.as_ref().and_then(installer_download_if_range) {
+            request = request.header(IF_RANGE, if_range);
+        }
+    }
+
+    let mut response = request.send().await.context("failed to download installer")?;
+    let headers = response.headers().clone();
+    let status = response.status();
+    let attempt = if status == StatusCode::PARTIAL_CONTENT && offset > 0 {
+        parse_content_range(headers.get(CONTENT_RANGE), offset)?
+    } else if status == StatusCode::OK {
+        offset = 0;
+        DownloadAttempt {
+            total_length: content_length(&headers),
+        }
+    } else if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(metadata_path);
+        bail!("installer partial download could not be resumed; retrying from the beginning");
+    } else if status.is_success() {
+        bail!("unexpected installer download HTTP status {status}");
+    } else {
+        bail!("Download failed: HTTP {status}");
+    };
+
+    if offset == 0 {
+        let _ = fs::remove_file(part_path);
+    }
+
+    let mut file = if offset == 0 {
+        fs::File::create(part_path).with_context(|| format!("failed to create {}", part_path.display()))?
+    } else {
+        OpenOptions::new()
+            .append(true)
+            .open(part_path)
+            .with_context(|| format!("failed to open {}", part_path.display()))?
+    };
+
+    let mut metadata = InstallerDownloadMetadata {
+        url: url.to_owned(),
+        etag: strong_etag(&headers),
+        last_modified: header_string(&headers, LAST_MODIFIED),
+        total_length: attempt.total_length,
+        offset,
+    };
+    write_installer_download_metadata(metadata_path, &metadata)?;
+
+    let mut next_metadata_offset = offset.saturating_add(INSTALLER_DOWNLOAD_METADATA_INTERVAL);
+    while let Some(chunk) = tokio::time::timeout(INSTALLER_DOWNLOAD_IDLE_TIMEOUT, response.chunk())
+        .await
+        .context("installer download stalled while waiting for data")?
+        .context("failed to read installer response body")?
+    {
+        file.write_all(&chunk)
+            .with_context(|| format!("failed to write {}", part_path.display()))?;
+        offset += u64::try_from(chunk.len()).expect("chunk length fits in u64");
+
+        if offset >= next_metadata_offset {
+            file.flush()
+                .with_context(|| format!("failed to flush {}", part_path.display()))?;
+            metadata.offset = offset;
+            write_installer_download_metadata(metadata_path, &metadata)?;
+            next_metadata_offset = offset.saturating_add(INSTALLER_DOWNLOAD_METADATA_INTERVAL);
+        }
+    }
+
+    file.flush()
+        .with_context(|| format!("failed to flush {}", part_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", part_path.display()))?;
+
+    if let Some(total_length) = attempt.total_length
+        && offset != total_length
+    {
+        bail!("installer download ended early: received {offset} of {total_length} bytes");
+    }
+
+    metadata.offset = offset;
+    metadata.total_length = attempt.total_length;
+    write_installer_download_metadata(metadata_path, &metadata)?;
+    Ok(())
+}
+
+fn read_installer_download_metadata(
+    metadata_path: &Path,
+    part_path: &Path,
+    url: &str,
+) -> Result<Option<InstallerDownloadMetadata>> {
+    let Some(mut metadata) = fs::read(metadata_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<InstallerDownloadMetadata>(&bytes).ok())
+    else {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(metadata_path);
+        return Ok(None);
+    };
+
+    if metadata.url != url || metadata.offset == 0 {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(metadata_path);
+        return Ok(None);
+    }
+
+    let part_len = fs::metadata(part_path).map(|metadata| metadata.len()).unwrap_or(0);
+    metadata.offset = metadata.offset.min(part_len);
+    if metadata.offset == 0 {
+        let _ = fs::remove_file(part_path);
+        let _ = fs::remove_file(metadata_path);
+        return Ok(None);
+    }
+
+    OpenOptions::new()
+        .write(true)
+        .open(part_path)
+        .with_context(|| format!("failed to open {}", part_path.display()))?
+        .set_len(metadata.offset)
+        .with_context(|| format!("failed to truncate {}", part_path.display()))?;
+
+    Ok(Some(metadata))
+}
+
+fn write_installer_download_metadata(path: &Path, metadata: &InstallerDownloadMetadata) -> Result<()> {
+    let bytes = serde_json::to_vec(metadata).context("failed to serialize installer download metadata")?;
+    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn installer_download_if_range(metadata: &InstallerDownloadMetadata) -> Option<String> {
+    metadata
+        .etag
+        .as_ref()
+        .filter(|etag| !etag.starts_with("W/"))
+        .cloned()
+        .or_else(|| metadata.last_modified.clone())
+}
+
+fn parse_content_range(value: Option<&HeaderValue>, expected_start: u64) -> Result<DownloadAttempt> {
+    let value = value
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow!("partial installer response missing Content-Range"))?;
+    let range = value
+        .strip_prefix("bytes ")
+        .ok_or_else(|| anyhow!("unsupported Content-Range value: {value}"))?;
+    let (span, total) = range
+        .split_once('/')
+        .ok_or_else(|| anyhow!("invalid Content-Range value: {value}"))?;
+    let (start, _) = span
+        .split_once('-')
+        .ok_or_else(|| anyhow!("invalid Content-Range byte span: {value}"))?;
+    let start = start
+        .parse::<u64>()
+        .with_context(|| format!("invalid Content-Range start: {value}"))?;
+    if start != expected_start {
+        bail!("partial installer response started at {start}, expected {expected_start}");
+    }
+    let total_length = if total == "*" {
+        None
+    } else {
+        Some(
+            total
+                .parse::<u64>()
+                .with_context(|| format!("invalid Content-Range total: {value}"))?,
+        )
+    };
+    Ok(DownloadAttempt { total_length })
+}
+
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn strong_etag(headers: &HeaderMap) -> Option<String> {
+    header_string(headers, ETAG).filter(|value| !value.starts_with("W/"))
+}
+
+fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".");
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
 fn hash_matches(expected_hash: Option<&str>, bytes: &[u8]) -> bool {
     expected_hash
         .map(|expected| sha256_hex(bytes).eq_ignore_ascii_case(expected))
@@ -7966,6 +8326,27 @@ fn hash_matches(expected_hash: Option<&str>, bytes: &[u8]) -> bool {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
+    sha256_digest_hex(digest)
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(sha256_digest_hex(hasher.finalize()))
+}
+
+fn sha256_digest_hex(digest: impl AsRef<[u8]>) -> String {
+    let digest = digest.as_ref();
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {
         output.push_str(&format!("{byte:02X}"));
@@ -8018,22 +8399,19 @@ fn dispatch_installer(
     manifest: &Manifest,
     installer: &Installer,
 ) -> Result<i32> {
-    use std::process::Command;
-
     match installer_type {
-        "msi" | "wix" => {
-            let mut cmd = Command::new("msiexec");
-            cmd.args(installer_command_arguments(
-                installer_type,
-                request,
-                manifest,
-                installer_path,
-                installer,
-            ));
-            let status = cmd.status().context("failed to run msiexec")?;
-            Ok(status.code().unwrap_or(-1))
-        }
+        "msi" | "wix" if should_run_msi_direct(request, installer) => run_msi_direct(
+            installer_path,
+            &installer_direct_msi_arguments(installer_type, request, manifest, installer_path, installer),
+        ),
+        "msi" | "wix" => shell_execute_installer(
+            Path::new("msiexec.exe"),
+            &installer_shell_execute_arguments(installer_type, request, manifest, installer_path, installer),
+            should_elevate_msi_shell_execute(installer),
+        ),
         "msix" | "appx" => {
+            use std::process::Command;
+
             let mut cmd = Command::new("powershell");
             cmd.arg("-NoProfile")
                 .arg("-Command")
@@ -8064,20 +8442,335 @@ fn dispatch_installer(
             Ok(0)
         }
         "portable" => install_portable(installer_path, request, manifest, installer),
-        // exe, inno, nullsoft, burn, etc.
-        _ => {
-            let mut cmd = Command::new(installer_path);
-            cmd.args(installer_command_arguments(
-                installer_type,
-                request,
-                manifest,
-                installer_path,
-                installer,
-            ));
-            let status = cmd.status().context("failed to run installer")?;
-            Ok(status.code().unwrap_or(-1))
+        // exe, inno, nullsoft, burn, etc. are launched through ShellExecute so
+        // Windows can honor installer manifests and legacy elevation detection.
+        _ => shell_execute_installer(
+            installer_path,
+            &installer_shell_execute_arguments(installer_type, request, manifest, installer_path, installer),
+            false,
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn should_run_msi_direct(request: &InstallRequest, installer: &Installer) -> bool {
+    request.mode == InstallerMode::Silent && !should_elevate_msi_shell_execute(installer)
+}
+
+#[cfg(windows)]
+fn should_elevate_msi_shell_execute(installer: &Installer) -> bool {
+    installer
+        .scope
+        .as_deref()
+        .is_some_and(|scope| scope.eq_ignore_ascii_case("machine"))
+}
+
+#[cfg(windows)]
+fn shell_execute_installer(installer_path: &Path, args: &[String], run_as: bool) -> Result<i32> {
+    use std::ffi::OsStr;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+    use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
+
+    let file = wide_null(installer_path.as_os_str());
+    let parameters = wide_null(OsStr::new(&join_windows_arguments(args)));
+    let verb = run_as.then(|| wide_null(OsStr::new("runas")));
+
+    // SAFETY: SHELLEXECUTEINFOW is a plain Win32 data structure; zero initialization
+    // is the documented starting point before setting cbSize and the fields we use.
+    let mut exec_info = unsafe { std::mem::zeroed::<SHELLEXECUTEINFOW>() };
+    exec_info.cbSize =
+        u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>()).expect("SHELLEXECUTEINFOW size fits in u32");
+    exec_info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    exec_info.lpFile = file.as_ptr();
+    exec_info.lpParameters = parameters.as_ptr();
+    if let Some(verb) = verb.as_ref() {
+        exec_info.lpVerb = verb.as_ptr();
+    }
+    exec_info.nShow = SW_SHOW;
+
+    // SAFETY: exec_info points to a valid SHELLEXECUTEINFOW whose string pointers
+    // reference live, nul-terminated UTF-16 buffers for the duration of the call.
+    if unsafe { ShellExecuteExW(&mut exec_info) } == 0 {
+        bail!(
+            "failed to launch installer through ShellExecute (Win32 error {})",
+            // SAFETY: GetLastError reads the calling thread's last-error value.
+            unsafe { GetLastError() }
+        );
+    }
+
+    if exec_info.hProcess.is_null() {
+        bail!("ShellExecute did not return an installer process handle");
+    }
+
+    // SAFETY: ShellExecuteExW returned a non-null process handle with
+    // SEE_MASK_NOCLOSEPROCESS, so waiting on it is valid.
+    let wait_result = unsafe { WaitForSingleObject(exec_info.hProcess, INFINITE) };
+    if wait_result != WAIT_OBJECT_0 {
+        // SAFETY: hProcess is the owned process handle returned by ShellExecuteExW.
+        let _ = unsafe { CloseHandle(exec_info.hProcess) };
+        bail!("failed while waiting for installer process (Win32 wait result {wait_result})");
+    }
+
+    let mut exit_code = 0u32;
+    // SAFETY: hProcess is still open and valid, and exit_code points to writable memory.
+    let got_exit_code = unsafe { GetExitCodeProcess(exec_info.hProcess, &mut exit_code) };
+    // SAFETY: hProcess is the owned process handle returned by ShellExecuteExW.
+    let _ = unsafe { CloseHandle(exec_info.hProcess) };
+    if got_exit_code == 0 {
+        // SAFETY: GetLastError reads the calling thread's last-error value.
+        let error = unsafe { GetLastError() };
+        bail!("failed to retrieve installer exit code (Win32 error {error})");
+    }
+
+    Ok(exit_code.cast_signed())
+}
+
+#[cfg(windows)]
+fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn run_msi_direct(installer_path: &Path, args: &[String]) -> Result<i32> {
+    use std::ffi::OsStr;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::System::ApplicationInstallationAndServicing::{
+        INSTALLUILEVEL_NONE, INSTALLUILEVEL_UACONLY, MsiEnableLogW, MsiInstallProductW, MsiSetInternalUI,
+    };
+
+    let parsed = parse_msi_direct_arguments(args)?;
+    let package_path = wide_null(installer_path.as_os_str());
+    let properties = wide_null(OsStr::new(&parsed.properties));
+    let property_ptr = if parsed.properties.is_empty() {
+        null()
+    } else {
+        properties.as_ptr()
+    };
+    let log_path = parsed.log_path.as_ref().map(|path| wide_null(OsStr::new(path)));
+
+    if let Some(path) = log_path.as_ref() {
+        // SAFETY: path is a live, nul-terminated UTF-16 buffer; mode and attributes
+        // are parsed from MSI logging switches.
+        let result = unsafe { MsiEnableLogW(parsed.log_mode, path.as_ptr(), parsed.log_attributes) };
+        if result != 0 {
+            bail!("failed to enable MSI logging (Win32 error {result})");
+        }
+    } else {
+        // SAFETY: Passing a null file with mode 0 disables MSI logging.
+        let _ = unsafe { MsiEnableLogW(0, null(), 0) };
+    }
+
+    let ui_level = if parsed.ui_level == INSTALLUILEVEL_NONE as u32 {
+        (INSTALLUILEVEL_NONE | INSTALLUILEVEL_UACONLY) as u32
+    } else {
+        parsed.ui_level
+    };
+    // SAFETY: ui_level is composed from documented INSTALLUILEVEL flags; null HWND
+    // matches the MsiSetInternalUI contract when no owner window is supplied.
+    unsafe { MsiSetInternalUI(ui_level.cast_signed(), null_mut()) };
+    // SAFETY: package_path and property_ptr are valid, nul-terminated UTF-16
+    // strings (or null for no properties) for the duration of the call.
+    let result = unsafe { MsiInstallProductW(package_path.as_ptr(), property_ptr) };
+    Ok(result.cast_signed())
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+struct MsiDirectArguments {
+    ui_level: u32,
+    properties: String,
+    log_mode: u32,
+    log_path: Option<String>,
+    log_attributes: u32,
+}
+
+#[cfg(any(windows, test))]
+fn parse_msi_direct_arguments(args: &[String]) -> Result<MsiDirectArguments> {
+    const INSTALLUILEVEL_DEFAULT: u32 = 1;
+    const INSTALLUILEVEL_NONE: u32 = 2;
+    const INSTALLUILEVEL_BASIC: u32 = 3;
+    const INSTALLUILEVEL_PROGRESSONLY: u32 = 0x40;
+    const INSTALLUILEVEL_HIDECANCEL: u32 = 0x20;
+    const INSTALLUILEVEL_UACONLY: u32 = 0x100;
+    const LOGMODE_DEFAULT: u32 = 1 | 2 | 4 | 16 | 128 | 256 | 512;
+    const LOGMODE_ALL: u32 = LOGMODE_DEFAULT | 8 | 1024 | 2048;
+    const LOGMODE_VERBOSE: u32 = 4096;
+    const LOGMODE_EXTRADEBUG: u32 = 8192;
+    const LOGATTR_APPEND: u32 = 1;
+    const LOGATTR_FLUSH: u32 = 2;
+
+    let mut parsed = MsiDirectArguments {
+        ui_level: INSTALLUILEVEL_DEFAULT,
+        properties: String::new(),
+        log_mode: 0,
+        log_path: None,
+        log_attributes: 0,
+    };
+
+    let mut index = 0;
+    while index < args.len() {
+        let token = &args[index];
+        if is_msi_switch(token) {
+            let option = &token[1..];
+            if option.eq_ignore_ascii_case("quiet") {
+                parsed.ui_level = INSTALLUILEVEL_NONE | INSTALLUILEVEL_UACONLY;
+            } else if option.eq_ignore_ascii_case("passive") {
+                parsed.ui_level = INSTALLUILEVEL_BASIC | INSTALLUILEVEL_PROGRESSONLY | INSTALLUILEVEL_HIDECANCEL;
+                append_msi_property(&mut parsed.properties, "REBOOTPROMPT=S");
+            } else if option.eq_ignore_ascii_case("norestart") {
+                append_msi_property(&mut parsed.properties, "REBOOT=ReallySuppress");
+            } else if option.eq_ignore_ascii_case("forcerestart") {
+                append_msi_property(&mut parsed.properties, "REBOOT=Force");
+            } else if option.eq_ignore_ascii_case("promptrestart") {
+                append_msi_property(&mut parsed.properties, "REBOOTPROMPT=\"\"");
+            } else if option.eq_ignore_ascii_case("log") {
+                index += 1;
+                let path = args.get(index).ok_or_else(|| anyhow!("MSI /log requires a log path"))?;
+                parsed.log_mode = LOGMODE_ALL;
+                parsed.log_path = Some(path.clone());
+            } else if option.len() == 1 && option.eq_ignore_ascii_case("q") {
+                parsed.ui_level = INSTALLUILEVEL_NONE | INSTALLUILEVEL_UACONLY;
+            } else if option.starts_with(['q', 'Q']) {
+                parsed.ui_level = parse_msi_ui_level(&option[1..])?;
+            } else if option.starts_with(['l', 'L']) {
+                index += 1;
+                let path = args
+                    .get(index)
+                    .ok_or_else(|| anyhow!("MSI logging switch requires a log path"))?;
+                let (mode, attributes) = parse_msi_log_mode(
+                    &option[1..],
+                    LOGMODE_DEFAULT,
+                    LOGMODE_ALL,
+                    LOGMODE_VERBOSE,
+                    LOGMODE_EXTRADEBUG,
+                    LOGATTR_APPEND,
+                    LOGATTR_FLUSH,
+                )?;
+                parsed.log_mode = mode;
+                parsed.log_attributes = attributes;
+                parsed.log_path = Some(path.clone());
+            } else {
+                bail!("unsupported MSI switch for direct MSI execution: {token}");
+            }
+        } else {
+            append_msi_property(&mut parsed.properties, &format_msi_property(token)?);
+        }
+        index += 1;
+    }
+
+    Ok(parsed)
+}
+
+#[cfg(any(windows, test))]
+fn is_msi_switch(token: &str) -> bool {
+    token.starts_with('/') || token.starts_with('-')
+}
+
+#[cfg(any(windows, test))]
+fn append_msi_property(properties: &mut String, property: &str) {
+    if !properties.is_empty() {
+        properties.push(' ');
+    }
+    properties.push_str(property);
+}
+
+#[cfg(any(windows, test))]
+fn format_msi_property(token: &str) -> Result<String> {
+    let Some((name, value)) = token.split_once('=') else {
+        bail!("invalid MSI property argument: {token}");
+    };
+    if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        bail!("invalid MSI property name: {name}");
+    }
+    if value.contains(char::is_whitespace) && !(value.starts_with('"') && value.ends_with('"')) {
+        Ok(format!("{name}=\"{}\"", value.replace('"', "\"\"")))
+    } else {
+        Ok(token.to_owned())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn parse_msi_ui_level(modifier: &str) -> Result<u32> {
+    const INSTALLUILEVEL_NONE: u32 = 2;
+    const INSTALLUILEVEL_BASIC: u32 = 3;
+    const INSTALLUILEVEL_REDUCED: u32 = 4;
+    const INSTALLUILEVEL_FULL: u32 = 5;
+    const INSTALLUILEVEL_ENDDIALOG: u32 = 0x80;
+    const INSTALLUILEVEL_PROGRESSONLY: u32 = 0x40;
+    const INSTALLUILEVEL_HIDECANCEL: u32 = 0x20;
+    const INSTALLUILEVEL_UACONLY: u32 = 0x100;
+
+    let modifier = if modifier.is_empty() { "n" } else { modifier };
+    let mut chars = modifier.chars();
+    let Some(first) = chars.next() else {
+        return Ok(INSTALLUILEVEL_NONE | INSTALLUILEVEL_UACONLY);
+    };
+    let mut ui_level = match first.to_ascii_lowercase() {
+        'f' => INSTALLUILEVEL_FULL,
+        'r' => INSTALLUILEVEL_REDUCED,
+        'b' => INSTALLUILEVEL_BASIC,
+        'n' => INSTALLUILEVEL_NONE,
+        '+' => INSTALLUILEVEL_NONE | INSTALLUILEVEL_ENDDIALOG,
+        _ => bail!("invalid MSI /q modifier: {modifier}"),
+    };
+
+    for ch in chars {
+        match ch {
+            '+' => ui_level |= INSTALLUILEVEL_ENDDIALOG,
+            '-' if ui_level & 0xF == INSTALLUILEVEL_BASIC => ui_level |= INSTALLUILEVEL_PROGRESSONLY,
+            '!' if ui_level & 0xF == INSTALLUILEVEL_BASIC => ui_level |= INSTALLUILEVEL_HIDECANCEL,
+            '-' | '!' => bail!("MSI /q modifier {ch} is only valid with basic UI"),
+            _ => bail!("invalid MSI /q modifier: {modifier}"),
         }
     }
+
+    if ui_level & 0xF == INSTALLUILEVEL_NONE {
+        ui_level |= INSTALLUILEVEL_UACONLY;
+    }
+    Ok(ui_level)
+}
+
+#[cfg(any(windows, test))]
+#[allow(clippy::too_many_arguments)]
+fn parse_msi_log_mode(
+    modifier: &str,
+    default_mode: u32,
+    all_mode: u32,
+    verbose: u32,
+    extra_debug: u32,
+    append: u32,
+    flush: u32,
+) -> Result<(u32, u32)> {
+    let mut mode = 0;
+    let mut attributes = 0;
+    for ch in modifier.chars() {
+        match ch.to_ascii_lowercase() {
+            '*' => mode |= all_mode,
+            'm' => mode |= 1,
+            'e' => mode |= 2,
+            'w' => mode |= 4,
+            'u' => mode |= 8,
+            'i' => mode |= 16,
+            'o' => mode |= 128,
+            'a' => mode |= 256,
+            'r' => mode |= 512,
+            'p' => mode |= 1024,
+            'c' => mode |= 2048,
+            'v' => mode |= verbose,
+            'x' => mode |= extra_debug,
+            '+' => attributes |= append,
+            '!' => attributes |= flush,
+            _ => bail!("invalid MSI /l modifier: {modifier}"),
+        }
+    }
+    if mode == 0 {
+        mode = default_mode;
+    }
+    Ok((mode, attributes))
 }
 
 #[cfg(not(windows))]
@@ -8091,7 +8784,7 @@ fn dispatch_installer(
     bail!("Installing packages is only supported on Windows")
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn installer_command_arguments(
     installer_type: &str,
     request: &InstallRequest,
@@ -8099,13 +8792,46 @@ fn installer_command_arguments(
     installer_path: &Path,
     installer: &Installer,
 ) -> Vec<String> {
+    installer_command_arguments_with_options(installer_type, request, installer_path, installer, true)
+}
+
+#[cfg(any(windows, test))]
+fn installer_direct_msi_arguments(
+    installer_type: &str,
+    request: &InstallRequest,
+    _manifest: &Manifest,
+    installer_path: &Path,
+    installer: &Installer,
+) -> Vec<String> {
+    installer_command_arguments_with_options(installer_type, request, installer_path, installer, false)
+}
+
+#[cfg(any(windows, test))]
+fn installer_shell_execute_arguments(
+    installer_type: &str,
+    request: &InstallRequest,
+    _manifest: &Manifest,
+    installer_path: &Path,
+    installer: &Installer,
+) -> Vec<String> {
+    installer_command_arguments_with_options(installer_type, request, installer_path, installer, true)
+}
+
+#[cfg(any(windows, test))]
+fn installer_command_arguments_with_options(
+    installer_type: &str,
+    request: &InstallRequest,
+    installer_path: &Path,
+    installer: &Installer,
+    include_msi_install_target: bool,
+) -> Vec<String> {
     if let Some(override_args) = request.override_args.as_deref() {
         return split_installer_switches(override_args);
     }
 
     let mut args = Vec::new();
     match installer_type {
-        "msi" | "wix" => {
+        "msi" | "wix" if include_msi_install_target => {
             args.push("/i".to_owned());
             args.push(installer_path.display().to_string());
         }
@@ -8154,6 +8880,42 @@ fn installer_command_arguments(
         ),
     );
     args
+}
+
+#[cfg(any(windows, test))]
+fn join_windows_arguments(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| quote_windows_argument(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(any(windows, test))]
+fn quote_windows_argument(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+        return arg.to_owned();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(any(windows, test))]
@@ -11266,6 +12028,215 @@ Installers:
     }
 
     #[test]
+    fn msi_shell_execute_arguments_include_msiexec_target() {
+        let installer = Installer {
+            architecture: None,
+            installer_type: Some("wix".to_owned()),
+            url: None,
+            sha256: None,
+            product_code: None,
+            locale: None,
+            scope: None,
+            release_date: None,
+            package_family_name: None,
+            upgrade_code: None,
+            platforms: Vec::new(),
+            minimum_os_version: None,
+            switches: InstallerSwitches {
+                log: Some("/log \"<LOGPATH>\"".to_owned()),
+                install_location: Some("INSTALLDIR=\"<INSTALLPATH>\"".to_owned()),
+                ..InstallerSwitches::default()
+            },
+            commands: Vec::new(),
+            package_dependencies: Vec::new(),
+            require_explicit_upgrade: false,
+            nested_installer_type: None,
+            nested_installer_files: Vec::new(),
+        };
+        let mut request = InstallRequest::new(PackageQuery::default());
+        request.mode = InstallerMode::Silent;
+        request.log_path = Some(PathBuf::from(r"C:\temp\node.log"));
+        request.install_location = Some(r"C:\Program Files\nodejs".to_owned());
+
+        assert_eq!(
+            installer_shell_execute_arguments(
+                "wix",
+                &request,
+                &Manifest {
+                    id: "OpenJS.NodeJS.22".to_owned(),
+                    name: "Node.js".to_owned(),
+                    version: "22.22.3".to_owned(),
+                    channel: String::new(),
+                    publisher: None,
+                    description: None,
+                    moniker: None,
+                    package_url: None,
+                    publisher_url: None,
+                    publisher_support_url: None,
+                    license: None,
+                    license_url: None,
+                    privacy_url: None,
+                    author: None,
+                    copyright: None,
+                    copyright_url: None,
+                    release_notes: None,
+                    release_notes_url: None,
+                    tags: Vec::new(),
+                    agreements: Vec::new(),
+                    package_dependencies: Vec::new(),
+                    documentation: Vec::new(),
+                    icons: Vec::new(),
+                    installers: Vec::new(),
+                    require_explicit_upgrade: false,
+                },
+                Path::new(r"C:\temp\node.msi"),
+                &installer
+            ),
+            vec![
+                "/i".to_owned(),
+                r"C:\temp\node.msi".to_owned(),
+                "/quiet".to_owned(),
+                "/norestart".to_owned(),
+                "/log".to_owned(),
+                r"C:\temp\node.log".to_owned(),
+                r"INSTALLDIR=C:\Program Files\nodejs".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn msi_direct_arguments_omit_msiexec_target() {
+        let installer = Installer::default();
+        let mut request = InstallRequest::new(PackageQuery::default());
+        request.mode = InstallerMode::Silent;
+
+        assert_eq!(
+            installer_direct_msi_arguments(
+                "wix",
+                &request,
+                &Manifest {
+                    id: "Test.Package".to_owned(),
+                    name: "Test".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    channel: String::new(),
+                    publisher: None,
+                    description: None,
+                    moniker: None,
+                    package_url: None,
+                    publisher_url: None,
+                    publisher_support_url: None,
+                    license: None,
+                    license_url: None,
+                    privacy_url: None,
+                    author: None,
+                    copyright: None,
+                    copyright_url: None,
+                    release_notes: None,
+                    release_notes_url: None,
+                    tags: Vec::new(),
+                    agreements: Vec::new(),
+                    package_dependencies: Vec::new(),
+                    documentation: Vec::new(),
+                    icons: Vec::new(),
+                    installers: Vec::new(),
+                    require_explicit_upgrade: false,
+                },
+                Path::new(r"C:\temp\test.msi"),
+                &installer
+            ),
+            vec!["/quiet".to_owned(), "/norestart".to_owned()]
+        );
+    }
+
+    #[test]
+    fn msi_direct_arguments_enable_uac_only_for_quiet_ui() {
+        let args = vec![
+            "/quiet".to_owned(),
+            "/norestart".to_owned(),
+            "/log".to_owned(),
+            r"C:\temp\node.log".to_owned(),
+            r"INSTALLDIR=C:\Program Files\nodejs".to_owned(),
+        ];
+
+        let parsed = parse_msi_direct_arguments(&args).expect("parsed");
+
+        assert_eq!(parsed.ui_level, 0x102);
+        assert_eq!(
+            parsed.properties,
+            r#"REBOOT=ReallySuppress INSTALLDIR="C:\Program Files\nodejs""#
+        );
+        assert_eq!(parsed.log_path.as_deref(), Some(r"C:\temp\node.log"));
+    }
+
+    #[test]
+    fn machine_scope_silent_msi_uses_shell_execute_instead_of_direct_msi() {
+        let mut request = InstallRequest::new(PackageQuery::default());
+        request.mode = InstallerMode::Silent;
+
+        let installer = Installer {
+            installer_type: Some("wix".to_owned()),
+            scope: Some("machine".to_owned()),
+            ..Installer::default()
+        };
+
+        assert!(!should_run_msi_direct(&request, &installer));
+        assert!(should_elevate_msi_shell_execute(&installer));
+    }
+
+    #[test]
+    fn installer_download_if_range_prefers_strong_etag_and_rejects_weak_etag() {
+        let strong = InstallerDownloadMetadata {
+            url: "https://example.test/app.exe".to_owned(),
+            etag: Some(r#""abc""#.to_owned()),
+            last_modified: Some("Wed, 03 Jun 2026 21:00:00 GMT".to_owned()),
+            total_length: Some(100),
+            offset: 50,
+        };
+        let weak = InstallerDownloadMetadata {
+            etag: Some(r#"W/"abc""#.to_owned()),
+            ..strong.clone()
+        };
+
+        assert_eq!(installer_download_if_range(&strong).as_deref(), Some(r#""abc""#));
+        assert_eq!(
+            installer_download_if_range(&weak).as_deref(),
+            Some("Wed, 03 Jun 2026 21:00:00 GMT")
+        );
+    }
+
+    #[test]
+    fn parse_content_range_validates_resume_start_and_total() {
+        let value = HeaderValue::from_static("bytes 50-99/100");
+        let parsed = parse_content_range(Some(&value), 50).expect("content range");
+
+        assert_eq!(parsed.total_length, Some(100));
+        assert!(parse_content_range(Some(&value), 49).is_err());
+    }
+
+    #[test]
+    fn installer_download_sidecar_paths_append_suffixes() {
+        let path = Path::new(r"C:\temp\installer.msi");
+
+        assert_eq!(sidecar_path(path, "part"), PathBuf::from(r"C:\temp\installer.msi.part"));
+        assert_eq!(
+            sidecar_path(path, "part.json"),
+            PathBuf::from(r"C:\temp\installer.msi.part.json")
+        );
+    }
+
+    #[test]
+    fn shell_execute_argument_joining_quotes_spaces() {
+        assert_eq!(
+            join_windows_arguments(&[
+                "/quiet".to_owned(),
+                r"INSTALLDIR=C:\Program Files\nodejs".to_owned(),
+                r#"VALUE=has "quotes""#.to_owned(),
+            ]),
+            r#"/quiet "INSTALLDIR=C:\Program Files\nodejs" "VALUE=has \"quotes\"""#
+        );
+    }
+
+    #[test]
     fn decompresses_mszyml_payload() {
         let payload = "sV: 1.0.0\nvD:\n  - v: 1.2.3\n    rP: manifests/test.yaml\n    s256H: ABCD\n";
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
@@ -11299,6 +12270,8 @@ Installers:
         assert_eq!(compare_version("1.10.0", "1.9.9"), Ordering::Greater);
         assert_eq!(compare_version("2.0", "10.0"), Ordering::Less);
         assert_eq!(compare_version("1.0.0-preview2", "1.0.0-preview1"), Ordering::Greater);
+        assert_eq!(compare_version("25.4.1", "< 25.4.1"), Ordering::Greater);
+        assert_eq!(compare_version("< 25.4.1", "25.4.1"), Ordering::Less);
     }
 
     #[test]
@@ -12905,7 +13878,7 @@ Installers:
         fs::write(&target, b"old-index").expect("write existing target");
         fs::write(&source, b"new-index").expect("write replacement");
 
-        let held = fs::OpenOptions::new()
+        let held = OpenOptions::new()
             .read(true)
             .share_mode(SHARE_ALL)
             .open(&target)
@@ -13126,6 +14099,26 @@ Installers:
     }
 
     #[test]
+    fn explicit_source_search_failure_is_not_reported_as_no_match() {
+        let app_root = temp_app_root("preindexed_source_search_failure");
+        let server = TestHttpServer::start();
+        server.set_status("/source2.msix", 404);
+        server.set_status("/source.msix", 404);
+        let source = test_source_record(server.url());
+        let mut repository = open_test_preindexed_repository(&app_root, &source, None);
+
+        let error = repository
+            .show(&show_test_package(None))
+            .expect_err("source failure must surface");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to search source 'test-winget'"));
+        assert!(message.contains("source.msix"));
+        assert!(!message.contains("no package matched the supplied query"));
+        let _ = fs::remove_dir_all(app_root);
+    }
+
+    #[test]
     fn preindexed_explicit_missing_version_does_not_refresh_twice_after_stale_refresh() {
         let app_root = temp_app_root("preindexed_no_double_refresh");
         let server = TestHttpServer::start();
@@ -13243,6 +14236,24 @@ Installers:
         ];
 
         assert!(map_arp_version_to_catalog(&entries, "40.10.18029").is_none());
+    }
+
+    #[test]
+    fn map_arp_version_reports_less_than_latest_for_coarse_display_version() {
+        // Snagit 2025 reports ARP DisplayVersion `25.4.1`, but the catalog's
+        // latest ARP build is `25.4.1.10325`. winget renders this as
+        // installed `< 25.4.1` so the latest installer remains applicable.
+        let entries = vec![
+            version_entry("25.4.1", Some("25.4.1.10325"), Some("25.4.1.10325")),
+            version_entry("25.4.0", Some("25.4.0"), Some("25.4.0.8498")),
+        ];
+
+        assert!(map_arp_version_to_catalog(&entries, "25.4.1").is_none());
+        assert_eq!(
+            less_than_latest_arp_anchored_version(&entries, "25.4.1").as_deref(),
+            Some("< 25.4.1")
+        );
+        assert!(less_than_latest_arp_anchored_version(&entries, "25.4.0").is_none());
     }
 
     #[test]

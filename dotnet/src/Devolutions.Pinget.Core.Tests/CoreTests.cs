@@ -24,6 +24,8 @@ public class VersionCompareTests
     [InlineData("0.98.1", "0.98.1", 0)]
     [InlineData("10.0.0", "9.0.0", 1)]
     [InlineData("1.3.18-stable", "1.3.17-stable", 1)]
+    [InlineData("25.4.1", "< 25.4.1", 1)]
+    [InlineData("< 25.4.1", "25.4.1", -1)]
     public void CompareVersionStrings_ReturnsCorrectOrdering(string a, string b, int expected)
     {
         var result = RestSource.CompareVersionStrings(a, b);
@@ -1441,6 +1443,101 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void BuildArguments_CanOmitMsiTargetForDirectMsiExecution()
+    {
+        var installer = new Installer
+        {
+            InstallerType = "wix",
+            Switches = new InstallerSwitches
+            {
+                Log = "/log \"<LOGPATH>\"",
+                InstallLocation = "INSTALLDIR=\"<INSTALLPATH>\"",
+            }
+        };
+
+        var args = InstallerDispatch.BuildArguments(
+            "wix",
+            new InstallRequest
+            {
+                Query = new PackageQuery(),
+                Mode = InstallerMode.Silent,
+                LogPath = @"C:\temp\node.log",
+                InstallLocation = @"C:\Program Files\nodejs",
+            },
+            new Manifest { Id = "OpenJS.NodeJS.22", Name = "Node.js", Version = "22.22.3" },
+            installer,
+            @"C:\temp\node.msi",
+            includeMsiInstallTarget: false);
+
+        Assert.Equal(["/quiet", "/norestart", "/log", @"C:\temp\node.log", @"INSTALLDIR=C:\Program Files\nodejs"], args);
+    }
+
+    [Fact]
+    public void ParseMsiDirectArguments_EnablesUacOnlyForQuietUi()
+    {
+        var parsed = InstallerDispatch.ParseMsiDirectArguments([
+            "/quiet",
+            "/norestart",
+            "/log",
+            @"C:\temp\node.log",
+            @"INSTALLDIR=C:\Program Files\nodejs",
+        ]);
+
+        Assert.Equal(0x102u, parsed.UiLevel);
+        Assert.Equal(@"REBOOT=ReallySuppress INSTALLDIR=""C:\Program Files\nodejs""", parsed.Properties);
+        Assert.Equal(@"C:\temp\node.log", parsed.LogPath);
+    }
+
+    [Fact]
+    public void ShouldRunMsiDirect_DisablesDirectMsiForMachineScopeSilentInstallers()
+    {
+        var request = new InstallRequest { Query = new PackageQuery(), Mode = InstallerMode.Silent };
+        var installer = new Installer { InstallerType = "wix", Scope = "machine" };
+
+        Assert.False(InstallerDispatch.ShouldRunMsiDirect(request, installer));
+        Assert.True(InstallerDispatch.ShouldElevateMsiShellExecute(installer));
+    }
+
+    [Fact]
+    public void InstallerDownloadIfRange_PrefersStrongEtagAndRejectsWeakEtag()
+    {
+        var strong = new Repository.InstallerDownloadMetadata(
+            "https://example.test/app.exe",
+            @"""abc""",
+            "Wed, 03 Jun 2026 21:00:00 GMT",
+            100,
+            50);
+        var weak = strong with { ETag = @"W/""abc""" };
+
+        Assert.Equal(@"""abc""", Repository.InstallerDownloadIfRange(strong));
+        Assert.Equal("Wed, 03 Jun 2026 21:00:00 GMT", Repository.InstallerDownloadIfRange(weak));
+    }
+
+    [Fact]
+    public void ParseContentRange_ValidatesResumeStartAndTotal()
+    {
+        var range = new System.Net.Http.Headers.ContentRangeHeaderValue(50, 99, 100);
+
+        Assert.Equal(100, Repository.ParseContentRange(range, 50));
+        Assert.Throws<InvalidOperationException>(() => Repository.ParseContentRange(range, 49));
+    }
+
+    [Fact]
+    public void InstallerDownloadSidecarPaths_AppendSuffixes()
+    {
+        Assert.Equal(@"C:\temp\installer.msi.part", Repository.SidecarPath(@"C:\temp\installer.msi", "part"));
+        Assert.Equal(@"C:\temp\installer.msi.part.json", Repository.SidecarPath(@"C:\temp\installer.msi", "part.json"));
+    }
+
+    [Fact]
+    public void JoinArguments_QuotesArgumentsWithSpaces()
+    {
+        Assert.Equal(
+            @"/quiet ""INSTALLDIR=C:\Program Files\nodejs"" ""VALUE=has \""quotes\""""",
+            InstallerDispatch.JoinArguments(["/quiet", @"INSTALLDIR=C:\Program Files\nodejs", "VALUE=has \"quotes\""]));
+    }
+
+    [Fact]
     public void BuildArguments_UsesOverrideInsteadOfSynthesizedArguments()
     {
         var installer = new Installer { InstallerType = "inno" };
@@ -1641,6 +1738,23 @@ public class RepositoryParityTests
         Assert.Null(Repository.MapArpVersionToCatalog(entries, "40.10.18029"));
         Assert.Null(Repository.MapArpVersionToCatalog(entries, "Unknown"));
         Assert.Null(Repository.MapArpVersionToCatalog(entries, ""));
+    }
+
+    [Fact]
+    public void LessThanLatestArpAnchoredVersion_HandlesCoarseDisplayVersion()
+    {
+        // Snagit 2025 reports ARP DisplayVersion `25.4.1`, but the catalog's
+        // latest ARP build is `25.4.1.10325`. winget renders this as
+        // installed `< 25.4.1` so the latest installer remains applicable.
+        var entries = new List<PreIndexedSource.V2VersionDataEntry>
+        {
+            new() { Version = "25.4.1", ArpMinVersion = "25.4.1.10325", ArpMaxVersion = "25.4.1.10325" },
+            new() { Version = "25.4.0", ArpMinVersion = "25.4.0", ArpMaxVersion = "25.4.0.8498" },
+        };
+
+        Assert.Null(Repository.MapArpVersionToCatalog(entries, "25.4.1"));
+        Assert.Equal("< 25.4.1", Repository.LessThanLatestArpAnchoredVersion(entries, "25.4.1"));
+        Assert.Null(Repository.LessThanLatestArpAnchoredVersion(entries, "25.4.0"));
     }
 
     [Fact]

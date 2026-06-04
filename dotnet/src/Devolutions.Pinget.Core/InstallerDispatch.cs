@@ -132,12 +132,56 @@ internal static class InstallerDispatch
 
     private static int RunMsi(string path, InstallRequest request, Manifest manifest, Installer installer)
     {
-        var psi = new ProcessStartInfo("msiexec") { UseShellExecute = false };
-        foreach (var arg in BuildArguments("msi", request, manifest, installer, path))
-            psi.ArgumentList.Add(arg);
-        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to run msiexec");
+        if (ShouldRunMsiDirect(request, installer))
+        {
+            var args = BuildArguments("msi", request, manifest, installer, path, includeMsiInstallTarget: false);
+            return RunMsiDirect(path, args);
+        }
+
+        var shellArgs = BuildArguments("msi", request, manifest, installer, path, includeMsiInstallTarget: true);
+        return RunShellExecute("msiexec.exe", shellArgs, ShouldElevateMsiShellExecute(installer));
+    }
+
+    internal static bool ShouldRunMsiDirect(InstallRequest request, Installer installer) =>
+        request.Mode == InstallerMode.Silent &&
+        !ShouldElevateMsiShellExecute(installer);
+
+    internal static bool ShouldElevateMsiShellExecute(Installer installer) =>
+        string.Equals(installer.Scope, "machine", StringComparison.OrdinalIgnoreCase);
+
+    private static int RunShellExecute(string path, IReadOnlyList<string> args, bool runAs = false)
+    {
+        var psi = new ProcessStartInfo(path)
+        {
+            UseShellExecute = true,
+            Arguments = JoinArguments(args),
+            WindowStyle = ProcessWindowStyle.Normal,
+        };
+        if (runAs)
+            psi.Verb = "runas";
+
+        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to launch installer");
         proc.WaitForExit();
         return proc.ExitCode;
+    }
+
+    private static int RunMsiDirect(string path, IReadOnlyList<string> args)
+    {
+        var parsed = ParseMsiDirectArguments(args);
+
+        if (parsed.LogPath is null)
+        {
+            _ = MsiEnableLog(0, null, 0);
+        }
+        else
+        {
+            var logResult = MsiEnableLog(parsed.LogMode, parsed.LogPath, parsed.LogAttributes);
+            if (logResult != 0)
+                throw new InvalidOperationException($"Failed to enable MSI logging (Win32 error {logResult}).");
+        }
+
+        MsiSetInternalUI(parsed.UiLevel, IntPtr.Zero);
+        return unchecked((int)MsiInstallProduct(path, string.IsNullOrEmpty(parsed.Properties) ? null : parsed.Properties));
     }
 
     private static int RunMsix(string path)
@@ -556,12 +600,7 @@ internal static class InstallerDispatch
 
     private static int RunExe(string path, string installerType, InstallRequest request, Manifest manifest, Installer installer)
     {
-        var psi = new ProcessStartInfo(path) { UseShellExecute = false };
-        foreach (var arg in BuildArguments(installerType, request, manifest, installer, path))
-            psi.ArgumentList.Add(arg);
-        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to run installer");
-        proc.WaitForExit();
-        return proc.ExitCode;
+        return RunShellExecute(path, BuildArguments(installerType, request, manifest, installer, path));
     }
 
     internal static List<string> BuildArguments(string installerType, InstallerMode mode, Installer installer)
@@ -571,7 +610,7 @@ internal static class InstallerDispatch
             new Manifest { Id = "Test.Package", Name = "Test Package", Version = "1.0.0" },
             installer);
 
-    internal static List<string> BuildArguments(string installerType, InstallRequest request, Manifest manifest, Installer installer, string? installerPath = null)
+    internal static List<string> BuildArguments(string installerType, InstallRequest request, Manifest manifest, Installer installer, string? installerPath = null, bool includeMsiInstallTarget = true)
     {
         if (!string.IsNullOrWhiteSpace(request.Override))
             return SplitArguments(request.Override!);
@@ -579,7 +618,7 @@ internal static class InstallerDispatch
         var normalizedType = installerType.ToLowerInvariant();
         var args = new List<string>();
 
-        if (normalizedType is "msi" or "wix")
+        if (includeMsiInstallTarget && normalizedType is ("msi" or "wix"))
         {
             args.Add("/i");
             args.Add(installerPath ?? throw new InvalidOperationException("Installer path is required for MSI arguments."));
@@ -603,6 +642,276 @@ internal static class InstallerDispatch
 
         return args;
     }
+
+    internal readonly record struct MsiDirectArguments(
+        uint UiLevel,
+        string Properties,
+        uint LogMode,
+        string? LogPath,
+        uint LogAttributes);
+
+    internal static MsiDirectArguments ParseMsiDirectArguments(IReadOnlyList<string> args)
+    {
+        const uint installUiLevelDefault = 1;
+        const uint installUiLevelNone = 2;
+        const uint installUiLevelBasic = 3;
+        const uint installUiLevelProgressOnly = 0x40;
+        const uint installUiLevelHideCancel = 0x20;
+        const uint installUiLevelUacOnly = 0x100;
+        const uint logModeDefault = 1 | 2 | 4 | 16 | 128 | 256 | 512;
+        const uint logModeAll = logModeDefault | 8 | 1024 | 2048;
+        const uint logModeVerbose = 4096;
+        const uint logModeExtraDebug = 8192;
+        const uint logAttributeAppend = 1;
+        const uint logAttributeFlushEachLine = 2;
+
+        var uiLevel = installUiLevelDefault;
+        var properties = new List<string>();
+        uint logMode = 0;
+        string? logPath = null;
+        uint logAttributes = 0;
+
+        for (var index = 0; index < args.Count; index++)
+        {
+            var token = args[index];
+            if (IsMsiSwitch(token))
+            {
+                var option = token[1..];
+                if (option.Equals("quiet", StringComparison.OrdinalIgnoreCase))
+                {
+                    uiLevel = installUiLevelNone | installUiLevelUacOnly;
+                }
+                else if (option.Equals("passive", StringComparison.OrdinalIgnoreCase))
+                {
+                    uiLevel = installUiLevelBasic | installUiLevelProgressOnly | installUiLevelHideCancel;
+                    properties.Add("REBOOTPROMPT=S");
+                }
+                else if (option.Equals("norestart", StringComparison.OrdinalIgnoreCase))
+                {
+                    properties.Add("REBOOT=ReallySuppress");
+                }
+                else if (option.Equals("forcerestart", StringComparison.OrdinalIgnoreCase))
+                {
+                    properties.Add("REBOOT=Force");
+                }
+                else if (option.Equals("promptrestart", StringComparison.OrdinalIgnoreCase))
+                {
+                    properties.Add("REBOOTPROMPT=\"\"");
+                }
+                else if (option.Equals("log", StringComparison.OrdinalIgnoreCase))
+                {
+                    index++;
+                    logPath = index < args.Count ? args[index] : throw new InvalidOperationException("MSI /log requires a log path.");
+                    logMode = logModeAll;
+                }
+                else if (option.Equals("q", StringComparison.OrdinalIgnoreCase))
+                {
+                    uiLevel = installUiLevelNone | installUiLevelUacOnly;
+                }
+                else if (option.StartsWith("q", StringComparison.OrdinalIgnoreCase))
+                {
+                    uiLevel = ParseMsiUiLevel(option[1..]);
+                }
+                else if (option.StartsWith("l", StringComparison.OrdinalIgnoreCase))
+                {
+                    index++;
+                    logPath = index < args.Count ? args[index] : throw new InvalidOperationException("MSI logging switch requires a log path.");
+                    (logMode, logAttributes) = ParseMsiLogMode(option[1..], logModeDefault, logModeAll, logModeVerbose, logModeExtraDebug, logAttributeAppend, logAttributeFlushEachLine);
+                }
+                else
+                {
+                    throw new InvalidOperationException($"Unsupported MSI switch for direct MSI execution: {token}");
+                }
+            }
+            else
+            {
+                properties.Add(FormatMsiProperty(token));
+            }
+        }
+
+        return new MsiDirectArguments(uiLevel, string.Join(' ', properties), logMode, logPath, logAttributes);
+
+        static uint ParseMsiUiLevel(string modifier)
+        {
+            const uint installUiLevelNone = 2;
+            const uint installUiLevelBasic = 3;
+            const uint installUiLevelReduced = 4;
+            const uint installUiLevelFull = 5;
+            const uint installUiLevelEndDialog = 0x80;
+            const uint installUiLevelProgressOnly = 0x40;
+            const uint installUiLevelHideCancel = 0x20;
+            const uint installUiLevelUacOnly = 0x100;
+
+            if (string.IsNullOrEmpty(modifier))
+                modifier = "n";
+
+            var uiLevel = char.ToLowerInvariant(modifier[0]) switch
+            {
+                'f' => installUiLevelFull,
+                'r' => installUiLevelReduced,
+                'b' => installUiLevelBasic,
+                'n' => installUiLevelNone,
+                '+' => installUiLevelNone | installUiLevelEndDialog,
+                _ => throw new InvalidOperationException($"Invalid MSI /q modifier: {modifier}")
+            };
+
+            foreach (var ch in modifier[1..])
+            {
+                switch (ch)
+                {
+                    case '+':
+                        uiLevel |= installUiLevelEndDialog;
+                        break;
+                    case '-' when (uiLevel & 0xF) == installUiLevelBasic:
+                        uiLevel |= installUiLevelProgressOnly;
+                        break;
+                    case '!' when (uiLevel & 0xF) == installUiLevelBasic:
+                        uiLevel |= installUiLevelHideCancel;
+                        break;
+                    case '-' or '!':
+                        throw new InvalidOperationException($"MSI /q modifier {ch} is only valid with basic UI.");
+                    default:
+                        throw new InvalidOperationException($"Invalid MSI /q modifier: {modifier}");
+                }
+            }
+
+            if ((uiLevel & 0xF) == installUiLevelNone)
+                uiLevel |= installUiLevelUacOnly;
+            return uiLevel;
+        }
+
+        static (uint LogMode, uint LogAttributes) ParseMsiLogMode(
+            string modifier,
+            uint defaultMode,
+            uint allMode,
+            uint verbose,
+            uint extraDebug,
+            uint append,
+            uint flush)
+        {
+            uint mode = 0;
+            uint attributes = 0;
+            foreach (var ch in modifier)
+            {
+                switch (char.ToLowerInvariant(ch))
+                {
+                    case '*':
+                        mode |= allMode;
+                        break;
+                    case 'm':
+                        mode |= 1;
+                        break;
+                    case 'e':
+                        mode |= 2;
+                        break;
+                    case 'w':
+                        mode |= 4;
+                        break;
+                    case 'u':
+                        mode |= 8;
+                        break;
+                    case 'i':
+                        mode |= 16;
+                        break;
+                    case 'o':
+                        mode |= 128;
+                        break;
+                    case 'a':
+                        mode |= 256;
+                        break;
+                    case 'r':
+                        mode |= 512;
+                        break;
+                    case 'p':
+                        mode |= 1024;
+                        break;
+                    case 'c':
+                        mode |= 2048;
+                        break;
+                    case 'v':
+                        mode |= verbose;
+                        break;
+                    case 'x':
+                        mode |= extraDebug;
+                        break;
+                    case '+':
+                        attributes |= append;
+                        break;
+                    case '!':
+                        attributes |= flush;
+                        break;
+                    default:
+                        throw new InvalidOperationException($"Invalid MSI /l modifier: {modifier}");
+                }
+            }
+
+            return (mode == 0 ? defaultMode : mode, attributes);
+        }
+    }
+
+    private static bool IsMsiSwitch(string token) =>
+        token.StartsWith('/') || token.StartsWith('-');
+
+    private static string FormatMsiProperty(string token)
+    {
+        var separator = token.IndexOf('=');
+        if (separator <= 0)
+            throw new InvalidOperationException($"Invalid MSI property argument: {token}");
+
+        var name = token[..separator];
+        if (name.Any(ch => !char.IsAsciiLetterOrDigit(ch) && ch != '_'))
+            throw new InvalidOperationException($"Invalid MSI property name: {name}");
+
+        var value = token[(separator + 1)..];
+        if (value.Any(char.IsWhiteSpace) && !(value.StartsWith('"') && value.EndsWith('"')))
+            return $"{name}=\"{value.Replace("\"", "\"\"")}\"";
+
+        return token;
+    }
+
+    internal static string JoinArguments(IReadOnlyList<string> args) =>
+        string.Join(' ', args.Select(QuoteArgument));
+
+    private static string QuoteArgument(string arg)
+    {
+        if (arg.Length > 0 && !arg.Any(ch => char.IsWhiteSpace(ch) || ch == '"'))
+            return arg;
+
+        var result = new System.Text.StringBuilder("\"");
+        var backslashes = 0;
+        foreach (var ch in arg)
+        {
+            switch (ch)
+            {
+                case '\\':
+                    backslashes++;
+                    break;
+                case '"':
+                    result.Append('\\', backslashes * 2 + 1);
+                    result.Append('"');
+                    backslashes = 0;
+                    break;
+                default:
+                    result.Append('\\', backslashes);
+                    backslashes = 0;
+                    result.Append(ch);
+                    break;
+            }
+        }
+
+        result.Append('\\', backslashes * 2);
+        result.Append('"');
+        return result.ToString();
+    }
+
+    [System.Runtime.InteropServices.DllImport("msi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern uint MsiInstallProduct(string packagePath, string? commandLine);
+
+    [System.Runtime.InteropServices.DllImport("msi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern uint MsiEnableLog(uint logMode, string? logFile, uint logAttributes);
+
+    [System.Runtime.InteropServices.DllImport("msi.dll")]
+    private static extern uint MsiSetInternalUI(uint uiLevel, IntPtr window);
 
     private static List<string> SplitArguments(string value)
     {
