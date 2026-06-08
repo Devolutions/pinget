@@ -28,10 +28,12 @@ public class Repository : IDisposable
 
     private readonly string _appRoot;
     private readonly HttpClient _client;
-    private readonly bool _useSystemWingetSources;
     private readonly Action<RepositoryWarning>? _diagnostics;
     private readonly TimeSpan? _preIndexedSourceAutoUpdateInterval;
     private SourceStore _store;
+    private readonly EffectiveSourceMode _sourceMode;
+    private bool UsesSystemWingetSources => _sourceMode != EffectiveSourceMode.Private;
+    private bool MirrorsSystemWingetSources => _sourceMode == EffectiveSourceMode.SystemWingetMirror;
     private static readonly ConcurrentDictionary<string, object> s_preIndexedRefreshLocks = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan s_preIndexedRefreshRetryInterval = TimeSpan.FromMinutes(5);
     private readonly object _preIndexedRefreshAttemptGate = new();
@@ -41,14 +43,14 @@ public class Repository : IDisposable
         string appRoot,
         HttpClient client,
         SourceStore store,
-        bool useSystemWingetSources,
+        EffectiveSourceMode sourceMode,
         Action<RepositoryWarning>? diagnostics,
         TimeSpan? preIndexedSourceAutoUpdateInterval)
     {
         _appRoot = appRoot;
         _client = client;
         _store = store;
-        _useSystemWingetSources = useSystemWingetSources;
+        _sourceMode = sourceMode;
         _diagnostics = diagnostics;
         _preIndexedSourceAutoUpdateInterval = preIndexedSourceAutoUpdateInterval;
     }
@@ -60,10 +62,13 @@ public class Repository : IDisposable
     {
         options ??= new RepositoryOptions();
         EnsureSqliteNativeLibraryLoaded();
-        var appRoot = SourceStoreManager.NormalizeAppRoot(options.AppRoot ?? Environment.GetEnvironmentVariable(AppRootEnvironmentVariable));
+        var requestedAppRoot = options.AppRoot ?? Environment.GetEnvironmentVariable(AppRootEnvironmentVariable);
+        var appRoot = SourceStoreManager.NormalizeAppRoot(requestedAppRoot);
         SourceStoreManager.EnsureAppDirs(appRoot);
-        var useSystemWingetSources = SourceStoreManager.UsesSystemWingetSourceCommands(appRoot);
-        var store = SourceStoreManager.Load(appRoot);
+        var requestedSourceMode = options.SourceMode == SourceMode.Auto && requestedAppRoot is not null
+            ? SourceMode.Private
+            : options.SourceMode;
+        var (sourceMode, store) = SourceStoreManager.LoadEffective(appRoot, requestedSourceMode);
         var client = new HttpClient(new SocketsHttpHandler
         {
             AutomaticDecompression = System.Net.DecompressionMethods.None,
@@ -71,7 +76,7 @@ public class Repository : IDisposable
         });
         client.Timeout = Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
-        return new Repository(appRoot, client, store, useSystemWingetSources, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
+        return new Repository(appRoot, client, store, sourceMode, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
     }
 
     internal static IEnumerable<string> GetSqliteNativeLibraryCandidates(string assemblyDirectory)
@@ -177,7 +182,7 @@ public class Repository : IDisposable
 
     public void AddSource(string name, string arg, SourceKind kind, string trustLevel = "None", bool explicitSource = false, int priority = 0)
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.AddSource(name, arg, kind, NormalizeSourceTrustLevel(trustLevel), explicitSource);
             RefreshSystemWingetSources();
@@ -204,7 +209,7 @@ public class Repository : IDisposable
 
     public void EditSource(string name, bool? explicitSource = null, string? trustLevel = null)
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
             throw new InvalidOperationException("Editing system WinGet sources is not supported by winget source commands.");
 
         var source = _store.Sources.FirstOrDefault(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase))
@@ -221,7 +226,7 @@ public class Repository : IDisposable
 
     public void RemoveSource(string name)
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.RemoveSource(name);
             RefreshSystemWingetSources();
@@ -232,7 +237,7 @@ public class Repository : IDisposable
             ?? throw new InvalidOperationException($"Source '{name}' not found.");
 
         _store.Sources.Remove(source);
-        var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot);
+        var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources);
         if (Directory.Exists(stateDir))
             Directory.Delete(stateDir, recursive: true);
         SourceStoreManager.Save(_store, _appRoot);
@@ -240,7 +245,7 @@ public class Repository : IDisposable
 
     public void ResetSource(string name)
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.ResetSource(name);
             RefreshSystemWingetSources();
@@ -252,7 +257,7 @@ public class Repository : IDisposable
             throw new InvalidOperationException($"Source '{name}' not found.");
 
         var source = _store.Sources[index];
-        var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot);
+        var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources);
         if (Directory.Exists(stateDir))
             Directory.Delete(stateDir, recursive: true);
 
@@ -276,7 +281,7 @@ public class Repository : IDisposable
 
     public void ResetSources()
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.ResetSources();
             RefreshSystemWingetSources();
@@ -285,7 +290,7 @@ public class Repository : IDisposable
 
         foreach (var source in _store.Sources)
         {
-            var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot);
+            var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources);
             if (Directory.Exists(stateDir))
                 Directory.Delete(stateDir, recursive: true);
         }
@@ -366,8 +371,11 @@ public class Repository : IDisposable
 
     public List<SourceUpdateResult> UpdateSources(string? sourceName = null)
     {
-        if (_useSystemWingetSources)
+        if (_sourceMode == EffectiveSourceMode.SystemWingetDirect)
             return UpdateSystemWingetSources(sourceName);
+
+        if (MirrorsSystemWingetSources)
+            RefreshSystemWingetSources();
 
         var indexes = ResolveSourceIndexes(sourceName);
         var results = new List<SourceUpdateResult>();
@@ -377,15 +385,15 @@ public class Repository : IDisposable
             var source = _store.Sources[index];
             var detail = source.Kind switch
             {
-                SourceKind.PreIndexed => PreIndexedSource.Update(_client, source, _appRoot),
-                SourceKind.Rest => RestSource.UpdateRest(_client, source, _appRoot),
+                SourceKind.PreIndexed => PreIndexedSource.Update(_client, source, _appRoot, MirrorsSystemWingetSources),
+                SourceKind.Rest => RestSource.UpdateRest(_client, source, _appRoot, MirrorsSystemWingetSources),
                 _ => "Unknown source kind"
             };
             source.LastUpdate = DateTime.UtcNow;
             results.Add(new SourceUpdateResult { Name = source.Name, Kind = source.Kind, Detail = detail });
         }
 
-        SourceStoreManager.Save(_store, _appRoot);
+        SaveStore();
         return results;
     }
 
@@ -1509,7 +1517,7 @@ public class Repository : IDisposable
         RestSource.RestInformation info;
         try
         {
-            info = RestSource.LoadInformation(_client, source, _appRoot);
+            info = RestSource.LoadInformation(_client, source, _appRoot, MirrorsSystemWingetSources);
         }
         catch (Exception ex)
         {
@@ -1579,8 +1587,8 @@ public class Repository : IDisposable
     private string? SourceDiagnosticCachePath(SourceRecord source) =>
         source.Kind switch
         {
-            SourceKind.PreIndexed => PreIndexedSource.IndexPath(source, _appRoot),
-            SourceKind.Rest => Path.Combine(SourceStoreManager.SourceStateDir(source, _appRoot), "rest_info.json"),
+            SourceKind.PreIndexed => PreIndexedSource.IndexPath(source, _appRoot, MirrorsSystemWingetSources),
+            SourceKind.Rest => Path.Combine(SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources), "rest_info.json"),
             _ => null,
         };
 
@@ -1612,7 +1620,7 @@ public class Repository : IDisposable
     private SqliteConnection OpenPreindexedConnection(int sourceIndex, out PreIndexedRefreshOutcome refreshOutcome)
     {
         var source = _store.Sources[sourceIndex];
-        var indexPath = PreIndexedSource.IndexPath(source, _appRoot);
+        var indexPath = PreIndexedSource.IndexPath(source, _appRoot, MirrorsSystemWingetSources);
         refreshOutcome = EnsurePreindexedIndex(sourceIndex, indexPath);
 
         var conn = new SqliteConnection($"Data Source={indexPath};Mode=ReadOnly;Pooling=False");
@@ -1672,7 +1680,7 @@ public class Repository : IDisposable
     private string RefreshPreindexedSource(int sourceIndex, bool force, PreIndexedRefreshKind kind)
     {
         var source = _store.Sources[sourceIndex];
-        var indexPath = PreIndexedSource.IndexPath(source, _appRoot);
+        var indexPath = PreIndexedSource.IndexPath(source, _appRoot, MirrorsSystemWingetSources);
         var lockKey = PreindexedRefreshLockKey(source);
         var refreshLock = s_preIndexedRefreshLocks.GetOrAdd(lockKey, _ => new object());
 
@@ -1683,10 +1691,10 @@ public class Repository : IDisposable
 
             try
             {
-                var detail = PreIndexedSource.Update(_client, source, _appRoot);
+                var detail = PreIndexedSource.Update(_client, source, _appRoot, MirrorsSystemWingetSources);
                 source.LastUpdate = DateTime.UtcNow;
-                if (!_useSystemWingetSources)
-                    SourceStoreManager.Save(_store, _appRoot);
+                if (_sourceMode != EffectiveSourceMode.SystemWingetDirect)
+                    SaveStore();
                 RecordPreindexedRefreshAttempt(lockKey, null, kind);
                 return detail;
             }
@@ -1916,7 +1924,7 @@ public class Repository : IDisposable
         PackageQuery query)
     {
         var source = _store.Sources[sourceIndex];
-        var info = RestSource.LoadInformation(_client, source, _appRoot);
+        var info = RestSource.LoadInformation(_client, source, _appRoot, MirrorsSystemWingetSources);
         var selected = SelectRestVersion(versions, query.Version, query.Channel, display.Id, source.Name);
         var (manifest, structuredDocument) = RestSource.FetchManifestWithDocuments(_client, source, info, packageId, selected.Version, selected.Channel);
         return (manifest, structuredDocument, []);
@@ -2930,7 +2938,7 @@ public class Repository : IDisposable
             if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            var installedDbPath = SourceStoreManager.SourceInstalledDbPath(source, _appRoot);
+            var installedDbPath = SourceStoreManager.SourceInstalledDbPath(source, _appRoot, MirrorsSystemWingetSources);
             if (!File.Exists(installedDbPath))
                 continue;
 
@@ -4008,8 +4016,21 @@ public class Repository : IDisposable
 
     private void RefreshSystemWingetSources()
     {
-        if (_useSystemWingetSources)
-            _store = SystemWingetSourceStore.Load();
+        _store = _sourceMode switch
+        {
+            EffectiveSourceMode.Private => _store,
+            EffectiveSourceMode.SystemWingetDirect => SystemWingetSourceStore.Load(),
+            EffectiveSourceMode.SystemWingetMirror => SourceStoreManager.RefreshSystemWingetMirrorStore(_appRoot),
+            _ => _store,
+        };
+    }
+
+    private void SaveStore()
+    {
+        if (MirrorsSystemWingetSources)
+            SourceStoreManager.SaveSystemWingetMirrorStore(_appRoot, _store);
+        else
+            SourceStoreManager.Save(_store, _appRoot);
     }
 
     private List<SourceUpdateResult> UpdateSystemWingetSources(string? sourceName)

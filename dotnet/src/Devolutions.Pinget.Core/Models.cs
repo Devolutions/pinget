@@ -16,6 +16,13 @@ public enum PinType
     Gating
 }
 
+public enum SourceMode
+{
+    Auto,
+    Private,
+    SystemWingetMirror
+}
+
 public record SourceRecord
 {
     public required string Name { get; init; }
@@ -37,9 +44,10 @@ public record SourceRecord
 public record RepositoryOptions
 {
     /// <summary>
-    /// Storage root for source state and caches. A null value uses the real Desktop App Installer / WinGet state on Windows.
+    /// Storage root for Pinget state and caches.
     /// </summary>
     public string? AppRoot { get; init; }
+    public SourceMode SourceMode { get; init; } = SourceMode.Auto;
     public string UserAgent { get; init; } = "pinget-dotnet/0.1";
     public Action<RepositoryWarning>? Diagnostics { get; init; }
 

@@ -33,6 +33,13 @@ internal record SourceStore
     };
 }
 
+internal enum EffectiveSourceMode
+{
+    Private,
+    SystemWingetDirect,
+    SystemWingetMirror
+}
+
 [JsonSerializable(typeof(SourceStore))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase, WriteIndented = true)]
 internal partial class SourceStoreContext : JsonSerializerContext;
@@ -43,6 +50,7 @@ internal static class SourceStoreManager
     internal const string PackagedName = "Microsoft.DesktopAppInstaller";
 
     private const string LegacyStoreFileName = "sources.json";
+    private const string SystemWingetMirrorStoreFileName = "system-sources.json";
     private const string PackagedSourcesFileName = "user_sources";
     private const string PackagedMetadataFileName = "sources_metadata";
     private const string LegacyPinsFileName = "pins.db";
@@ -99,7 +107,7 @@ internal static class SourceStoreManager
         }
     }
 
-    public static string SourceStateDir(SourceRecord source, string? appRoot = null)
+    public static string SourceStateDir(SourceRecord source, string? appRoot = null, bool identifierKeyed = false)
     {
         var root = NormalizeAppRoot(appRoot);
         if (UsesPackagedLayout(root))
@@ -110,16 +118,19 @@ internal static class SourceStoreManager
                 SanitizePathSegment(source.Identifier));
         }
 
+        if (identifierKeyed)
+            return Path.Combine(root, "sources", SanitizePathSegment(source.Identifier));
+
         return Path.Combine(root, "sources", SanitizePathSegment(source.Name));
     }
 
-    public static string SourceInstalledDbPath(SourceRecord source, string? appRoot = null)
+    public static string SourceInstalledDbPath(SourceRecord source, string? appRoot = null, bool identifierKeyed = false)
     {
         var root = NormalizeAppRoot(appRoot);
         if (UsesPackagedLayout(root))
             return Path.Combine(root, SanitizePathSegment(source.Identifier), "installed.db");
 
-        return Path.Combine(SourceStateDir(source, root), "installed.db");
+        return Path.Combine(SourceStateDir(source, root, identifierKeyed), "installed.db");
     }
 
     public static string PinsDbPath(string? appRoot = null)
@@ -144,6 +155,84 @@ internal static class SourceStoreManager
 
         var json = File.ReadAllText(legacyPath);
         return JsonSerializer.Deserialize(json, SourceStoreContext.Default.SourceStore) ?? SourceStore.Default();
+    }
+
+    internal static (EffectiveSourceMode Mode, SourceStore Store) LoadEffective(string appRoot, SourceMode sourceMode)
+    {
+        if (UsesSystemWingetSourceCommands(appRoot))
+            return (EffectiveSourceMode.SystemWingetDirect, SystemWingetSourceStore.Load());
+
+        return sourceMode switch
+        {
+            SourceMode.Private => (EffectiveSourceMode.Private, Load(appRoot)),
+            SourceMode.SystemWingetMirror => (EffectiveSourceMode.SystemWingetMirror, LoadOrRefreshSystemWingetMirrorStore(appRoot, forceRefresh: false)),
+            _ => TryLoadAutoSystemWingetMirror(appRoot),
+        };
+    }
+
+    private static (EffectiveSourceMode Mode, SourceStore Store) TryLoadAutoSystemWingetMirror(string appRoot)
+    {
+        try
+        {
+            return (EffectiveSourceMode.SystemWingetMirror, LoadOrRefreshSystemWingetMirrorStore(appRoot, forceRefresh: false));
+        }
+        catch
+        {
+            return (EffectiveSourceMode.Private, Load(appRoot));
+        }
+    }
+
+    internal static SourceStore RefreshSystemWingetMirrorStore(string appRoot)
+    {
+        var prior = LoadSystemWingetMirrorStore(appRoot) ?? SourceStore.Default();
+        var exported = SystemWingetSourceStore.Load();
+        MergeSourceCacheMetadata(exported, prior);
+        SaveSystemWingetMirrorStore(appRoot, exported);
+        return exported;
+    }
+
+    internal static void SaveSystemWingetMirrorStore(string appRoot, SourceStore store)
+    {
+        Directory.CreateDirectory(NormalizeAppRoot(appRoot));
+        var json = JsonSerializer.Serialize(store, SourceStoreContext.Default.SourceStore);
+        File.WriteAllText(SystemWingetMirrorStorePath(appRoot), json);
+    }
+
+    private static SourceStore LoadOrRefreshSystemWingetMirrorStore(string appRoot, bool forceRefresh)
+    {
+        if (!forceRefresh && LoadSystemWingetMirrorStore(appRoot) is { } cached)
+            return cached;
+
+        return RefreshSystemWingetMirrorStore(appRoot);
+    }
+
+    private static SourceStore? LoadSystemWingetMirrorStore(string appRoot)
+    {
+        var path = SystemWingetMirrorStorePath(appRoot);
+        if (!File.Exists(path))
+            return null;
+
+        var json = File.ReadAllText(path);
+        return JsonSerializer.Deserialize(json, SourceStoreContext.Default.SourceStore)
+            ?? throw new InvalidOperationException("Failed to parse system WinGet mirror source store.");
+    }
+
+    private static string SystemWingetMirrorStorePath(string appRoot) =>
+        Path.Combine(NormalizeAppRoot(appRoot), SystemWingetMirrorStoreFileName);
+
+    private static void MergeSourceCacheMetadata(SourceStore target, SourceStore prior)
+    {
+        var priorByIdentifier = prior.Sources.ToDictionary(source => source.Identifier, StringComparer.OrdinalIgnoreCase);
+        foreach (var source in target.Sources)
+        {
+            if (!priorByIdentifier.TryGetValue(source.Identifier, out var previous))
+                continue;
+
+            source.LastUpdate = previous.LastUpdate;
+            source.SourceVersion = previous.SourceVersion;
+            source.ETag = previous.ETag;
+            source.LastModified = previous.LastModified;
+        }
     }
 
     internal static bool UsesSystemWingetSourceCommands(string? appRoot)

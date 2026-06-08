@@ -367,6 +367,49 @@ public class SourceStoreTests
     }
 
     [Fact]
+    public void SystemWingetMirror_UsesPrivateCacheAndPreservesMetadata()
+    {
+        var appRoot = TestPaths.CreateTempAppRoot();
+        var originalRunner = SystemWingetSourceStore.CommandRunner;
+        try
+        {
+            SystemWingetSourceStore.CommandRunner = _ => new WingetCommandResult(
+                0,
+                """
+{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+""",
+                "");
+
+            var (mode, store) = SourceStoreManager.LoadEffective(appRoot, SourceMode.SystemWingetMirror);
+
+            Assert.Equal(EffectiveSourceMode.SystemWingetMirror, mode);
+            Assert.Single(store.Sources);
+            Assert.True(File.Exists(Path.Combine(appRoot, "system-sources.json")));
+            Assert.False(File.Exists(Path.Combine(appRoot, "sources.json")));
+
+            var source = store.Sources[0];
+            source.LastUpdate = DateTime.UtcNow;
+            source.SourceVersion = "cached-contract";
+            source.ETag = "\"etag\"";
+            source.LastModified = "Wed, 03 Jun 2026 12:00:00 GMT";
+            SourceStoreManager.SaveSystemWingetMirrorStore(appRoot, store);
+
+            var refreshed = SourceStoreManager.RefreshSystemWingetMirrorStore(appRoot);
+            var refreshedSource = Assert.Single(refreshed.Sources);
+
+            Assert.Equal("cached-contract", refreshedSource.SourceVersion);
+            Assert.Equal("\"etag\"", refreshedSource.ETag);
+            Assert.Equal(Path.Combine(appRoot, "sources", "api.contoso.test"), SourceStoreManager.SourceStateDir(refreshedSource, appRoot, identifierKeyed: true));
+            Assert.Equal(Path.Combine(appRoot, "sources", "contoso"), SourceStoreManager.SourceStateDir(refreshedSource, appRoot));
+        }
+        finally
+        {
+            SystemWingetSourceStore.CommandRunner = originalRunner;
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
     public void EditSourceAndResetSource_PreserveCustomMetadata()
     {
         var appRoot = TestPaths.CreateTempAppRoot();

@@ -49,6 +49,7 @@ const PREINDEXED_CANDIDATES: &[&str] = &["source2.msix", "source.msix"];
 const DEFAULT_USER_AGENT: &str = "pinget-rs/0.1";
 const DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES: i64 = 15;
 const PREINDEXED_REFRESH_RETRY_MINUTES: i64 = 5;
+const SYSTEM_WINGET_MIRROR_STORE_FILE_NAME: &str = "system-sources.json";
 #[cfg(windows)]
 const PACKAGED_FAMILY_NAME: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
 #[cfg(windows)]
@@ -159,8 +160,23 @@ impl Default for SourceStore {
 pub struct RepositoryOptions {
     pub app_root: PathBuf,
     pub user_agent: String,
+    pub source_mode: SourceMode,
     pub pre_indexed_source_auto_update_interval: Option<Duration>,
     pub install_progress: Option<fn(&InstallProgress)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMode {
+    Auto,
+    Private,
+    SystemWingetMirror,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveSourceMode {
+    Private,
+    SystemWingetDirect,
+    SystemWingetMirror,
 }
 
 impl RepositoryOptions {
@@ -169,6 +185,7 @@ impl RepositoryOptions {
         Self {
             app_root: app_root.into(),
             user_agent: DEFAULT_USER_AGENT.to_owned(),
+            source_mode: SourceMode::Private,
             pre_indexed_source_auto_update_interval: Some(Duration::minutes(DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES)),
             install_progress: None,
         }
@@ -176,13 +193,24 @@ impl RepositoryOptions {
 
     /// Uses the default per-user app-data root that the CLI also uses.
     pub fn for_current_user() -> Result<Self> {
-        Ok(Self::new(default_app_root()?))
+        let source_mode = if std::env::var_os("PINGET_APPROOT").is_some() {
+            SourceMode::Private
+        } else {
+            SourceMode::Auto
+        };
+        Ok(Self::new(default_app_root()?).with_source_mode(source_mode))
     }
 
     /// Overrides the HTTP user-agent sent to source endpoints.
     #[must_use]
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_mode(mut self, source_mode: SourceMode) -> Self {
+        self.source_mode = source_mode;
         self
     }
 
@@ -871,7 +899,7 @@ pub struct Repository {
     user_agent: String,
     client: Client,
     store: SourceStore,
-    use_system_winget_sources: bool,
+    source_mode: EffectiveSourceMode,
     install_progress: Option<fn(&InstallProgress)>,
     pre_indexed_source_auto_update_interval: Option<Duration>,
     preindexed_refresh_attempts: HashMap<String, PreindexedRefreshAttempt>,
@@ -935,8 +963,7 @@ impl Repository {
     /// Opens the repository with explicit hosting options for library consumers.
     pub fn open_with_options(options: RepositoryOptions) -> Result<Self> {
         ensure_app_dirs(&options.app_root)?;
-        let use_system_winget_sources = uses_system_winget_source_commands(&options.app_root);
-        let store = load_store(&options.app_root)?;
+        let (source_mode, store) = load_effective_source_store(&options.app_root, options.source_mode)?;
         let client = Client::builder()
             .user_agent(&options.user_agent)
             .timeout(StdDuration::from_secs(30 * 60))
@@ -947,11 +974,19 @@ impl Repository {
             user_agent: options.user_agent,
             client,
             store,
-            use_system_winget_sources,
+            source_mode,
             install_progress: options.install_progress,
             pre_indexed_source_auto_update_interval: options.pre_indexed_source_auto_update_interval,
             preindexed_refresh_attempts: HashMap::new(),
         })
+    }
+
+    fn uses_system_winget_sources(&self) -> bool {
+        self.source_mode != EffectiveSourceMode::Private
+    }
+
+    fn mirrors_system_winget_sources(&self) -> bool {
+        self.source_mode == EffectiveSourceMode::SystemWingetMirror
     }
 
     fn emit_install_progress(&self, progress: InstallProgress) {
@@ -981,7 +1016,7 @@ impl Repository {
         explicit: bool,
         priority: i32,
     ) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             system_winget_add_source(name, arg, kind, &normalize_source_trust_level(trust_level)?, explicit)?;
             self.refresh_system_winget_sources()?;
             return Ok(());
@@ -1007,12 +1042,14 @@ impl Repository {
             etag: None,
             last_modified: None,
         });
-        self.save_store()?;
+        if self.source_mode != EffectiveSourceMode::SystemWingetDirect {
+            self.save_store()?;
+        }
         Ok(())
     }
 
     pub fn edit_source(&mut self, name: &str, explicit: Option<bool>, trust_level: Option<&str>) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             bail!("Editing system WinGet sources is not supported by winget source commands.");
         }
 
@@ -1036,7 +1073,7 @@ impl Repository {
     }
 
     pub fn remove_source(&mut self, name: &str) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             system_winget_remove_source(name)?;
             self.refresh_system_winget_sources()?;
             return Ok(());
@@ -1059,7 +1096,7 @@ impl Repository {
     }
 
     pub fn reset_source(&mut self, name: &str) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             system_winget_reset_source(name)?;
             self.refresh_system_winget_sources()?;
             return Ok(());
@@ -1096,7 +1133,7 @@ impl Repository {
     }
 
     pub fn reset_sources(&mut self) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             system_winget_reset_sources()?;
             self.refresh_system_winget_sources()?;
             return Ok(());
@@ -1210,8 +1247,12 @@ impl Repository {
     }
 
     pub fn update_sources(&mut self, source_name: Option<&str>) -> Result<Vec<SourceUpdateResult>> {
-        if self.use_system_winget_sources {
+        if self.source_mode == EffectiveSourceMode::SystemWingetDirect {
             return self.update_system_winget_sources(source_name);
+        }
+
+        if self.mirrors_system_winget_sources() {
+            self.refresh_system_winget_sources()?;
         }
 
         let indexes = self.resolve_source_indexes(source_name)?;
@@ -1441,7 +1482,7 @@ impl Repository {
 
         for source_index in source_indices {
             let source = self.source_clone(source_index);
-            let installed_db_path = source_installed_db_path(&self.app_root, &source);
+            let installed_db_path = self.source_installed_db_path(&source);
             if !installed_db_path.exists() {
                 continue;
             }
@@ -2034,11 +2075,46 @@ impl Repository {
     }
 
     fn save_store(&self) -> Result<()> {
-        save_store(&self.app_root, &self.store)
+        if self.mirrors_system_winget_sources() {
+            save_system_winget_mirror_store(&self.app_root, &self.store)
+        } else {
+            save_store(&self.app_root, &self.store)
+        }
     }
 
     fn source_state_dir(&self, source: &SourceRecord) -> PathBuf {
-        source_state_dir(&self.app_root, source)
+        source_state_dir_with_keying(&self.app_root, source, self.mirrors_system_winget_sources())
+    }
+
+    fn source_installed_db_path(&self, source: &SourceRecord) -> PathBuf {
+        source_installed_db_path_with_keying(&self.app_root, source, self.mirrors_system_winget_sources())
+    }
+
+    fn preindexed_package_path(&self, source: &SourceRecord) -> PathBuf {
+        self.source_state_dir(source).join("source.msix")
+    }
+
+    fn preindexed_index_path(&self, source: &SourceRecord) -> PathBuf {
+        self.source_state_dir(source).join("index.db")
+    }
+
+    fn rest_information_cache_path(&self, source: &SourceRecord) -> PathBuf {
+        self.source_state_dir(source).join("rest-information.json")
+    }
+
+    fn rest_manifest_cache_path(
+        &self,
+        source: &SourceRecord,
+        package_id: &str,
+        version: &str,
+        channel: &str,
+    ) -> PathBuf {
+        let key = format!("{}|{}|{}|{}", source.identifier, package_id, version, channel);
+        let digest = sha256_hex(key.as_bytes());
+        cache_root(&self.app_root)
+            .join("REST_M")
+            .join(sanitize_path_segment(&source.identifier))
+            .join(format!("{digest}.json"))
     }
 
     // ── Install / download ──
@@ -3064,7 +3140,7 @@ impl Repository {
 
     fn open_preindexed_connection_with_refresh(&mut self, source_index: usize) -> Result<PreindexedOpenConnection> {
         let source = self.source_clone(source_index);
-        let index_path = preindexed_index_path(&self.app_root, &source);
+        let index_path = self.preindexed_index_path(&source);
         let mut refresh = PreindexedRefreshOutcome::default();
         if !index_path.exists() {
             let _ = self.refresh_preindexed_source(source_index, true)?;
@@ -3161,7 +3237,7 @@ impl Repository {
 
     fn refresh_preindexed_source(&mut self, source_index: usize, force: bool) -> Result<String> {
         let source = self.source_clone(source_index);
-        let index_path = preindexed_index_path(&self.app_root, &source);
+        let index_path = self.preindexed_index_path(&source);
         let lock_key = self.preindexed_refresh_lock_key(&source);
         let refresh_lock = Self::preindexed_refresh_lock(&lock_key)?;
         let _guard = refresh_lock
@@ -3175,9 +3251,7 @@ impl Repository {
         let result = self.update_preindexed(source_index);
         self.record_preindexed_refresh_attempt(lock_key, result.is_ok());
         let detail = result?;
-        if !self.use_system_winget_sources {
-            self.save_store()?;
-        }
+        self.save_store()?;
         Ok(detail)
     }
 
@@ -3192,9 +3266,9 @@ impl Repository {
 
     fn update_preindexed(&mut self, source_index: usize) -> Result<String> {
         let source_snapshot = self.store.sources[source_index].clone();
-        let state_dir = source_state_dir(&self.app_root, &source_snapshot);
+        let state_dir = self.source_state_dir(&source_snapshot);
         fs::create_dir_all(&state_dir).context("failed to create source state directory")?;
-        let index_path = preindexed_index_path(&self.app_root, &source_snapshot);
+        let index_path = self.preindexed_index_path(&source_snapshot);
         let has_local_index = index_path.exists();
 
         let mut last_error = None;
@@ -3240,7 +3314,7 @@ impl Repository {
                     let index_bytes = extract_zip_member(&payload, "Public/index.db")
                         .context("preindexed package did not contain Public/index.db")?;
 
-                    fs::write(preindexed_package_path(&self.app_root, &source_snapshot), &payload)
+                    fs::write(self.preindexed_package_path(&source_snapshot), &payload)
                         .context("failed to persist source package")?;
                     let temp_index_path = state_dir.join(format!(
                         "index.{}.tmp",
@@ -3313,7 +3387,7 @@ impl Repository {
 
     fn load_rest_information(&mut self, source_index: usize) -> Result<RestInformation> {
         let source = self.source_clone(source_index);
-        let cache_path = rest_information_cache_path(&self.app_root, &source);
+        let cache_path = self.rest_information_cache_path(&source);
 
         if cache_path.exists() {
             let cache = serde_json::from_slice::<RestInfoCache>(
@@ -3355,7 +3429,7 @@ impl Repository {
                 expires_at: Utc::now() + Duration::seconds(i64::try_from(max_age).unwrap_or(i64::MAX)),
                 value: info.clone(),
             };
-            write_json(rest_information_cache_path(&self.app_root, &source), &cache)?;
+            write_json(self.rest_information_cache_path(&source), &cache)?;
         }
 
         Ok(info)
@@ -3367,7 +3441,7 @@ impl Repository {
         package_rowid: i64,
         package_hash: &str,
     ) -> Result<(Vec<PackageVersionDataEntry>, PathBuf)> {
-        let connection = Self::open_sqlite_connection(preindexed_index_path(&self.app_root, source))
+        let connection = Self::open_sqlite_connection(self.preindexed_index_path(source))
             .context("failed to reopen preindexed index for V2 version data")?;
         let package_hash = package_hash.to_ascii_lowercase();
         let package_id = query_optional_value(
@@ -3442,7 +3516,7 @@ impl Repository {
         version: &str,
         channel: &str,
     ) -> Result<(Vec<u8>, PathBuf)> {
-        let cache_path = rest_manifest_cache_path_with_root(&self.app_root, source, package_id, version, channel);
+        let cache_path = self.rest_manifest_cache_path(source, package_id, version, channel);
         if cache_path.exists() {
             return Ok((
                 fs::read(&cache_path).context("failed to read cached REST manifest")?,
@@ -3531,9 +3605,11 @@ impl Repository {
     }
 
     fn refresh_system_winget_sources(&mut self) -> Result<()> {
-        if self.use_system_winget_sources {
-            self.store = load_system_winget_source_store()?;
-        }
+        self.store = match self.source_mode {
+            EffectiveSourceMode::Private => self.store.clone(),
+            EffectiveSourceMode::SystemWingetDirect => load_system_winget_source_store()?,
+            EffectiveSourceMode::SystemWingetMirror => refresh_system_winget_mirror_store(&self.app_root)?,
+        };
         Ok(())
     }
 
@@ -4969,30 +5045,41 @@ fn admin_settings_path(app_root: &Path) -> PathBuf {
     app_root.join("admin-settings.json")
 }
 
+#[cfg(test)]
 fn source_state_dir(app_root: &Path, source: &SourceRecord) -> PathBuf {
+    source_state_dir_with_keying(app_root, source, false)
+}
+
+fn source_state_dir_with_keying(app_root: &Path, source: &SourceRecord, identifier_keyed: bool) -> PathBuf {
     if uses_packaged_layout(app_root) {
         return app_root
             .join(packaged_source_type(source.kind))
             .join(sanitize_path_segment(&source.identifier));
     }
 
+    if identifier_keyed {
+        return app_root.join("sources").join(sanitize_path_segment(&source.identifier));
+    }
+
     app_root.join("sources").join(sanitize_path_segment(&source.name))
 }
 
+#[cfg(test)]
 fn source_installed_db_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
+    source_installed_db_path_with_keying(app_root, source, false)
+}
+
+fn source_installed_db_path_with_keying(app_root: &Path, source: &SourceRecord, identifier_keyed: bool) -> PathBuf {
     if uses_packaged_layout(app_root) {
         return app_root
             .join(sanitize_path_segment(&source.identifier))
             .join("installed.db");
     }
 
-    source_state_dir(app_root, source).join("installed.db")
+    source_state_dir_with_keying(app_root, source, identifier_keyed).join("installed.db")
 }
 
-fn preindexed_package_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
-    source_state_dir(app_root, source).join("source.msix")
-}
-
+#[cfg(test)]
 fn preindexed_index_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
     source_state_dir(app_root, source).join("index.db")
 }
@@ -5105,25 +5192,6 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("failed to replace {} with {}", target.display(), source.display()))
 }
 
-fn rest_information_cache_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
-    source_state_dir(app_root, source).join("rest-information.json")
-}
-
-fn rest_manifest_cache_path_with_root(
-    app_root: &Path,
-    source: &SourceRecord,
-    package_id: &str,
-    version: &str,
-    channel: &str,
-) -> PathBuf {
-    let key = format!("{}|{}|{}|{}", source.identifier, package_id, version, channel);
-    let digest = sha256_hex(key.as_bytes());
-    cache_root(app_root)
-        .join("REST_M")
-        .join(sanitize_path_segment(&source.identifier))
-        .join(format!("{digest}.json"))
-}
-
 fn temp_cache_path(app_root: &Path, bucket: &str, identifier: &str) -> PathBuf {
     cache_root(app_root)
         .join(bucket)
@@ -5146,6 +5214,81 @@ fn load_store(app_root: &Path) -> Result<SourceStore> {
 
     let bytes = fs::read(path).context("failed to read source store")?;
     serde_json::from_slice(&bytes).context("failed to parse source store")
+}
+
+fn load_effective_source_store(app_root: &Path, source_mode: SourceMode) -> Result<(EffectiveSourceMode, SourceStore)> {
+    if uses_system_winget_source_commands(app_root) {
+        return Ok((
+            EffectiveSourceMode::SystemWingetDirect,
+            load_system_winget_source_store()?,
+        ));
+    }
+
+    match source_mode {
+        SourceMode::Private => Ok((EffectiveSourceMode::Private, load_store(app_root)?)),
+        SourceMode::SystemWingetMirror => {
+            let store = load_or_refresh_system_winget_mirror_store(app_root, false)?;
+            Ok((EffectiveSourceMode::SystemWingetMirror, store))
+        }
+        SourceMode::Auto => match load_or_refresh_system_winget_mirror_store(app_root, false) {
+            Ok(store) => Ok((EffectiveSourceMode::SystemWingetMirror, store)),
+            Err(_) => Ok((EffectiveSourceMode::Private, load_store(app_root)?)),
+        },
+    }
+}
+
+fn system_winget_mirror_store_path(app_root: &Path) -> PathBuf {
+    app_root.join(SYSTEM_WINGET_MIRROR_STORE_FILE_NAME)
+}
+
+fn load_system_winget_mirror_store(app_root: &Path) -> Result<Option<SourceStore>> {
+    let path = system_winget_mirror_store_path(app_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(path).context("failed to read system WinGet mirror source store")?;
+    serde_json::from_slice(&bytes)
+        .context("failed to parse system WinGet mirror source store")
+        .map(Some)
+}
+
+fn save_system_winget_mirror_store(app_root: &Path, store: &SourceStore) -> Result<()> {
+    write_json(system_winget_mirror_store_path(app_root), store)
+}
+
+fn load_or_refresh_system_winget_mirror_store(app_root: &Path, force_refresh: bool) -> Result<SourceStore> {
+    if !force_refresh && let Some(store) = load_system_winget_mirror_store(app_root)? {
+        return Ok(store);
+    }
+
+    refresh_system_winget_mirror_store(app_root)
+}
+
+fn refresh_system_winget_mirror_store(app_root: &Path) -> Result<SourceStore> {
+    let prior = load_system_winget_mirror_store(app_root)?.unwrap_or_default();
+    let mut exported = load_system_winget_source_store()?;
+    merge_source_cache_metadata(&mut exported, &prior);
+    save_system_winget_mirror_store(app_root, &exported)?;
+    Ok(exported)
+}
+
+fn merge_source_cache_metadata(target: &mut SourceStore, prior: &SourceStore) {
+    let prior_by_identifier: HashMap<_, _> = prior
+        .sources
+        .iter()
+        .map(|source| (source.identifier.to_ascii_lowercase(), source))
+        .collect();
+
+    for source in &mut target.sources {
+        let Some(previous) = prior_by_identifier.get(&source.identifier.to_ascii_lowercase()) else {
+            continue;
+        };
+        source.last_update = previous.last_update;
+        source.source_version = previous.source_version.clone();
+        source.etag = previous.etag.clone();
+        source.last_modified = previous.last_modified.clone();
+    }
 }
 
 fn save_store(app_root: &Path, store: &SourceStore) -> Result<()> {
@@ -11134,6 +11277,66 @@ mod tests {
         assert_eq!(store.sources.len(), 1);
         assert_eq!(source.name, "contoso");
         assert_eq!(source.kind, SourceKind::Rest);
+    }
+
+    #[test]
+    fn system_winget_mirror_store_uses_private_cache_and_preserves_metadata() {
+        let original_runner = {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            let original = *runner;
+            *runner = fake_system_winget_source_export;
+            original
+        };
+
+        let app_root = temp_app_root("system-winget-mirror");
+        let result = load_effective_source_store(&app_root, SourceMode::SystemWingetMirror);
+
+        {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            *runner = original_runner;
+        }
+
+        let (mode, mut store) = result.expect("mirror store");
+        assert_eq!(mode, EffectiveSourceMode::SystemWingetMirror);
+        assert!(system_winget_mirror_store_path(&app_root).exists());
+        assert!(
+            !store_path(&app_root).exists(),
+            "mirror mode must not write private sources.json"
+        );
+
+        let source = store.sources.first_mut().expect("source");
+        source.last_update = Some(Utc::now());
+        source.source_version = Some("cached-contract".to_owned());
+        source.etag = Some("\"etag\"".to_owned());
+        source.last_modified = Some("Wed, 03 Jun 2026 12:00:00 GMT".to_owned());
+        save_system_winget_mirror_store(&app_root, &store).expect("save mirror");
+
+        let original_runner = {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            let original = *runner;
+            *runner = fake_system_winget_source_export;
+            original
+        };
+        let refreshed = refresh_system_winget_mirror_store(&app_root);
+        {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            *runner = original_runner;
+        }
+
+        let refreshed = refreshed.expect("refresh mirror");
+        let source = refreshed.sources.first().expect("source");
+        assert_eq!(source.source_version.as_deref(), Some("cached-contract"));
+        assert_eq!(source.etag.as_deref(), Some("\"etag\""));
+        assert_eq!(
+            source_state_dir_with_keying(&app_root, source, true),
+            app_root.join("sources").join("api.contoso.test")
+        );
+        assert_eq!(
+            source_state_dir_with_keying(&app_root, source, false),
+            app_root.join("sources").join("contoso")
+        );
+
+        let _ = fs::remove_dir_all(&app_root);
     }
 
     #[test]
