@@ -12,22 +12,22 @@ internal static class PreIndexedSource
 {
     private static readonly string[] MsixCandidates = ["source2.msix", "source.msix"];
 
-    public static string IndexPath(SourceRecord source, string? appRoot = null)
+    public static string IndexPath(SourceRecord source, string? appRoot = null, bool identifierKeyed = false)
     {
-        var stateDir = SourceStoreManager.SourceStateDir(source, appRoot);
+        var stateDir = SourceStoreManager.SourceStateDir(source, appRoot, identifierKeyed);
         return Path.Combine(stateDir, "index.db");
     }
 
-    public static string Update(HttpClient client, SourceRecord source, string? appRoot = null)
+    public static string Update(HttpClient client, SourceRecord source, string? appRoot = null, bool identifierKeyed = false)
     {
-        var stateDir = SourceStoreManager.SourceStateDir(source, appRoot);
+        var stateDir = SourceStoreManager.SourceStateDir(source, appRoot, identifierKeyed);
         Directory.CreateDirectory(stateDir);
 
         Exception? lastError = null;
         foreach (var candidate in MsixCandidates)
         {
             var url = $"{source.Arg.TrimEnd('/')}/{candidate}";
-            var hasLocalIndex = File.Exists(IndexPath(source, appRoot));
+            var hasLocalIndex = File.Exists(IndexPath(source, appRoot, identifierKeyed));
             try
             {
                 if (hasLocalIndex && TrySkipUnchangedBySourceVersion(client, url, source, candidate, out var detail))
@@ -59,7 +59,7 @@ internal static class PreIndexedSource
                 var indexEntry = archive.GetEntry("Public/index.db")
                     ?? throw new InvalidOperationException($"No Public/index.db in {candidate}");
 
-                var indexPath = IndexPath(source, appRoot);
+                var indexPath = IndexPath(source, appRoot, identifierKeyed);
                 var tempIndexPath = Path.Combine(stateDir, $"index.{Guid.NewGuid():N}.tmp");
                 try
                 {
@@ -571,9 +571,9 @@ internal static class PreIndexedSource
         return bytes;
     }
 
-    public static byte[] GetCachedSourceFileFromMsix(SourceRecord source, string relativePath, string? appRoot = null)
+    public static byte[] GetCachedSourceFileFromMsix(SourceRecord source, string relativePath, string? appRoot = null, bool identifierKeyed = false)
     {
-        var stateDir = SourceStoreManager.SourceStateDir(source, appRoot);
+        var stateDir = SourceStoreManager.SourceStateDir(source, appRoot, identifierKeyed);
         foreach (var candidate in MsixCandidates)
         {
             var msixPath = Path.Combine(stateDir, candidate);

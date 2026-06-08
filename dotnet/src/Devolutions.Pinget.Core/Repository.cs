@@ -28,10 +28,12 @@ public class Repository : IDisposable
 
     private readonly string _appRoot;
     private readonly HttpClient _client;
-    private readonly bool _useSystemWingetSources;
     private readonly Action<RepositoryWarning>? _diagnostics;
     private readonly TimeSpan? _preIndexedSourceAutoUpdateInterval;
     private SourceStore _store;
+    private readonly EffectiveSourceMode _sourceMode;
+    private bool UsesSystemWingetSources => _sourceMode != EffectiveSourceMode.Private;
+    private bool MirrorsSystemWingetSources => _sourceMode == EffectiveSourceMode.SystemWingetMirror;
     private static readonly ConcurrentDictionary<string, object> s_preIndexedRefreshLocks = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan s_preIndexedRefreshRetryInterval = TimeSpan.FromMinutes(5);
     private readonly object _preIndexedRefreshAttemptGate = new();
@@ -41,14 +43,14 @@ public class Repository : IDisposable
         string appRoot,
         HttpClient client,
         SourceStore store,
-        bool useSystemWingetSources,
+        EffectiveSourceMode sourceMode,
         Action<RepositoryWarning>? diagnostics,
         TimeSpan? preIndexedSourceAutoUpdateInterval)
     {
         _appRoot = appRoot;
         _client = client;
         _store = store;
-        _useSystemWingetSources = useSystemWingetSources;
+        _sourceMode = sourceMode;
         _diagnostics = diagnostics;
         _preIndexedSourceAutoUpdateInterval = preIndexedSourceAutoUpdateInterval;
     }
@@ -60,10 +62,13 @@ public class Repository : IDisposable
     {
         options ??= new RepositoryOptions();
         EnsureSqliteNativeLibraryLoaded();
-        var appRoot = SourceStoreManager.NormalizeAppRoot(options.AppRoot ?? Environment.GetEnvironmentVariable(AppRootEnvironmentVariable));
+        var requestedAppRoot = options.AppRoot ?? Environment.GetEnvironmentVariable(AppRootEnvironmentVariable);
+        var appRoot = SourceStoreManager.NormalizeAppRoot(requestedAppRoot);
         SourceStoreManager.EnsureAppDirs(appRoot);
-        var useSystemWingetSources = SourceStoreManager.UsesSystemWingetSourceCommands(appRoot);
-        var store = SourceStoreManager.Load(appRoot);
+        var requestedSourceMode = options.SourceMode == SourceMode.Auto && requestedAppRoot is not null
+            ? SourceMode.Private
+            : options.SourceMode;
+        var (sourceMode, store) = SourceStoreManager.LoadEffective(appRoot, requestedSourceMode);
         var client = new HttpClient(new SocketsHttpHandler
         {
             AutomaticDecompression = System.Net.DecompressionMethods.None,
@@ -71,7 +76,7 @@ public class Repository : IDisposable
         });
         client.Timeout = Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
-        return new Repository(appRoot, client, store, useSystemWingetSources, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
+        return new Repository(appRoot, client, store, sourceMode, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
     }
 
     internal static IEnumerable<string> GetSqliteNativeLibraryCandidates(string assemblyDirectory)
@@ -177,7 +182,7 @@ public class Repository : IDisposable
 
     public void AddSource(string name, string arg, SourceKind kind, string trustLevel = "None", bool explicitSource = false, int priority = 0)
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.AddSource(name, arg, kind, NormalizeSourceTrustLevel(trustLevel), explicitSource);
             RefreshSystemWingetSources();
@@ -204,7 +209,7 @@ public class Repository : IDisposable
 
     public void EditSource(string name, bool? explicitSource = null, string? trustLevel = null)
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
             throw new InvalidOperationException("Editing system WinGet sources is not supported by winget source commands.");
 
         var source = _store.Sources.FirstOrDefault(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase))
@@ -221,7 +226,7 @@ public class Repository : IDisposable
 
     public void RemoveSource(string name)
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.RemoveSource(name);
             RefreshSystemWingetSources();
@@ -232,7 +237,7 @@ public class Repository : IDisposable
             ?? throw new InvalidOperationException($"Source '{name}' not found.");
 
         _store.Sources.Remove(source);
-        var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot);
+        var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources);
         if (Directory.Exists(stateDir))
             Directory.Delete(stateDir, recursive: true);
         SourceStoreManager.Save(_store, _appRoot);
@@ -240,7 +245,7 @@ public class Repository : IDisposable
 
     public void ResetSource(string name)
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.ResetSource(name);
             RefreshSystemWingetSources();
@@ -252,7 +257,7 @@ public class Repository : IDisposable
             throw new InvalidOperationException($"Source '{name}' not found.");
 
         var source = _store.Sources[index];
-        var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot);
+        var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources);
         if (Directory.Exists(stateDir))
             Directory.Delete(stateDir, recursive: true);
 
@@ -276,7 +281,7 @@ public class Repository : IDisposable
 
     public void ResetSources()
     {
-        if (_useSystemWingetSources)
+        if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.ResetSources();
             RefreshSystemWingetSources();
@@ -285,7 +290,7 @@ public class Repository : IDisposable
 
         foreach (var source in _store.Sources)
         {
-            var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot);
+            var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources);
             if (Directory.Exists(stateDir))
                 Directory.Delete(stateDir, recursive: true);
         }
@@ -366,8 +371,11 @@ public class Repository : IDisposable
 
     public List<SourceUpdateResult> UpdateSources(string? sourceName = null)
     {
-        if (_useSystemWingetSources)
+        if (_sourceMode == EffectiveSourceMode.SystemWingetDirect)
             return UpdateSystemWingetSources(sourceName);
+
+        if (MirrorsSystemWingetSources)
+            RefreshSystemWingetSources();
 
         var indexes = ResolveSourceIndexes(sourceName);
         var results = new List<SourceUpdateResult>();
@@ -377,15 +385,15 @@ public class Repository : IDisposable
             var source = _store.Sources[index];
             var detail = source.Kind switch
             {
-                SourceKind.PreIndexed => PreIndexedSource.Update(_client, source, _appRoot),
-                SourceKind.Rest => RestSource.UpdateRest(_client, source, _appRoot),
+                SourceKind.PreIndexed => PreIndexedSource.Update(_client, source, _appRoot, MirrorsSystemWingetSources),
+                SourceKind.Rest => RestSource.UpdateRest(_client, source, _appRoot, MirrorsSystemWingetSources),
                 _ => "Unknown source kind"
             };
             source.LastUpdate = DateTime.UtcNow;
             results.Add(new SourceUpdateResult { Name = source.Name, Kind = source.Kind, Detail = detail });
         }
 
-        SourceStoreManager.Save(_store, _appRoot);
+        SaveStore();
         return results;
     }
 
@@ -417,7 +425,7 @@ public class Repository : IDisposable
 
     public ShowResult Show(PackageQuery query)
     {
-        var (located, warnings, sourceWarnings) = FindSingleMatch(query);
+        var (located, warnings, sourceWarnings) = FindSingleMatchForShow(query, SearchSemantics.Single);
         return CreateShowResult(located, query, warnings, sourceWarnings);
     }
 
@@ -483,7 +491,7 @@ public class Repository : IDisposable
 
     public VersionsResult ShowVersions(PackageQuery query)
     {
-        var (located, warnings, sourceWarnings) = FindSingleMatch(query);
+        var (located, warnings, sourceWarnings) = FindSingleMatchForShow(query, SearchSemantics.Single);
         var versions = VersionsForMatch(located, query);
         return new VersionsResult { Package = located.Display, Versions = versions, Warnings = warnings, SourceWarnings = sourceWarnings };
     }
@@ -508,6 +516,8 @@ public class Repository : IDisposable
 
     public ListResponse List(ListQuery query)
     {
+        RefreshSystemWingetSources();
+
         if ((query.IncludeUnknown || query.IncludePinned) && !query.UpgradeOnly)
             throw new InvalidOperationException("--include-unknown and --include-pinned require --upgrade-available");
 
@@ -525,6 +535,7 @@ public class Repository : IDisposable
         // Even plain `list` should canonicalize installed package ids and
         // sources when the local package can be correlated back to a source
         // catalog entry. Available-version lookups stay gated below.
+        warnings.AddRange(CorrelateInstalledViaInstalledDb(installed, query.Source));
         warnings.AddRange(CorrelateInstalledViaIndex(installed, query.Source));
         warnings.AddRange(CorrelateInstalledByNormalizedIdentity(installed, query.Source));
 
@@ -585,6 +596,8 @@ public class Repository : IDisposable
             .Select(ListMatchFromInstalled)
             .Where(match => !query.UpgradeOnly || query.IncludePinned || !IsUpgradeBlockedByPin(match, pins))
             .ToList();
+        if (!query.UpgradeOnly)
+            listMatches = SuppressDuplicateAvailableVersions(listMatches);
 
         bool truncated = false;
         if (query.Count is int limit)
@@ -1504,7 +1517,7 @@ public class Repository : IDisposable
         RestSource.RestInformation info;
         try
         {
-            info = RestSource.LoadInformation(_client, source, _appRoot);
+            info = RestSource.LoadInformation(_client, source, _appRoot, MirrorsSystemWingetSources);
         }
         catch (Exception ex)
         {
@@ -1574,8 +1587,8 @@ public class Repository : IDisposable
     private string? SourceDiagnosticCachePath(SourceRecord source) =>
         source.Kind switch
         {
-            SourceKind.PreIndexed => PreIndexedSource.IndexPath(source, _appRoot),
-            SourceKind.Rest => Path.Combine(SourceStoreManager.SourceStateDir(source, _appRoot), "rest_info.json"),
+            SourceKind.PreIndexed => PreIndexedSource.IndexPath(source, _appRoot, MirrorsSystemWingetSources),
+            SourceKind.Rest => Path.Combine(SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources), "rest_info.json"),
             _ => null,
         };
 
@@ -1607,7 +1620,7 @@ public class Repository : IDisposable
     private SqliteConnection OpenPreindexedConnection(int sourceIndex, out PreIndexedRefreshOutcome refreshOutcome)
     {
         var source = _store.Sources[sourceIndex];
-        var indexPath = PreIndexedSource.IndexPath(source, _appRoot);
+        var indexPath = PreIndexedSource.IndexPath(source, _appRoot, MirrorsSystemWingetSources);
         refreshOutcome = EnsurePreindexedIndex(sourceIndex, indexPath);
 
         var conn = new SqliteConnection($"Data Source={indexPath};Mode=ReadOnly;Pooling=False");
@@ -1667,7 +1680,7 @@ public class Repository : IDisposable
     private string RefreshPreindexedSource(int sourceIndex, bool force, PreIndexedRefreshKind kind)
     {
         var source = _store.Sources[sourceIndex];
-        var indexPath = PreIndexedSource.IndexPath(source, _appRoot);
+        var indexPath = PreIndexedSource.IndexPath(source, _appRoot, MirrorsSystemWingetSources);
         var lockKey = PreindexedRefreshLockKey(source);
         var refreshLock = s_preIndexedRefreshLocks.GetOrAdd(lockKey, _ => new object());
 
@@ -1678,10 +1691,10 @@ public class Repository : IDisposable
 
             try
             {
-                var detail = PreIndexedSource.Update(_client, source, _appRoot);
+                var detail = PreIndexedSource.Update(_client, source, _appRoot, MirrorsSystemWingetSources);
                 source.LastUpdate = DateTime.UtcNow;
-                if (!_useSystemWingetSources)
-                    SourceStoreManager.Save(_store, _appRoot);
+                if (_sourceMode != EffectiveSourceMode.SystemWingetDirect)
+                    SaveStore();
                 RecordPreindexedRefreshAttempt(lockKey, null, kind);
                 return detail;
             }
@@ -1744,23 +1757,58 @@ public class Repository : IDisposable
     private (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) FindSingleMatch(PackageQuery query)
         => FindSingleMatchWithSemantics(query, SearchSemantics.Single);
 
+    private (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) FindSingleMatchForShow(
+        PackageQuery query,
+        SearchSemantics semantics)
+    {
+        var located = SearchLocated(query, semantics);
+        if (ShouldRetryShowAcrossSystemWingetSources(query, located.Matches, located.Failures))
+        {
+            var fallbackQuery = query with { Source = null };
+            return SingleMatchFromLocated(SearchLocated(fallbackQuery, semantics), reportFirstSourceFailure: false);
+        }
+
+        return SingleMatchFromLocated(located, reportFirstSourceFailure: query.Source is not null);
+    }
+
+    private bool ShouldRetryShowAcrossSystemWingetSources(
+        PackageQuery query,
+        IReadOnlyCollection<LocatedMatch> matches,
+        IReadOnlyCollection<SourceSearchFailure> failures) =>
+        ShouldRetryShowAcrossSystemWingetSources(UsesSystemWingetSources, query.Source, matches.Count, failures.Count);
+
+    internal static bool ShouldRetryShowAcrossSystemWingetSources(
+        bool usesSystemWingetSources,
+        string? source,
+        int matchCount,
+        int failureCount) =>
+        usesSystemWingetSources &&
+        string.Equals(source, "winget", StringComparison.OrdinalIgnoreCase) &&
+        matchCount == 0 &&
+        failureCount == 0;
+
     private (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) FindSingleMatchWithSemantics(
         PackageQuery query, SearchSemantics semantics)
     {
-        var (matches, warnings, failures, _) = SearchLocated(query, semantics);
+        return SingleMatchFromLocated(SearchLocated(query, semantics), reportFirstSourceFailure: query.Source is not null);
+    }
 
-        if (matches.Count == 0)
+    private static (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) SingleMatchFromLocated(
+        (List<LocatedMatch> Matches, List<string> Warnings, List<SourceSearchFailure> Failures, bool Truncated) located,
+        bool reportFirstSourceFailure)
+    {
+        if (located.Matches.Count == 0)
         {
-            if (query.Source is not null && failures.Count > 0)
-                throw new SourceSearchException(failures[0].Warning, failures[0].Exception);
+            if (reportFirstSourceFailure && located.Failures.Count > 0)
+                throw new SourceSearchException(located.Failures[0].Warning, located.Failures[0].Exception);
 
             throw new InvalidOperationException("no package matched the supplied query");
         }
 
-        if (matches.Count > 1)
-            throw new MultiplePackageMatchesException(matches.Select(m => m.Display));
+        if (located.Matches.Count > 1)
+            throw new MultiplePackageMatchesException(located.Matches.Select(m => m.Display));
 
-        return (matches[0], warnings, failures.Select(f => f.Warning).ToList());
+        return (located.Matches[0], located.Warnings, located.Failures.Select(f => f.Warning).ToList());
     }
 
     private List<VersionKey> VersionsForMatch(LocatedMatch located, PackageQuery query)
@@ -1911,7 +1959,7 @@ public class Repository : IDisposable
         PackageQuery query)
     {
         var source = _store.Sources[sourceIndex];
-        var info = RestSource.LoadInformation(_client, source, _appRoot);
+        var info = RestSource.LoadInformation(_client, source, _appRoot, MirrorsSystemWingetSources);
         var selected = SelectRestVersion(versions, query.Version, query.Channel, display.Id, source.Name);
         var (manifest, structuredDocument) = RestSource.FetchManifestWithDocuments(_client, source, info, packageId, selected.Version, selected.Channel);
         return (manifest, structuredDocument, []);
@@ -2839,6 +2887,57 @@ public class Repository : IDisposable
     }
 
     /// <summary>
+    /// Returns "&gt; latest&gt;" when ARP range metadata proves the installed
+    /// package version is newer than the newest catalog version that has ARP
+    /// bounds. This is common for inbox MSIX frameworks such as
+    /// WindowsAppRuntime, where Windows can service a package beyond the
+    /// latest winget catalog mapping.
+    /// </summary>
+    internal static string? GreaterThanLatestArpAnchoredVersion(
+        IReadOnlyList<PreIndexedSource.V2VersionDataEntry> entries,
+        string arpVersion,
+        string catalogLatestVersion)
+    {
+        if (string.IsNullOrEmpty(arpVersion) || arpVersion.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        PreIndexedSource.V2VersionDataEntry? latest = null;
+        foreach (var entry in entries)
+        {
+            if (entry.ArpMinVersion is null || entry.ArpMaxVersion is null) continue;
+            if (latest is null || RestSource.CompareVersionStrings(entry.Version, latest.Version) > 0)
+                latest = entry;
+        }
+        if (latest?.ArpMaxVersion is null)
+            return null;
+        if (!latest.Version.Equals(catalogLatestVersion, StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (!HasDifferentLeadingVersionNumber(latest.ArpMaxVersion, latest.Version))
+            return null;
+        if (RestSource.CompareVersionStrings(arpVersion, latest.ArpMaxVersion) <= 0)
+            return null;
+
+        return $"> {latest.Version}";
+    }
+
+    private static bool HasDifferentLeadingVersionNumber(string left, string right)
+    {
+        var leftLeading = LeadingVersionNumber(left);
+        var rightLeading = LeadingVersionNumber(right);
+        return leftLeading is not null && rightLeading is not null &&
+               !leftLeading.Equals(rightLeading, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? LeadingVersionNumber(string value)
+    {
+        var trimmed = value.TrimStart();
+        int length = 0;
+        while (length < trimmed.Length && char.IsAsciiDigit(trimmed[length]))
+            length++;
+        return length == 0 ? null : trimmed[..length];
+    }
+
+    /// <summary>
     /// Returns the latest catalog Version that carries ARP-range metadata.
     /// Packages like `Microsoft.WindowsAppRuntime.1.8` also publish "internal"
     /// version rows whose `v` is an MSI build number (`8000.836.2153.0`)
@@ -2857,6 +2956,151 @@ public class Repository : IDisposable
                 best = entry;
         }
         return best?.Version;
+    }
+
+    /// <summary>
+    /// Uses winget's per-source installed tracking DB when available. This is
+    /// an exact identity signal recorded by winget itself, and it preserves
+    /// source order for sources that do not expose a preindexed identity table
+    /// such as REST sources.
+    /// </summary>
+    private List<string> CorrelateInstalledViaInstalledDb(List<InstalledPackage> installed, string? requestedSource)
+    {
+        var warnings = new List<string>();
+        for (int sourceIndex = 0; sourceIndex < _store.Sources.Count; sourceIndex++)
+        {
+            var source = _store.Sources[sourceIndex];
+            if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var installedDbPath = SourceStoreManager.SourceInstalledDbPath(source, _appRoot, MirrorsSystemWingetSources);
+            if (!File.Exists(installedDbPath))
+                continue;
+
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={installedDbPath};Mode=ReadOnly;Pooling=False");
+            conn.Open();
+            if (!InstalledDbIdentityTablesPresent(conn))
+                continue;
+
+            for (int i = 0; i < installed.Count; i++)
+            {
+                if (installed[i].Correlated is not null) continue;
+                var hit = LookupInstalledDbIdentityMatch(conn, installed[i]);
+                if (hit is null) continue;
+
+                string? version = null;
+                string? moniker = null;
+                if (source.Kind == SourceKind.PreIndexed)
+                {
+                    try
+                    {
+                        using var indexConn = OpenPreindexedConnection(sourceIndex);
+                        var meta = LookupV2MetadataById(indexConn, hit.Value.Id);
+                        if (meta is not null)
+                        {
+                            hit = (meta.Id, meta.Name, hit.Value.MatchedBy);
+                            moniker = meta.Moniker;
+
+                            var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, indexConn, source, meta.Rowid, meta.PackageHash, _appRoot);
+                            var canonicalInstalled = MapArpVersionToCatalog(entries, installed[i].InstalledVersion)
+                                ?? LessThanLatestArpAnchoredVersion(entries, installed[i].InstalledVersion)
+                                ?? GreaterThanLatestArpAnchoredVersion(entries, installed[i].InstalledVersion, meta.LatestVersion);
+                            var anchoredLatest = LatestArpAnchoredVersion(entries);
+                            version = canonicalInstalled is not null
+                                ? (IsGreaterThanVersionMarker(canonicalInstalled) ? null : anchoredLatest)
+                                : meta.LatestVersion;
+
+                            if (canonicalInstalled is not null)
+                            {
+                                installed[i].InstalledVersion = canonicalInstalled;
+                                installed[i].InstalledVersionCanonical = true;
+                            }
+                        }
+                    }
+                    catch { /* version data fetch is best-effort; fall back to the installed DB identity below */ }
+                }
+
+                installed[i].Correlated = new SearchMatch
+                {
+                    SourceName = source.Name,
+                    SourceKind = source.Kind,
+                    Id = hit.Value.Id,
+                    Name = hit.Value.Name,
+                    Moniker = moniker,
+                    Version = version,
+                    MatchCriteria = hit.Value.MatchedBy,
+                };
+            }
+        }
+
+        return warnings;
+    }
+
+    private static bool InstalledDbIdentityTablesPresent(Microsoft.Data.Sqlite.SqliteConnection conn) =>
+        TableExists(conn, "manifest") &&
+        TableExists(conn, "ids") &&
+        TableExists(conn, "names") &&
+        ((TableExists(conn, "pfns") && TableExists(conn, "pfns_map")) ||
+         (TableExists(conn, "productcodes") && TableExists(conn, "productcodes_map")) ||
+         (TableExists(conn, "upgradecodes") && TableExists(conn, "upgradecodes_map")));
+
+    private static bool TableExists(Microsoft.Data.Sqlite.SqliteConnection conn, string name) =>
+        QueryOptionalLong(conn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @v LIMIT 1", name) is not null;
+
+    private static (string Id, string Name, string MatchedBy)? LookupInstalledDbIdentityMatch(
+        Microsoft.Data.Sqlite.SqliteConnection conn,
+        InstalledPackage pkg)
+    {
+        foreach (var pfn in pkg.PackageFamilyNames)
+        {
+            var hit = LookupInstalledDbIdentityMatch(conn, "pfns", "pfns_map", "pfn", pfn, "PackageFamilyName");
+            if (hit is not null) return hit;
+        }
+
+        foreach (var code in pkg.UpgradeCodes)
+        {
+            var hit = LookupInstalledDbIdentityMatch(conn, "upgradecodes", "upgradecodes_map", "upgradecode", code, "UpgradeCode");
+            if (hit is not null) return hit;
+        }
+
+        foreach (var code in pkg.ProductCodes)
+        {
+            var hit = LookupInstalledDbIdentityMatch(conn, "productcodes", "productcodes_map", "productcode", code, "ProductCode");
+            if (hit is not null) return hit;
+        }
+
+        return null;
+    }
+
+    internal static (string Id, string Name, string MatchedBy)? LookupInstalledDbIdentityMatchForTesting(
+        Microsoft.Data.Sqlite.SqliteConnection conn,
+        InstalledPackage pkg)
+        => LookupInstalledDbIdentityMatch(conn, pkg);
+
+    private static (string Id, string Name, string MatchedBy)? LookupInstalledDbIdentityMatch(
+        Microsoft.Data.Sqlite.SqliteConnection conn,
+        string valueTable,
+        string mapTable,
+        string valueColumn,
+        string value,
+        string matchedBy)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT ids.id, names.name
+            FROM {mapTable} map
+            JOIN {valueTable} value ON map.{valueColumn} = value.rowid
+            JOIN manifest ON map.manifest = manifest.rowid
+            JOIN ids ON manifest.id = ids.rowid
+            JOIN names ON manifest.name = names.rowid
+            WHERE value.{valueColumn} = @v
+            LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("@v", value.ToLowerInvariant());
+        using var reader = cmd.ExecuteReader();
+        return reader.Read()
+            ? (reader.GetString(0), reader.GetString(1), matchedBy)
+            : null;
     }
 
     /// <summary>
@@ -2907,7 +3151,8 @@ public class Repository : IDisposable
                     using var conn2 = OpenPreindexedConnection(sourceIndex);
                     var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
                     canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion)
-                        ?? LessThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion);
+                        ?? LessThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion)
+                        ?? GreaterThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion, meta.LatestVersion);
                     anchoredLatest = LatestArpAnchoredVersion(entries);
                 }
                 catch { /* version data fetch is best-effort; fall back below */ }
@@ -2918,8 +3163,8 @@ public class Repository : IDisposable
                 // `latest_version`, which can be an internal/MSI build
                 // number that would manufacture a phantom upgrade against
                 // an installed canonical.
-                var availableVersion = (canonicalInstalled is not null && anchoredLatest is not null)
-                    ? anchoredLatest
+                var availableVersion = canonicalInstalled is not null
+                    ? (IsGreaterThanVersionMarker(canonicalInstalled) ? null : anchoredLatest)
                     : meta.LatestVersion;
 
                 installed[idx].Correlated = new SearchMatch
@@ -2999,13 +3244,15 @@ public class Repository : IDisposable
                 {
                     using var conn2 = OpenPreindexedConnection(sourceIndex);
                     var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
-                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion)
+                        ?? LessThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion)
+                        ?? GreaterThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion, meta.LatestVersion);
                     anchoredLatest = LatestArpAnchoredVersion(entries);
                 }
                 catch { /* best-effort */ }
 
-                var availableVersion = (canonicalInstalled is not null && anchoredLatest is not null)
-                    ? anchoredLatest
+                var availableVersion = canonicalInstalled is not null
+                    ? (IsGreaterThanVersionMarker(canonicalInstalled) ? null : anchoredLatest)
                     : meta.LatestVersion;
 
                 installed[idx].Correlated = new SearchMatch
@@ -3199,14 +3446,21 @@ public class Repository : IDisposable
 
                 if (!installed[idx].InstalledVersionCanonical)
                 {
-                    var canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    var canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion)
+                        ?? LessThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion)
+                        ?? GreaterThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion, meta.LatestVersion);
                     var anchoredLatest = LatestArpAnchoredVersion(entries);
                     if (canonicalInstalled is not null)
                     {
                         installed[idx].InstalledVersion = canonicalInstalled;
                         installed[idx].InstalledVersionCanonical = true;
                         if (installed[idx].Correlated is SearchMatch correlated && anchoredLatest is not null)
-                            installed[idx].Correlated = correlated with { Version = anchoredLatest };
+                        {
+                            installed[idx].Correlated = correlated with
+                            {
+                                Version = IsGreaterThanVersionMarker(canonicalInstalled) ? null : anchoredLatest
+                            };
+                        }
                     }
                 }
 
@@ -3448,20 +3702,36 @@ public class Repository : IDisposable
     }
 
     private ListMatch ListMatchFromInstalled(InstalledPackage pkg)
+        => ListMatchFromInstalled(pkg, _store.Sources);
+
+    internal static ListMatch ListMatchFromInstalledForTesting(InstalledPackage pkg, IReadOnlyList<SourceRecord> sources)
+        => ListMatchFromInstalled(pkg, sources);
+
+    private static ListMatch ListMatchFromInstalled(InstalledPackage pkg, IReadOnlyList<SourceRecord> sources)
     {
         string? availableVersion = null;
         if (pkg.Correlated?.Version is string av)
         {
-            if (InstalledPackageHasUnknownVersion(pkg) ||
-                RestSource.CompareVersionStrings(av, pkg.InstalledVersion) > 0)
+            if (!IsGreaterThanVersionMarker(pkg.InstalledVersion) &&
+                (InstalledPackageHasUnknownVersion(pkg) ||
+                 RestSource.CompareVersionStrings(av, pkg.InstalledVersion) > 0))
+            {
                 availableVersion = av;
+            }
         }
 
         string packageId = pkg.Correlated?.Id ?? pkg.LocalId;
         string? sourceName = pkg.Correlated?.SourceName;
+        if (sourceName is null && !string.IsNullOrWhiteSpace(pkg.WinGetPackageIdentifier))
+        {
+            packageId = pkg.WinGetPackageIdentifier;
+            if (!string.IsNullOrWhiteSpace(pkg.WinGetSourceIdentifier))
+                sourceName = SourceNameFromIdentifier(pkg.WinGetSourceIdentifier, sources);
+        }
+
         if (sourceName is null && TryGetWinGetPackageIdentityFromLocalId(
             pkg.LocalId,
-            _store.Sources,
+            sources,
             out string? localPackageId,
             out string? localSourceName))
         {
@@ -3486,6 +3756,48 @@ public class Repository : IDisposable
             UpgradeCodes = pkg.UpgradeCodes,
         };
     }
+
+    internal static List<ListMatch> SuppressDuplicateAvailableVersions(IReadOnlyList<ListMatch> matches)
+    {
+        var duplicateKeys = matches
+            .Where(match => !string.IsNullOrWhiteSpace(match.SourceName))
+            .GroupBy(match => $"{match.SourceName}\0{match.Id}", StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() > 1)
+            .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.OrdinalIgnoreCase);
+
+        if (duplicateKeys.Count == 0)
+            return matches.ToList();
+
+        var keepLocalIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, group) in duplicateKeys)
+        {
+            var bestVersion = group
+                .Select(match => match.InstalledVersion)
+                .Aggregate((best, version) => RestSource.CompareVersionStrings(version, best) > 0 ? version : best);
+            foreach (var match in group.Where(match => RestSource.CompareVersionStrings(match.InstalledVersion, bestVersion) == 0))
+                keepLocalIds.Add($"{key}\0{match.LocalId}");
+        }
+
+        return matches
+            .Select(match =>
+            {
+                if (match.AvailableVersion is null || string.IsNullOrWhiteSpace(match.SourceName))
+                    return match;
+
+                var key = $"{match.SourceName}\0{match.Id}";
+                if (!duplicateKeys.ContainsKey(key))
+                    return match;
+
+                return keepLocalIds.Contains($"{key}\0{match.LocalId}")
+                    ? match
+                    : match with { AvailableVersion = null };
+            })
+            .ToList();
+    }
+
+    private static string SourceNameFromIdentifier(string identifier, IReadOnlyList<SourceRecord> sources) =>
+        sources.FirstOrDefault(source => source.Identifier.Equals(identifier, StringComparison.OrdinalIgnoreCase))?.Name
+        ?? identifier;
 
     internal static bool TryGetWinGetPackageIdentityFromLocalId(
         string localId,
@@ -3536,8 +3848,12 @@ public class Repository : IDisposable
         pkg.InstalledVersion.Equals("Unknown", StringComparison.OrdinalIgnoreCase);
 
     private static bool InstalledPackageHasUpgrade(InstalledPackage pkg) =>
+        !IsGreaterThanVersionMarker(pkg.InstalledVersion) &&
         pkg.Correlated?.Version is string availableVersion &&
         RestSource.CompareVersionStrings(availableVersion, pkg.InstalledVersion) > 0;
+
+    private static bool IsGreaterThanVersionMarker(string version) =>
+        version.TrimStart().StartsWith('>');
 
     private static bool InstallerMatchesRequested(
         Installer installer,
@@ -3730,13 +4046,33 @@ public class Repository : IDisposable
             if (_store.Sources[i].Name.Equals(sourceName, StringComparison.OrdinalIgnoreCase))
                 return [i];
         }
+
+        for (int i = 0; i < _store.Sources.Count; i++)
+        {
+            if (_store.Sources[i].Identifier.Equals(sourceName, StringComparison.OrdinalIgnoreCase))
+                return [i];
+        }
+
         throw new InvalidOperationException($"Source '{sourceName}' not found.");
     }
 
     private void RefreshSystemWingetSources()
     {
-        if (_useSystemWingetSources)
-            _store = SystemWingetSourceStore.Load();
+        _store = _sourceMode switch
+        {
+            EffectiveSourceMode.Private => _store,
+            EffectiveSourceMode.SystemWingetDirect => SystemWingetSourceStore.Load(),
+            EffectiveSourceMode.SystemWingetMirror => SourceStoreManager.RefreshSystemWingetMirrorStore(_appRoot),
+            _ => _store,
+        };
+    }
+
+    private void SaveStore()
+    {
+        if (MirrorsSystemWingetSources)
+            SourceStoreManager.SaveSystemWingetMirrorStore(_appRoot, _store);
+        else
+            SourceStoreManager.Save(_store, _appRoot);
     }
 
     private List<SourceUpdateResult> UpdateSystemWingetSources(string? sourceName)

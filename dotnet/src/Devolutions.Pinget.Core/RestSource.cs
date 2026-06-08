@@ -23,9 +23,9 @@ internal static class RestSource
         public RestInformation Value { get; init; } = new();
     }
 
-    public static RestInformation LoadInformation(HttpClient client, SourceRecord source, string? appRoot = null)
+    public static RestInformation LoadInformation(HttpClient client, SourceRecord source, string? appRoot = null, bool identifierKeyed = false)
     {
-        var stateDir = SourceStoreManager.SourceStateDir(source, appRoot);
+        var stateDir = SourceStoreManager.SourceStateDir(source, appRoot, identifierKeyed);
         Directory.CreateDirectory(stateDir);
         var cachePath = Path.Combine(stateDir, "rest_info.json");
 
@@ -148,9 +148,9 @@ internal static class RestSource
         return ParseRestManifest(json, packageId, version, channel);
     }
 
-    public static string UpdateRest(HttpClient client, SourceRecord source, string? appRoot = null)
+    public static string UpdateRest(HttpClient client, SourceRecord source, string? appRoot = null, bool identifierKeyed = false)
     {
-        var info = LoadInformation(client, source, appRoot);
+        var info = LoadInformation(client, source, appRoot, identifierKeyed);
         source.SourceVersion = info.ServerSupportedVersions.FirstOrDefault();
         return $"REST source up to date (contract: {source.SourceVersion})";
     }

@@ -49,6 +49,7 @@ const PREINDEXED_CANDIDATES: &[&str] = &["source2.msix", "source.msix"];
 const DEFAULT_USER_AGENT: &str = "pinget-rs/0.1";
 const DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES: i64 = 15;
 const PREINDEXED_REFRESH_RETRY_MINUTES: i64 = 5;
+const SYSTEM_WINGET_MIRROR_STORE_FILE_NAME: &str = "system-sources.json";
 #[cfg(windows)]
 const PACKAGED_FAMILY_NAME: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
 #[cfg(windows)]
@@ -159,7 +160,23 @@ impl Default for SourceStore {
 pub struct RepositoryOptions {
     pub app_root: PathBuf,
     pub user_agent: String,
+    pub source_mode: SourceMode,
     pub pre_indexed_source_auto_update_interval: Option<Duration>,
+    pub install_progress: Option<fn(&InstallProgress)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMode {
+    Auto,
+    Private,
+    SystemWingetMirror,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveSourceMode {
+    Private,
+    SystemWingetDirect,
+    SystemWingetMirror,
 }
 
 impl RepositoryOptions {
@@ -168,13 +185,20 @@ impl RepositoryOptions {
         Self {
             app_root: app_root.into(),
             user_agent: DEFAULT_USER_AGENT.to_owned(),
+            source_mode: SourceMode::Private,
             pre_indexed_source_auto_update_interval: Some(Duration::minutes(DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES)),
+            install_progress: None,
         }
     }
 
     /// Uses the default per-user app-data root that the CLI also uses.
     pub fn for_current_user() -> Result<Self> {
-        Ok(Self::new(default_app_root()?))
+        let source_mode = if std::env::var_os("PINGET_APPROOT").is_some() {
+            SourceMode::Private
+        } else {
+            SourceMode::Auto
+        };
+        Ok(Self::new(default_app_root()?).with_source_mode(source_mode))
     }
 
     /// Overrides the HTTP user-agent sent to source endpoints.
@@ -184,10 +208,25 @@ impl RepositoryOptions {
         self
     }
 
+    #[must_use]
+    pub fn with_source_mode(mut self, source_mode: SourceMode) -> Self {
+        self.source_mode = source_mode;
+        self
+    }
+
     /// Overrides automatic freshness checks for existing pre-indexed source indexes.
     #[must_use]
     pub fn with_pre_indexed_source_auto_update_interval(mut self, interval: Option<Duration>) -> Self {
         self.pre_indexed_source_auto_update_interval = interval;
+        self
+    }
+
+    /// Receives coarse install/update phase notifications. Intended for CLIs
+    /// and host applications that need to show progress while downloads or
+    /// silent installers are running.
+    #[must_use]
+    pub fn with_install_progress(mut self, progress: fn(&InstallProgress)) -> Self {
+        self.install_progress = Some(progress);
         self
     }
 }
@@ -670,6 +709,20 @@ pub struct InstallResult {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub enum InstallProgress {
+    ResolvingManifest,
+    ResolvedManifest { package_id: String, version: String },
+    CheckingInstalled,
+    InstallingDependencies,
+    SelectingInstaller,
+    DownloadingInstaller { url: String, path: PathBuf },
+    VerifyingInstaller { path: PathBuf },
+    StartingInstaller { installer_type: String, path: PathBuf },
+    WaitingForInstaller { installer_type: String },
+    InstallerFinished { exit_code: i32 },
+}
+
 impl InstallerSwitches {
     fn with_fallback(&self, fallback: &Self) -> Self {
         Self {
@@ -724,6 +777,8 @@ struct InstalledPackage {
     scope: Option<String>,
     installer_category: Option<String>,
     install_location: Option<String>,
+    winget_package_identifier: Option<String>,
+    winget_source_identifier: Option<String>,
     package_family_names: Vec<String>,
     product_codes: Vec<String>,
     upgrade_codes: Vec<String>,
@@ -770,6 +825,50 @@ struct SearchLocatedResult {
     warnings: Vec<String>,
     failures: Vec<SourceSearchFailure>,
     truncated: bool,
+}
+
+fn single_match_from_located(
+    located: SearchLocatedResult,
+    report_first_source_failure: bool,
+) -> Result<(LocatedMatch, Vec<String>)> {
+    if located.matches.is_empty() {
+        if report_first_source_failure && let Some(failure) = located.failures.first() {
+            bail!("failed to search source '{}': {}", failure.source_name, failure.message);
+        }
+        bail!("no package matched the supplied query");
+    }
+
+    if located.matches.len() > 1 {
+        let choices = located
+            .matches
+            .iter()
+            .take(10)
+            .map(|item| {
+                format!(
+                    "{} [{}] ({})",
+                    item.display.name, item.display.id, item.display.source_name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("multiple packages matched: {choices}");
+    }
+
+    Ok((located.matches.into_iter().next().expect("one match"), located.warnings))
+}
+
+fn should_retry_show_across_system_winget_sources(
+    uses_system_winget_sources: bool,
+    query: &PackageQuery,
+    located: &SearchLocatedResult,
+) -> bool {
+    uses_system_winget_sources
+        && query
+            .source
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case("winget"))
+        && located.matches.is_empty()
+        && located.failures.is_empty()
 }
 
 #[derive(Debug, Clone)]
@@ -844,7 +943,8 @@ pub struct Repository {
     user_agent: String,
     client: Client,
     store: SourceStore,
-    use_system_winget_sources: bool,
+    source_mode: EffectiveSourceMode,
+    install_progress: Option<fn(&InstallProgress)>,
     pre_indexed_source_auto_update_interval: Option<Duration>,
     preindexed_refresh_attempts: HashMap<String, PreindexedRefreshAttempt>,
 }
@@ -907,8 +1007,7 @@ impl Repository {
     /// Opens the repository with explicit hosting options for library consumers.
     pub fn open_with_options(options: RepositoryOptions) -> Result<Self> {
         ensure_app_dirs(&options.app_root)?;
-        let use_system_winget_sources = uses_system_winget_source_commands(&options.app_root);
-        let store = load_store(&options.app_root)?;
+        let (source_mode, store) = load_effective_source_store(&options.app_root, options.source_mode)?;
         let client = Client::builder()
             .user_agent(&options.user_agent)
             .timeout(StdDuration::from_secs(30 * 60))
@@ -919,10 +1018,25 @@ impl Repository {
             user_agent: options.user_agent,
             client,
             store,
-            use_system_winget_sources,
+            source_mode,
+            install_progress: options.install_progress,
             pre_indexed_source_auto_update_interval: options.pre_indexed_source_auto_update_interval,
             preindexed_refresh_attempts: HashMap::new(),
         })
+    }
+
+    fn uses_system_winget_sources(&self) -> bool {
+        self.source_mode != EffectiveSourceMode::Private
+    }
+
+    fn mirrors_system_winget_sources(&self) -> bool {
+        self.source_mode == EffectiveSourceMode::SystemWingetMirror
+    }
+
+    fn emit_install_progress(&self, progress: InstallProgress) {
+        if let Some(callback) = self.install_progress {
+            callback(&progress);
+        }
     }
 
     pub fn app_root(&self) -> &Path {
@@ -946,7 +1060,7 @@ impl Repository {
         explicit: bool,
         priority: i32,
     ) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             system_winget_add_source(name, arg, kind, &normalize_source_trust_level(trust_level)?, explicit)?;
             self.refresh_system_winget_sources()?;
             return Ok(());
@@ -972,12 +1086,14 @@ impl Repository {
             etag: None,
             last_modified: None,
         });
-        self.save_store()?;
+        if self.source_mode != EffectiveSourceMode::SystemWingetDirect {
+            self.save_store()?;
+        }
         Ok(())
     }
 
     pub fn edit_source(&mut self, name: &str, explicit: Option<bool>, trust_level: Option<&str>) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             bail!("Editing system WinGet sources is not supported by winget source commands.");
         }
 
@@ -1001,7 +1117,7 @@ impl Repository {
     }
 
     pub fn remove_source(&mut self, name: &str) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             system_winget_remove_source(name)?;
             self.refresh_system_winget_sources()?;
             return Ok(());
@@ -1024,7 +1140,7 @@ impl Repository {
     }
 
     pub fn reset_source(&mut self, name: &str) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             system_winget_reset_source(name)?;
             self.refresh_system_winget_sources()?;
             return Ok(());
@@ -1061,7 +1177,7 @@ impl Repository {
     }
 
     pub fn reset_sources(&mut self) -> Result<()> {
-        if self.use_system_winget_sources {
+        if self.uses_system_winget_sources() {
             system_winget_reset_sources()?;
             self.refresh_system_winget_sources()?;
             return Ok(());
@@ -1175,8 +1291,12 @@ impl Repository {
     }
 
     pub fn update_sources(&mut self, source_name: Option<&str>) -> Result<Vec<SourceUpdateResult>> {
-        if self.use_system_winget_sources {
+        if self.source_mode == EffectiveSourceMode::SystemWingetDirect {
             return self.update_system_winget_sources(source_name);
+        }
+
+        if self.mirrors_system_winget_sources() {
+            self.refresh_system_winget_sources()?;
         }
 
         let indexes = self.resolve_source_indexes(source_name)?;
@@ -1235,12 +1355,10 @@ impl Repository {
             bail!("list --source currently requires a query or explicit filter");
         }
 
+        self.refresh_system_winget_sources()?;
+
         let has_filter = list_query_needs_available_lookup(query);
-        // Plain `list` should still correlate installed packages back to their
-        // catalog identities so callers see canonical package ids/source names,
-        // matching winget and the fixed C# Pinget behavior. `upgrade_only`
-        // still adds the available-version specific filtering on top.
-        let needs_available = true;
+        let needs_available = has_filter || query.upgrade_only;
 
         let mut warnings = Vec::new();
         if !installed_package_discovery_supported() {
@@ -1248,24 +1366,13 @@ impl Repository {
         }
         let mut installed = collect_installed_packages(query.install_scope.as_deref())?;
 
-        if needs_available {
-            // Authoritative correlation via the v2 index's identity tables
-            // (PackageFamilyName / ProductCode / UpgradeCode). This is winget's
-            // primary path and resolves cases where display-name matching is
-            // ambiguous (Microsoft.Teams vs Microsoft.Teams.Free) or impossible
-            // (MSIX with `ms-resource:` placeholder names).
-            warnings.extend(self.correlate_installed_via_index(&mut installed, query.source.as_deref())?);
-
-            // ARP entries that lack identity keys (no PFN/PC/UC) still match
-            // winget's ARP correlation when their (DisplayName, Publisher),
-            // run through the NameNormalizer, lands on a single package in
-            // norm_names2 ∩ norm_publishers2. Covers Inno Setup-style
-            // installers, MSIs whose ARP keys don't include ProductCode, and
-            // any vendor that publishes a DisplayName that differs from the
-            // catalog's PackageName but matches an AppsAndFeaturesEntries
-            // DisplayName.
-            warnings.extend(self.correlate_installed_by_normalized_identity(&mut installed, query.source.as_deref())?);
-        }
+        // Plain `list` should still correlate installed packages back to their
+        // catalog identities so callers see canonical package ids/source names.
+        // Available-version lookups and loose name-only enrichment remain gated
+        // by `needs_available` below.
+        warnings.extend(self.correlate_installed_via_installed_db(&mut installed, query.source.as_deref())?);
+        warnings.extend(self.correlate_installed_via_index(&mut installed, query.source.as_deref())?);
+        warnings.extend(self.correlate_installed_by_normalized_identity(&mut installed, query.source.as_deref())?);
 
         if needs_available && has_filter {
             // Filtered lookup: search sources with the user's query for any
@@ -1335,9 +1442,12 @@ impl Repository {
         };
         let mut list_matches = matches
             .into_iter()
-            .map(list_match_from_installed)
+            .map(|package| list_match_from_installed(package, &self.store.sources))
             .filter(|item| !query.upgrade_only || query.include_pinned || !is_upgrade_blocked_by_pin(item, &pins))
             .collect::<Vec<_>>();
+        if !query.upgrade_only {
+            list_matches = suppress_duplicate_available_versions(list_matches);
+        }
         let truncated = if let Some(limit) = query.count {
             let was_truncated = list_matches.len() > limit;
             list_matches.truncate(limit);
@@ -1390,6 +1500,109 @@ impl Repository {
         }
 
         Ok(located.warnings)
+    }
+
+    /// Uses winget's per-source installed tracking DB when available. This is
+    /// an exact identity signal recorded by winget itself, and it preserves
+    /// source order for sources that do not expose a preindexed identity table
+    /// such as REST sources.
+    fn correlate_installed_via_installed_db(
+        &mut self,
+        installed: &mut [InstalledPackage],
+        requested_source: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let source_indices = self
+            .store
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                requested_source
+                    .map(|name| source.name.eq_ignore_ascii_case(name))
+                    .unwrap_or(true)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        for source_index in source_indices {
+            let source = self.source_clone(source_index);
+            let installed_db_path = self.source_installed_db_path(&source);
+            if !installed_db_path.exists() {
+                continue;
+            }
+
+            let connection = Self::open_sqlite_connection(installed_db_path)?;
+            if !installed_db_identity_tables_present(&connection)? {
+                continue;
+            }
+
+            for package in installed.iter_mut() {
+                if package.correlated.is_some() {
+                    continue;
+                }
+                let Some((id, name, matched_by)) = lookup_installed_db_identity_match(&connection, package)? else {
+                    continue;
+                };
+                let (id, name, moniker, version) = if source.kind == SourceKind::PreIndexed {
+                    match self
+                        .open_preindexed_connection(source_index)
+                        .and_then(|index_connection| {
+                            let Some(meta) = lookup_v2_metadata_by_id(&index_connection, &id)? else {
+                                return Ok((id.clone(), name.clone(), None, None));
+                            };
+                            let (canonical_installed, anchored_latest) =
+                                match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
+                                    Ok((entries, _)) => (
+                                        map_arp_version_to_catalog(&entries, &package.installed_version)
+                                            .or_else(|| {
+                                                less_than_latest_arp_anchored_version(
+                                                    &entries,
+                                                    &package.installed_version,
+                                                )
+                                            })
+                                            .or_else(|| {
+                                                greater_than_latest_arp_anchored_version(
+                                                    &entries,
+                                                    &package.installed_version,
+                                                    &meta.latest_version,
+                                                )
+                                            }),
+                                        latest_arp_anchored_version(&entries),
+                                    ),
+                                    Err(_) => (None, None),
+                                };
+                            let version = match (&canonical_installed, anchored_latest) {
+                                (Some(canonical), _) if is_greater_than_version_marker(canonical) => None,
+                                (Some(_), Some(anchored)) => Some(anchored),
+                                (Some(_), None) => None,
+                                _ => Some(meta.latest_version.clone()),
+                            };
+                            if let Some(version) = canonical_installed {
+                                package.installed_version = version;
+                                package.installed_version_canonical = true;
+                            }
+                            Ok((meta.id, meta.name, meta.moniker, version))
+                        }) {
+                        Ok(enriched) => enriched,
+                        Err(_) => (id, name, None, None),
+                    }
+                } else {
+                    (id, name, None, None)
+                };
+                package.correlated = Some(SearchMatch {
+                    source_name: source.name.clone(),
+                    source_kind: source.kind,
+                    id,
+                    name,
+                    moniker,
+                    version,
+                    channel: None,
+                    match_criteria: Some(matched_by.to_owned()),
+                });
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// Correlates installed packages against the v2 pre-indexed catalog using
@@ -1450,9 +1663,17 @@ impl Repository {
                 let (canonical_installed, anchored_latest) =
                     match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
                         Ok((entries, _)) => (
-                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version).or_else(|| {
-                                less_than_latest_arp_anchored_version(&entries, &installed[idx].installed_version)
-                            }),
+                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version)
+                                .or_else(|| {
+                                    less_than_latest_arp_anchored_version(&entries, &installed[idx].installed_version)
+                                })
+                                .or_else(|| {
+                                    greater_than_latest_arp_anchored_version(
+                                        &entries,
+                                        &installed[idx].installed_version,
+                                        &meta.latest_version,
+                                    )
+                                }),
                             latest_arp_anchored_version(&entries),
                         ),
                         Err(_) => (None, None),
@@ -1464,8 +1685,10 @@ impl Repository {
                 // 1.8's `8000.836.2153.0`) that would manufacture a phantom
                 // upgrade against an installed canonical like `1.8.6`.
                 let available_version = match (&canonical_installed, anchored_latest) {
-                    (Some(_), Some(anchored)) => anchored,
-                    _ => meta.latest_version,
+                    (Some(canonical), _) if is_greater_than_version_marker(canonical) => None,
+                    (Some(_), Some(anchored)) => Some(anchored),
+                    (Some(_), None) => None,
+                    _ => Some(meta.latest_version),
                 };
                 let installed_pkg = &mut installed[idx];
                 installed_pkg.correlated = Some(SearchMatch {
@@ -1474,7 +1697,7 @@ impl Repository {
                     id: meta.id,
                     name: meta.name,
                     moniker: meta.moniker,
-                    version: Some(available_version),
+                    version: available_version,
                     channel: None,
                     match_criteria: Some(by.to_owned()),
                 });
@@ -1566,14 +1789,26 @@ impl Repository {
                 let (canonical_installed, anchored_latest) =
                     match self.load_v2_version_data(&source, meta.rowid, &meta.package_hash) {
                         Ok((entries, _)) => (
-                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version),
+                            map_arp_version_to_catalog(&entries, &installed[idx].installed_version)
+                                .or_else(|| {
+                                    less_than_latest_arp_anchored_version(&entries, &installed[idx].installed_version)
+                                })
+                                .or_else(|| {
+                                    greater_than_latest_arp_anchored_version(
+                                        &entries,
+                                        &installed[idx].installed_version,
+                                        &meta.latest_version,
+                                    )
+                                }),
                             latest_arp_anchored_version(&entries),
                         ),
                         Err(_) => (None, None),
                     };
                 let available_version = match (&canonical_installed, anchored_latest) {
-                    (Some(_), Some(anchored)) => anchored,
-                    _ => meta.latest_version,
+                    (Some(canonical), _) if is_greater_than_version_marker(canonical) => None,
+                    (Some(_), Some(anchored)) => Some(anchored),
+                    (Some(_), None) => None,
+                    _ => Some(meta.latest_version),
                 };
                 let installed_pkg = &mut installed[idx];
                 installed_pkg.correlated = Some(SearchMatch {
@@ -1582,7 +1817,7 @@ impl Repository {
                     id: meta.id,
                     name: meta.name,
                     moniker: meta.moniker,
-                    version: Some(available_version),
+                    version: available_version,
                     channel: None,
                     match_criteria: Some("NormalizedNameAndPublisher".to_owned()),
                 });
@@ -1678,15 +1913,21 @@ impl Repository {
 
                 if !installed[idx].installed_version_canonical {
                     let canonical_installed = map_arp_version_to_catalog(&entries, &installed[idx].installed_version)
-                        .or_else(|| less_than_latest_arp_anchored_version(&entries, &installed[idx].installed_version));
+                        .or_else(|| less_than_latest_arp_anchored_version(&entries, &installed[idx].installed_version))
+                        .or_else(|| {
+                            greater_than_latest_arp_anchored_version(
+                                &entries,
+                                &installed[idx].installed_version,
+                                &meta.latest_version,
+                            )
+                        });
                     let anchored_latest = latest_arp_anchored_version(&entries);
                     if let Some(canonical) = canonical_installed {
+                        let greater_than_latest = is_greater_than_version_marker(&canonical);
                         installed[idx].installed_version = canonical;
                         installed[idx].installed_version_canonical = true;
-                        if let (Some(correlated), Some(anchored)) =
-                            (installed[idx].correlated.as_mut(), anchored_latest)
-                        {
-                            correlated.version = Some(anchored);
+                        if let Some(correlated) = installed[idx].correlated.as_mut() {
+                            correlated.version = if greater_than_latest { None } else { anchored_latest };
                         }
                     }
                 }
@@ -1728,7 +1969,7 @@ impl Repository {
     }
 
     pub fn show_versions(&mut self, query: &PackageQuery) -> Result<VersionsResult> {
-        let (located, warnings) = self.find_single_match(query)?;
+        let (located, warnings) = self.find_single_match_for_show(query, SearchSemantics::Single)?;
         let versions = self.versions_for_match(&located, query)?;
         Ok(VersionsResult {
             package: located.display,
@@ -1738,7 +1979,7 @@ impl Repository {
     }
 
     pub fn show(&mut self, query: &PackageQuery) -> Result<ShowResult> {
-        let (located, warnings) = self.find_single_match(query)?;
+        let (located, warnings) = self.find_single_match_for_show(query, SearchSemantics::Single)?;
         let (manifest, manifest_documents, cached_files) = self.manifest_for_match(&located, query)?;
         let selected_installer = select_installer(&manifest.installers, query);
 
@@ -1878,11 +2119,46 @@ impl Repository {
     }
 
     fn save_store(&self) -> Result<()> {
-        save_store(&self.app_root, &self.store)
+        if self.mirrors_system_winget_sources() {
+            save_system_winget_mirror_store(&self.app_root, &self.store)
+        } else {
+            save_store(&self.app_root, &self.store)
+        }
     }
 
     fn source_state_dir(&self, source: &SourceRecord) -> PathBuf {
-        source_state_dir(&self.app_root, source)
+        source_state_dir_with_keying(&self.app_root, source, self.mirrors_system_winget_sources())
+    }
+
+    fn source_installed_db_path(&self, source: &SourceRecord) -> PathBuf {
+        source_installed_db_path_with_keying(&self.app_root, source, self.mirrors_system_winget_sources())
+    }
+
+    fn preindexed_package_path(&self, source: &SourceRecord) -> PathBuf {
+        self.source_state_dir(source).join("source.msix")
+    }
+
+    fn preindexed_index_path(&self, source: &SourceRecord) -> PathBuf {
+        self.source_state_dir(source).join("index.db")
+    }
+
+    fn rest_information_cache_path(&self, source: &SourceRecord) -> PathBuf {
+        self.source_state_dir(source).join("rest-information.json")
+    }
+
+    fn rest_manifest_cache_path(
+        &self,
+        source: &SourceRecord,
+        package_id: &str,
+        version: &str,
+        channel: &str,
+    ) -> PathBuf {
+        let key = format!("{}|{}|{}|{}", source.identifier, package_id, version, channel);
+        let digest = sha256_hex(key.as_bytes());
+        cache_root(&self.app_root)
+            .join("REST_M")
+            .join(sanitize_path_segment(&source.identifier))
+            .join(format!("{digest}.json"))
     }
 
     // ── Install / download ──
@@ -1940,8 +2216,13 @@ impl Repository {
         });
         let dest = download_dir.join(filename);
 
+        self.emit_install_progress(InstallProgress::DownloadingInstaller {
+            url: url.to_owned(),
+            path: dest.clone(),
+        });
         let actual_hash = download_installer_to_file(&self.user_agent, url, &dest)?;
 
+        self.emit_install_progress(InstallProgress::VerifyingInstaller { path: dest.clone() });
         if let Err(error) =
             verify_installer_hash_hex(installer.sha256.as_deref(), &actual_hash, request.ignore_security_hash)
         {
@@ -1974,7 +2255,12 @@ impl Repository {
     }
 
     pub fn install_request(&mut self, request: &InstallRequest) -> Result<InstallResult> {
+        self.emit_install_progress(InstallProgress::ResolvingManifest);
         let manifest = self.resolve_manifest_for_install(request)?;
+        self.emit_install_progress(InstallProgress::ResolvedManifest {
+            package_id: manifest.id.clone(),
+            version: manifest.version.clone(),
+        });
         if !package_actions_supported() {
             let installer_type = select_installer(&manifest.installers, &request.query)
                 .and_then(|installer| installer.installer_type)
@@ -1988,12 +2274,14 @@ impl Repository {
             ));
         }
 
+        self.emit_install_progress(InstallProgress::CheckingInstalled);
         let existing_match = self.find_installed_package_for_install(request, &manifest)?;
         if let Some(no_op_result) = Self::create_install_no_op_result(request, &manifest, existing_match.as_ref()) {
             return Ok(no_op_result);
         }
 
         Self::ensure_package_agreements_accepted(&manifest, request)?;
+        self.emit_install_progress(InstallProgress::InstallingDependencies);
         self.install_dependencies(&manifest, request, &mut HashSet::new())?;
 
         if request.dependencies_only {
@@ -2009,6 +2297,7 @@ impl Repository {
             });
         }
 
+        self.emit_install_progress(InstallProgress::SelectingInstaller);
         let installer = select_installer(&manifest.installers, &request.query)
             .ok_or_else(|| anyhow!("No applicable installer found"))?;
 
@@ -2033,7 +2322,15 @@ impl Repository {
 
         let installer_type = installer.installer_type.as_deref().unwrap_or("exe").to_lowercase();
 
+        self.emit_install_progress(InstallProgress::StartingInstaller {
+            installer_type: installer_type.clone(),
+            path: installer_path.clone(),
+        });
+        self.emit_install_progress(InstallProgress::WaitingForInstaller {
+            installer_type: installer_type.clone(),
+        });
         let exit_code = dispatch_installer(&installer_path, &installer_type, request, &manifest, &installer)?;
+        self.emit_install_progress(InstallProgress::InstallerFinished { exit_code });
 
         Ok(InstallResult {
             package_id: manifest.id.clone(),
@@ -2440,39 +2737,36 @@ impl Repository {
         self.find_single_match_with_semantics(query, SearchSemantics::Single)
     }
 
+    fn find_single_match_for_show(
+        &mut self,
+        query: &PackageQuery,
+        semantics: SearchSemantics,
+    ) -> Result<(LocatedMatch, Vec<String>)> {
+        let located = self.search_located(query, semantics)?;
+        if self.should_retry_show_across_system_winget_sources(query, &located) {
+            let mut fallback_query = query.clone();
+            fallback_query.source = None;
+            return single_match_from_located(self.search_located(&fallback_query, semantics)?, false);
+        }
+
+        single_match_from_located(located, query.source.is_some())
+    }
+
+    fn should_retry_show_across_system_winget_sources(
+        &self,
+        query: &PackageQuery,
+        located: &SearchLocatedResult,
+    ) -> bool {
+        should_retry_show_across_system_winget_sources(self.uses_system_winget_sources(), query, located)
+    }
+
     fn find_single_match_with_semantics(
         &mut self,
         query: &PackageQuery,
         semantics: SearchSemantics,
     ) -> Result<(LocatedMatch, Vec<String>)> {
         let located = self.search_located(query, semantics)?;
-
-        if located.matches.is_empty() {
-            if query.source.is_some()
-                && let Some(failure) = located.failures.first()
-            {
-                bail!("failed to search source '{}': {}", failure.source_name, failure.message);
-            }
-            bail!("no package matched the supplied query");
-        }
-
-        if located.matches.len() > 1 {
-            let choices = located
-                .matches
-                .iter()
-                .take(10)
-                .map(|item| {
-                    format!(
-                        "{} [{}] ({})",
-                        item.display.name, item.display.id, item.display.source_name
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!("multiple packages matched: {choices}");
-        }
-
-        Ok((located.matches.into_iter().next().expect("one match"), located.warnings))
+        single_match_from_located(located, query.source.is_some())
     }
 
     fn search_located(&mut self, query: &PackageQuery, semantics: SearchSemantics) -> Result<SearchLocatedResult> {
@@ -2887,7 +3181,7 @@ impl Repository {
 
     fn open_preindexed_connection_with_refresh(&mut self, source_index: usize) -> Result<PreindexedOpenConnection> {
         let source = self.source_clone(source_index);
-        let index_path = preindexed_index_path(&self.app_root, &source);
+        let index_path = self.preindexed_index_path(&source);
         let mut refresh = PreindexedRefreshOutcome::default();
         if !index_path.exists() {
             let _ = self.refresh_preindexed_source(source_index, true)?;
@@ -2984,7 +3278,7 @@ impl Repository {
 
     fn refresh_preindexed_source(&mut self, source_index: usize, force: bool) -> Result<String> {
         let source = self.source_clone(source_index);
-        let index_path = preindexed_index_path(&self.app_root, &source);
+        let index_path = self.preindexed_index_path(&source);
         let lock_key = self.preindexed_refresh_lock_key(&source);
         let refresh_lock = Self::preindexed_refresh_lock(&lock_key)?;
         let _guard = refresh_lock
@@ -2998,9 +3292,7 @@ impl Repository {
         let result = self.update_preindexed(source_index);
         self.record_preindexed_refresh_attempt(lock_key, result.is_ok());
         let detail = result?;
-        if !self.use_system_winget_sources {
-            self.save_store()?;
-        }
+        self.save_store()?;
         Ok(detail)
     }
 
@@ -3015,9 +3307,9 @@ impl Repository {
 
     fn update_preindexed(&mut self, source_index: usize) -> Result<String> {
         let source_snapshot = self.store.sources[source_index].clone();
-        let state_dir = source_state_dir(&self.app_root, &source_snapshot);
+        let state_dir = self.source_state_dir(&source_snapshot);
         fs::create_dir_all(&state_dir).context("failed to create source state directory")?;
-        let index_path = preindexed_index_path(&self.app_root, &source_snapshot);
+        let index_path = self.preindexed_index_path(&source_snapshot);
         let has_local_index = index_path.exists();
 
         let mut last_error = None;
@@ -3063,7 +3355,7 @@ impl Repository {
                     let index_bytes = extract_zip_member(&payload, "Public/index.db")
                         .context("preindexed package did not contain Public/index.db")?;
 
-                    fs::write(preindexed_package_path(&self.app_root, &source_snapshot), &payload)
+                    fs::write(self.preindexed_package_path(&source_snapshot), &payload)
                         .context("failed to persist source package")?;
                     let temp_index_path = state_dir.join(format!(
                         "index.{}.tmp",
@@ -3136,7 +3428,7 @@ impl Repository {
 
     fn load_rest_information(&mut self, source_index: usize) -> Result<RestInformation> {
         let source = self.source_clone(source_index);
-        let cache_path = rest_information_cache_path(&self.app_root, &source);
+        let cache_path = self.rest_information_cache_path(&source);
 
         if cache_path.exists() {
             let cache = serde_json::from_slice::<RestInfoCache>(
@@ -3178,7 +3470,7 @@ impl Repository {
                 expires_at: Utc::now() + Duration::seconds(i64::try_from(max_age).unwrap_or(i64::MAX)),
                 value: info.clone(),
             };
-            write_json(rest_information_cache_path(&self.app_root, &source), &cache)?;
+            write_json(self.rest_information_cache_path(&source), &cache)?;
         }
 
         Ok(info)
@@ -3190,7 +3482,7 @@ impl Repository {
         package_rowid: i64,
         package_hash: &str,
     ) -> Result<(Vec<PackageVersionDataEntry>, PathBuf)> {
-        let connection = Self::open_sqlite_connection(preindexed_index_path(&self.app_root, source))
+        let connection = Self::open_sqlite_connection(self.preindexed_index_path(source))
             .context("failed to reopen preindexed index for V2 version data")?;
         let package_hash = package_hash.to_ascii_lowercase();
         let package_id = query_optional_value(
@@ -3265,7 +3557,7 @@ impl Repository {
         version: &str,
         channel: &str,
     ) -> Result<(Vec<u8>, PathBuf)> {
-        let cache_path = rest_manifest_cache_path_with_root(&self.app_root, source, package_id, version, channel);
+        let cache_path = self.rest_manifest_cache_path(source, package_id, version, channel);
         if cache_path.exists() {
             return Ok((
                 fs::read(&cache_path).context("failed to read cached REST manifest")?,
@@ -3324,11 +3616,20 @@ impl Repository {
 
     fn resolve_source_indexes(&self, source_name: Option<&str>) -> Result<Vec<usize>> {
         if let Some(name) = source_name {
-            let index = self
+            if let Some(index) = self
                 .store
                 .sources
                 .iter()
                 .position(|source| source.name.eq_ignore_ascii_case(name))
+            {
+                return Ok(vec![index]);
+            }
+
+            let index = self
+                .store
+                .sources
+                .iter()
+                .position(|source| source.identifier.eq_ignore_ascii_case(name))
                 .ok_or_else(|| anyhow!("source '{name}' was not configured"))?;
             return Ok(vec![index]);
         }
@@ -3354,9 +3655,11 @@ impl Repository {
     }
 
     fn refresh_system_winget_sources(&mut self) -> Result<()> {
-        if self.use_system_winget_sources {
-            self.store = load_system_winget_source_store()?;
-        }
+        self.store = match self.source_mode {
+            EffectiveSourceMode::Private => self.store.clone(),
+            EffectiveSourceMode::SystemWingetDirect => load_system_winget_source_store()?,
+            EffectiveSourceMode::SystemWingetMirror => refresh_system_winget_mirror_store(&self.app_root)?,
+        };
         Ok(())
     }
 
@@ -3465,11 +3768,18 @@ fn allow_loose_list_correlation(query: &ListQuery) -> bool {
 }
 
 fn installed_package_has_upgrade(package: &InstalledPackage) -> bool {
+    if is_greater_than_version_marker(&package.installed_version) {
+        return false;
+    }
     package
         .correlated
         .as_ref()
         .and_then(|candidate| candidate.version.as_deref())
         .is_some_and(|version| compare_version(version, &package.installed_version) == Ordering::Greater)
+}
+
+fn is_greater_than_version_marker(version: &str) -> bool {
+    version.trim_start().starts_with('>')
 }
 
 fn installed_package_has_unknown_version(package: &InstalledPackage) -> bool {
@@ -3598,11 +3908,12 @@ fn version_matches_pin_pattern(version: &str, pattern: &str) -> bool {
     version.eq_ignore_ascii_case(pattern)
 }
 
-fn list_match_from_installed(package: InstalledPackage) -> ListMatch {
+fn list_match_from_installed(package: InstalledPackage, sources: &[SourceRecord]) -> ListMatch {
     let available_version = package.correlated.as_ref().and_then(|candidate| {
         candidate.version.as_ref().and_then(|candidate_version| {
-            if installed_package_has_unknown_version(&package)
-                || compare_version(candidate_version, &package.installed_version) == Ordering::Greater
+            if !is_greater_than_version_marker(&package.installed_version)
+                && (installed_package_has_unknown_version(&package)
+                    || compare_version(candidate_version, &package.installed_version) == Ordering::Greater)
             {
                 Some(candidate_version.clone())
             } else {
@@ -3610,16 +3921,38 @@ fn list_match_from_installed(package: InstalledPackage) -> ListMatch {
             }
         })
     });
-    let source_name = package
+    let mut source_name = package
         .correlated
         .as_ref()
         .map(|candidate| candidate.source_name.clone())
         .filter(|value| !value.is_empty());
-    let id = package
+    let mut id = package
         .correlated
         .as_ref()
         .map(|candidate| candidate.id.clone())
         .unwrap_or_else(|| package.local_id.clone());
+
+    if source_name.is_none()
+        && let Some(package_id) = package
+            .winget_package_identifier
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+    {
+        id = package_id.to_owned();
+        source_name = package
+            .winget_source_identifier
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|identifier| source_name_from_identifier(identifier, sources));
+    }
+
+    if source_name.is_none()
+        && let Some((local_package_id, local_source_name)) =
+            winget_package_identity_from_local_id(&package.local_id, sources)
+    {
+        id = local_package_id;
+        source_name = Some(local_source_name);
+    }
 
     ListMatch {
         name: package.name,
@@ -3636,6 +3969,87 @@ fn list_match_from_installed(package: InstalledPackage) -> ListMatch {
         product_codes: package.product_codes,
         upgrade_codes: package.upgrade_codes,
     }
+}
+
+fn suppress_duplicate_available_versions(matches: Vec<ListMatch>) -> Vec<ListMatch> {
+    let mut grouped: HashMap<(String, String), Vec<usize>> = HashMap::new();
+    for (index, item) in matches.iter().enumerate() {
+        let Some(source_name) = item.source_name.as_ref().filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        grouped
+            .entry((source_name.to_ascii_lowercase(), item.id.to_ascii_lowercase()))
+            .or_default()
+            .push(index);
+    }
+
+    let mut keep = BTreeSet::new();
+    for indexes in grouped.values().filter(|indexes| indexes.len() > 1) {
+        let Some(best) = indexes
+            .iter()
+            .map(|index| matches[*index].installed_version.as_str())
+            .max_by(|left, right| compare_version(left, right))
+        else {
+            continue;
+        };
+        for index in indexes {
+            if compare_version(&matches[*index].installed_version, best) == Ordering::Equal {
+                keep.insert(*index);
+            }
+        }
+    }
+
+    matches
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut item)| {
+            if item.available_version.is_some() && !keep.contains(&index) {
+                let is_duplicate = item
+                    .source_name
+                    .as_ref()
+                    .map(|source_name| {
+                        grouped
+                            .get(&(source_name.to_ascii_lowercase(), item.id.to_ascii_lowercase()))
+                            .is_some_and(|indexes| indexes.len() > 1)
+                    })
+                    .unwrap_or(false);
+                if is_duplicate {
+                    item.available_version = None;
+                }
+            }
+            item
+        })
+        .collect()
+}
+
+fn source_name_from_identifier(identifier: &str, sources: &[SourceRecord]) -> String {
+    sources
+        .iter()
+        .find(|source| source.identifier.eq_ignore_ascii_case(identifier))
+        .map(|source| source.name.clone())
+        .unwrap_or_else(|| identifier.to_owned())
+}
+
+fn winget_package_identity_from_local_id(local_id: &str, sources: &[SourceRecord]) -> Option<(String, String)> {
+    let package_id_start_index = local_id.rfind('\\').map_or(0, |index| index + 1);
+    for source in sources {
+        let source_suffix = format!("_{}", source.identifier);
+        let Some(source_identifier_start_index) = local_id.len().checked_sub(source_suffix.len()) else {
+            continue;
+        };
+        if !local_id[source_identifier_start_index..].eq_ignore_ascii_case(&source_suffix) {
+            continue;
+        }
+        if source_identifier_start_index <= package_id_start_index {
+            return None;
+        }
+        let package_id = local_id[package_id_start_index..source_identifier_start_index].to_owned();
+        if package_id.trim().is_empty() {
+            return None;
+        }
+        return Some((package_id, source.name.clone()));
+    }
+    None
 }
 
 fn list_sort_weight(package: &InstalledPackage) -> usize {
@@ -3893,6 +4307,89 @@ fn lookup_identity_match_v2(
     Ok(None)
 }
 
+fn installed_db_identity_tables_present(connection: &Connection) -> Result<bool> {
+    Ok(table_exists(connection, "manifest")?
+        && table_exists(connection, "ids")?
+        && table_exists(connection, "names")?
+        && ((table_exists(connection, "pfns")? && table_exists(connection, "pfns_map")?)
+            || (table_exists(connection, "productcodes")? && table_exists(connection, "productcodes_map")?)
+            || (table_exists(connection, "upgradecodes")? && table_exists(connection, "upgradecodes_map")?)))
+}
+
+fn table_exists(connection: &Connection, name: &str) -> Result<bool> {
+    query_optional_value(
+        connection,
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        vec![SqlValue::Text(name.to_owned())],
+        |row| row_i64(row, 0),
+    )
+    .map(|value| value.is_some())
+}
+
+fn lookup_installed_db_identity_match(
+    connection: &Connection,
+    package: &InstalledPackage,
+) -> Result<Option<(String, String, &'static str)>> {
+    for pfn in &package.package_family_names {
+        if let Some(hit) =
+            lookup_installed_db_identity_match_value(connection, "pfns", "pfns_map", "pfn", pfn, "PackageFamilyName")?
+        {
+            return Ok(Some(hit));
+        }
+    }
+    for code in &package.upgrade_codes {
+        if let Some(hit) = lookup_installed_db_identity_match_value(
+            connection,
+            "upgradecodes",
+            "upgradecodes_map",
+            "upgradecode",
+            code,
+            "UpgradeCode",
+        )? {
+            return Ok(Some(hit));
+        }
+    }
+    for code in &package.product_codes {
+        if let Some(hit) = lookup_installed_db_identity_match_value(
+            connection,
+            "productcodes",
+            "productcodes_map",
+            "productcode",
+            code,
+            "ProductCode",
+        )? {
+            return Ok(Some(hit));
+        }
+    }
+    Ok(None)
+}
+
+fn lookup_installed_db_identity_match_value(
+    connection: &Connection,
+    value_table: &'static str,
+    map_table: &'static str,
+    value_column: &'static str,
+    value: &str,
+    matched_by: &'static str,
+) -> Result<Option<(String, String, &'static str)>> {
+    let sql = format!(
+        "SELECT ids.id, names.name \
+         FROM {map_table} map \
+         JOIN {value_table} value ON map.{value_column} = value.rowid \
+         JOIN manifest ON map.manifest = manifest.rowid \
+         JOIN ids ON manifest.id = ids.rowid \
+         JOIN names ON manifest.name = names.rowid \
+         WHERE value.{value_column} = ?1 \
+         LIMIT 1"
+    );
+    query_optional_value(
+        connection,
+        &sql,
+        vec![SqlValue::Text(value.to_ascii_lowercase())],
+        |row| Ok((row_string(row, 0)?, row_string(row, 1)?, matched_by)),
+    )
+}
+
 /// Resolves a v2 package by its catalog id back to its rowid + hash so the
 /// post-correlation enrichment pass can load versionData for rows that
 /// correlated through the name-based fallback (which throws the rowid away).
@@ -4058,6 +4555,57 @@ fn less_than_latest_arp_anchored_version(entries: &[PackageVersionDataEntry], ar
     }
 
     Some(format!("< {}", latest.version))
+}
+
+/// Returns `> latest` when ARP range metadata proves the installed package
+/// version is newer than the newest catalog version that has ARP bounds. This
+/// happens for inbox MSIX frameworks that Windows services beyond winget's
+/// latest user-facing catalog mapping.
+fn greater_than_latest_arp_anchored_version(
+    entries: &[PackageVersionDataEntry],
+    arp_version: &str,
+    catalog_latest_version: &str,
+) -> Option<String> {
+    if arp_version.is_empty() || arp_version.eq_ignore_ascii_case("Unknown") {
+        return None;
+    }
+
+    let latest = entries
+        .iter()
+        .filter(|e| e.arp_min_version.is_some() && e.arp_max_version.is_some())
+        .max_by(|a, b| compare_version(&a.version, &b.version))?;
+    let latest_max = latest.arp_max_version.as_deref()?;
+    if !latest.version.eq_ignore_ascii_case(catalog_latest_version) {
+        return None;
+    }
+    if !has_different_leading_version_number(latest_max, &latest.version) {
+        return None;
+    }
+    if compare_version(arp_version, latest_max) != Ordering::Greater {
+        return None;
+    }
+
+    Some(format!("> {}", latest.version))
+}
+
+fn has_different_leading_version_number(left: &str, right: &str) -> bool {
+    let Some(left) = leading_version_number(left) else {
+        return false;
+    };
+    let Some(right) = leading_version_number(right) else {
+        return false;
+    };
+    !left.eq_ignore_ascii_case(right)
+}
+
+fn leading_version_number(value: &str) -> Option<&str> {
+    let trimmed = value.trim_start();
+    let length = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .map(char::len_utf8)
+        .sum();
+    (length > 0).then_some(&trimmed[..length])
 }
 
 /// Returns the latest catalog Version that carries ARP-range metadata
@@ -4264,6 +4812,8 @@ fn collect_uninstall_view(
         let installed_version = read_reg_string(&subkey, "DisplayVersion").unwrap_or_else(|| "Unknown".to_owned());
         let publisher = read_reg_string(&subkey, "Publisher");
         let install_location = read_reg_string(&subkey, "InstallLocation");
+        let winget_package_identifier = read_reg_string(&subkey, "WinGetPackageIdentifier");
+        let winget_source_identifier = read_reg_string(&subkey, "WinGetSourceIdentifier");
         let package_family_names = read_reg_string(&subkey, "PackageFamilyName")
             .into_iter()
             .collect::<Vec<_>>();
@@ -4320,6 +4870,8 @@ fn collect_uninstall_view(
             scope: Some(scope.to_owned()),
             installer_category,
             install_location,
+            winget_package_identifier,
+            winget_source_identifier,
             package_family_names,
             product_codes,
             upgrade_codes,
@@ -4355,15 +4907,22 @@ fn collect_appmodel_packages(
             Err(_) => continue,
         };
 
-        let Some(name) = read_reg_string(&subkey, "DisplayName").filter(|value| !value.is_empty()) else {
-            continue;
-        };
         let install_location = read_reg_string(&subkey, "PackageRootFolder");
         if install_location.as_deref().is_some_and(is_windows_system_path) {
             continue;
         }
 
         let Some(metadata) = parse_msix_package_full_name(&key_name) else {
+            continue;
+        };
+        if is_msix_split_resource_package(&metadata.resource_id) {
+            continue;
+        }
+
+        let Some(name) = read_reg_string(&subkey, "DisplayName")
+            .or_else(|| read_appmodel_display_name(&subkey))
+            .filter(|value| !value.is_empty())
+        else {
             continue;
         };
 
@@ -4386,6 +4945,8 @@ fn collect_appmodel_packages(
             scope: Some(scope.to_owned()),
             installer_category: Some("msix".to_owned()),
             install_location,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             package_family_names: vec![metadata.family_name],
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
@@ -4402,6 +4963,7 @@ fn collect_appmodel_packages(
 #[cfg(windows)]
 struct ParsedMsixPackageFullName {
     version: String,
+    resource_id: String,
     family_name: String,
 }
 
@@ -4432,8 +4994,20 @@ fn parse_msix_package_full_name(value: &str) -> Option<ParsedMsixPackageFullName
 
     Some(ParsedMsixPackageFullName {
         version: version.to_owned(),
+        resource_id: resource_id.to_owned(),
         family_name,
     })
+}
+
+#[cfg(windows)]
+fn read_appmodel_display_name(package_key: &RegKey) -> Option<String> {
+    let app_key = package_key.open_subkey(r"App\Capabilities").ok()?;
+    read_reg_string(&app_key, "ApplicationDescription").or_else(|| read_reg_string(&app_key, "ApplicationName"))
+}
+
+#[cfg(windows)]
+fn is_msix_split_resource_package(resource_id: &str) -> bool {
+    resource_id.trim().to_ascii_lowercase().starts_with("split.")
 }
 
 #[cfg(windows)]
@@ -4521,20 +5095,36 @@ fn admin_settings_path(app_root: &Path) -> PathBuf {
     app_root.join("admin-settings.json")
 }
 
+#[cfg(test)]
 fn source_state_dir(app_root: &Path, source: &SourceRecord) -> PathBuf {
+    source_state_dir_with_keying(app_root, source, false)
+}
+
+fn source_state_dir_with_keying(app_root: &Path, source: &SourceRecord, identifier_keyed: bool) -> PathBuf {
     if uses_packaged_layout(app_root) {
         return app_root
             .join(packaged_source_type(source.kind))
             .join(sanitize_path_segment(&source.identifier));
     }
 
+    if identifier_keyed {
+        return app_root.join("sources").join(sanitize_path_segment(&source.identifier));
+    }
+
     app_root.join("sources").join(sanitize_path_segment(&source.name))
 }
 
-fn preindexed_package_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
-    source_state_dir(app_root, source).join("source.msix")
+fn source_installed_db_path_with_keying(app_root: &Path, source: &SourceRecord, identifier_keyed: bool) -> PathBuf {
+    if uses_packaged_layout(app_root) {
+        return app_root
+            .join(sanitize_path_segment(&source.identifier))
+            .join("installed.db");
+    }
+
+    source_state_dir_with_keying(app_root, source, identifier_keyed).join("installed.db")
 }
 
+#[cfg(test)]
 fn preindexed_index_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
     source_state_dir(app_root, source).join("index.db")
 }
@@ -4647,25 +5237,6 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("failed to replace {} with {}", target.display(), source.display()))
 }
 
-fn rest_information_cache_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
-    source_state_dir(app_root, source).join("rest-information.json")
-}
-
-fn rest_manifest_cache_path_with_root(
-    app_root: &Path,
-    source: &SourceRecord,
-    package_id: &str,
-    version: &str,
-    channel: &str,
-) -> PathBuf {
-    let key = format!("{}|{}|{}|{}", source.identifier, package_id, version, channel);
-    let digest = sha256_hex(key.as_bytes());
-    cache_root(app_root)
-        .join("REST_M")
-        .join(sanitize_path_segment(&source.identifier))
-        .join(format!("{digest}.json"))
-}
-
 fn temp_cache_path(app_root: &Path, bucket: &str, identifier: &str) -> PathBuf {
     cache_root(app_root)
         .join(bucket)
@@ -4688,6 +5259,81 @@ fn load_store(app_root: &Path) -> Result<SourceStore> {
 
     let bytes = fs::read(path).context("failed to read source store")?;
     serde_json::from_slice(&bytes).context("failed to parse source store")
+}
+
+fn load_effective_source_store(app_root: &Path, source_mode: SourceMode) -> Result<(EffectiveSourceMode, SourceStore)> {
+    if uses_system_winget_source_commands(app_root) {
+        return Ok((
+            EffectiveSourceMode::SystemWingetDirect,
+            load_system_winget_source_store()?,
+        ));
+    }
+
+    match source_mode {
+        SourceMode::Private => Ok((EffectiveSourceMode::Private, load_store(app_root)?)),
+        SourceMode::SystemWingetMirror => {
+            let store = load_or_refresh_system_winget_mirror_store(app_root, false)?;
+            Ok((EffectiveSourceMode::SystemWingetMirror, store))
+        }
+        SourceMode::Auto => match load_or_refresh_system_winget_mirror_store(app_root, false) {
+            Ok(store) => Ok((EffectiveSourceMode::SystemWingetMirror, store)),
+            Err(_) => Ok((EffectiveSourceMode::Private, load_store(app_root)?)),
+        },
+    }
+}
+
+fn system_winget_mirror_store_path(app_root: &Path) -> PathBuf {
+    app_root.join(SYSTEM_WINGET_MIRROR_STORE_FILE_NAME)
+}
+
+fn load_system_winget_mirror_store(app_root: &Path) -> Result<Option<SourceStore>> {
+    let path = system_winget_mirror_store_path(app_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(path).context("failed to read system WinGet mirror source store")?;
+    serde_json::from_slice(&bytes)
+        .context("failed to parse system WinGet mirror source store")
+        .map(Some)
+}
+
+fn save_system_winget_mirror_store(app_root: &Path, store: &SourceStore) -> Result<()> {
+    write_json(system_winget_mirror_store_path(app_root), store)
+}
+
+fn load_or_refresh_system_winget_mirror_store(app_root: &Path, force_refresh: bool) -> Result<SourceStore> {
+    if !force_refresh && let Some(store) = load_system_winget_mirror_store(app_root)? {
+        return Ok(store);
+    }
+
+    refresh_system_winget_mirror_store(app_root)
+}
+
+fn refresh_system_winget_mirror_store(app_root: &Path) -> Result<SourceStore> {
+    let prior = load_system_winget_mirror_store(app_root)?.unwrap_or_default();
+    let mut exported = load_system_winget_source_store()?;
+    merge_source_cache_metadata(&mut exported, &prior);
+    save_system_winget_mirror_store(app_root, &exported)?;
+    Ok(exported)
+}
+
+fn merge_source_cache_metadata(target: &mut SourceStore, prior: &SourceStore) {
+    let prior_by_identifier: HashMap<_, _> = prior
+        .sources
+        .iter()
+        .map(|source| (source.identifier.to_ascii_lowercase(), source))
+        .collect();
+
+    for source in &mut target.sources {
+        let Some(previous) = prior_by_identifier.get(&source.identifier.to_ascii_lowercase()) else {
+            continue;
+        };
+        source.last_update = previous.last_update;
+        source.source_version = previous.source_version.clone();
+        source.etag = previous.etag.clone();
+        source.last_modified = previous.last_modified.clone();
+    }
 }
 
 fn save_store(app_root: &Path, store: &SourceStore) -> Result<()> {
@@ -4950,7 +5596,7 @@ fn parse_system_winget_source_export(output: &str) -> Result<Vec<SourceRecord>> 
     if let Ok(value) = serde_json::from_str::<JsonValue>(trimmed)
         && let Some(sources) = parse_system_winget_source_export_value(&value)?
     {
-        return Ok(order_sources(sources));
+        return Ok(sources);
     }
 
     let mut sources = Vec::new();
@@ -4967,7 +5613,7 @@ fn parse_system_winget_source_export(output: &str) -> Result<Vec<SourceRecord>> 
         sources.append(&mut parsed);
     }
 
-    Ok(order_sources(sources))
+    Ok(sources)
 }
 
 fn parse_system_winget_source_export_value(value: &JsonValue) -> Result<Option<Vec<SourceRecord>>> {
@@ -5076,16 +5722,6 @@ fn json_trust_value_is_trusted(value: &JsonValue) -> bool {
     value
         .as_str()
         .is_some_and(|value| value.eq_ignore_ascii_case("Trusted"))
-}
-
-fn order_sources(mut sources: Vec<SourceRecord>) -> Vec<SourceRecord> {
-    sources.sort_by(|left, right| {
-        left.explicit
-            .cmp(&right.explicit)
-            .then_with(|| right.priority.cmp(&left.priority))
-            .then_with(|| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()))
-    });
-    sources
 }
 
 fn parse_packaged_source_store(user_sources_yaml: Option<&str>, metadata_yaml: Option<&str>) -> Option<SourceStore> {
@@ -10469,6 +11105,11 @@ mod tests {
             .join("Packages")
             .join(PACKAGED_FAMILY_NAME)
             .join("LocalState");
+        let source = SourceStore::default()
+            .sources
+            .into_iter()
+            .find(|source| source.name == "winget")
+            .expect("winget source");
         assert!(uses_packaged_layout(&app_root));
         assert!(
             user_settings_path(&app_root)
@@ -10482,6 +11123,24 @@ mod tests {
                 .to_string()
                 .ends_with(&format!(
                     r"Packages\{}\LocalState\Microsoft\Windows Package Manager",
+                    PACKAGED_FAMILY_NAME
+                ))
+        );
+        assert!(
+            source_state_dir(&app_root, &source)
+                .display()
+                .to_string()
+                .ends_with(&format!(
+                    r"Packages\{}\LocalState\Microsoft.PreIndexed.Package\Microsoft.Winget.Source_8wekyb3d8bbwe",
+                    PACKAGED_FAMILY_NAME
+                ))
+        );
+        assert!(
+            source_installed_db_path_with_keying(&app_root, &source, false)
+                .display()
+                .to_string()
+                .ends_with(&format!(
+                    r"Packages\{}\LocalState\Microsoft.Winget.Source_8wekyb3d8bbwe\installed.db",
                     PACKAGED_FAMILY_NAME
                 ))
         );
@@ -10543,24 +11202,26 @@ mod tests {
 
     #[test]
     fn system_winget_export_parses_json_lines() {
-        let output = r#"{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
-{"Arg":"https://cdn.contoso.test/cache","Data":"Contoso.Source_8wekyb3d8bbwe","Explicit":true,"Identifier":"Contoso.Source_8wekyb3d8bbwe","Name":"contoso-cache","TrustLevel":["Trusted","StoreOrigin"],"Type":"Microsoft.PreIndexed.Package"}
+        let output = r#"{"Arg":"https://api.winget.pro/feed","Data":"","Explicit":false,"Identifier":"api.winget.pro","Name":"winget.pro","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+{"Arg":"https://storeedgefd.dsx.mp.microsoft.com/v9.0","Data":"","Explicit":false,"Identifier":"StoreEdgeFD","Name":"msstore","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+{"Arg":"https://cdn.winget.microsoft.com/cache","Data":"Microsoft.Winget.Source_8wekyb3d8bbwe","Explicit":false,"Identifier":"Microsoft.Winget.Source_8wekyb3d8bbwe","Name":"winget","TrustLevel":["Trusted","StoreOrigin"],"Type":"Microsoft.PreIndexed.Package"}
+{"Arg":"https://cdn.winget.microsoft.com/fonts","Data":"Microsoft.Winget.Fonts.Source_8wekyb3d8bbwe","Explicit":true,"Identifier":"Microsoft.Winget.Fonts.Source_8wekyb3d8bbwe","Name":"winget-font","TrustLevel":["Trusted","StoreOrigin"],"Type":"Microsoft.PreIndexed.Package"}
 "#;
 
         let sources = parse_system_winget_source_export(output).expect("source export");
 
         assert_eq!(
             sources.iter().map(|source| source.name.as_str()).collect::<Vec<_>>(),
-            vec!["contoso", "contoso-cache"]
+            vec!["winget.pro", "msstore", "winget", "winget-font"]
         );
         assert_eq!(sources[0].kind, SourceKind::Rest);
-        assert_eq!(sources[0].arg, "https://api.contoso.test/feed");
-        assert_eq!(sources[0].identifier, "api.contoso.test");
+        assert_eq!(sources[0].arg, "https://api.winget.pro/feed");
+        assert_eq!(sources[0].identifier, "api.winget.pro");
         assert_eq!(sources[0].trust_level, "Trusted");
         assert!(!sources[0].explicit);
-        assert_eq!(sources[1].kind, SourceKind::PreIndexed);
-        assert_eq!(sources[1].identifier, "Contoso.Source_8wekyb3d8bbwe");
-        assert!(sources[1].explicit);
+        assert_eq!(sources[2].kind, SourceKind::PreIndexed);
+        assert_eq!(sources[2].identifier, "Microsoft.Winget.Source_8wekyb3d8bbwe");
+        assert!(!sources[2].explicit);
     }
 
     #[test]
@@ -10664,6 +11325,66 @@ mod tests {
     }
 
     #[test]
+    fn system_winget_mirror_store_uses_private_cache_and_preserves_metadata() {
+        let original_runner = {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            let original = *runner;
+            *runner = fake_system_winget_source_export;
+            original
+        };
+
+        let app_root = temp_app_root("system-winget-mirror");
+        let result = load_effective_source_store(&app_root, SourceMode::SystemWingetMirror);
+
+        {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            *runner = original_runner;
+        }
+
+        let (mode, mut store) = result.expect("mirror store");
+        assert_eq!(mode, EffectiveSourceMode::SystemWingetMirror);
+        assert!(system_winget_mirror_store_path(&app_root).exists());
+        assert!(
+            !store_path(&app_root).exists(),
+            "mirror mode must not write private sources.json"
+        );
+
+        let source = store.sources.first_mut().expect("source");
+        source.last_update = Some(Utc::now());
+        source.source_version = Some("cached-contract".to_owned());
+        source.etag = Some("\"etag\"".to_owned());
+        source.last_modified = Some("Wed, 03 Jun 2026 12:00:00 GMT".to_owned());
+        save_system_winget_mirror_store(&app_root, &store).expect("save mirror");
+
+        let original_runner = {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            let original = *runner;
+            *runner = fake_system_winget_source_export;
+            original
+        };
+        let refreshed = refresh_system_winget_mirror_store(&app_root);
+        {
+            let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+            *runner = original_runner;
+        }
+
+        let refreshed = refreshed.expect("refresh mirror");
+        let source = refreshed.sources.first().expect("source");
+        assert_eq!(source.source_version.as_deref(), Some("cached-contract"));
+        assert_eq!(source.etag.as_deref(), Some("\"etag\""));
+        assert_eq!(
+            source_state_dir_with_keying(&app_root, source, true),
+            app_root.join("sources").join("api.contoso.test")
+        );
+        assert_eq!(
+            source_state_dir_with_keying(&app_root, source, false),
+            app_root.join("sources").join("contoso")
+        );
+
+        let _ = fs::remove_dir_all(&app_root);
+    }
+
+    #[test]
     fn source_metadata_and_named_reset_round_trip() {
         let app_root = temp_app_root("source-reset");
         let result = (|| -> Result<()> {
@@ -10730,6 +11451,81 @@ mod tests {
 
         let _ = fs::remove_dir_all(&app_root);
         result.expect("source resolution");
+    }
+
+    #[test]
+    fn source_resolution_accepts_source_identifier() {
+        let app_root = temp_app_root("source-identifier-resolution");
+        let result = (|| -> Result<()> {
+            let mut repository = Repository::open_with_options(RepositoryOptions::new(app_root.clone()))?;
+            repository.add_source_with_metadata(
+                "winget.pro",
+                "https://api.winget.pro/feed",
+                SourceKind::Rest,
+                Some("trusted"),
+                false,
+                0,
+            )?;
+            repository.store.sources[0].identifier = "api.winget.pro".to_owned();
+
+            let indexes = repository.resolve_source_indexes(Some("api.winget.pro"))?;
+            assert_eq!(indexes, vec![0]);
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&app_root);
+        result.expect("source identifier resolution");
+    }
+
+    #[test]
+    fn show_metadata_retries_winget_manager_alias_only_for_clean_misses() {
+        let query = PackageQuery {
+            id: Some("tessl.tessl".to_owned()),
+            source: Some("winget".to_owned()),
+            exact: true,
+            ..PackageQuery::default()
+        };
+        let clean_miss = SearchLocatedResult {
+            matches: Vec::new(),
+            warnings: Vec::new(),
+            failures: Vec::new(),
+            truncated: false,
+        };
+        assert!(should_retry_show_across_system_winget_sources(
+            true,
+            &query,
+            &clean_miss
+        ));
+
+        let private_mode = false;
+        assert!(!should_retry_show_across_system_winget_sources(
+            private_mode,
+            &query,
+            &clean_miss
+        ));
+
+        let explicit_custom_source = PackageQuery {
+            source: Some("winget.pro".to_owned()),
+            ..query.clone()
+        };
+        assert!(!should_retry_show_across_system_winget_sources(
+            true,
+            &explicit_custom_source,
+            &clean_miss
+        ));
+
+        let failed_source = SearchLocatedResult {
+            failures: vec![SourceSearchFailure {
+                source_name: "winget".to_owned(),
+                message: "network failure".to_owned(),
+            }],
+            ..clean_miss
+        };
+        assert!(!should_retry_show_across_system_winget_sources(
+            true,
+            &query,
+            &failed_source
+        ));
     }
 
     #[test]
@@ -11203,6 +11999,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: true,
             correlated_lacks_compatible_installer: false,
@@ -11256,6 +12054,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: true,
@@ -11382,6 +12182,51 @@ Installers:
             .expect("query")
             .expect("unique match");
         assert_eq!(rowid, 100);
+    }
+
+    #[test]
+    fn lookup_installed_db_identity_match_returns_product_code_match() {
+        let connection = Repository::open_sqlite_connection(PathBuf::from(":memory:")).expect("open in-memory db");
+        execute_batch_sql(
+            &connection,
+            "CREATE TABLE ids (rowid INTEGER PRIMARY KEY, id TEXT NOT NULL);\n\
+             CREATE TABLE names (rowid INTEGER PRIMARY KEY, name TEXT NOT NULL);\n\
+             CREATE TABLE manifest (rowid INTEGER PRIMARY KEY, id INT64 NOT NULL, name INT64 NOT NULL);\n\
+             CREATE TABLE productcodes (rowid INTEGER PRIMARY KEY, productcode TEXT NOT NULL);\n\
+             CREATE TABLE productcodes_map (manifest INT64 NOT NULL, productcode INT64 NOT NULL);\n\
+             INSERT INTO ids VALUES (1, 'Git.Git');\n\
+             INSERT INTO names VALUES (1, 'Git');\n\
+             INSERT INTO manifest VALUES (10, 1, 1);\n\
+             INSERT INTO productcodes VALUES (20, 'git_is1');\n\
+             INSERT INTO productcodes_map VALUES (10, 20);",
+        )
+        .expect("seed schema");
+        let package = InstalledPackage {
+            name: "Git".to_owned(),
+            local_id: r"ARP\Machine\X64\Git_is1".to_owned(),
+            installed_version: "2.54.0".to_owned(),
+            publisher: None,
+            scope: None,
+            installer_category: None,
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: vec!["git_is1".to_owned()],
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+
+        let (id, name, matched_by) = lookup_installed_db_identity_match(&connection, &package)
+            .expect("query")
+            .expect("product code match");
+
+        assert_eq!(id, "Git.Git");
+        assert_eq!(name, "Git");
+        assert_eq!(matched_by, "ProductCode");
     }
 
     #[test]
@@ -12611,6 +13456,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -12654,6 +13501,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -12696,6 +13545,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -12745,6 +13596,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -12807,6 +13660,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -12846,6 +13701,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -12893,6 +13750,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -12925,6 +13784,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -12966,6 +13827,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -12997,6 +13860,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13009,7 +13874,7 @@ Installers:
 
         assert!(installed_package_matches_upgrade_filter(&package, &query));
         assert_eq!(
-            list_match_from_installed(package).available_version.as_deref(),
+            list_match_from_installed(package, &[]).available_version.as_deref(),
             Some("2.0.0")
         );
     }
@@ -13266,7 +14131,26 @@ Installers:
             .expect("package metadata");
 
         assert_eq!(parsed.version, "0.98.1.0");
+        assert_eq!(parsed.resource_id, "");
         assert_eq!(parsed.family_name, "Microsoft.PowerToys.SparseApp_8wekyb3d8bbwe");
+        assert!(!is_msix_split_resource_package(&parsed.resource_id));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classifies_msix_split_resource_package() {
+        let parsed = parse_msix_package_full_name(
+            "Microsoft.XboxSpeechToTextOverlay_1.97.17002.0_neutral_split.scale-125_8wekyb3d8bbwe",
+        )
+        .expect("package metadata");
+
+        assert_eq!(parsed.version, "1.97.17002.0");
+        assert_eq!(parsed.resource_id, "split.scale-125");
+        assert_eq!(
+            parsed.family_name,
+            "Microsoft.XboxSpeechToTextOverlay_split.scale-125_8wekyb3d8bbwe"
+        );
+        assert!(is_msix_split_resource_package(&parsed.resource_id));
     }
 
     #[cfg(windows)]
@@ -13428,6 +14312,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13444,6 +14330,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13460,6 +14348,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -14258,6 +15148,30 @@ Installers:
     }
 
     #[test]
+    fn map_arp_version_reports_greater_than_latest_for_serviced_msix_framework_version() {
+        // WindowsAppRuntime packages can be serviced beyond the latest winget
+        // catalog versionData range. winget renders those as `> latest` and
+        // does not report an available downgrade.
+        let entries = vec![
+            version_entry("1.5.8", Some("5001.373.1736.0"), Some("5001.373.1736.0")),
+            version_entry("1.5.7", Some("5001.337.1906.0"), Some("5001.337.1906.0")),
+        ];
+
+        assert!(map_arp_version_to_catalog(&entries, "5001.400.42.0").is_none());
+        assert!(less_than_latest_arp_anchored_version(&entries, "5001.400.42.0").is_none());
+        assert_eq!(
+            greater_than_latest_arp_anchored_version(&entries, "5001.400.42.0", "1.5.8").as_deref(),
+            Some("> 1.5.8")
+        );
+        assert!(greater_than_latest_arp_anchored_version(&entries, "5001.337.1906.0", "1.5.8").is_none());
+
+        let stale_normal_app_entries = vec![version_entry("2024.1.1", Some("2024.1.1.0"), Some("2024.1.1.0"))];
+        assert!(
+            greater_than_latest_arp_anchored_version(&stale_normal_app_entries, "2026.1.3.0", "2026.2.0.0").is_none()
+        );
+    }
+
+    #[test]
     fn map_arp_version_skips_entries_missing_arp_bounds() {
         // Older catalog packages predate AppsAndFeaturesEntries and have no
         // aMiV/aMaV. Those entries must be ignored — not silently treated as
@@ -14358,17 +15272,76 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
         };
 
-        let item = list_match_from_installed(package);
+        let item = list_match_from_installed(package, &[]);
 
         assert_eq!(item.id, "Microsoft.Azure.AZCopy.10");
         assert_eq!(item.local_id, r"ARP\Machine\X64\AzCopy");
         assert_eq!(item.source_name.as_deref(), Some("winget"));
         assert_eq!(item.available_version.as_deref(), Some("10.32.3"));
+    }
+
+    #[test]
+    fn suppress_duplicate_available_versions_keeps_available_only_on_newest_installed_row() {
+        let rows = vec![
+            ListMatch {
+                name: "Example 1.0".to_owned(),
+                id: "Example.Tool".to_owned(),
+                local_id: r"ARP\Machine\X64\old".to_owned(),
+                installed_version: "1.0.0".to_owned(),
+                available_version: Some("3.0.0".to_owned()),
+                source_name: Some("winget".to_owned()),
+                publisher: None,
+                scope: None,
+                installer_category: None,
+                install_location: None,
+                package_family_names: Vec::new(),
+                product_codes: Vec::new(),
+                upgrade_codes: Vec::new(),
+            },
+            ListMatch {
+                name: "Example 2.0".to_owned(),
+                id: "Example.Tool".to_owned(),
+                local_id: r"ARP\Machine\X64\new".to_owned(),
+                installed_version: "2.0.0".to_owned(),
+                available_version: Some("3.0.0".to_owned()),
+                source_name: Some("winget".to_owned()),
+                publisher: None,
+                scope: None,
+                installer_category: None,
+                install_location: None,
+                package_family_names: Vec::new(),
+                product_codes: Vec::new(),
+                upgrade_codes: Vec::new(),
+            },
+            ListMatch {
+                name: "Other".to_owned(),
+                id: "Other.Tool".to_owned(),
+                local_id: r"ARP\Machine\X64\other".to_owned(),
+                installed_version: "1.0.0".to_owned(),
+                available_version: Some("2.0.0".to_owned()),
+                source_name: Some("winget".to_owned()),
+                publisher: None,
+                scope: None,
+                installer_category: None,
+                install_location: None,
+                package_family_names: Vec::new(),
+                product_codes: Vec::new(),
+                upgrade_codes: Vec::new(),
+            },
+        ];
+
+        let result = suppress_duplicate_available_versions(rows);
+
+        assert_eq!(result[0].available_version, None);
+        assert_eq!(result[1].available_version.as_deref(), Some("3.0.0"));
+        assert_eq!(result[2].available_version.as_deref(), Some("2.0.0"));
     }
 
     #[test]
@@ -14394,12 +15367,14 @@ Installers:
                 channel: None,
                 match_criteria: Some("ProductCode".to_owned()),
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
         };
 
-        let item = list_match_from_installed(package);
+        let item = list_match_from_installed(package, &[]);
 
         assert_eq!(item.id, "Atlassian.AtlassianCLI");
         assert_eq!(
@@ -14408,6 +15383,172 @@ Installers:
         );
         assert_ne!(item.id, item.local_id);
         assert_eq!(item.source_name.as_deref(), Some("winget"));
+    }
+
+    #[test]
+    fn list_match_from_installed_derives_winget_portable_identity_from_local_id() {
+        let package = InstalledPackage {
+            name: "FFmpeg".to_owned(),
+            local_id: r"ARP\User\X64\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned(),
+            installed_version: "8.0".to_owned(),
+            publisher: Some("Gyan".to_owned()),
+            scope: Some("User".to_owned()),
+            installer_category: Some("portable".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+        let sources = vec![SourceRecord {
+            name: "winget".to_owned(),
+            kind: SourceKind::PreIndexed,
+            arg: "https://cdn.winget.microsoft.com/cache".to_owned(),
+            identifier: "Microsoft.Winget.Source_8wekyb3d8bbwe".to_owned(),
+            trust_level: "Trusted".to_owned(),
+            explicit: false,
+            priority: 0,
+            last_update: None,
+            source_version: None,
+            etag: None,
+            last_modified: None,
+        }];
+
+        let item = list_match_from_installed(package, &sources);
+
+        assert_eq!(item.id, "Gyan.FFmpeg");
+        assert_eq!(
+            item.local_id,
+            r"ARP\User\X64\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        );
+        assert_eq!(item.source_name.as_deref(), Some("winget"));
+    }
+
+    #[test]
+    fn list_match_from_installed_uses_winget_arp_identity_metadata() {
+        let package = InstalledPackage {
+            name: "tessl".to_owned(),
+            local_id: r"ARP\User\X64\tessl.tessl_api.winget.pro".to_owned(),
+            installed_version: "0.77.0".to_owned(),
+            publisher: Some("tessl.io".to_owned()),
+            scope: Some("User".to_owned()),
+            installer_category: Some("portable".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            winget_package_identifier: Some("tessl.tessl".to_owned()),
+            winget_source_identifier: Some("api.winget.pro".to_owned()),
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+
+        let item = list_match_from_installed(package, &[]);
+
+        assert_eq!(item.id, "tessl.tessl");
+        assert_eq!(item.source_name.as_deref(), Some("api.winget.pro"));
+    }
+
+    #[test]
+    fn list_match_from_installed_maps_winget_arp_source_identifier_to_configured_name() {
+        let package = InstalledPackage {
+            name: "tessl".to_owned(),
+            local_id: r"ARP\User\X64\tessl.tessl_api.winget.pro".to_owned(),
+            installed_version: "0.77.0".to_owned(),
+            publisher: Some("tessl.io".to_owned()),
+            scope: Some("User".to_owned()),
+            installer_category: Some("portable".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            winget_package_identifier: Some("tessl.tessl".to_owned()),
+            winget_source_identifier: Some("api.winget.pro".to_owned()),
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+        let sources = vec![SourceRecord {
+            name: "winget.pro".to_owned(),
+            kind: SourceKind::Rest,
+            arg: "https://api.winget.pro/4259fd23-6fcd-46bf-9287-be8833cfbdd5".to_owned(),
+            identifier: "api.winget.pro".to_owned(),
+            trust_level: "Trusted".to_owned(),
+            explicit: false,
+            priority: 0,
+            last_update: None,
+            source_version: None,
+            etag: None,
+            last_modified: None,
+        }];
+
+        let item = list_match_from_installed(package, &sources);
+
+        assert_eq!(item.id, "tessl.tessl");
+        assert_eq!(item.source_name.as_deref(), Some("winget.pro"));
+    }
+
+    #[test]
+    fn list_match_from_installed_keeps_scanning_portable_source_identifiers() {
+        let package = InstalledPackage {
+            name: "Example".to_owned(),
+            local_id: r"ARP\User\X64\Vendor.Example_short".to_owned(),
+            installed_version: "1.0".to_owned(),
+            publisher: Some("Vendor".to_owned()),
+            scope: Some("User".to_owned()),
+            installer_category: Some("portable".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+        let sources = vec![
+            SourceRecord {
+                name: "long".to_owned(),
+                kind: SourceKind::PreIndexed,
+                arg: "https://example.invalid/long".to_owned(),
+                identifier: "identifier-longer-than-local-id".to_owned(),
+                trust_level: "Trusted".to_owned(),
+                explicit: false,
+                priority: 0,
+                last_update: None,
+                source_version: None,
+                etag: None,
+                last_modified: None,
+            },
+            SourceRecord {
+                name: "short".to_owned(),
+                kind: SourceKind::PreIndexed,
+                arg: "https://example.invalid/short".to_owned(),
+                identifier: "short".to_owned(),
+                trust_level: "Trusted".to_owned(),
+                explicit: false,
+                priority: 1,
+                last_update: None,
+                source_version: None,
+                etag: None,
+                last_modified: None,
+            },
+        ];
+
+        let item = list_match_from_installed(package, &sources);
+
+        assert_eq!(item.id, "Vendor.Example");
+        assert_eq!(item.source_name.as_deref(), Some("short"));
     }
 
     #[test]
@@ -14549,6 +15690,8 @@ Installers:
                 channel: None,
                 match_criteria: Some("PackageFamilyName".to_owned()),
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -14584,6 +15727,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -14619,6 +15764,8 @@ Installers:
                 channel: None,
                 match_criteria: Some("PackageFamilyName".to_owned()),
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -14674,6 +15821,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: canonical,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -14724,6 +15873,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,

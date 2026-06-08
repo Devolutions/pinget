@@ -185,6 +185,8 @@ internal static class InstalledPackages
                         var packageFamilyName = subkey.GetValue("PackageFamilyName") as string;
                         var productCode = subkey.GetValue("ProductCode") as string;
                         var upgradeCode = subkey.GetValue("UpgradeCode") as string;
+                        var wingetPackageIdentifier = subkey.GetValue("WinGetPackageIdentifier") as string;
+                        var wingetSourceIdentifier = subkey.GetValue("WinGetSourceIdentifier") as string;
 
                         var localId = $@"ARP\{scopeLabel}\{effectiveArch}\{subkeyName}";
                         // Honor the WinGet ARP signal so uninstall flows through the
@@ -246,6 +248,8 @@ internal static class InstalledPackages
                             Scope = scopeLabel,
                             InstallerCategory = installerCategory,
                             InstallLocation = installLocation,
+                            WinGetPackageIdentifier = wingetPackageIdentifier,
+                            WinGetSourceIdentifier = wingetSourceIdentifier,
                             PackageFamilyNames = packageFamilyNames,
                             ProductCodes = productCodes,
                             UpgradeCodes = upgradeCodes,
@@ -279,16 +283,19 @@ internal static class InstalledPackages
                 if (subkey is null)
                     continue;
 
-                var displayName = subkey.GetValue("DisplayName") as string;
-                if (string.IsNullOrWhiteSpace(displayName))
-                    continue;
-
                 var installLocation = subkey.GetValue("PackageRootFolder") as string;
                 if (IsWindowsSystemPath(installLocation))
                     continue;
 
                 var parsed = ParseMsixFullName(subkeyName);
                 if (parsed is null) continue;
+                if (IsMsixSplitResourcePackage(parsed.Value.ResourceId)) continue;
+
+                var displayName = subkey.GetValue("DisplayName") as string;
+                if (string.IsNullOrWhiteSpace(displayName))
+                    displayName = GetAppModelDisplayName(subkey);
+                if (string.IsNullOrWhiteSpace(displayName))
+                    continue;
 
                 var localId = $@"MSIX\{subkeyName}";
                 var dedupKey = $"{localId}|{displayName.ToLowerInvariant()}|{parsed.Value.Version.ToLowerInvariant()}";
@@ -316,7 +323,25 @@ internal static class InstalledPackages
         return path.Trim().StartsWith(@"C:\Windows\", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static (string Version, string FamilyName)? ParseMsixFullName(string fullName)
+    [SupportedOSPlatform("windows")]
+    private static string? GetAppModelDisplayName(Microsoft.Win32.RegistryKey packageKey)
+    {
+        using var appKey = packageKey.OpenSubKey(@"App\Capabilities");
+        if (appKey is null) return null;
+
+        var description = appKey.GetValue("ApplicationDescription") as string;
+        if (!string.IsNullOrWhiteSpace(description))
+            return description;
+
+        var name = appKey.GetValue("ApplicationName") as string;
+        return string.IsNullOrWhiteSpace(name) ? null : name;
+    }
+
+    internal static bool IsMsixSplitResourcePackage(string? resourceId) =>
+        !string.IsNullOrWhiteSpace(resourceId)
+        && resourceId.StartsWith("split.", StringComparison.OrdinalIgnoreCase);
+
+    internal static MsixPackageFullName? ParseMsixFullName(string fullName)
     {
         var parts = fullName.Split('_');
         if (parts.Length < 5) return null;
@@ -335,6 +360,8 @@ internal static class InstalledPackages
             ? $"{name}_{publisherHash}"
             : $"{name}_{resourceId}_{publisherHash}";
 
-        return (version, familyName);
+        return new MsixPackageFullName(version, resourceId, familyName);
     }
+
+    internal readonly record struct MsixPackageFullName(string Version, string ResourceId, string FamilyName);
 }
