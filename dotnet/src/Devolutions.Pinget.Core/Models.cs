@@ -651,6 +651,8 @@ internal record InstalledPackage
     public string? Scope { get; init; }
     public string? InstallerCategory { get; init; }
     public string? InstallLocation { get; init; }
+    public string? WinGetPackageIdentifier { get; init; }
+    public string? WinGetSourceIdentifier { get; init; }
     public List<string> PackageFamilyNames { get; init; } = [];
     public List<string> ProductCodes { get; init; } = [];
     public List<string> UpgradeCodes { get; init; } = [];

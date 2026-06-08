@@ -956,6 +956,55 @@ public class ModelsTests
         Assert.Null(sourceName);
     }
 
+    [Fact]
+    public void ListMatchFromInstalled_UsesWinGetArpIdentityMetadata()
+    {
+        var package = new InstalledPackage
+        {
+            Name = "tessl",
+            LocalId = @"ARP\User\X64\tessl.tessl_api.winget.pro",
+            InstalledVersion = "0.77.0",
+            Publisher = "tessl.io",
+            Scope = "User",
+            InstallerCategory = "portable",
+            WinGetPackageIdentifier = "tessl.tessl",
+            WinGetSourceIdentifier = "api.winget.pro",
+        };
+
+        var item = Repository.ListMatchFromInstalledForTesting(package, []);
+
+        Assert.Equal("tessl.tessl", item.Id);
+        Assert.Equal("api.winget.pro", item.SourceName);
+    }
+
+    [Fact]
+    public void ListMatchFromInstalled_MapsWinGetArpSourceIdentifierToConfiguredName()
+    {
+        var package = new InstalledPackage
+        {
+            Name = "tessl",
+            LocalId = @"ARP\User\X64\tessl.tessl_api.winget.pro",
+            InstalledVersion = "0.77.0",
+            Publisher = "tessl.io",
+            Scope = "User",
+            InstallerCategory = "portable",
+            WinGetPackageIdentifier = "tessl.tessl",
+            WinGetSourceIdentifier = "api.winget.pro",
+        };
+        SourceRecord source = new()
+        {
+            Name = "winget.pro",
+            Kind = SourceKind.Rest,
+            Arg = "https://api.winget.pro/4259fd23-6fcd-46bf-9287-be8833cfbdd5",
+            Identifier = "api.winget.pro",
+        };
+
+        var item = Repository.ListMatchFromInstalledForTesting(package, [source]);
+
+        Assert.Equal("tessl.tessl", item.Id);
+        Assert.Equal("winget.pro", item.SourceName);
+    }
+
 }
 
 public class PinStoreTests

@@ -749,6 +749,8 @@ struct InstalledPackage {
     scope: Option<String>,
     installer_category: Option<String>,
     install_location: Option<String>,
+    winget_package_identifier: Option<String>,
+    winget_source_identifier: Option<String>,
     package_family_names: Vec<String>,
     product_codes: Vec<String>,
     upgrade_codes: Vec<String>,
@@ -3805,6 +3807,20 @@ fn list_match_from_installed(package: InstalledPackage, sources: &[SourceRecord]
         .unwrap_or_else(|| package.local_id.clone());
 
     if source_name.is_none()
+        && let Some(package_id) = package
+            .winget_package_identifier
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+    {
+        id = package_id.to_owned();
+        source_name = package
+            .winget_source_identifier
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|identifier| source_name_from_identifier(identifier, sources));
+    }
+
+    if source_name.is_none()
         && let Some((local_package_id, local_source_name)) =
             winget_package_identity_from_local_id(&package.local_id, sources)
     {
@@ -3878,6 +3894,14 @@ fn suppress_duplicate_available_versions(matches: Vec<ListMatch>) -> Vec<ListMat
             item
         })
         .collect()
+}
+
+fn source_name_from_identifier(identifier: &str, sources: &[SourceRecord]) -> String {
+    sources
+        .iter()
+        .find(|source| source.identifier.eq_ignore_ascii_case(identifier))
+        .map(|source| source.name.clone())
+        .unwrap_or_else(|| identifier.to_owned())
 }
 
 fn winget_package_identity_from_local_id(local_id: &str, sources: &[SourceRecord]) -> Option<(String, String)> {
@@ -4662,6 +4686,8 @@ fn collect_uninstall_view(
         let installed_version = read_reg_string(&subkey, "DisplayVersion").unwrap_or_else(|| "Unknown".to_owned());
         let publisher = read_reg_string(&subkey, "Publisher");
         let install_location = read_reg_string(&subkey, "InstallLocation");
+        let winget_package_identifier = read_reg_string(&subkey, "WinGetPackageIdentifier");
+        let winget_source_identifier = read_reg_string(&subkey, "WinGetSourceIdentifier");
         let package_family_names = read_reg_string(&subkey, "PackageFamilyName")
             .into_iter()
             .collect::<Vec<_>>();
@@ -4718,6 +4744,8 @@ fn collect_uninstall_view(
             scope: Some(scope.to_owned()),
             installer_category,
             install_location,
+            winget_package_identifier,
+            winget_source_identifier,
             package_family_names,
             product_codes,
             upgrade_codes,
@@ -4791,6 +4819,8 @@ fn collect_appmodel_packages(
             scope: Some(scope.to_owned()),
             installer_category: Some("msix".to_owned()),
             install_location,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             package_family_names: vec![metadata.family_name],
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
@@ -11646,6 +11676,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: true,
             correlated_lacks_compatible_installer: false,
@@ -11699,6 +11731,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: true,
@@ -11856,6 +11890,8 @@ Installers:
             product_codes: vec!["git_is1".to_owned()],
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13097,6 +13133,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13140,6 +13178,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13182,6 +13222,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13231,6 +13273,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13293,6 +13337,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13332,6 +13378,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13379,6 +13427,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13411,6 +13461,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13452,6 +13504,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13483,6 +13537,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13933,6 +13989,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13949,6 +14007,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -13965,6 +14025,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -14887,6 +14949,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -14980,6 +15044,8 @@ Installers:
                 channel: None,
                 match_criteria: Some("ProductCode".to_owned()),
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -15010,6 +15076,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -15039,6 +15107,73 @@ Installers:
     }
 
     #[test]
+    fn list_match_from_installed_uses_winget_arp_identity_metadata() {
+        let package = InstalledPackage {
+            name: "tessl".to_owned(),
+            local_id: r"ARP\User\X64\tessl.tessl_api.winget.pro".to_owned(),
+            installed_version: "0.77.0".to_owned(),
+            publisher: Some("tessl.io".to_owned()),
+            scope: Some("User".to_owned()),
+            installer_category: Some("portable".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            winget_package_identifier: Some("tessl.tessl".to_owned()),
+            winget_source_identifier: Some("api.winget.pro".to_owned()),
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+
+        let item = list_match_from_installed(package, &[]);
+
+        assert_eq!(item.id, "tessl.tessl");
+        assert_eq!(item.source_name.as_deref(), Some("api.winget.pro"));
+    }
+
+    #[test]
+    fn list_match_from_installed_maps_winget_arp_source_identifier_to_configured_name() {
+        let package = InstalledPackage {
+            name: "tessl".to_owned(),
+            local_id: r"ARP\User\X64\tessl.tessl_api.winget.pro".to_owned(),
+            installed_version: "0.77.0".to_owned(),
+            publisher: Some("tessl.io".to_owned()),
+            scope: Some("User".to_owned()),
+            installer_category: Some("portable".to_owned()),
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            winget_package_identifier: Some("tessl.tessl".to_owned()),
+            winget_source_identifier: Some("api.winget.pro".to_owned()),
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+        let sources = vec![SourceRecord {
+            name: "winget.pro".to_owned(),
+            kind: SourceKind::Rest,
+            arg: "https://api.winget.pro/4259fd23-6fcd-46bf-9287-be8833cfbdd5".to_owned(),
+            identifier: "api.winget.pro".to_owned(),
+            trust_level: "Trusted".to_owned(),
+            explicit: false,
+            priority: 0,
+            last_update: None,
+            source_version: None,
+            etag: None,
+            last_modified: None,
+        }];
+
+        let item = list_match_from_installed(package, &sources);
+
+        assert_eq!(item.id, "tessl.tessl");
+        assert_eq!(item.source_name.as_deref(), Some("winget.pro"));
+    }
+
+    #[test]
     fn list_match_from_installed_keeps_scanning_portable_source_identifiers() {
         let package = InstalledPackage {
             name: "Example".to_owned(),
@@ -15052,6 +15187,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -15230,6 +15367,8 @@ Installers:
                 channel: None,
                 match_criteria: Some("PackageFamilyName".to_owned()),
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -15265,6 +15404,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -15300,6 +15441,8 @@ Installers:
                 channel: None,
                 match_criteria: Some("PackageFamilyName".to_owned()),
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -15355,6 +15498,8 @@ Installers:
                 channel: None,
                 match_criteria: None,
             }),
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: canonical,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,
@@ -15405,6 +15550,8 @@ Installers:
             product_codes: Vec::new(),
             upgrade_codes: Vec::new(),
             correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
             installed_version_canonical: false,
             correlated_requires_explicit_upgrade: false,
             correlated_lacks_compatible_installer: false,

@@ -3659,6 +3659,12 @@ public class Repository : IDisposable
     }
 
     private ListMatch ListMatchFromInstalled(InstalledPackage pkg)
+        => ListMatchFromInstalled(pkg, _store.Sources);
+
+    internal static ListMatch ListMatchFromInstalledForTesting(InstalledPackage pkg, IReadOnlyList<SourceRecord> sources)
+        => ListMatchFromInstalled(pkg, sources);
+
+    private static ListMatch ListMatchFromInstalled(InstalledPackage pkg, IReadOnlyList<SourceRecord> sources)
     {
         string? availableVersion = null;
         if (pkg.Correlated?.Version is string av)
@@ -3673,9 +3679,16 @@ public class Repository : IDisposable
 
         string packageId = pkg.Correlated?.Id ?? pkg.LocalId;
         string? sourceName = pkg.Correlated?.SourceName;
+        if (sourceName is null && !string.IsNullOrWhiteSpace(pkg.WinGetPackageIdentifier))
+        {
+            packageId = pkg.WinGetPackageIdentifier;
+            if (!string.IsNullOrWhiteSpace(pkg.WinGetSourceIdentifier))
+                sourceName = SourceNameFromIdentifier(pkg.WinGetSourceIdentifier, sources);
+        }
+
         if (sourceName is null && TryGetWinGetPackageIdentityFromLocalId(
             pkg.LocalId,
-            _store.Sources,
+            sources,
             out string? localPackageId,
             out string? localSourceName))
         {
@@ -3738,6 +3751,10 @@ public class Repository : IDisposable
             })
             .ToList();
     }
+
+    private static string SourceNameFromIdentifier(string identifier, IReadOnlyList<SourceRecord> sources) =>
+        sources.FirstOrDefault(source => source.Identifier.Equals(identifier, StringComparison.OrdinalIgnoreCase))?.Name
+        ?? identifier;
 
     internal static bool TryGetWinGetPackageIdentityFromLocalId(
         string localId,

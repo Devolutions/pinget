@@ -185,6 +185,8 @@ internal static class InstalledPackages
                         var packageFamilyName = subkey.GetValue("PackageFamilyName") as string;
                         var productCode = subkey.GetValue("ProductCode") as string;
                         var upgradeCode = subkey.GetValue("UpgradeCode") as string;
+                        var wingetPackageIdentifier = subkey.GetValue("WinGetPackageIdentifier") as string;
+                        var wingetSourceIdentifier = subkey.GetValue("WinGetSourceIdentifier") as string;
 
                         var localId = $@"ARP\{scopeLabel}\{effectiveArch}\{subkeyName}";
                         // Honor the WinGet ARP signal so uninstall flows through the
@@ -246,6 +248,8 @@ internal static class InstalledPackages
                             Scope = scopeLabel,
                             InstallerCategory = installerCategory,
                             InstallLocation = installLocation,
+                            WinGetPackageIdentifier = wingetPackageIdentifier,
+                            WinGetSourceIdentifier = wingetSourceIdentifier,
                             PackageFamilyNames = packageFamilyNames,
                             ProductCodes = productCodes,
                             UpgradeCodes = upgradeCodes,
