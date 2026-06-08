@@ -827,6 +827,50 @@ struct SearchLocatedResult {
     truncated: bool,
 }
 
+fn single_match_from_located(
+    located: SearchLocatedResult,
+    report_first_source_failure: bool,
+) -> Result<(LocatedMatch, Vec<String>)> {
+    if located.matches.is_empty() {
+        if report_first_source_failure && let Some(failure) = located.failures.first() {
+            bail!("failed to search source '{}': {}", failure.source_name, failure.message);
+        }
+        bail!("no package matched the supplied query");
+    }
+
+    if located.matches.len() > 1 {
+        let choices = located
+            .matches
+            .iter()
+            .take(10)
+            .map(|item| {
+                format!(
+                    "{} [{}] ({})",
+                    item.display.name, item.display.id, item.display.source_name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("multiple packages matched: {choices}");
+    }
+
+    Ok((located.matches.into_iter().next().expect("one match"), located.warnings))
+}
+
+fn should_retry_show_across_system_winget_sources(
+    uses_system_winget_sources: bool,
+    query: &PackageQuery,
+    located: &SearchLocatedResult,
+) -> bool {
+    uses_system_winget_sources
+        && query
+            .source
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case("winget"))
+        && located.matches.is_empty()
+        && located.failures.is_empty()
+}
+
 #[derive(Debug, Clone)]
 enum MatchLocator {
     PreIndexedV1 {
@@ -1925,7 +1969,7 @@ impl Repository {
     }
 
     pub fn show_versions(&mut self, query: &PackageQuery) -> Result<VersionsResult> {
-        let (located, warnings) = self.find_single_match(query)?;
+        let (located, warnings) = self.find_single_match_for_show(query, SearchSemantics::Single)?;
         let versions = self.versions_for_match(&located, query)?;
         Ok(VersionsResult {
             package: located.display,
@@ -1935,7 +1979,7 @@ impl Repository {
     }
 
     pub fn show(&mut self, query: &PackageQuery) -> Result<ShowResult> {
-        let (located, warnings) = self.find_single_match(query)?;
+        let (located, warnings) = self.find_single_match_for_show(query, SearchSemantics::Single)?;
         let (manifest, manifest_documents, cached_files) = self.manifest_for_match(&located, query)?;
         let selected_installer = select_installer(&manifest.installers, query);
 
@@ -2693,39 +2737,36 @@ impl Repository {
         self.find_single_match_with_semantics(query, SearchSemantics::Single)
     }
 
+    fn find_single_match_for_show(
+        &mut self,
+        query: &PackageQuery,
+        semantics: SearchSemantics,
+    ) -> Result<(LocatedMatch, Vec<String>)> {
+        let located = self.search_located(query, semantics)?;
+        if self.should_retry_show_across_system_winget_sources(query, &located) {
+            let mut fallback_query = query.clone();
+            fallback_query.source = None;
+            return single_match_from_located(self.search_located(&fallback_query, semantics)?, false);
+        }
+
+        single_match_from_located(located, query.source.is_some())
+    }
+
+    fn should_retry_show_across_system_winget_sources(
+        &self,
+        query: &PackageQuery,
+        located: &SearchLocatedResult,
+    ) -> bool {
+        should_retry_show_across_system_winget_sources(self.uses_system_winget_sources(), query, located)
+    }
+
     fn find_single_match_with_semantics(
         &mut self,
         query: &PackageQuery,
         semantics: SearchSemantics,
     ) -> Result<(LocatedMatch, Vec<String>)> {
         let located = self.search_located(query, semantics)?;
-
-        if located.matches.is_empty() {
-            if query.source.is_some()
-                && let Some(failure) = located.failures.first()
-            {
-                bail!("failed to search source '{}': {}", failure.source_name, failure.message);
-            }
-            bail!("no package matched the supplied query");
-        }
-
-        if located.matches.len() > 1 {
-            let choices = located
-                .matches
-                .iter()
-                .take(10)
-                .map(|item| {
-                    format!(
-                        "{} [{}] ({})",
-                        item.display.name, item.display.id, item.display.source_name
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!("multiple packages matched: {choices}");
-        }
-
-        Ok((located.matches.into_iter().next().expect("one match"), located.warnings))
+        single_match_from_located(located, query.source.is_some())
     }
 
     fn search_located(&mut self, query: &PackageQuery, semantics: SearchSemantics) -> Result<SearchLocatedResult> {
@@ -3575,11 +3616,20 @@ impl Repository {
 
     fn resolve_source_indexes(&self, source_name: Option<&str>) -> Result<Vec<usize>> {
         if let Some(name) = source_name {
-            let index = self
+            if let Some(index) = self
                 .store
                 .sources
                 .iter()
                 .position(|source| source.name.eq_ignore_ascii_case(name))
+            {
+                return Ok(vec![index]);
+            }
+
+            let index = self
+                .store
+                .sources
+                .iter()
+                .position(|source| source.identifier.eq_ignore_ascii_case(name))
                 .ok_or_else(|| anyhow!("source '{name}' was not configured"))?;
             return Ok(vec![index]);
         }
@@ -11406,6 +11456,81 @@ mod tests {
 
         let _ = fs::remove_dir_all(&app_root);
         result.expect("source resolution");
+    }
+
+    #[test]
+    fn source_resolution_accepts_source_identifier() {
+        let app_root = temp_app_root("source-identifier-resolution");
+        let result = (|| -> Result<()> {
+            let mut repository = Repository::open_with_options(RepositoryOptions::new(app_root.clone()))?;
+            repository.add_source_with_metadata(
+                "winget.pro",
+                "https://api.winget.pro/feed",
+                SourceKind::Rest,
+                Some("trusted"),
+                false,
+                0,
+            )?;
+            repository.store.sources[0].identifier = "api.winget.pro".to_owned();
+
+            let indexes = repository.resolve_source_indexes(Some("api.winget.pro"))?;
+            assert_eq!(indexes, vec![0]);
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&app_root);
+        result.expect("source identifier resolution");
+    }
+
+    #[test]
+    fn show_metadata_retries_winget_manager_alias_only_for_clean_misses() {
+        let query = PackageQuery {
+            id: Some("tessl.tessl".to_owned()),
+            source: Some("winget".to_owned()),
+            exact: true,
+            ..PackageQuery::default()
+        };
+        let clean_miss = SearchLocatedResult {
+            matches: Vec::new(),
+            warnings: Vec::new(),
+            failures: Vec::new(),
+            truncated: false,
+        };
+        assert!(should_retry_show_across_system_winget_sources(
+            true,
+            &query,
+            &clean_miss
+        ));
+
+        let private_mode = false;
+        assert!(!should_retry_show_across_system_winget_sources(
+            private_mode,
+            &query,
+            &clean_miss
+        ));
+
+        let explicit_custom_source = PackageQuery {
+            source: Some("winget.pro".to_owned()),
+            ..query.clone()
+        };
+        assert!(!should_retry_show_across_system_winget_sources(
+            true,
+            &explicit_custom_source,
+            &clean_miss
+        ));
+
+        let failed_source = SearchLocatedResult {
+            failures: vec![SourceSearchFailure {
+                source_name: "winget".to_owned(),
+                message: "network failure".to_owned(),
+            }],
+            ..clean_miss
+        };
+        assert!(!should_retry_show_across_system_winget_sources(
+            true,
+            &query,
+            &failed_source
+        ));
     }
 
     #[test]

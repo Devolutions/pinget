@@ -425,7 +425,7 @@ public class Repository : IDisposable
 
     public ShowResult Show(PackageQuery query)
     {
-        var (located, warnings, sourceWarnings) = FindSingleMatch(query);
+        var (located, warnings, sourceWarnings) = FindSingleMatchForShow(query, SearchSemantics.Single);
         return CreateShowResult(located, query, warnings, sourceWarnings);
     }
 
@@ -491,7 +491,7 @@ public class Repository : IDisposable
 
     public VersionsResult ShowVersions(PackageQuery query)
     {
-        var (located, warnings, sourceWarnings) = FindSingleMatch(query);
+        var (located, warnings, sourceWarnings) = FindSingleMatchForShow(query, SearchSemantics.Single);
         var versions = VersionsForMatch(located, query);
         return new VersionsResult { Package = located.Display, Versions = versions, Warnings = warnings, SourceWarnings = sourceWarnings };
     }
@@ -1757,23 +1757,58 @@ public class Repository : IDisposable
     private (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) FindSingleMatch(PackageQuery query)
         => FindSingleMatchWithSemantics(query, SearchSemantics.Single);
 
+    private (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) FindSingleMatchForShow(
+        PackageQuery query,
+        SearchSemantics semantics)
+    {
+        var located = SearchLocated(query, semantics);
+        if (ShouldRetryShowAcrossSystemWingetSources(query, located.Matches, located.Failures))
+        {
+            var fallbackQuery = query with { Source = null };
+            return SingleMatchFromLocated(SearchLocated(fallbackQuery, semantics), reportFirstSourceFailure: false);
+        }
+
+        return SingleMatchFromLocated(located, reportFirstSourceFailure: query.Source is not null);
+    }
+
+    private bool ShouldRetryShowAcrossSystemWingetSources(
+        PackageQuery query,
+        IReadOnlyCollection<LocatedMatch> matches,
+        IReadOnlyCollection<SourceSearchFailure> failures) =>
+        ShouldRetryShowAcrossSystemWingetSources(UsesSystemWingetSources, query.Source, matches.Count, failures.Count);
+
+    internal static bool ShouldRetryShowAcrossSystemWingetSources(
+        bool usesSystemWingetSources,
+        string? source,
+        int matchCount,
+        int failureCount) =>
+        usesSystemWingetSources &&
+        string.Equals(source, "winget", StringComparison.OrdinalIgnoreCase) &&
+        matchCount == 0 &&
+        failureCount == 0;
+
     private (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) FindSingleMatchWithSemantics(
         PackageQuery query, SearchSemantics semantics)
     {
-        var (matches, warnings, failures, _) = SearchLocated(query, semantics);
+        return SingleMatchFromLocated(SearchLocated(query, semantics), reportFirstSourceFailure: query.Source is not null);
+    }
 
-        if (matches.Count == 0)
+    private static (LocatedMatch Match, List<string> Warnings, List<RepositoryWarning> SourceWarnings) SingleMatchFromLocated(
+        (List<LocatedMatch> Matches, List<string> Warnings, List<SourceSearchFailure> Failures, bool Truncated) located,
+        bool reportFirstSourceFailure)
+    {
+        if (located.Matches.Count == 0)
         {
-            if (query.Source is not null && failures.Count > 0)
-                throw new SourceSearchException(failures[0].Warning, failures[0].Exception);
+            if (reportFirstSourceFailure && located.Failures.Count > 0)
+                throw new SourceSearchException(located.Failures[0].Warning, located.Failures[0].Exception);
 
             throw new InvalidOperationException("no package matched the supplied query");
         }
 
-        if (matches.Count > 1)
-            throw new MultiplePackageMatchesException(matches.Select(m => m.Display));
+        if (located.Matches.Count > 1)
+            throw new MultiplePackageMatchesException(located.Matches.Select(m => m.Display));
 
-        return (matches[0], warnings, failures.Select(f => f.Warning).ToList());
+        return (located.Matches[0], located.Warnings, located.Failures.Select(f => f.Warning).ToList());
     }
 
     private List<VersionKey> VersionsForMatch(LocatedMatch located, PackageQuery query)
@@ -4011,6 +4046,13 @@ public class Repository : IDisposable
             if (_store.Sources[i].Name.Equals(sourceName, StringComparison.OrdinalIgnoreCase))
                 return [i];
         }
+
+        for (int i = 0; i < _store.Sources.Count; i++)
+        {
+            if (_store.Sources[i].Identifier.Equals(sourceName, StringComparison.OrdinalIgnoreCase))
+                return [i];
+        }
+
         throw new InvalidOperationException($"Source '{sourceName}' not found.");
     }
 

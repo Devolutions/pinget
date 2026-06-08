@@ -153,6 +153,31 @@ public class SourceStoreTests
         }
 
         [Fact]
+        public void ShowMetadata_RetriesWingetManagerAliasOnlyForCleanMisses()
+        {
+                Assert.True(Repository.ShouldRetryShowAcrossSystemWingetSources(
+                        usesSystemWingetSources: true,
+                        source: "winget",
+                        matchCount: 0,
+                        failureCount: 0));
+                Assert.False(Repository.ShouldRetryShowAcrossSystemWingetSources(
+                        usesSystemWingetSources: false,
+                        source: "winget",
+                        matchCount: 0,
+                        failureCount: 0));
+                Assert.False(Repository.ShouldRetryShowAcrossSystemWingetSources(
+                        usesSystemWingetSources: true,
+                        source: "winget.pro",
+                        matchCount: 0,
+                        failureCount: 0));
+                Assert.False(Repository.ShouldRetryShowAcrossSystemWingetSources(
+                        usesSystemWingetSources: true,
+                        source: "winget",
+                        matchCount: 0,
+                        failureCount: 1));
+        }
+
+        [Fact]
         public void PackagedSourceYaml_OverlaysDefaultsAndMetadata()
         {
                 const string userSourcesYaml = @"Sources:
