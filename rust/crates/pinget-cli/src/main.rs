@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use pinget_core::{
-    CacheWarmResult, Documentation, InstallRequest, InstallResult, InstallerMode, ListMatch, ListQuery, ListResponse,
-    PackageQuery, PinRecord, PinType, RepairRequest, Repository, SearchMatch, SearchResponse, ShowResult, SourceKind,
-    SourceRecord, SourceUpdateResult, UninstallRequest, VersionsResult,
+    CacheWarmResult, Documentation, InstallProgress, InstallRequest, InstallResult, InstallerMode, ListMatch,
+    ListQuery, ListResponse, PackageQuery, PinRecord, PinType, RepairRequest, Repository, RepositoryOptions,
+    SearchMatch, SearchResponse, ShowResult, SourceKind, SourceRecord, SourceUpdateResult, UninstallRequest,
+    VersionsResult,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -597,12 +598,16 @@ fn run() -> Result<()> {
             }
         }
         Commands::Upgrade(args) => {
-            let mut repository = Repository::open()?;
             let do_install = args.all
                 || args.query.is_some()
                 || args.query_option.is_some()
                 || args.id.is_some()
                 || args.name.is_some();
+            let mut repository = if do_install {
+                open_repository_with_install_progress()?
+            } else {
+                Repository::open()?
+            };
             if do_install && !cfg!(windows) {
                 print_warnings(&[UPGRADE_UNSUPPORTED_WARNING.to_owned()]);
                 println!("No changes were made.");
@@ -953,7 +958,7 @@ fn run() -> Result<()> {
             }
         }
         Commands::Install(args) => {
-            let mut repository = Repository::open()?;
+            let mut repository = open_repository_with_install_progress()?;
             let mode = if args.interactive {
                 InstallerMode::Interactive
             } else if args.silent {
@@ -1004,7 +1009,7 @@ fn run() -> Result<()> {
             print_install_result(&result);
         }
         Commands::Repair(args) => {
-            let mut repository = Repository::open()?;
+            let mut repository = open_repository_with_install_progress()?;
             let mode = if args.interactive {
                 InstallerMode::Interactive
             } else if args.silent {
@@ -1473,6 +1478,45 @@ fn print_cache_warm(result: CacheWarmResult) {
 fn print_warnings(warnings: &[String]) {
     for warning in warnings {
         write_stderr_line(format_args!("warning: {warning}"));
+    }
+}
+
+fn open_repository_with_install_progress() -> Result<Repository> {
+    Repository::open_with_options(RepositoryOptions::for_current_user()?.with_install_progress(print_install_progress))
+}
+
+fn print_install_progress(progress: &InstallProgress) {
+    match progress {
+        InstallProgress::ResolvingManifest => write_stderr_line(format_args!("Resolving package manifest...")),
+        InstallProgress::ResolvedManifest { package_id, version } => {
+            write_stderr_line(format_args!("Resolved {package_id} {version}."));
+        }
+        InstallProgress::CheckingInstalled => write_stderr_line(format_args!("Checking installed package state...")),
+        InstallProgress::InstallingDependencies => write_stderr_line(format_args!("Checking package dependencies...")),
+        InstallProgress::SelectingInstaller => {
+            write_stderr_line(format_args!("Selecting applicable installer for this system..."));
+        }
+        InstallProgress::DownloadingInstaller { url, path } => {
+            write_stderr_line(format_args!(
+                "Downloading installer from {url} to {}...",
+                path.display()
+            ));
+        }
+        InstallProgress::VerifyingInstaller { path } => {
+            write_stderr_line(format_args!("Verifying installer hash for {}...", path.display()));
+        }
+        InstallProgress::StartingInstaller { installer_type, path } => {
+            write_stderr_line(format_args!(
+                "Starting {installer_type} installer: {}...",
+                path.display()
+            ));
+        }
+        InstallProgress::WaitingForInstaller { installer_type } => {
+            write_stderr_line(format_args!("Waiting for {installer_type} installer to finish..."));
+        }
+        InstallProgress::InstallerFinished { exit_code } => {
+            write_stderr_line(format_args!("Installer exited with code {exit_code}."));
+        }
     }
 }
 

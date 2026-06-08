@@ -160,6 +160,7 @@ pub struct RepositoryOptions {
     pub app_root: PathBuf,
     pub user_agent: String,
     pub pre_indexed_source_auto_update_interval: Option<Duration>,
+    pub install_progress: Option<fn(&InstallProgress)>,
 }
 
 impl RepositoryOptions {
@@ -169,6 +170,7 @@ impl RepositoryOptions {
             app_root: app_root.into(),
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             pre_indexed_source_auto_update_interval: Some(Duration::minutes(DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES)),
+            install_progress: None,
         }
     }
 
@@ -188,6 +190,15 @@ impl RepositoryOptions {
     #[must_use]
     pub fn with_pre_indexed_source_auto_update_interval(mut self, interval: Option<Duration>) -> Self {
         self.pre_indexed_source_auto_update_interval = interval;
+        self
+    }
+
+    /// Receives coarse install/update phase notifications. Intended for CLIs
+    /// and host applications that need to show progress while downloads or
+    /// silent installers are running.
+    #[must_use]
+    pub fn with_install_progress(mut self, progress: fn(&InstallProgress)) -> Self {
+        self.install_progress = Some(progress);
         self
     }
 }
@@ -670,6 +681,20 @@ pub struct InstallResult {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub enum InstallProgress {
+    ResolvingManifest,
+    ResolvedManifest { package_id: String, version: String },
+    CheckingInstalled,
+    InstallingDependencies,
+    SelectingInstaller,
+    DownloadingInstaller { url: String, path: PathBuf },
+    VerifyingInstaller { path: PathBuf },
+    StartingInstaller { installer_type: String, path: PathBuf },
+    WaitingForInstaller { installer_type: String },
+    InstallerFinished { exit_code: i32 },
+}
+
 impl InstallerSwitches {
     fn with_fallback(&self, fallback: &Self) -> Self {
         Self {
@@ -845,6 +870,7 @@ pub struct Repository {
     client: Client,
     store: SourceStore,
     use_system_winget_sources: bool,
+    install_progress: Option<fn(&InstallProgress)>,
     pre_indexed_source_auto_update_interval: Option<Duration>,
     preindexed_refresh_attempts: HashMap<String, PreindexedRefreshAttempt>,
 }
@@ -920,9 +946,16 @@ impl Repository {
             client,
             store,
             use_system_winget_sources,
+            install_progress: options.install_progress,
             pre_indexed_source_auto_update_interval: options.pre_indexed_source_auto_update_interval,
             preindexed_refresh_attempts: HashMap::new(),
         })
+    }
+
+    fn emit_install_progress(&self, progress: InstallProgress) {
+        if let Some(callback) = self.install_progress {
+            callback(&progress);
+        }
     }
 
     pub fn app_root(&self) -> &Path {
@@ -2061,8 +2094,13 @@ impl Repository {
         });
         let dest = download_dir.join(filename);
 
+        self.emit_install_progress(InstallProgress::DownloadingInstaller {
+            url: url.to_owned(),
+            path: dest.clone(),
+        });
         let actual_hash = download_installer_to_file(&self.user_agent, url, &dest)?;
 
+        self.emit_install_progress(InstallProgress::VerifyingInstaller { path: dest.clone() });
         if let Err(error) =
             verify_installer_hash_hex(installer.sha256.as_deref(), &actual_hash, request.ignore_security_hash)
         {
@@ -2095,7 +2133,12 @@ impl Repository {
     }
 
     pub fn install_request(&mut self, request: &InstallRequest) -> Result<InstallResult> {
+        self.emit_install_progress(InstallProgress::ResolvingManifest);
         let manifest = self.resolve_manifest_for_install(request)?;
+        self.emit_install_progress(InstallProgress::ResolvedManifest {
+            package_id: manifest.id.clone(),
+            version: manifest.version.clone(),
+        });
         if !package_actions_supported() {
             let installer_type = select_installer(&manifest.installers, &request.query)
                 .and_then(|installer| installer.installer_type)
@@ -2109,12 +2152,14 @@ impl Repository {
             ));
         }
 
+        self.emit_install_progress(InstallProgress::CheckingInstalled);
         let existing_match = self.find_installed_package_for_install(request, &manifest)?;
         if let Some(no_op_result) = Self::create_install_no_op_result(request, &manifest, existing_match.as_ref()) {
             return Ok(no_op_result);
         }
 
         Self::ensure_package_agreements_accepted(&manifest, request)?;
+        self.emit_install_progress(InstallProgress::InstallingDependencies);
         self.install_dependencies(&manifest, request, &mut HashSet::new())?;
 
         if request.dependencies_only {
@@ -2130,6 +2175,7 @@ impl Repository {
             });
         }
 
+        self.emit_install_progress(InstallProgress::SelectingInstaller);
         let installer = select_installer(&manifest.installers, &request.query)
             .ok_or_else(|| anyhow!("No applicable installer found"))?;
 
@@ -2154,7 +2200,15 @@ impl Repository {
 
         let installer_type = installer.installer_type.as_deref().unwrap_or("exe").to_lowercase();
 
+        self.emit_install_progress(InstallProgress::StartingInstaller {
+            installer_type: installer_type.clone(),
+            path: installer_path.clone(),
+        });
+        self.emit_install_progress(InstallProgress::WaitingForInstaller {
+            installer_type: installer_type.clone(),
+        });
         let exit_code = dispatch_installer(&installer_path, &installer_type, request, &manifest, &installer)?;
+        self.emit_install_progress(InstallProgress::InstallerFinished { exit_code });
 
         Ok(InstallResult {
             package_id: manifest.id.clone(),
