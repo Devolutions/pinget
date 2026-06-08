@@ -113,6 +113,15 @@ internal static class SourceStoreManager
         return Path.Combine(root, "sources", SanitizePathSegment(source.Name));
     }
 
+    public static string SourceInstalledDbPath(SourceRecord source, string? appRoot = null)
+    {
+        var root = NormalizeAppRoot(appRoot);
+        if (UsesPackagedLayout(root))
+            return Path.Combine(root, SanitizePathSegment(source.Identifier), "installed.db");
+
+        return Path.Combine(SourceStateDir(source, root), "installed.db");
+    }
+
     public static string PinsDbPath(string? appRoot = null)
     {
         var root = NormalizeAppRoot(appRoot);

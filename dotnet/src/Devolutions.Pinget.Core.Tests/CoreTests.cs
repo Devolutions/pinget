@@ -130,9 +130,12 @@ public class SourceStoreTests
 
                 var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
                 var appRoot = Path.Combine(localAppData, "Packages", SourceStoreManager.PackagedFamilyName, "LocalState");
+                var source = SourceStore.Default().Sources.First(s => s.Name == "winget");
                 Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState"), appRoot, StringComparison.OrdinalIgnoreCase);
                 Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "settings.json"), SettingsStoreManager.UserSettingsPath(appRoot), StringComparison.OrdinalIgnoreCase);
                 Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "Microsoft", "Windows Package Manager"), SourceStoreManager.GetPackagedFileCacheRoot(appRoot), StringComparison.OrdinalIgnoreCase);
+                Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "Microsoft.PreIndexed.Package", "Microsoft.Winget.Source_8wekyb3d8bbwe"), SourceStoreManager.SourceStateDir(source, appRoot), StringComparison.OrdinalIgnoreCase);
+                Assert.EndsWith(Path.Combine("Packages", SourceStoreManager.PackagedFamilyName, "LocalState", "Microsoft.Winget.Source_8wekyb3d8bbwe", "installed.db"), SourceStoreManager.SourceInstalledDbPath(source, appRoot), StringComparison.OrdinalIgnoreCase);
         }
 
         [Fact]
@@ -192,24 +195,26 @@ public class SourceStoreTests
         public void SystemWingetExport_ParsesJsonLines()
         {
                 const string output = """
-{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
-{"Arg":"https://cdn.contoso.test/cache","Data":"Contoso.Source_8wekyb3d8bbwe","Explicit":true,"Identifier":"Contoso.Source_8wekyb3d8bbwe","Name":"contoso-cache","TrustLevel":["Trusted","StoreOrigin"],"Type":"Microsoft.PreIndexed.Package"}
+{"Arg":"https://api.winget.pro/feed","Data":"","Explicit":false,"Identifier":"api.winget.pro","Name":"winget.pro","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+{"Arg":"https://storeedgefd.dsx.mp.microsoft.com/v9.0","Data":"","Explicit":false,"Identifier":"StoreEdgeFD","Name":"msstore","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+{"Arg":"https://cdn.winget.microsoft.com/cache","Data":"Microsoft.Winget.Source_8wekyb3d8bbwe","Explicit":false,"Identifier":"Microsoft.Winget.Source_8wekyb3d8bbwe","Name":"winget","TrustLevel":["Trusted","StoreOrigin"],"Type":"Microsoft.PreIndexed.Package"}
+{"Arg":"https://cdn.winget.microsoft.com/fonts","Data":"Microsoft.Winget.Fonts.Source_8wekyb3d8bbwe","Explicit":true,"Identifier":"Microsoft.Winget.Fonts.Source_8wekyb3d8bbwe","Name":"winget-font","TrustLevel":["Trusted","StoreOrigin"],"Type":"Microsoft.PreIndexed.Package"}
 """;
 
                 var sources = SystemWingetSourceStore.ParseExport(output);
 
-                Assert.Equal(["contoso", "contoso-cache"], sources.Select(source => source.Name).ToArray());
+                Assert.Equal(["winget.pro", "msstore", "winget", "winget-font"], sources.Select(source => source.Name).ToArray());
                 var rest = sources[0];
                 Assert.Equal(SourceKind.Rest, rest.Kind);
-                Assert.Equal("https://api.contoso.test/feed", rest.Arg);
-                Assert.Equal("api.contoso.test", rest.Identifier);
+                Assert.Equal("https://api.winget.pro/feed", rest.Arg);
+                Assert.Equal("api.winget.pro", rest.Identifier);
                 Assert.Equal("Trusted", rest.TrustLevel);
                 Assert.False(rest.Explicit);
 
-                var preIndexed = sources[1];
+                var preIndexed = sources[2];
                 Assert.Equal(SourceKind.PreIndexed, preIndexed.Kind);
-                Assert.Equal("Contoso.Source_8wekyb3d8bbwe", preIndexed.Identifier);
-                Assert.True(preIndexed.Explicit);
+                Assert.Equal("Microsoft.Winget.Source_8wekyb3d8bbwe", preIndexed.Identifier);
+                Assert.False(preIndexed.Explicit);
         }
 
         [Fact]
@@ -1758,6 +1763,30 @@ public class RepositoryParityTests
     }
 
     [Fact]
+    public void GreaterThanLatestArpAnchoredVersion_HandlesServicedMsixFrameworkVersion()
+    {
+        // WindowsAppRuntime packages can be serviced beyond the latest winget
+        // catalog versionData range. winget renders those as `> latest` and
+        // does not report an available downgrade.
+        var entries = new List<PreIndexedSource.V2VersionDataEntry>
+        {
+            new() { Version = "1.5.8", ArpMinVersion = "5001.373.1736.0", ArpMaxVersion = "5001.373.1736.0" },
+            new() { Version = "1.5.7", ArpMinVersion = "5001.337.1906.0", ArpMaxVersion = "5001.337.1906.0" },
+        };
+
+        Assert.Null(Repository.MapArpVersionToCatalog(entries, "5001.400.42.0"));
+        Assert.Null(Repository.LessThanLatestArpAnchoredVersion(entries, "5001.400.42.0"));
+        Assert.Equal("> 1.5.8", Repository.GreaterThanLatestArpAnchoredVersion(entries, "5001.400.42.0", "1.5.8"));
+        Assert.Null(Repository.GreaterThanLatestArpAnchoredVersion(entries, "5001.337.1906.0", "1.5.8"));
+
+        var staleNormalAppEntries = new List<PreIndexedSource.V2VersionDataEntry>
+        {
+            new() { Version = "2024.1.1", ArpMinVersion = "2024.1.1.0", ArpMaxVersion = "2024.1.1.0" },
+        };
+        Assert.Null(Repository.GreaterThanLatestArpAnchoredVersion(staleNormalAppEntries, "2026.1.3.0", "2026.2.0.0"));
+    }
+
+    [Fact]
     public void LatestArpAnchoredVersion_SkipsInternalRows()
     {
         // Microsoft.WindowsAppRuntime.1.8 publishes both an internal build
@@ -1781,6 +1810,47 @@ public class RepositoryParityTests
             new() { Version = "1.27.470.0" },
         };
         Assert.Null(Repository.LatestArpAnchoredVersion(entries));
+    }
+
+    [Fact]
+    public void SuppressDuplicateAvailableVersions_KeepsAvailableOnlyOnNewestInstalledRow()
+    {
+        var rows = new List<ListMatch>
+        {
+            new()
+            {
+                Name = "Example 1.0",
+                Id = "Example.Tool",
+                LocalId = @"ARP\Machine\X64\old",
+                InstalledVersion = "1.0.0",
+                AvailableVersion = "3.0.0",
+                SourceName = "winget",
+            },
+            new()
+            {
+                Name = "Example 2.0",
+                Id = "Example.Tool",
+                LocalId = @"ARP\Machine\X64\new",
+                InstalledVersion = "2.0.0",
+                AvailableVersion = "3.0.0",
+                SourceName = "winget",
+            },
+            new()
+            {
+                Name = "Other",
+                Id = "Other.Tool",
+                LocalId = @"ARP\Machine\X64\other",
+                InstalledVersion = "1.0.0",
+                AvailableVersion = "2.0.0",
+                SourceName = "winget",
+            },
+        };
+
+        var result = Repository.SuppressDuplicateAvailableVersions(rows);
+
+        Assert.Null(result[0].AvailableVersion);
+        Assert.Equal("3.0.0", result[1].AvailableVersion);
+        Assert.Equal("2.0.0", result[2].AvailableVersion);
     }
 
     [Fact]
@@ -2038,6 +2108,43 @@ Installers:
     }
 
     [Fact]
+    public void LookupInstalledDbIdentityMatch_ReturnsProductCodeMatch()
+    {
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE ids (rowid INTEGER PRIMARY KEY, id TEXT NOT NULL);
+                CREATE TABLE names (rowid INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE manifest (rowid INTEGER PRIMARY KEY, id INT64 NOT NULL, name INT64 NOT NULL);
+                CREATE TABLE productcodes (rowid INTEGER PRIMARY KEY, productcode TEXT NOT NULL);
+                CREATE TABLE productcodes_map (manifest INT64 NOT NULL, productcode INT64 NOT NULL);
+                INSERT INTO ids VALUES (1, 'Git.Git');
+                INSERT INTO names VALUES (1, 'Git');
+                INSERT INTO manifest VALUES (10, 1, 1);
+                INSERT INTO productcodes VALUES (20, 'git_is1');
+                INSERT INTO productcodes_map VALUES (10, 20);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var package = new InstalledPackage
+        {
+            Name = "Git",
+            LocalId = @"ARP\Machine\X64\Git_is1",
+            InstalledVersion = "2.54.0",
+            ProductCodes = ["git_is1"],
+        };
+
+        var hit = Repository.LookupInstalledDbIdentityMatchForTesting(connection, package);
+
+        Assert.NotNull(hit);
+        Assert.Equal("Git.Git", hit.Value.Id);
+        Assert.Equal("Git", hit.Value.Name);
+        Assert.Equal("ProductCode", hit.Value.MatchedBy);
+    }
+
+    [Fact]
     public void UpgradeFilter_HidesRequireExplicitUpgrade_ByDefault()
     {
         // winget hides RequireExplicitUpgrade rows from bulk `upgrade`
@@ -2238,6 +2345,34 @@ Installers:
         Assert.Null(InstalledPackages.UnflipPackedGuid("nothex"));
         Assert.Null(InstalledPackages.UnflipPackedGuid("9DBC2929593B4D2488740C8E00C4F65"));
         Assert.Null(InstalledPackages.UnflipPackedGuid("ZZZZZZZZ593B4D2488740C8E00C4F652"));
+    }
+
+    [Fact]
+    public void ParseMsixFullName_ReturnsBasePackageMetadata()
+    {
+        var parsed = InstalledPackages.ParseMsixFullName(
+            "Microsoft.XboxSpeechToTextOverlay_1.97.17002.0_x64__8wekyb3d8bbwe");
+
+        Assert.NotNull(parsed);
+        Assert.Equal("1.97.17002.0", parsed.Value.Version);
+        Assert.Equal("", parsed.Value.ResourceId);
+        Assert.Equal("Microsoft.XboxSpeechToTextOverlay_8wekyb3d8bbwe", parsed.Value.FamilyName);
+        Assert.False(InstalledPackages.IsMsixSplitResourcePackage(parsed.Value.ResourceId));
+    }
+
+    [Fact]
+    public void ParseMsixFullName_ClassifiesSplitResourcePackages()
+    {
+        var parsed = InstalledPackages.ParseMsixFullName(
+            "Microsoft.XboxSpeechToTextOverlay_1.97.17002.0_neutral_split.scale-125_8wekyb3d8bbwe");
+
+        Assert.NotNull(parsed);
+        Assert.Equal("1.97.17002.0", parsed.Value.Version);
+        Assert.Equal("split.scale-125", parsed.Value.ResourceId);
+        Assert.Equal(
+            "Microsoft.XboxSpeechToTextOverlay_split.scale-125_8wekyb3d8bbwe",
+            parsed.Value.FamilyName);
+        Assert.True(InstalledPackages.IsMsixSplitResourcePackage(parsed.Value.ResourceId));
     }
 
     [Fact]

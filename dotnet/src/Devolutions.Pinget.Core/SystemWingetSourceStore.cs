@@ -110,7 +110,7 @@ internal static class SystemWingetSourceStore
             records.Add(source);
         }
 
-        return OrderSources(records);
+        return records;
     }
 
     private static WingetCommandResult RunChecked(IReadOnlyList<string> args, string action)
@@ -158,7 +158,6 @@ internal static class SystemWingetSourceStore
             {
                 foreach (var sourceElement in root.EnumerateArray())
                     sources.Add(ParseSourceElement(sourceElement));
-                sources = OrderSources(sources);
                 return true;
             }
 
@@ -168,7 +167,6 @@ internal static class SystemWingetSourceStore
             {
                 foreach (var sourceElement in sourcesElement.EnumerateArray())
                     sources.Add(ParseSourceElement(sourceElement));
-                sources = OrderSources(sources);
                 return true;
             }
 
@@ -301,13 +299,6 @@ internal static class SystemWingetSourceStore
     private static bool IsTrustedValue(JsonElement value) =>
         value.ValueKind == JsonValueKind.String &&
         value.GetString()?.Equals("Trusted", StringComparison.OrdinalIgnoreCase) == true;
-
-    private static List<SourceRecord> OrderSources(List<SourceRecord> sources) =>
-        sources
-            .OrderBy(source => source.Explicit)
-            .ThenByDescending(source => source.Priority)
-            .ThenBy(source => source.Name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
 }
 
 internal sealed record WingetCommandResult(int ExitCode, string Stdout, string Stderr);

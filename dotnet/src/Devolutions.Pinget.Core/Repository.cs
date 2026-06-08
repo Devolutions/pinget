@@ -508,6 +508,8 @@ public class Repository : IDisposable
 
     public ListResponse List(ListQuery query)
     {
+        RefreshSystemWingetSources();
+
         if ((query.IncludeUnknown || query.IncludePinned) && !query.UpgradeOnly)
             throw new InvalidOperationException("--include-unknown and --include-pinned require --upgrade-available");
 
@@ -525,6 +527,7 @@ public class Repository : IDisposable
         // Even plain `list` should canonicalize installed package ids and
         // sources when the local package can be correlated back to a source
         // catalog entry. Available-version lookups stay gated below.
+        warnings.AddRange(CorrelateInstalledViaInstalledDb(installed, query.Source));
         warnings.AddRange(CorrelateInstalledViaIndex(installed, query.Source));
         warnings.AddRange(CorrelateInstalledByNormalizedIdentity(installed, query.Source));
 
@@ -585,6 +588,8 @@ public class Repository : IDisposable
             .Select(ListMatchFromInstalled)
             .Where(match => !query.UpgradeOnly || query.IncludePinned || !IsUpgradeBlockedByPin(match, pins))
             .ToList();
+        if (!query.UpgradeOnly)
+            listMatches = SuppressDuplicateAvailableVersions(listMatches);
 
         bool truncated = false;
         if (query.Count is int limit)
@@ -2839,6 +2844,57 @@ public class Repository : IDisposable
     }
 
     /// <summary>
+    /// Returns "&gt; latest&gt;" when ARP range metadata proves the installed
+    /// package version is newer than the newest catalog version that has ARP
+    /// bounds. This is common for inbox MSIX frameworks such as
+    /// WindowsAppRuntime, where Windows can service a package beyond the
+    /// latest winget catalog mapping.
+    /// </summary>
+    internal static string? GreaterThanLatestArpAnchoredVersion(
+        IReadOnlyList<PreIndexedSource.V2VersionDataEntry> entries,
+        string arpVersion,
+        string catalogLatestVersion)
+    {
+        if (string.IsNullOrEmpty(arpVersion) || arpVersion.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        PreIndexedSource.V2VersionDataEntry? latest = null;
+        foreach (var entry in entries)
+        {
+            if (entry.ArpMinVersion is null || entry.ArpMaxVersion is null) continue;
+            if (latest is null || RestSource.CompareVersionStrings(entry.Version, latest.Version) > 0)
+                latest = entry;
+        }
+        if (latest?.ArpMaxVersion is null)
+            return null;
+        if (!latest.Version.Equals(catalogLatestVersion, StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (!HasDifferentLeadingVersionNumber(latest.ArpMaxVersion, latest.Version))
+            return null;
+        if (RestSource.CompareVersionStrings(arpVersion, latest.ArpMaxVersion) <= 0)
+            return null;
+
+        return $"> {latest.Version}";
+    }
+
+    private static bool HasDifferentLeadingVersionNumber(string left, string right)
+    {
+        var leftLeading = LeadingVersionNumber(left);
+        var rightLeading = LeadingVersionNumber(right);
+        return leftLeading is not null && rightLeading is not null &&
+               !leftLeading.Equals(rightLeading, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? LeadingVersionNumber(string value)
+    {
+        var trimmed = value.TrimStart();
+        int length = 0;
+        while (length < trimmed.Length && char.IsAsciiDigit(trimmed[length]))
+            length++;
+        return length == 0 ? null : trimmed[..length];
+    }
+
+    /// <summary>
     /// Returns the latest catalog Version that carries ARP-range metadata.
     /// Packages like `Microsoft.WindowsAppRuntime.1.8` also publish "internal"
     /// version rows whose `v` is an MSI build number (`8000.836.2153.0`)
@@ -2857,6 +2913,151 @@ public class Repository : IDisposable
                 best = entry;
         }
         return best?.Version;
+    }
+
+    /// <summary>
+    /// Uses winget's per-source installed tracking DB when available. This is
+    /// an exact identity signal recorded by winget itself, and it preserves
+    /// source order for sources that do not expose a preindexed identity table
+    /// such as REST sources.
+    /// </summary>
+    private List<string> CorrelateInstalledViaInstalledDb(List<InstalledPackage> installed, string? requestedSource)
+    {
+        var warnings = new List<string>();
+        for (int sourceIndex = 0; sourceIndex < _store.Sources.Count; sourceIndex++)
+        {
+            var source = _store.Sources[sourceIndex];
+            if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var installedDbPath = SourceStoreManager.SourceInstalledDbPath(source, _appRoot);
+            if (!File.Exists(installedDbPath))
+                continue;
+
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={installedDbPath};Mode=ReadOnly;Pooling=False");
+            conn.Open();
+            if (!InstalledDbIdentityTablesPresent(conn))
+                continue;
+
+            for (int i = 0; i < installed.Count; i++)
+            {
+                if (installed[i].Correlated is not null) continue;
+                var hit = LookupInstalledDbIdentityMatch(conn, installed[i]);
+                if (hit is null) continue;
+
+                string? version = null;
+                string? moniker = null;
+                if (source.Kind == SourceKind.PreIndexed)
+                {
+                    try
+                    {
+                        using var indexConn = OpenPreindexedConnection(sourceIndex);
+                        var meta = LookupV2MetadataById(indexConn, hit.Value.Id);
+                        if (meta is not null)
+                        {
+                            hit = (meta.Id, meta.Name, hit.Value.MatchedBy);
+                            moniker = meta.Moniker;
+
+                            var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, indexConn, source, meta.Rowid, meta.PackageHash, _appRoot);
+                            var canonicalInstalled = MapArpVersionToCatalog(entries, installed[i].InstalledVersion)
+                                ?? LessThanLatestArpAnchoredVersion(entries, installed[i].InstalledVersion)
+                                ?? GreaterThanLatestArpAnchoredVersion(entries, installed[i].InstalledVersion, meta.LatestVersion);
+                            var anchoredLatest = LatestArpAnchoredVersion(entries);
+                            version = canonicalInstalled is not null
+                                ? (IsGreaterThanVersionMarker(canonicalInstalled) ? null : anchoredLatest)
+                                : meta.LatestVersion;
+
+                            if (canonicalInstalled is not null)
+                            {
+                                installed[i].InstalledVersion = canonicalInstalled;
+                                installed[i].InstalledVersionCanonical = true;
+                            }
+                        }
+                    }
+                    catch { /* version data fetch is best-effort; fall back to the installed DB identity below */ }
+                }
+
+                installed[i].Correlated = new SearchMatch
+                {
+                    SourceName = source.Name,
+                    SourceKind = source.Kind,
+                    Id = hit.Value.Id,
+                    Name = hit.Value.Name,
+                    Moniker = moniker,
+                    Version = version,
+                    MatchCriteria = hit.Value.MatchedBy,
+                };
+            }
+        }
+
+        return warnings;
+    }
+
+    private static bool InstalledDbIdentityTablesPresent(Microsoft.Data.Sqlite.SqliteConnection conn) =>
+        TableExists(conn, "manifest") &&
+        TableExists(conn, "ids") &&
+        TableExists(conn, "names") &&
+        ((TableExists(conn, "pfns") && TableExists(conn, "pfns_map")) ||
+         (TableExists(conn, "productcodes") && TableExists(conn, "productcodes_map")) ||
+         (TableExists(conn, "upgradecodes") && TableExists(conn, "upgradecodes_map")));
+
+    private static bool TableExists(Microsoft.Data.Sqlite.SqliteConnection conn, string name) =>
+        QueryOptionalLong(conn, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = @v LIMIT 1", name) is not null;
+
+    private static (string Id, string Name, string MatchedBy)? LookupInstalledDbIdentityMatch(
+        Microsoft.Data.Sqlite.SqliteConnection conn,
+        InstalledPackage pkg)
+    {
+        foreach (var pfn in pkg.PackageFamilyNames)
+        {
+            var hit = LookupInstalledDbIdentityMatch(conn, "pfns", "pfns_map", "pfn", pfn, "PackageFamilyName");
+            if (hit is not null) return hit;
+        }
+
+        foreach (var code in pkg.UpgradeCodes)
+        {
+            var hit = LookupInstalledDbIdentityMatch(conn, "upgradecodes", "upgradecodes_map", "upgradecode", code, "UpgradeCode");
+            if (hit is not null) return hit;
+        }
+
+        foreach (var code in pkg.ProductCodes)
+        {
+            var hit = LookupInstalledDbIdentityMatch(conn, "productcodes", "productcodes_map", "productcode", code, "ProductCode");
+            if (hit is not null) return hit;
+        }
+
+        return null;
+    }
+
+    internal static (string Id, string Name, string MatchedBy)? LookupInstalledDbIdentityMatchForTesting(
+        Microsoft.Data.Sqlite.SqliteConnection conn,
+        InstalledPackage pkg)
+        => LookupInstalledDbIdentityMatch(conn, pkg);
+
+    private static (string Id, string Name, string MatchedBy)? LookupInstalledDbIdentityMatch(
+        Microsoft.Data.Sqlite.SqliteConnection conn,
+        string valueTable,
+        string mapTable,
+        string valueColumn,
+        string value,
+        string matchedBy)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT ids.id, names.name
+            FROM {mapTable} map
+            JOIN {valueTable} value ON map.{valueColumn} = value.rowid
+            JOIN manifest ON map.manifest = manifest.rowid
+            JOIN ids ON manifest.id = ids.rowid
+            JOIN names ON manifest.name = names.rowid
+            WHERE value.{valueColumn} = @v
+            LIMIT 1
+            """;
+        cmd.Parameters.AddWithValue("@v", value.ToLowerInvariant());
+        using var reader = cmd.ExecuteReader();
+        return reader.Read()
+            ? (reader.GetString(0), reader.GetString(1), matchedBy)
+            : null;
     }
 
     /// <summary>
@@ -2907,7 +3108,8 @@ public class Repository : IDisposable
                     using var conn2 = OpenPreindexedConnection(sourceIndex);
                     var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
                     canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion)
-                        ?? LessThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion);
+                        ?? LessThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion)
+                        ?? GreaterThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion, meta.LatestVersion);
                     anchoredLatest = LatestArpAnchoredVersion(entries);
                 }
                 catch { /* version data fetch is best-effort; fall back below */ }
@@ -2918,8 +3120,8 @@ public class Repository : IDisposable
                 // `latest_version`, which can be an internal/MSI build
                 // number that would manufacture a phantom upgrade against
                 // an installed canonical.
-                var availableVersion = (canonicalInstalled is not null && anchoredLatest is not null)
-                    ? anchoredLatest
+                var availableVersion = canonicalInstalled is not null
+                    ? (IsGreaterThanVersionMarker(canonicalInstalled) ? null : anchoredLatest)
                     : meta.LatestVersion;
 
                 installed[idx].Correlated = new SearchMatch
@@ -2999,13 +3201,15 @@ public class Repository : IDisposable
                 {
                     using var conn2 = OpenPreindexedConnection(sourceIndex);
                     var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn2, source, meta.Rowid, meta.PackageHash, _appRoot);
-                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion)
+                        ?? LessThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion)
+                        ?? GreaterThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion, meta.LatestVersion);
                     anchoredLatest = LatestArpAnchoredVersion(entries);
                 }
                 catch { /* best-effort */ }
 
-                var availableVersion = (canonicalInstalled is not null && anchoredLatest is not null)
-                    ? anchoredLatest
+                var availableVersion = canonicalInstalled is not null
+                    ? (IsGreaterThanVersionMarker(canonicalInstalled) ? null : anchoredLatest)
                     : meta.LatestVersion;
 
                 installed[idx].Correlated = new SearchMatch
@@ -3199,14 +3403,21 @@ public class Repository : IDisposable
 
                 if (!installed[idx].InstalledVersionCanonical)
                 {
-                    var canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion);
+                    var canonicalInstalled = MapArpVersionToCatalog(entries, installed[idx].InstalledVersion)
+                        ?? LessThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion)
+                        ?? GreaterThanLatestArpAnchoredVersion(entries, installed[idx].InstalledVersion, meta.LatestVersion);
                     var anchoredLatest = LatestArpAnchoredVersion(entries);
                     if (canonicalInstalled is not null)
                     {
                         installed[idx].InstalledVersion = canonicalInstalled;
                         installed[idx].InstalledVersionCanonical = true;
                         if (installed[idx].Correlated is SearchMatch correlated && anchoredLatest is not null)
-                            installed[idx].Correlated = correlated with { Version = anchoredLatest };
+                        {
+                            installed[idx].Correlated = correlated with
+                            {
+                                Version = IsGreaterThanVersionMarker(canonicalInstalled) ? null : anchoredLatest
+                            };
+                        }
                     }
                 }
 
@@ -3452,9 +3663,12 @@ public class Repository : IDisposable
         string? availableVersion = null;
         if (pkg.Correlated?.Version is string av)
         {
-            if (InstalledPackageHasUnknownVersion(pkg) ||
-                RestSource.CompareVersionStrings(av, pkg.InstalledVersion) > 0)
+            if (!IsGreaterThanVersionMarker(pkg.InstalledVersion) &&
+                (InstalledPackageHasUnknownVersion(pkg) ||
+                 RestSource.CompareVersionStrings(av, pkg.InstalledVersion) > 0))
+            {
                 availableVersion = av;
+            }
         }
 
         string packageId = pkg.Correlated?.Id ?? pkg.LocalId;
@@ -3485,6 +3699,44 @@ public class Repository : IDisposable
             ProductCodes = pkg.ProductCodes,
             UpgradeCodes = pkg.UpgradeCodes,
         };
+    }
+
+    internal static List<ListMatch> SuppressDuplicateAvailableVersions(IReadOnlyList<ListMatch> matches)
+    {
+        var duplicateKeys = matches
+            .Where(match => !string.IsNullOrWhiteSpace(match.SourceName))
+            .GroupBy(match => $"{match.SourceName}\0{match.Id}", StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() > 1)
+            .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.OrdinalIgnoreCase);
+
+        if (duplicateKeys.Count == 0)
+            return matches.ToList();
+
+        var keepLocalIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, group) in duplicateKeys)
+        {
+            var bestVersion = group
+                .Select(match => match.InstalledVersion)
+                .Aggregate((best, version) => RestSource.CompareVersionStrings(version, best) > 0 ? version : best);
+            foreach (var match in group.Where(match => RestSource.CompareVersionStrings(match.InstalledVersion, bestVersion) == 0))
+                keepLocalIds.Add($"{key}\0{match.LocalId}");
+        }
+
+        return matches
+            .Select(match =>
+            {
+                if (match.AvailableVersion is null || string.IsNullOrWhiteSpace(match.SourceName))
+                    return match;
+
+                var key = $"{match.SourceName}\0{match.Id}";
+                if (!duplicateKeys.ContainsKey(key))
+                    return match;
+
+                return keepLocalIds.Contains($"{key}\0{match.LocalId}")
+                    ? match
+                    : match with { AvailableVersion = null };
+            })
+            .ToList();
     }
 
     internal static bool TryGetWinGetPackageIdentityFromLocalId(
@@ -3536,8 +3788,12 @@ public class Repository : IDisposable
         pkg.InstalledVersion.Equals("Unknown", StringComparison.OrdinalIgnoreCase);
 
     private static bool InstalledPackageHasUpgrade(InstalledPackage pkg) =>
+        !IsGreaterThanVersionMarker(pkg.InstalledVersion) &&
         pkg.Correlated?.Version is string availableVersion &&
         RestSource.CompareVersionStrings(availableVersion, pkg.InstalledVersion) > 0;
+
+    private static bool IsGreaterThanVersionMarker(string version) =>
+        version.TrimStart().StartsWith('>');
 
     private static bool InstallerMatchesRequested(
         Installer installer,
