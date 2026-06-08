@@ -5114,11 +5114,6 @@ fn source_state_dir_with_keying(app_root: &Path, source: &SourceRecord, identifi
     app_root.join("sources").join(sanitize_path_segment(&source.name))
 }
 
-#[cfg(test)]
-fn source_installed_db_path(app_root: &Path, source: &SourceRecord) -> PathBuf {
-    source_installed_db_path_with_keying(app_root, source, false)
-}
-
 fn source_installed_db_path_with_keying(app_root: &Path, source: &SourceRecord, identifier_keyed: bool) -> PathBuf {
     if uses_packaged_layout(app_root) {
         return app_root
@@ -11141,7 +11136,7 @@ mod tests {
                 ))
         );
         assert!(
-            source_installed_db_path(&app_root, &source)
+            source_installed_db_path_with_keying(&app_root, &source, false)
                 .display()
                 .to_string()
                 .ends_with(&format!(
