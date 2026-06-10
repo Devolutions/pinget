@@ -1,6 +1,6 @@
 @{
     RootModule = 'Devolutions.Pinget.Client.psm1'
-    ModuleVersion = '0.8.2'
+    ModuleVersion = '0.9.0'
     CompatiblePSEditions = @('Desktop', 'Core')
     GUID = 'c6d1b5f2-5ccd-4771-9480-25caad7c58bd'
     Author = 'Devolutions'
