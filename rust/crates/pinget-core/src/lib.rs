@@ -18,8 +18,8 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{
-    ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH,
-    IF_RANGE, LAST_MODIFIED, RANGE,
+    ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE,
+    IF_NONE_MATCH, IF_RANGE, LAST_MODIFIED, RANGE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -3121,14 +3121,15 @@ impl Repository {
             .client
             .post(url)
             .header("Version", contract)
-            .json(&body)
+            .header(CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&body).context("failed to serialize REST search request")?)
             .send()
             .context("REST search request failed")?
             .error_for_status()
             .context("REST search request returned an error")?;
-        let json = response
-            .json::<JsonValue>()
-            .context("failed to parse REST search response")?;
+        let json =
+            serde_json::from_slice::<JsonValue>(&response.bytes().context("failed to read REST search response")?)
+                .context("failed to parse REST search response")?;
         let data = json
             .get("Data")
             .and_then(JsonValue::as_array)
@@ -3455,9 +3456,9 @@ impl Repository {
             .context("REST information request returned an error")?;
 
         let max_age = cache_control_max_age(&response);
-        let json = response
-            .json::<JsonValue>()
-            .context("failed to parse REST information response")?;
+        let json =
+            serde_json::from_slice::<JsonValue>(&response.bytes().context("failed to read REST information response")?)
+                .context("failed to parse REST information response")?;
         let data = json
             .get("Data")
             .cloned()
