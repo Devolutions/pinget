@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/Devolutions/pinget/compare/pinget-core-v0.10.0...pinget-core-v0.11.0) - 2026-09-01
+
+### Other
+
+- Address review: unsafe env mutation and Auto precedence
+- Drop a redundant Read import from the core test module
+- Bump version to 0.11.0
+- Cover the source-mode environment variable end to end
+- Let a host relocate storage without losing the machine's sources
+
 ## [0.8.1](https://github.com/Devolutions/pinget/compare/pinget-core-v0.8.0...pinget-core-v0.8.1) - 2026-06-02
 
 ### Other
