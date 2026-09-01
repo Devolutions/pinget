@@ -10663,7 +10663,7 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write};
+    use std::io::Write;
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
