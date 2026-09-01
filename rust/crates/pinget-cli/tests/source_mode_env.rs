@@ -1,3 +1,9 @@
+// The observable assertion needs a real `winget` to mirror from, so the whole file is
+// Windows-only. Gating at the crate level rather than per-test keeps the helpers and
+// imports from being dead code on other platforms. Parsing and precedence are covered
+// by pinget-core unit tests on every platform.
+#![cfg(windows)]
+
 //! Covers the `PINGET_SOURCE_MODE` wiring through a real process.
 //!
 //! This lives here rather than as a unit test because asserting on an environment
@@ -34,10 +40,6 @@ fn run_source_list(app_root: &Path, source_mode: Option<&str>) {
     );
 }
 
-/// The mirror store only exists once the machine's WinGet sources are mirrored, which
-/// needs a real `winget`, so the observable assertion is Windows-only. The parsing and
-/// precedence rules are covered by unit tests on every platform.
-#[cfg(windows)]
 #[test]
 fn source_mode_environment_variable_overrides_the_custom_app_root_default() {
     let app_root = temp_app_root("with-source-mode");
@@ -48,7 +50,6 @@ fn source_mode_environment_variable_overrides_the_custom_app_root_default() {
     );
 }
 
-#[cfg(windows)]
 #[test]
 fn a_custom_app_root_alone_still_selects_the_private_store() {
     let app_root = temp_app_root("without-source-mode");
