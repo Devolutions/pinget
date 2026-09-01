@@ -50,6 +50,8 @@ const DEFAULT_USER_AGENT: &str = "pinget-rs/0.1";
 const DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES: i64 = 15;
 const PREINDEXED_REFRESH_RETRY_MINUTES: i64 = 5;
 const SYSTEM_WINGET_MIRROR_STORE_FILE_NAME: &str = "system-sources.json";
+const APP_ROOT_ENV_VAR: &str = "PINGET_APPROOT";
+const SOURCE_MODE_ENV_VAR: &str = "PINGET_SOURCE_MODE";
 #[cfg(windows)]
 const PACKAGED_FAMILY_NAME: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
 #[cfg(windows)]
@@ -172,6 +174,29 @@ pub enum SourceMode {
     SystemWingetMirror,
 }
 
+impl SourceMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "private" => Some(Self::Private),
+            "system-winget-mirror" | "systemwingetmirror" => Some(Self::SystemWingetMirror),
+            _ => None,
+        }
+    }
+
+    fn from_env() -> Option<Self> {
+        Self::parse(&std::env::var(SOURCE_MODE_ENV_VAR).ok()?)
+    }
+
+    fn resolve(from_env: Option<Self>, has_app_root_override: bool) -> Self {
+        from_env.unwrap_or(if has_app_root_override {
+            Self::Private
+        } else {
+            Self::Auto
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectiveSourceMode {
     Private,
@@ -193,11 +218,7 @@ impl RepositoryOptions {
 
     /// Uses the default per-user app-data root that the CLI also uses.
     pub fn for_current_user() -> Result<Self> {
-        let source_mode = if std::env::var_os("PINGET_APPROOT").is_some() {
-            SourceMode::Private
-        } else {
-            SourceMode::Auto
-        };
+        let source_mode = SourceMode::resolve(SourceMode::from_env(), std::env::var_os(APP_ROOT_ENV_VAR).is_some());
         Ok(Self::new(default_app_root()?).with_source_mode(source_mode))
     }
 
@@ -5044,7 +5065,7 @@ fn ensure_app_dirs(app_root: &Path) -> Result<()> {
 }
 
 fn default_app_root() -> Result<PathBuf> {
-    if let Some(app_root) = std::env::var_os("PINGET_APPROOT") {
+    if let Some(app_root) = std::env::var_os(APP_ROOT_ENV_VAR) {
         return Ok(PathBuf::from(app_root));
     }
 
@@ -11147,21 +11168,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_mode_parses_accepted_spellings() {
+        assert_eq!(SourceMode::parse("auto"), Some(SourceMode::Auto));
+        assert_eq!(SourceMode::parse("  Auto  "), Some(SourceMode::Auto));
+        assert_eq!(SourceMode::parse("PRIVATE"), Some(SourceMode::Private));
+        assert_eq!(
+            SourceMode::parse("system-winget-mirror"),
+            Some(SourceMode::SystemWingetMirror)
+        );
+        assert_eq!(
+            SourceMode::parse("SystemWingetMirror"),
+            Some(SourceMode::SystemWingetMirror)
+        );
+    }
+
+    #[test]
+    fn source_mode_rejects_unknown_spellings() {
+        assert_eq!(SourceMode::parse(""), None);
+        assert_eq!(SourceMode::parse("mirror"), None);
+        assert_eq!(SourceMode::parse("system_winget_mirror"), None);
+    }
+
+    #[test]
+    fn source_mode_resolution_keeps_private_default_for_a_custom_app_root() {
+        assert_eq!(SourceMode::resolve(None, true), SourceMode::Private);
+        assert_eq!(SourceMode::resolve(None, false), SourceMode::Auto);
+    }
+
+    #[test]
+    fn source_mode_resolution_lets_the_environment_override_a_custom_app_root() {
+        assert_eq!(SourceMode::resolve(Some(SourceMode::Auto), true), SourceMode::Auto);
+        assert_eq!(
+            SourceMode::resolve(Some(SourceMode::SystemWingetMirror), true),
+            SourceMode::SystemWingetMirror
+        );
+        assert_eq!(
+            SourceMode::resolve(Some(SourceMode::Private), false),
+            SourceMode::Private
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn default_app_root_outside_package_avoids_packaged_layout() {
         // Tests run without AppX package identity, so the default app root must not
         // resolve to the WinGet packaged LocalState — that location requires a
         // brokered/elevated writer for its secure-settings stream.
-        let prior = std::env::var_os("PINGET_APPROOT");
+        let prior = std::env::var_os(APP_ROOT_ENV_VAR);
         // SAFETY: tests in this module are not run concurrently with other env mutators.
-        unsafe { std::env::remove_var("PINGET_APPROOT") };
+        unsafe { std::env::remove_var(APP_ROOT_ENV_VAR) };
 
         let result = default_app_root();
 
         if let Some(prior) = prior {
             // SAFETY: restoring the prior value before assertions panic, single-threaded test.
-            unsafe { std::env::set_var("PINGET_APPROOT", prior) };
+            unsafe { std::env::set_var(APP_ROOT_ENV_VAR, prior) };
         }
 
         let app_root = result.expect("default app root");

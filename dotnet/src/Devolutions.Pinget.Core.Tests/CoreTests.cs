@@ -365,6 +365,75 @@ public class SourceStoreTests
                 }
         }
 
+    [Theory]
+    [InlineData("auto", SourceMode.Auto)]
+    [InlineData("  Auto  ", SourceMode.Auto)]
+    [InlineData("PRIVATE", SourceMode.Private)]
+    [InlineData("system-winget-mirror", SourceMode.SystemWingetMirror)]
+    [InlineData("SystemWingetMirror", SourceMode.SystemWingetMirror)]
+    public void TryParseSourceMode_AcceptsKnownSpellings(string value, SourceMode expected)
+    {
+        Assert.True(Repository.TryParseSourceMode(value, out var parsed));
+        Assert.Equal(expected, parsed);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("mirror")]
+    [InlineData("system_winget_mirror")]
+    public void TryParseSourceMode_RejectsUnknownSpellings(string? value)
+    {
+        Assert.False(Repository.TryParseSourceMode(value, out _));
+    }
+
+    [Fact]
+    public void ResolveRequestedSourceMode_KeepsPrivateDefaultForACustomAppRoot()
+    {
+        Assert.Equal(
+            SourceMode.Private,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", null));
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, null, null));
+    }
+
+    [Fact]
+    public void ResolveRequestedSourceMode_LetsTheEnvironmentOverrideACustomAppRoot()
+    {
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", "auto"));
+        Assert.Equal(
+            SourceMode.SystemWingetMirror,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", "system-winget-mirror"));
+        Assert.Equal(
+            SourceMode.Private,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, null, "private"));
+    }
+
+    [Fact]
+    public void ResolveRequestedSourceMode_IgnoresTheEnvironmentWhenTheCallerIsExplicit()
+    {
+        Assert.Equal(
+            SourceMode.SystemWingetMirror,
+            Repository.ResolveRequestedSourceMode(SourceMode.SystemWingetMirror, @"C:\custom", "private"));
+        Assert.Equal(
+            SourceMode.Private,
+            Repository.ResolveRequestedSourceMode(SourceMode.Private, null, "auto"));
+    }
+
+    [Fact]
+    public void ResolveRequestedSourceMode_IgnoresAnUnparseableEnvironmentValue()
+    {
+        Assert.Equal(
+            SourceMode.Private,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", "not-a-mode"));
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, null, "not-a-mode"));
+    }
+
     [Fact]
     public void RepositoryOpen_UsesCustomAppRoot()
     {
