@@ -47,7 +47,12 @@ public record RepositoryOptions
     /// Storage root for Pinget state and caches.
     /// </summary>
     public string? AppRoot { get; init; }
-    public SourceMode SourceMode { get; init; } = SourceMode.Auto;
+    /// <summary>
+    /// Source resolution mode. Leave unset to let the app root and the
+    /// <c>PINGET_SOURCE_MODE</c> environment variable decide; any explicit value,
+    /// including <see cref="Core.SourceMode.Auto"/>, wins over both.
+    /// </summary>
+    public SourceMode? SourceMode { get; init; }
     public string UserAgent { get; init; } = "pinget-dotnet/0.1";
     public Action<RepositoryWarning>? Diagnostics { get; init; }
 

@@ -12,6 +12,7 @@ namespace Devolutions.Pinget.Core;
 public class Repository : IDisposable
 {
     private const string AppRootEnvironmentVariable = "PINGET_APPROOT";
+    private const string SourceModeEnvironmentVariable = "PINGET_SOURCE_MODE";
 
     internal const string InstalledStateUnsupportedWarning = "Installed package discovery is not supported on this platform; returning no installed packages.";
     internal const string InstallUnsupportedWarning = "Installing packages is not supported on this platform; no changes were made.";
@@ -65,9 +66,7 @@ public class Repository : IDisposable
         var requestedAppRoot = options.AppRoot ?? Environment.GetEnvironmentVariable(AppRootEnvironmentVariable);
         var appRoot = SourceStoreManager.NormalizeAppRoot(requestedAppRoot);
         SourceStoreManager.EnsureAppDirs(appRoot);
-        var requestedSourceMode = options.SourceMode == SourceMode.Auto && requestedAppRoot is not null
-            ? SourceMode.Private
-            : options.SourceMode;
+        var requestedSourceMode = ResolveRequestedSourceMode(options.SourceMode, requestedAppRoot);
         var (sourceMode, store) = SourceStoreManager.LoadEffective(appRoot, requestedSourceMode);
         var client = new HttpClient(new SocketsHttpHandler
         {
@@ -77,6 +76,46 @@ public class Repository : IDisposable
         client.Timeout = Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
         return new Repository(appRoot, client, store, sourceMode, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
+    }
+
+    internal static SourceMode ResolveRequestedSourceMode(SourceMode? configuredSourceMode, string? requestedAppRoot) =>
+        ResolveRequestedSourceMode(
+            configuredSourceMode,
+            requestedAppRoot,
+            Environment.GetEnvironmentVariable(SourceModeEnvironmentVariable));
+
+    internal static SourceMode ResolveRequestedSourceMode(
+        SourceMode? configuredSourceMode,
+        string? requestedAppRoot,
+        string? sourceModeFromEnvironment)
+    {
+        if (configuredSourceMode is { } explicitSourceMode)
+            return explicitSourceMode;
+
+        if (TryParseSourceMode(sourceModeFromEnvironment, out var parsedSourceMode))
+            return parsedSourceMode;
+
+        return requestedAppRoot is null ? SourceMode.Auto : SourceMode.Private;
+    }
+
+    internal static bool TryParseSourceMode(string? value, out SourceMode sourceMode)
+    {
+        switch (value?.Trim().ToLowerInvariant())
+        {
+            case "auto":
+                sourceMode = SourceMode.Auto;
+                return true;
+            case "private":
+                sourceMode = SourceMode.Private;
+                return true;
+            case "system-winget-mirror":
+            case "systemwingetmirror":
+                sourceMode = SourceMode.SystemWingetMirror;
+                return true;
+            default:
+                sourceMode = SourceMode.Auto;
+                return false;
+        }
     }
 
     internal static IEnumerable<string> GetSqliteNativeLibraryCandidates(string assemblyDirectory)

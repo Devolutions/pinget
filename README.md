@@ -248,6 +248,34 @@ Pinget is designed to keep **source-backed functionality** working cross-platfor
   - `list` and upgrade inventory return empty results with an unsupported warning
   - `install`, `uninstall`, executed `upgrade`, and non-dry-run `import` return explicit no-op results with unsupported warnings
 
+## Storage location and source mode
+
+Two environment variables control where Pinget keeps its state and which sources it resolves
+against. Both are read by the Rust CLI and the C# core.
+
+| Variable | Effect |
+| --- | --- |
+| `PINGET_APPROOT` | Overrides the per-user storage root (`%LOCALAPPDATA%\Devolutions\Pinget` by default). Useful for embedding Pinget in a portable or sandboxed host. |
+| `PINGET_SOURCE_MODE` | Selects the source mode explicitly: `auto`, `private`, or `system-winget-mirror`. |
+
+Source modes:
+
+- `auto` mirrors the machine's configured WinGet sources, falling back to the private store when
+  they cannot be read.
+- `private` uses only the source list stored under the app root, seeded with the stock `winget`
+  and `msstore` entries.
+- `system-winget-mirror` mirrors the machine's WinGet sources with no fallback.
+
+Without `PINGET_SOURCE_MODE`, setting `PINGET_APPROOT` also selects `private`, on the assumption
+that a caller supplying its own root wants an isolated instance. A host that relocates storage but
+still wants the machine's real source list must set `PINGET_SOURCE_MODE=auto` as well; otherwise
+sources the user added to WinGet are silently absent.
+
+Precedence is the same in both implementations: an explicitly chosen mode wins, then
+`PINGET_SOURCE_MODE`, then the app-root inference. In the C# API `RepositoryOptions.SourceMode` is
+nullable for exactly this reason — leave it unset to let the environment decide, and note that
+setting it to `SourceMode.Auto` is an explicit choice that the environment will not override.
+
 ## Custom REST sources
 
 Both implementations support custom REST sources, including third-party services such as `winget.pro`.

@@ -12,6 +12,12 @@ using Devolutions.Pinget.Core;
 
 namespace Devolutions.Pinget.Core.Tests;
 
+[CollectionDefinition(Name, DisableParallelization = true)]
+public class RepositoryStateCollection
+{
+    public const string Name = "RepositoryState";
+}
+
 public class VersionCompareTests
 {
     [Theory]
@@ -112,6 +118,7 @@ public class VersionCompareTests
     }
 }
 
+[Collection(RepositoryStateCollection.Name)]
 public class SourceStoreTests
 {
     [Fact]
@@ -364,6 +371,127 @@ public class SourceStoreTests
                         SystemWingetSourceStore.CommandRunner = originalRunner;
                 }
         }
+
+    [Theory]
+    [InlineData("auto", SourceMode.Auto)]
+    [InlineData("  Auto  ", SourceMode.Auto)]
+    [InlineData("PRIVATE", SourceMode.Private)]
+    [InlineData("system-winget-mirror", SourceMode.SystemWingetMirror)]
+    [InlineData("SystemWingetMirror", SourceMode.SystemWingetMirror)]
+    public void TryParseSourceMode_AcceptsKnownSpellings(string value, SourceMode expected)
+    {
+        Assert.True(Repository.TryParseSourceMode(value, out var parsed));
+        Assert.Equal(expected, parsed);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("mirror")]
+    [InlineData("system_winget_mirror")]
+    public void TryParseSourceMode_RejectsUnknownSpellings(string? value)
+    {
+        Assert.False(Repository.TryParseSourceMode(value, out _));
+    }
+
+    [Fact]
+    public void ResolveRequestedSourceMode_KeepsPrivateDefaultForACustomAppRoot()
+    {
+        Assert.Equal(
+            SourceMode.Private,
+            Repository.ResolveRequestedSourceMode(null, @"C:\custom", null));
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(null, null, null));
+    }
+
+    [Fact]
+    public void ResolveRequestedSourceMode_LetsTheEnvironmentOverrideACustomAppRoot()
+    {
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(null, @"C:\custom", "auto"));
+        Assert.Equal(
+            SourceMode.SystemWingetMirror,
+            Repository.ResolveRequestedSourceMode(null, @"C:\custom", "system-winget-mirror"));
+        Assert.Equal(
+            SourceMode.Private,
+            Repository.ResolveRequestedSourceMode(null, null, "private"));
+    }
+
+    [Fact]
+    public void ResolveRequestedSourceMode_IgnoresTheEnvironmentWhenTheCallerIsExplicit()
+    {
+        Assert.Equal(
+            SourceMode.SystemWingetMirror,
+            Repository.ResolveRequestedSourceMode(SourceMode.SystemWingetMirror, @"C:\custom", "private"));
+        Assert.Equal(
+            SourceMode.Private,
+            Repository.ResolveRequestedSourceMode(SourceMode.Private, null, "auto"));
+    }
+
+    [Fact]
+    public void ResolveRequestedSourceMode_TreatsAnExplicitAutoAsAChoiceRatherThanAnUnsetValue()
+    {
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", "private"));
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", null));
+    }
+
+    [Fact]
+    public void ResolveRequestedSourceMode_IgnoresAnUnparseableEnvironmentValue()
+    {
+        Assert.Equal(
+            SourceMode.Private,
+            Repository.ResolveRequestedSourceMode(null, @"C:\custom", "not-a-mode"));
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(null, null, "not-a-mode"));
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData("auto", true)]
+    [InlineData("system-winget-mirror", true)]
+    [InlineData("private", false)]
+    [InlineData("not-a-mode", false)]
+    public void RepositoryOpen_ReadsTheSourceModeEnvironmentVariable(string? sourceMode, bool expectsMirror)
+    {
+        var appRoot = TestPaths.CreateTempAppRoot();
+        var originalRunner = SystemWingetSourceStore.CommandRunner;
+        var originalSourceMode = Environment.GetEnvironmentVariable("PINGET_SOURCE_MODE");
+        try
+        {
+            SystemWingetSourceStore.CommandRunner = _ => new WingetCommandResult(
+                0,
+                """
+{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+""",
+                "");
+            Environment.SetEnvironmentVariable("PINGET_SOURCE_MODE", sourceMode);
+
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                UserAgent = "pinget-dotnet-tests/1.0",
+            });
+
+            var mirrorPath = Path.Combine(appRoot, "system-sources.json");
+            Assert.Equal(expectsMirror, File.Exists(mirrorPath));
+
+            if (expectsMirror)
+                Assert.Contains("contoso", File.ReadAllText(mirrorPath));
+        }
+        finally
+        {
+            SystemWingetSourceStore.CommandRunner = originalRunner;
+            Environment.SetEnvironmentVariable("PINGET_SOURCE_MODE", originalSourceMode);
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
 
     [Fact]
     public void RepositoryOpen_UsesCustomAppRoot()
@@ -1177,6 +1305,7 @@ public class PinStoreTests
     }
 }
 
+[Collection(RepositoryStateCollection.Name)]
 public class RepositoryParityTests
 {
     [Fact]
@@ -2992,6 +3121,7 @@ Installers:
     }
 }
 
+[Collection(RepositoryStateCollection.Name)]
 public class RepositoryEmbeddingTests
 {
     private const string TesslPackageId = "tessl.tessl";
