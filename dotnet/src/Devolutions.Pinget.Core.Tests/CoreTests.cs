@@ -12,6 +12,12 @@ using Devolutions.Pinget.Core;
 
 namespace Devolutions.Pinget.Core.Tests;
 
+[CollectionDefinition(Name, DisableParallelization = true)]
+public class RepositoryStateCollection
+{
+    public const string Name = "RepositoryState";
+}
+
 public class VersionCompareTests
 {
     [Theory]
@@ -112,6 +118,7 @@ public class VersionCompareTests
     }
 }
 
+[Collection(RepositoryStateCollection.Name)]
 public class SourceStoreTests
 {
     [Fact]
@@ -432,6 +439,47 @@ public class SourceStoreTests
         Assert.Equal(
             SourceMode.Auto,
             Repository.ResolveRequestedSourceMode(SourceMode.Auto, null, "not-a-mode"));
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData("auto", true)]
+    [InlineData("system-winget-mirror", true)]
+    [InlineData("private", false)]
+    [InlineData("not-a-mode", false)]
+    public void RepositoryOpen_ReadsTheSourceModeEnvironmentVariable(string? sourceMode, bool expectsMirror)
+    {
+        var appRoot = TestPaths.CreateTempAppRoot();
+        var originalRunner = SystemWingetSourceStore.CommandRunner;
+        var originalSourceMode = Environment.GetEnvironmentVariable("PINGET_SOURCE_MODE");
+        try
+        {
+            SystemWingetSourceStore.CommandRunner = _ => new WingetCommandResult(
+                0,
+                """
+{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+""",
+                "");
+            Environment.SetEnvironmentVariable("PINGET_SOURCE_MODE", sourceMode);
+
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                UserAgent = "pinget-dotnet-tests/1.0",
+            });
+
+            var mirrorPath = Path.Combine(appRoot, "system-sources.json");
+            Assert.Equal(expectsMirror, File.Exists(mirrorPath));
+
+            if (expectsMirror)
+                Assert.Contains("contoso", File.ReadAllText(mirrorPath));
+        }
+        finally
+        {
+            SystemWingetSourceStore.CommandRunner = originalRunner;
+            Environment.SetEnvironmentVariable("PINGET_SOURCE_MODE", originalSourceMode);
+            TestPaths.DeleteAppRoot(appRoot);
+        }
     }
 
     [Fact]
@@ -1246,6 +1294,7 @@ public class PinStoreTests
     }
 }
 
+[Collection(RepositoryStateCollection.Name)]
 public class RepositoryParityTests
 {
     [Fact]
@@ -3061,6 +3110,7 @@ Installers:
     }
 }
 
+[Collection(RepositoryStateCollection.Name)]
 public class RepositoryEmbeddingTests
 {
     private const string TesslPackageId = "tessl.tessl";

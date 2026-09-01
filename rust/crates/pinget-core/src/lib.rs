@@ -11191,6 +11191,26 @@ mod tests {
     }
 
     #[test]
+    fn source_mode_reads_its_environment_variable() {
+        // The literal is deliberate: reading SOURCE_MODE_ENV_VAR here would keep this test
+        // self-consistent with a renamed constant instead of catching the rename.
+        let prior = std::env::var_os("PINGET_SOURCE_MODE");
+        // SAFETY: no other test in this module reads or writes PINGET_SOURCE_MODE.
+        unsafe { std::env::set_var("PINGET_SOURCE_MODE", "system-winget-mirror") };
+
+        let from_env = SourceMode::from_env();
+
+        match prior {
+            // SAFETY: restoring before any assertion can panic, as the test above does.
+            Some(prior) => unsafe { std::env::set_var("PINGET_SOURCE_MODE", prior) },
+            // SAFETY: as above; the variable was unset when the test started.
+            None => unsafe { std::env::remove_var("PINGET_SOURCE_MODE") },
+        }
+
+        assert_eq!(from_env, Some(SourceMode::SystemWingetMirror));
+    }
+
+    #[test]
     fn source_mode_resolution_keeps_private_default_for_a_custom_app_root() {
         assert_eq!(SourceMode::resolve(None, true), SourceMode::Private);
         assert_eq!(SourceMode::resolve(None, false), SourceMode::Auto);
