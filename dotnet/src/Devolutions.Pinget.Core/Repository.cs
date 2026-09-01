@@ -78,19 +78,19 @@ public class Repository : IDisposable
         return new Repository(appRoot, client, store, sourceMode, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
     }
 
-    internal static SourceMode ResolveRequestedSourceMode(SourceMode configuredSourceMode, string? requestedAppRoot) =>
+    internal static SourceMode ResolveRequestedSourceMode(SourceMode? configuredSourceMode, string? requestedAppRoot) =>
         ResolveRequestedSourceMode(
             configuredSourceMode,
             requestedAppRoot,
             Environment.GetEnvironmentVariable(SourceModeEnvironmentVariable));
 
     internal static SourceMode ResolveRequestedSourceMode(
-        SourceMode configuredSourceMode,
+        SourceMode? configuredSourceMode,
         string? requestedAppRoot,
         string? sourceModeFromEnvironment)
     {
-        if (configuredSourceMode != SourceMode.Auto)
-            return configuredSourceMode;
+        if (configuredSourceMode is { } explicitSourceMode)
+            return explicitSourceMode;
 
         if (TryParseSourceMode(sourceModeFromEnvironment, out var parsedSourceMode))
             return parsedSourceMode;

@@ -271,8 +271,10 @@ that a caller supplying its own root wants an isolated instance. A host that rel
 still wants the machine's real source list must set `PINGET_SOURCE_MODE=auto` as well; otherwise
 sources the user added to WinGet are silently absent.
 
-In the C# API, an explicit `RepositoryOptions.SourceMode` always wins over the environment; the
-variable only applies when the caller leaves it at `SourceMode.Auto`.
+Precedence is the same in both implementations: an explicitly chosen mode wins, then
+`PINGET_SOURCE_MODE`, then the app-root inference. In the C# API `RepositoryOptions.SourceMode` is
+nullable for exactly this reason — leave it unset to let the environment decide, and note that
+setting it to `SourceMode.Auto` is an explicit choice that the environment will not override.
 
 ## Custom REST sources
 

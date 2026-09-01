@@ -399,10 +399,10 @@ public class SourceStoreTests
     {
         Assert.Equal(
             SourceMode.Private,
-            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", null));
+            Repository.ResolveRequestedSourceMode(null, @"C:\custom", null));
         Assert.Equal(
             SourceMode.Auto,
-            Repository.ResolveRequestedSourceMode(SourceMode.Auto, null, null));
+            Repository.ResolveRequestedSourceMode(null, null, null));
     }
 
     [Fact]
@@ -410,13 +410,13 @@ public class SourceStoreTests
     {
         Assert.Equal(
             SourceMode.Auto,
-            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", "auto"));
+            Repository.ResolveRequestedSourceMode(null, @"C:\custom", "auto"));
         Assert.Equal(
             SourceMode.SystemWingetMirror,
-            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", "system-winget-mirror"));
+            Repository.ResolveRequestedSourceMode(null, @"C:\custom", "system-winget-mirror"));
         Assert.Equal(
             SourceMode.Private,
-            Repository.ResolveRequestedSourceMode(SourceMode.Auto, null, "private"));
+            Repository.ResolveRequestedSourceMode(null, null, "private"));
     }
 
     [Fact]
@@ -431,14 +431,25 @@ public class SourceStoreTests
     }
 
     [Fact]
+    public void ResolveRequestedSourceMode_TreatsAnExplicitAutoAsAChoiceRatherThanAnUnsetValue()
+    {
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", "private"));
+        Assert.Equal(
+            SourceMode.Auto,
+            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", null));
+    }
+
+    [Fact]
     public void ResolveRequestedSourceMode_IgnoresAnUnparseableEnvironmentValue()
     {
         Assert.Equal(
             SourceMode.Private,
-            Repository.ResolveRequestedSourceMode(SourceMode.Auto, @"C:\custom", "not-a-mode"));
+            Repository.ResolveRequestedSourceMode(null, @"C:\custom", "not-a-mode"));
         Assert.Equal(
             SourceMode.Auto,
-            Repository.ResolveRequestedSourceMode(SourceMode.Auto, null, "not-a-mode"));
+            Repository.ResolveRequestedSourceMode(null, null, "not-a-mode"));
     }
 
     [Theory]
