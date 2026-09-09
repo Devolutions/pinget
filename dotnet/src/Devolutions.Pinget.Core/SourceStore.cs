@@ -182,6 +182,16 @@ internal static class SourceStoreManager
         }
     }
 
+    internal static bool SystemWingetMirrorIsFresh(string appRoot, TimeSpan maxAge)
+    {
+        var path = SystemWingetMirrorStorePath(appRoot);
+        if (!File.Exists(path))
+            return false;
+
+        var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(path);
+        return age >= TimeSpan.Zero && age < maxAge;
+    }
+
     internal static SourceStore RefreshSystemWingetMirrorStore(string appRoot)
     {
         var prior = LoadSystemWingetMirrorStore(appRoot) ?? SourceStore.Default();

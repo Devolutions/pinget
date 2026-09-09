@@ -13,6 +13,7 @@ public class Repository : IDisposable
 {
     private const string AppRootEnvironmentVariable = "PINGET_APPROOT";
     private const string SourceModeEnvironmentVariable = "PINGET_SOURCE_MODE";
+    private const int SystemWingetMirrorAutoRefreshMinutes = 15;
 
     internal const string InstalledStateUnsupportedWarning = "Installed package discovery is not supported on this platform; returning no installed packages.";
     internal const string InstallUnsupportedWarning = "Installing packages is not supported on this platform; no changes were made.";
@@ -215,7 +216,7 @@ public class Repository : IDisposable
 
     public List<SourceRecord> ListSources()
     {
-        RefreshSystemWingetSources();
+        RefreshSystemWingetSourcesForQuery(TimeSpan.Zero);
         return _store.Sources.ToList();
     }
 
@@ -555,7 +556,7 @@ public class Repository : IDisposable
 
     public ListResponse List(ListQuery query)
     {
-        RefreshSystemWingetSources();
+        var sourceRefreshWarning = RefreshSystemWingetSourcesForQuery();
 
         if ((query.IncludeUnknown || query.IncludePinned) && !query.UpgradeOnly)
             throw new InvalidOperationException("--include-unknown and --include-pinned require --upgrade-available");
@@ -567,6 +568,9 @@ public class Repository : IDisposable
         bool hasFilter = ListQueryNeedsAvailableLookup(query);
         bool needsAvailable = hasFilter || query.UpgradeOnly;
         var warnings = new List<string>();
+        if (sourceRefreshWarning is not null)
+            warnings.Add(sourceRefreshWarning);
+
         var installed = InstalledPackages.Collect(query.InstallScope);
         if (!OperatingSystem.IsWindows())
             warnings.Add(InstalledStateUnsupportedWarning);
@@ -4105,6 +4109,51 @@ public class Repository : IDisposable
             _ => _store,
         };
     }
+
+    /// <summary>
+    /// A query must not fail because the sources could not be re-mirrored: the cached mirror is
+    /// what the previous queries already ran against. Mutating commands keep using the strict
+    /// refresh above, since they have to see the real source list.
+    /// </summary>
+    private string? RefreshSystemWingetSourcesForQuery() =>
+        RefreshSystemWingetSourcesForQuery(TimeSpan.FromMinutes(SystemWingetMirrorAutoRefreshMinutes));
+
+    internal string? RefreshSystemWingetSourcesForQuery(TimeSpan maxAge)
+    {
+        switch (_sourceMode)
+        {
+            case EffectiveSourceMode.SystemWingetDirect:
+                try
+                {
+                    _store = SystemWingetSourceStore.Load();
+                    return null;
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or IOException)
+                {
+                    return SystemWingetSourceRefreshWarning(ex);
+                }
+
+            case EffectiveSourceMode.SystemWingetMirror:
+                if (SourceStoreManager.SystemWingetMirrorIsFresh(_appRoot, maxAge))
+                    return null;
+
+                try
+                {
+                    _store = SourceStoreManager.RefreshSystemWingetMirrorStore(_appRoot);
+                    return null;
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or IOException)
+                {
+                    return SystemWingetSourceRefreshWarning(ex);
+                }
+
+            default:
+                return null;
+        }
+    }
+
+    private static string SystemWingetSourceRefreshWarning(Exception error) =>
+        $"Could not refresh the system WinGet sources; using the sources Pinget cached earlier. {error.Message}";
 
     private void SaveStore()
     {

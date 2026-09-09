@@ -250,13 +250,15 @@ Pinget is designed to keep **source-backed functionality** working cross-platfor
 
 ## Storage location and source mode
 
-Two environment variables control where Pinget keeps its state and which sources it resolves
-against. Both are read by the Rust CLI and the C# core.
+Three environment variables control where Pinget keeps its state, which sources it resolves
+against, and which WinGet it delegates source commands to. All three are read by the Rust CLI and
+the C# core.
 
 | Variable | Effect |
 | --- | --- |
 | `PINGET_APPROOT` | Overrides the per-user storage root (`%LOCALAPPDATA%\Devolutions\Pinget` by default). Useful for embedding Pinget in a portable or sandboxed host. |
 | `PINGET_SOURCE_MODE` | Selects the source mode explicitly: `auto`, `private`, or `system-winget-mirror`. |
+| `PINGET_WINGET_PATH` | Full path to the `winget.exe` that Pinget runs for source commands. Accepts the executable or the directory holding it. |
 
 Source modes:
 
@@ -275,6 +277,29 @@ Precedence is the same in both implementations: an explicitly chosen mode wins, 
 `PINGET_SOURCE_MODE`, then the app-root inference. In the C# API `RepositoryOptions.SourceMode` is
 nullable for exactly this reason — leave it unset to let the environment decide, and note that
 setting it to `SourceMode.Auto` is an explicit choice that the environment will not override.
+
+### Locating the system WinGet
+
+WinGet source management belongs to WinGet, so the mirror and `system-winget-mirror` modes shell
+out to `winget source ...`. WinGet ships as an App Execution Alias, which means a host that
+inherited a PATH without `%LOCALAPPDATA%\Microsoft\WindowsApps` cannot spawn it by name at all.
+Pinget therefore looks for it in this order:
+
+1. `PINGET_WINGET_PATH`, when set - a host that already knows the location should say so, and a
+   value that holds no `winget.exe` is reported rather than silently ignored
+2. the directory of the running executable, which is where Windows looks first when a bare
+   program name is spawned, so a host that ships its own copy keeps winning
+3. the PATH
+4. `%LOCALAPPDATA%\Microsoft\WindowsApps`, the execution-alias directory
+5. the newest registered `Microsoft.DesktopAppInstaller` package root
+
+Only the last two are new lookups. The rest is the order a bare `winget` already resolved in, so
+a machine that could run WinGet before resolves the very same executable.
+
+A query never fails because the source list could not be re-mirrored: `list` and `source list`
+keep the mirror Pinget cached earlier and, for `list`, report a warning alongside the results.
+Commands that change sources still fail loudly, since they have to see the real source list. The
+mirror is re-exported at most every 15 minutes, so a query no longer spawns WinGet every time.
 
 ## Custom REST sources
 

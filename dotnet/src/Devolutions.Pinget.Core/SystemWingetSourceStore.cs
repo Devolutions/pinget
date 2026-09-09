@@ -1,11 +1,20 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Text.Json;
+using Microsoft.Win32;
 
 namespace Devolutions.Pinget.Core;
 
 internal static class SystemWingetSourceStore
 {
-    private const string WingetExecutable = "winget";
+    internal const string ProgramEnvironmentVariable = "PINGET_WINGET_PATH";
+
+    private const string AppModelPackagesPath =
+        @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+
+    private const string AppInstallerFamilyName = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
+
+    internal static string ProgramName { get; } = OperatingSystem.IsWindows() ? "winget.exe" : "winget";
 
     internal static Func<IReadOnlyList<string>, WingetCommandResult> CommandRunner { get; set; } = RunWinget;
 
@@ -128,7 +137,8 @@ internal static class SystemWingetSourceStore
 
     private static WingetCommandResult RunWinget(IReadOnlyList<string> args)
     {
-        var psi = new ProcessStartInfo(WingetExecutable)
+        var program = ResolveProgram();
+        var psi = new ProcessStartInfo(program)
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -139,12 +149,175 @@ internal static class SystemWingetSourceStore
         foreach (var arg in args)
             psi.ArgumentList.Add(arg);
 
-        using var process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start winget.");
+        Process? started;
+        try
+        {
+            started = Process.Start(psi);
+        }
+        catch (Exception ex) when (ex is Win32Exception or PlatformNotSupportedException)
+        {
+            throw new InvalidOperationException(
+                $"Failed to run the WinGet source command with {program}: {ex.Message}", ex);
+        }
+
+        using var process = started
+            ?? throw new InvalidOperationException($"Failed to run the WinGet source command with {program}.");
         var stdout = process.StandardOutput.ReadToEndAsync();
         var stderr = process.StandardError.ReadToEndAsync();
         process.WaitForExit();
 
         return new WingetCommandResult(process.ExitCode, stdout.GetAwaiter().GetResult(), stderr.GetAwaiter().GetResult());
+    }
+
+    internal static string ResolveProgram() =>
+        ResolveProgram(
+            Environment.GetEnvironmentVariable(ProgramEnvironmentVariable),
+            CurrentExecutableDirectory(),
+            Environment.GetEnvironmentVariable("PATH"),
+            FallbackDirectories,
+            File.Exists);
+
+    private static string? CurrentExecutableDirectory()
+    {
+        var executable = Environment.ProcessPath;
+        return string.IsNullOrWhiteSpace(executable) ? AppContext.BaseDirectory : Path.GetDirectoryName(executable);
+    }
+
+    /// <summary>
+    /// WinGet ships as an App Execution Alias, so a host that inherited a PATH without
+    /// %LOCALAPPDATA%\Microsoft\WindowsApps cannot spawn it by name at all. Look past the PATH
+    /// before giving up, and let a host that already knows the location say so.
+    /// <para>
+    /// The directory of the running executable keeps the precedence it had while this started
+    /// <c>winget</c> by name: Windows resolves a bare program name against the application
+    /// directory before the PATH, and a host that ships its own copy relies on that.
+    /// </para>
+    /// </summary>
+    internal static string ResolveProgram(
+        string? configured,
+        string? applicationDirectory,
+        string? searchPath,
+        Func<IEnumerable<string>> fallbackDirectories,
+        Func<string, bool> fileExists)
+    {
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            if (fileExists(configured))
+                return configured;
+
+            var nested = Path.Combine(configured, ProgramName);
+            if (fileExists(nested))
+                return nested;
+
+            throw new InvalidOperationException(
+                $"{ProgramEnvironmentVariable} is set to {configured}, where no {ProgramName} was found.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(applicationDirectory) &&
+            FirstProgramIn([applicationDirectory], fileExists) is { } bundled)
+        {
+            return bundled;
+        }
+
+        var searchDirectories = (searchPath ?? string.Empty)
+            .Split(Path.PathSeparator)
+            .Select(entry => entry.Trim().Trim('"'))
+            .Where(entry => entry.Length is not 0);
+
+        if (FirstProgramIn(searchDirectories, fileExists) is { } onPath)
+            return onPath;
+
+        // Enumerating the App Installer package locations reads the registry, so it stays
+        // behind the PATH: the machines that already resolve winget by name pay nothing.
+        if (FirstProgramIn(fallbackDirectories(), fileExists) is { } offPath)
+            return offPath;
+
+        throw new InvalidOperationException(
+            $"{ProgramName} was not found on the PATH or in the App Installer install locations. " +
+            $"Set {ProgramEnvironmentVariable} to its full path, or install the App Installer.");
+    }
+
+    private static string? FirstProgramIn(IEnumerable<string> directories, Func<string, bool> fileExists)
+    {
+        foreach (var directory in directories)
+        {
+            var candidate = Path.Combine(directory, ProgramName);
+            if (fileExists(candidate))
+                return candidate;
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> FallbackDirectories()
+    {
+        if (!OperatingSystem.IsWindows())
+            return [];
+
+        var directories = new List<string>();
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrWhiteSpace(localAppData))
+            directories.Add(Path.Combine(localAppData, "Microsoft", "WindowsApps"));
+
+        directories.AddRange(AppInstallerPackageDirectories());
+        return directories;
+    }
+
+    private static List<string> AppInstallerPackageDirectories()
+    {
+        if (!OperatingSystem.IsWindows())
+            return [];
+
+        try
+        {
+            using var packages = Registry.CurrentUser.OpenSubKey(AppModelPackagesPath);
+            if (packages is null)
+                return [];
+
+            var found = new List<(string Version, string Directory)>();
+            foreach (var packageFullName in packages.GetSubKeyNames())
+            {
+                if (ParsePackageFullName(packageFullName) is not { } parsed ||
+                    !string.Equals(parsed.FamilyName, AppInstallerFamilyName, StringComparison.OrdinalIgnoreCase) ||
+                    parsed.ResourceId.StartsWith("split.", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                using var entry = packages.OpenSubKey(packageFullName);
+                if (entry?.GetValue("PackageRootFolder") is not string directory ||
+                    string.IsNullOrWhiteSpace(directory))
+                {
+                    continue;
+                }
+
+                found.Add((parsed.Version, directory));
+            }
+
+            found.Sort((left, right) => -RestSource.CompareVersionStrings(left.Version, right.Version));
+            return found.Select(match => match.Directory).ToList();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            return [];
+        }
+    }
+
+    internal static (string Version, string FamilyName, string ResourceId)? ParsePackageFullName(string packageFullName)
+    {
+        var segments = packageFullName.Split('_');
+        if (segments.Length < 5)
+            return null;
+
+        var name = string.Join("_", segments[..^4]);
+        var version = segments[^4].Trim();
+        var resourceId = segments[^2].Trim();
+        var publisherId = segments[^1].Trim();
+        if (name.Length is 0 || version.Length is 0 || publisherId.Length is 0)
+            return null;
+
+        var familyName = resourceId.Length is 0 ? $"{name}_{publisherId}" : $"{name}_{resourceId}_{publisherId}";
+        return (version, familyName, resourceId);
     }
 
     private static bool TryParseJsonSources(string json, out List<SourceRecord> sources)

@@ -2,6 +2,7 @@ mod name_normalization;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read, Write};
@@ -52,6 +53,15 @@ const PREINDEXED_REFRESH_RETRY_MINUTES: i64 = 5;
 const SYSTEM_WINGET_MIRROR_STORE_FILE_NAME: &str = "system-sources.json";
 const APP_ROOT_ENV_VAR: &str = "PINGET_APPROOT";
 const SOURCE_MODE_ENV_VAR: &str = "PINGET_SOURCE_MODE";
+const SYSTEM_WINGET_PROGRAM_ENV_VAR: &str = "PINGET_WINGET_PATH";
+const SYSTEM_WINGET_MIRROR_AUTO_REFRESH_MINUTES: u64 = 15;
+#[cfg(windows)]
+const SYSTEM_WINGET_PROGRAM_NAME: &str = "winget.exe";
+#[cfg(not(windows))]
+const SYSTEM_WINGET_PROGRAM_NAME: &str = "winget";
+#[cfg(windows)]
+const APPMODEL_PACKAGES_PATH: &str =
+    r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
 #[cfg(windows)]
 const PACKAGED_FAMILY_NAME: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
 #[cfg(windows)]
@@ -1376,12 +1386,13 @@ impl Repository {
             bail!("list --source currently requires a query or explicit filter");
         }
 
-        self.refresh_system_winget_sources()?;
+        let source_refresh_warning = self.refresh_system_winget_sources_for_query();
 
         let has_filter = list_query_needs_available_lookup(query);
         let needs_available = has_filter || query.upgrade_only;
 
         let mut warnings = Vec::new();
+        warnings.extend(source_refresh_warning);
         if !installed_package_discovery_supported() {
             warnings.push(INSTALLED_STATE_UNSUPPORTED_WARNING.to_owned());
         }
@@ -3685,6 +3696,41 @@ impl Repository {
         Ok(())
     }
 
+    /// A query must not fail because the sources could not be re-mirrored: the cached
+    /// mirror is what the previous queries already ran against. Mutating commands keep
+    /// using the strict refresh above, since they have to see the real source list.
+    fn refresh_system_winget_sources_for_query(&mut self) -> Option<String> {
+        self.refresh_system_winget_sources_for_query_with_max_age(StdDuration::from_secs(
+            SYSTEM_WINGET_MIRROR_AUTO_REFRESH_MINUTES * 60,
+        ))
+    }
+
+    fn refresh_system_winget_sources_for_query_with_max_age(&mut self, max_age: StdDuration) -> Option<String> {
+        match self.source_mode {
+            EffectiveSourceMode::Private => None,
+            EffectiveSourceMode::SystemWingetDirect => match load_system_winget_source_store() {
+                Ok(store) => {
+                    self.store = store;
+                    None
+                }
+                Err(error) => Some(system_winget_source_refresh_warning(&error)),
+            },
+            EffectiveSourceMode::SystemWingetMirror => {
+                if system_winget_mirror_is_fresh(&self.app_root, max_age) {
+                    return None;
+                }
+
+                match refresh_system_winget_mirror_store(&self.app_root) {
+                    Ok(store) => {
+                        self.store = store;
+                        None
+                    }
+                    Err(error) => Some(system_winget_source_refresh_warning(&error)),
+                }
+            }
+        }
+    }
+
     fn update_system_winget_sources(&mut self, source_name: Option<&str>) -> Result<Vec<SourceUpdateResult>> {
         self.refresh_system_winget_sources()?;
         let selected_names: Vec<_> = if source_name.is_none() {
@@ -4915,9 +4961,6 @@ fn collect_appmodel_packages(
     scope: &str,
     flags: u32,
 ) -> Result<()> {
-    const APPMODEL_PACKAGES_PATH: &str =
-        r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
-
     let appmodel = match root.open_subkey_with_flags(APPMODEL_PACKAGES_PATH, flags) {
         Ok(key) => key,
         Err(_) => return Ok(()),
@@ -5324,6 +5367,18 @@ fn save_system_winget_mirror_store(app_root: &Path, store: &SourceStore) -> Resu
     write_json(system_winget_mirror_store_path(app_root), store)
 }
 
+fn system_winget_mirror_is_fresh(app_root: &Path, max_age: StdDuration) -> bool {
+    fs::metadata(system_winget_mirror_store_path(app_root))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < max_age)
+}
+
+fn system_winget_source_refresh_warning(error: &anyhow::Error) -> String {
+    format!("Could not refresh the system WinGet sources; using the sources Pinget cached earlier. {error:#}")
+}
+
 fn load_or_refresh_system_winget_mirror_store(app_root: &Path, force_refresh: bool) -> Result<SourceStore> {
     if !force_refresh && let Some(store) = load_system_winget_mirror_store(app_root)? {
         return Ok(store);
@@ -5597,16 +5652,143 @@ fn run_winget_source_command(args: &[String]) -> Result<WingetSourceCommandResul
 fn run_winget_source_command_process(args: &[String]) -> Result<WingetSourceCommandResult> {
     use std::process::Command;
 
-    let output = Command::new("winget")
+    let program = resolve_system_winget_program()?;
+    let output = Command::new(&program)
         .args(args)
         .output()
-        .context("failed to run winget source command")?;
+        .with_context(|| format!("failed to run the WinGet source command with {}", program.display()))?;
 
     Ok(WingetSourceCommandResult {
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+fn resolve_system_winget_program() -> Result<PathBuf> {
+    resolve_system_winget_program_from(
+        std::env::var_os(SYSTEM_WINGET_PROGRAM_ENV_VAR),
+        current_executable_directory(),
+        std::env::var_os("PATH"),
+        &system_winget_fallback_directories,
+        &|candidate| candidate.is_file(),
+    )
+}
+
+fn current_executable_directory() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf))
+}
+
+/// WinGet ships as an App Execution Alias, so a host that inherited a PATH without
+/// %LOCALAPPDATA%\Microsoft\WindowsApps cannot spawn it by name at all. Look past the
+/// PATH before giving up, and let a host that already knows the location say so.
+///
+/// The directory of the running executable keeps the precedence it had while this spawned
+/// `winget` by name: Windows resolves a bare program name against the application directory
+/// before the PATH, and a host that ships its own copy relies on that.
+fn resolve_system_winget_program_from(
+    configured: Option<OsString>,
+    application_directory: Option<PathBuf>,
+    search_path: Option<OsString>,
+    fallback_directories: &dyn Fn() -> Vec<PathBuf>,
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Result<PathBuf> {
+    if let Some(configured) = configured.filter(|value| !value.to_string_lossy().trim().is_empty()) {
+        let configured = PathBuf::from(configured);
+        if is_file(&configured) {
+            return Ok(configured);
+        }
+
+        let nested = configured.join(SYSTEM_WINGET_PROGRAM_NAME);
+        if is_file(&nested) {
+            return Ok(nested);
+        }
+
+        bail!(
+            "{SYSTEM_WINGET_PROGRAM_ENV_VAR} is set to {}, where no {SYSTEM_WINGET_PROGRAM_NAME} was found.",
+            configured.display()
+        );
+    }
+
+    if let Some(program) = first_system_winget_program(application_directory, is_file) {
+        return Ok(program);
+    }
+
+    let search_directories = search_path
+        .as_deref()
+        .map(|value| std::env::split_paths(value).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    if let Some(program) = first_system_winget_program(search_directories, is_file) {
+        return Ok(program);
+    }
+
+    // Enumerating the App Installer package locations reads the registry, so it stays
+    // behind the PATH: the machines that already resolve winget by name pay nothing.
+    if let Some(program) = first_system_winget_program(fallback_directories(), is_file) {
+        return Ok(program);
+    }
+
+    bail!(
+        "{SYSTEM_WINGET_PROGRAM_NAME} was not found on the PATH or in the App Installer install locations. Set {SYSTEM_WINGET_PROGRAM_ENV_VAR} to its full path, or install the App Installer."
+    )
+}
+
+fn first_system_winget_program(
+    directories: impl IntoIterator<Item = PathBuf>,
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    directories.into_iter().find_map(|directory| {
+        let candidate = directory.join(SYSTEM_WINGET_PROGRAM_NAME);
+        is_file(&candidate).then_some(candidate)
+    })
+}
+
+#[cfg(windows)]
+fn system_winget_fallback_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        directories.push(local_app_data.join("Microsoft").join("WindowsApps"));
+    }
+
+    directories.extend(app_installer_package_directories());
+    directories
+}
+
+#[cfg(not(windows))]
+fn system_winget_fallback_directories() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn app_installer_package_directories() -> Vec<PathBuf> {
+    let Ok(packages) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(APPMODEL_PACKAGES_PATH) else {
+        return Vec::new();
+    };
+
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    for key_name in packages.enum_keys().flatten() {
+        let Some(metadata) = parse_msix_package_full_name(&key_name) else {
+            continue;
+        };
+        if metadata.family_name != PACKAGED_FAMILY_NAME || is_msix_split_resource_package(&metadata.resource_id) {
+            continue;
+        }
+
+        let Ok(entry) = packages.open_subkey(&key_name) else {
+            continue;
+        };
+        let Some(package_root) = read_reg_string(&entry, "PackageRootFolder") else {
+            continue;
+        };
+
+        found.push((metadata.version, PathBuf::from(package_root)));
+    }
+
+    found.sort_by(|left, right| compare_version(&right.0, &left.0));
+    found.into_iter().map(|(_, directory)| directory).collect()
 }
 
 fn parse_system_winget_source_export(output: &str) -> Result<Vec<SourceRecord>> {
@@ -6113,7 +6295,7 @@ fn current_user_sid() -> Result<String> {
 
     // SAFETY: sid_ptr points to len initialized UTF-16 code units.
     let sid_slice = unsafe { std::slice::from_raw_parts(sid_ptr, len) };
-    let sid = std::ffi::OsString::from_wide(sid_slice).to_string_lossy().into_owned();
+    let sid = OsString::from_wide(sid_slice).to_string_lossy().into_owned();
     // SAFETY: sid_ptr was allocated by ConvertSidToStringSidW and must be released with LocalFree.
     unsafe {
         LocalFree(sid_ptr.cast());
@@ -11361,8 +11543,271 @@ mod tests {
         })
     }
 
+    fn failing_system_winget_source_command(_args: &[String]) -> Result<WingetSourceCommandResult> {
+        bail!("{SYSTEM_WINGET_PROGRAM_NAME} was not found on the PATH")
+    }
+
+    static SYSTEM_WINGET_RUNNER_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_system_winget_source_command_runner() -> std::sync::MutexGuard<'static, ()> {
+        SYSTEM_WINGET_RUNNER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn swap_system_winget_source_command_runner(runner: WingetSourceCommandRunner) -> WingetSourceCommandRunner {
+        let mut current = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
+        let previous = *current;
+        *current = runner;
+        previous
+    }
+
+    fn search_path_of(directories: &[&Path]) -> OsString {
+        std::env::join_paths(directories).expect("search path")
+    }
+
+    #[test]
+    fn configured_system_winget_program_wins_over_the_search_path() {
+        let configured = PathBuf::from("tools").join(SYSTEM_WINGET_PROGRAM_NAME);
+        let on_path = PathBuf::from("windows");
+
+        let program = resolve_system_winget_program_from(
+            Some(configured.as_os_str().to_os_string()),
+            None,
+            Some(search_path_of(&[on_path.as_path()])),
+            &Vec::new,
+            &|candidate| candidate == configured || candidate == on_path.join(SYSTEM_WINGET_PROGRAM_NAME),
+        )
+        .expect("program");
+
+        assert_eq!(program, configured);
+    }
+
+    #[test]
+    fn configured_system_winget_directory_resolves_to_the_executable() {
+        let directory = PathBuf::from("tools");
+        let program = directory.join(SYSTEM_WINGET_PROGRAM_NAME);
+
+        let resolved = resolve_system_winget_program_from(
+            Some(directory.as_os_str().to_os_string()),
+            None,
+            None,
+            &Vec::new,
+            &|candidate| candidate == program,
+        )
+        .expect("program");
+
+        assert_eq!(resolved, program);
+    }
+
+    #[test]
+    fn configured_system_winget_program_that_is_missing_is_reported() {
+        let error = resolve_system_winget_program_from(
+            Some(PathBuf::from("tools").into_os_string()),
+            None,
+            None,
+            &Vec::new,
+            &|_| false,
+        )
+        .expect_err("missing configured program");
+
+        assert!(
+            error.to_string().contains(SYSTEM_WINGET_PROGRAM_ENV_VAR),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn system_winget_program_is_found_on_the_search_path() {
+        let first = PathBuf::from("empty");
+        let second = PathBuf::from("windows");
+        let program = second.join(SYSTEM_WINGET_PROGRAM_NAME);
+
+        let resolved = resolve_system_winget_program_from(
+            None,
+            None,
+            Some(search_path_of(&[first.as_path(), second.as_path()])),
+            &Vec::new,
+            &|candidate| candidate == program,
+        )
+        .expect("program");
+
+        assert_eq!(resolved, program);
+    }
+
+    #[test]
+    fn system_winget_program_falls_back_to_the_app_installer_locations() {
+        let on_path = PathBuf::from("windows");
+        let alias_directory = PathBuf::from("WindowsApps");
+        let program = alias_directory.join(SYSTEM_WINGET_PROGRAM_NAME);
+
+        let resolved = resolve_system_winget_program_from(
+            None,
+            None,
+            Some(search_path_of(&[on_path.as_path()])),
+            &|| vec![alias_directory.clone()],
+            &|candidate| candidate == program,
+        )
+        .expect("program");
+
+        assert_eq!(resolved, program);
+    }
+
+    #[test]
+    fn unresolvable_system_winget_program_points_at_the_environment_variable() {
+        let error = resolve_system_winget_program_from(
+            None,
+            None,
+            Some(search_path_of(&[Path::new("windows")])),
+            &Vec::new,
+            &|_| false,
+        )
+        .expect_err("no program");
+
+        assert!(
+            error.to_string().contains(SYSTEM_WINGET_PROGRAM_ENV_VAR),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn the_application_directory_keeps_precedence_over_the_search_path() {
+        let application_directory = PathBuf::from("app");
+        let on_path = PathBuf::from("windows");
+        let bundled = application_directory.join(SYSTEM_WINGET_PROGRAM_NAME);
+        let on_path_program = on_path.join(SYSTEM_WINGET_PROGRAM_NAME);
+
+        let resolved = resolve_system_winget_program_from(
+            None,
+            Some(application_directory),
+            Some(search_path_of(&[on_path.as_path()])),
+            &Vec::new,
+            &|candidate| candidate == bundled || candidate == on_path_program,
+        )
+        .expect("program");
+
+        assert_eq!(resolved, bundled);
+    }
+
+    #[test]
+    fn the_app_installer_locations_are_not_enumerated_when_the_path_resolves_winget() {
+        let on_path = PathBuf::from("windows");
+        let program = on_path.join(SYSTEM_WINGET_PROGRAM_NAME);
+        let enumerated = AtomicBool::new(false);
+
+        let resolved = resolve_system_winget_program_from(
+            None,
+            None,
+            Some(search_path_of(&[on_path.as_path()])),
+            &|| {
+                enumerated.store(true, AtomicOrdering::SeqCst);
+                Vec::new()
+            },
+            &|candidate| candidate == program,
+        )
+        .expect("program");
+
+        assert_eq!(resolved, program);
+        assert!(!enumerated.load(AtomicOrdering::SeqCst));
+    }
+
+    #[test]
+    fn a_blank_configured_system_winget_program_falls_through_to_the_path() {
+        let on_path = PathBuf::from("windows");
+        let program = on_path.join(SYSTEM_WINGET_PROGRAM_NAME);
+
+        let resolved = resolve_system_winget_program_from(
+            Some(OsString::from(" ")),
+            None,
+            Some(search_path_of(&[on_path.as_path()])),
+            &Vec::new,
+            &|candidate| candidate == program,
+        )
+        .expect("program");
+
+        assert_eq!(resolved, program);
+    }
+
+    #[test]
+    fn mirror_freshness_follows_the_store_file() {
+        let app_root = temp_app_root("mirror-freshness");
+        assert!(!system_winget_mirror_is_fresh(&app_root, StdDuration::from_secs(900)));
+
+        save_system_winget_mirror_store(&app_root, &SourceStore::default()).expect("save mirror");
+        assert!(system_winget_mirror_is_fresh(&app_root, StdDuration::from_secs(900)));
+        assert!(!system_winget_mirror_is_fresh(&app_root, StdDuration::ZERO));
+
+        let _ = fs::remove_dir_all(&app_root);
+    }
+
+    #[test]
+    fn a_query_keeps_the_cached_mirror_when_the_system_winget_cannot_be_run() {
+        let _runner_guard = lock_system_winget_source_command_runner();
+        let app_root = temp_app_root("mirror-refresh-failure");
+        let previous = swap_system_winget_source_command_runner(fake_system_winget_source_export);
+        let opened = Repository::open_with_options(
+            RepositoryOptions::new(app_root.clone()).with_source_mode(SourceMode::SystemWingetMirror),
+        );
+        swap_system_winget_source_command_runner(previous);
+
+        let result = (|| -> Result<()> {
+            let mut repository = opened?;
+            let cached: Vec<String> = repository
+                .list_sources()
+                .into_iter()
+                .map(|source| source.name)
+                .collect();
+            assert_eq!(cached, vec!["contoso".to_owned()]);
+
+            let previous = swap_system_winget_source_command_runner(failing_system_winget_source_command);
+            let warning = repository.refresh_system_winget_sources_for_query_with_max_age(StdDuration::ZERO);
+            swap_system_winget_source_command_runner(previous);
+
+            let warning = warning.expect("refresh warning");
+            assert!(
+                warning.contains("Could not refresh the system WinGet sources"),
+                "{warning}"
+            );
+            let kept: Vec<String> = repository
+                .list_sources()
+                .into_iter()
+                .map(|source| source.name)
+                .collect();
+            assert_eq!(kept, cached);
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&app_root);
+        result.expect("cached mirror query");
+    }
+
+    #[test]
+    fn a_query_does_not_re_export_a_fresh_mirror() {
+        let _runner_guard = lock_system_winget_source_command_runner();
+        let app_root = temp_app_root("mirror-refresh-fresh");
+        let previous = swap_system_winget_source_command_runner(fake_system_winget_source_export);
+        let opened = Repository::open_with_options(
+            RepositoryOptions::new(app_root.clone()).with_source_mode(SourceMode::SystemWingetMirror),
+        );
+        swap_system_winget_source_command_runner(previous);
+
+        let result = (|| -> Result<()> {
+            let mut repository = opened?;
+            let previous = swap_system_winget_source_command_runner(failing_system_winget_source_command);
+            let warning = repository.refresh_system_winget_sources_for_query();
+            swap_system_winget_source_command_runner(previous);
+
+            assert!(warning.is_none(), "{warning:?}");
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&app_root);
+        result.expect("fresh mirror query");
+    }
+
     #[test]
     fn packaged_secure_settings_stub_delegates_to_system_winget_export() {
+        let _runner_guard = lock_system_winget_source_command_runner();
         let original_runner = {
             let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
             let original = *runner;
@@ -11389,6 +11834,7 @@ mod tests {
 
     #[test]
     fn system_winget_mirror_store_uses_private_cache_and_preserves_metadata() {
+        let _runner_guard = lock_system_winget_source_command_runner();
         let original_runner = {
             let mut runner = SYSTEM_WINGET_SOURCE_COMMAND_RUNNER.write().expect("runner lock");
             let original = *runner;

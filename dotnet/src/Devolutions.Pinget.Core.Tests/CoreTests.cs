@@ -341,6 +341,216 @@ public class SourceStoreTests
         }
 
         [Fact]
+        public void SystemWingetSourceStore_ConfiguredProgramWinsOverTheSearchPath()
+        {
+                var configured = Path.Combine("tools", SystemWingetSourceStore.ProgramName);
+                var onPath = Path.Combine("windows", SystemWingetSourceStore.ProgramName);
+
+                var resolved = SystemWingetSourceStore.ResolveProgram(configured, null, "windows", () => [], candidate => candidate == configured || candidate == onPath);
+
+                Assert.Equal(configured, resolved);
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_ConfiguredDirectoryResolvesToTheExecutable()
+        {
+                var program = Path.Combine("tools", SystemWingetSourceStore.ProgramName);
+
+                var resolved = SystemWingetSourceStore.ResolveProgram("tools", null, null, () => [], candidate => candidate == program);
+
+                Assert.Equal(program, resolved);
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_MissingConfiguredProgramIsReported()
+        {
+                var error = Assert.Throws<InvalidOperationException>(
+                        () => SystemWingetSourceStore.ResolveProgram("tools", null, null, () => [], _ => false));
+
+                Assert.Contains(SystemWingetSourceStore.ProgramEnvironmentVariable, error.Message);
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_ProgramIsFoundOnTheSearchPath()
+        {
+                var program = Path.Combine("windows", SystemWingetSourceStore.ProgramName);
+                var searchPath = string.Join(Path.PathSeparator, ["empty", "windows"]);
+
+                var resolved = SystemWingetSourceStore.ResolveProgram(null, null, searchPath, () => [], candidate => candidate == program);
+
+                Assert.Equal(program, resolved);
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_ProgramFallsBackToTheAppInstallerLocations()
+        {
+                var program = Path.Combine("WindowsApps", SystemWingetSourceStore.ProgramName);
+
+                var resolved = SystemWingetSourceStore.ResolveProgram(null, null, "windows", () => ["WindowsApps"], candidate => candidate == program);
+
+                Assert.Equal(program, resolved);
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_UnresolvableProgramPointsAtTheEnvironmentVariable()
+        {
+                var error = Assert.Throws<InvalidOperationException>(
+                        () => SystemWingetSourceStore.ResolveProgram(null, null, "windows", () => [], _ => false));
+
+                Assert.Contains(SystemWingetSourceStore.ProgramEnvironmentVariable, error.Message);
+        }
+
+        [Theory]
+        [InlineData("Microsoft.DesktopAppInstaller_1.29.290.0_x64__8wekyb3d8bbwe", "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe", "1.29.290.0")]
+        [InlineData("Microsoft.DesktopAppInstaller_1.2.0.0_neutral_split.scale-100_8wekyb3d8bbwe", "Microsoft.DesktopAppInstaller_split.scale-100_8wekyb3d8bbwe", "1.2.0.0")]
+        public void SystemWingetSourceStore_ParsesPackageFullNames(string packageFullName, string familyName, string version)
+        {
+                var parsed = SystemWingetSourceStore.ParsePackageFullName(packageFullName);
+
+                Assert.NotNull(parsed);
+                Assert.Equal(familyName, parsed!.Value.FamilyName);
+                Assert.Equal(version, parsed.Value.Version);
+        }
+
+        [Theory]
+        [InlineData("Microsoft.DesktopAppInstaller_8wekyb3d8bbwe")]
+        [InlineData("Microsoft.DesktopAppInstaller")]
+        public void SystemWingetSourceStore_RejectsIncompletePackageFullNames(string packageFullName)
+        {
+                Assert.Null(SystemWingetSourceStore.ParsePackageFullName(packageFullName));
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_ApplicationDirectoryKeepsPrecedenceOverTheSearchPath()
+        {
+                var bundled = Path.Combine("app", SystemWingetSourceStore.ProgramName);
+                var onPath = Path.Combine("windows", SystemWingetSourceStore.ProgramName);
+
+                var resolved = SystemWingetSourceStore.ResolveProgram(
+                        null,
+                        "app",
+                        "windows",
+                        () => [],
+                        candidate => candidate == bundled || candidate == onPath);
+
+                Assert.Equal(bundled, resolved);
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_DoesNotEnumerateAppInstallerLocationsWhenThePathResolvesWinget()
+        {
+                var program = Path.Combine("windows", SystemWingetSourceStore.ProgramName);
+                var enumerated = false;
+
+                var resolved = SystemWingetSourceStore.ResolveProgram(null, null, "windows", () => { enumerated = true; return []; }, candidate => candidate == program);
+
+                Assert.Equal(program, resolved);
+                Assert.False(enumerated);
+        }
+
+        [Fact]
+        public void SystemWingetSourceStore_BlankConfiguredProgramFallsThroughToThePath()
+        {
+                var program = Path.Combine("windows", SystemWingetSourceStore.ProgramName);
+
+                var resolved = SystemWingetSourceStore.ResolveProgram(" ", null, "windows", () => [], candidate => candidate == program);
+
+                Assert.Equal(program, resolved);
+        }
+
+        [Fact]
+        public void SourceStoreManager_MirrorFreshnessFollowsTheStoreFile()
+        {
+                var appRoot = TestPaths.CreateTempAppRoot();
+                try
+                {
+                        Assert.False(SourceStoreManager.SystemWingetMirrorIsFresh(appRoot, TimeSpan.FromMinutes(15)));
+
+                        SourceStoreManager.SaveSystemWingetMirrorStore(appRoot, SourceStore.Default());
+
+                        Assert.True(SourceStoreManager.SystemWingetMirrorIsFresh(appRoot, TimeSpan.FromMinutes(15)));
+                        Assert.False(SourceStoreManager.SystemWingetMirrorIsFresh(appRoot, TimeSpan.Zero));
+                }
+                finally
+                {
+                        TestPaths.DeleteAppRoot(appRoot);
+                }
+        }
+
+        [Fact]
+        public void Repository_QueryKeepsTheCachedMirrorWhenTheSystemWingetCannotBeRun()
+        {
+                var appRoot = TestPaths.CreateTempAppRoot();
+                var originalRunner = SystemWingetSourceStore.CommandRunner;
+                try
+                {
+                        SystemWingetSourceStore.CommandRunner = _ => new WingetCommandResult(
+                                0,
+                                """
+{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+""",
+                                "");
+
+                        using var repo = Repository.Open(new RepositoryOptions
+                        {
+                                AppRoot = appRoot,
+                                SourceMode = SourceMode.SystemWingetMirror,
+                                UserAgent = "pinget-dotnet-tests/1.0",
+                        });
+
+                        var cached = repo.ListSources().Select(source => source.Name).ToList();
+                        Assert.Equal(["contoso"], cached);
+
+                        SystemWingetSourceStore.CommandRunner =
+                                _ => throw new InvalidOperationException($"{SystemWingetSourceStore.ProgramName} was not found on the PATH");
+
+                        var warning = repo.RefreshSystemWingetSourcesForQuery(TimeSpan.Zero);
+
+                        Assert.NotNull(warning);
+                        Assert.Contains("Could not refresh the system WinGet sources", warning);
+                        Assert.Equal(cached, repo.ListSources().Select(source => source.Name).ToList());
+                }
+                finally
+                {
+                        SystemWingetSourceStore.CommandRunner = originalRunner;
+                        TestPaths.DeleteAppRoot(appRoot);
+                }
+        }
+
+        [Fact]
+        public void Repository_QueryDoesNotReExportAFreshMirror()
+        {
+                var appRoot = TestPaths.CreateTempAppRoot();
+                var originalRunner = SystemWingetSourceStore.CommandRunner;
+                try
+                {
+                        SystemWingetSourceStore.CommandRunner = _ => new WingetCommandResult(
+                                0,
+                                """
+{"Arg":"https://api.contoso.test/feed","Data":"","Explicit":false,"Identifier":"api.contoso.test","Name":"contoso","TrustLevel":["Trusted"],"Type":"Microsoft.Rest"}
+""",
+                                "");
+
+                        using var repo = Repository.Open(new RepositoryOptions
+                        {
+                                AppRoot = appRoot,
+                                SourceMode = SourceMode.SystemWingetMirror,
+                                UserAgent = "pinget-dotnet-tests/1.0",
+                        });
+
+                        SystemWingetSourceStore.CommandRunner =
+                                _ => throw new InvalidOperationException("the mirror was re-exported while it was still fresh");
+
+                        Assert.Null(repo.RefreshSystemWingetSourcesForQuery(TimeSpan.FromMinutes(15)));
+                }
+                finally
+                {
+                        SystemWingetSourceStore.CommandRunner = originalRunner;
+                        TestPaths.DeleteAppRoot(appRoot);
+                }
+        }
+
+        [Fact]
         public void PackagedSecureSettingsStub_DelegatesToSystemWingetExport()
         {
                 var originalRunner = SystemWingetSourceStore.CommandRunner;
