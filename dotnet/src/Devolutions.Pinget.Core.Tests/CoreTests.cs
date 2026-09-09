@@ -459,14 +459,19 @@ public class SourceStoreTests
         }
 
         [Fact]
-        public void SourceStoreManager_MirrorFreshnessFollowsTheStoreFile()
+        public void SourceStoreManager_MirrorFreshnessFollowsTheExportStampNotTheStoreFile()
         {
                 var appRoot = TestPaths.CreateTempAppRoot();
                 try
                 {
                         Assert.False(SourceStoreManager.SystemWingetMirrorIsFresh(appRoot, TimeSpan.FromMinutes(15)));
 
+                        // A pre-indexed metadata save rewrites the mirror store without re-exporting.
                         SourceStoreManager.SaveSystemWingetMirrorStore(appRoot, SourceStore.Default());
+
+                        Assert.False(SourceStoreManager.SystemWingetMirrorIsFresh(appRoot, TimeSpan.FromMinutes(15)));
+
+                        SourceStoreManager.StampSystemWingetMirrorExport(appRoot);
 
                         Assert.True(SourceStoreManager.SystemWingetMirrorIsFresh(appRoot, TimeSpan.FromMinutes(15)));
                         Assert.False(SourceStoreManager.SystemWingetMirrorIsFresh(appRoot, TimeSpan.Zero));

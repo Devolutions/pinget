@@ -51,6 +51,7 @@ const DEFAULT_USER_AGENT: &str = "pinget-rs/0.1";
 const DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES: i64 = 15;
 const PREINDEXED_REFRESH_RETRY_MINUTES: i64 = 5;
 const SYSTEM_WINGET_MIRROR_STORE_FILE_NAME: &str = "system-sources.json";
+const SYSTEM_WINGET_MIRROR_EXPORT_STAMP_FILE_NAME: &str = "system-sources.stamp";
 const APP_ROOT_ENV_VAR: &str = "PINGET_APPROOT";
 const SOURCE_MODE_ENV_VAR: &str = "PINGET_SOURCE_MODE";
 const SYSTEM_WINGET_PROGRAM_ENV_VAR: &str = "PINGET_WINGET_PATH";
@@ -5367,12 +5368,32 @@ fn save_system_winget_mirror_store(app_root: &Path, store: &SourceStore) -> Resu
     write_json(system_winget_mirror_store_path(app_root), store)
 }
 
+/// Freshness follows a stamp that only a successful `winget source export` writes. The
+/// mirror store file itself is rewritten by ordinary pre-indexed metadata saves, so its
+/// timestamp would let index activity keep a stale source list looking fresh forever.
 fn system_winget_mirror_is_fresh(app_root: &Path, max_age: StdDuration) -> bool {
-    fs::metadata(system_winget_mirror_store_path(app_root))
+    if !system_winget_mirror_store_path(app_root).exists() {
+        return false;
+    }
+
+    fs::metadata(system_winget_mirror_export_stamp_path(app_root))
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|age| age < max_age)
+}
+
+fn system_winget_mirror_export_stamp_path(app_root: &Path) -> PathBuf {
+    app_root.join(SYSTEM_WINGET_MIRROR_EXPORT_STAMP_FILE_NAME)
+}
+
+/// A stamp that cannot be written only costs the export gate, so it must not fail the
+/// export that just succeeded.
+fn stamp_system_winget_mirror_export(app_root: &Path) {
+    let _ = fs::write(
+        system_winget_mirror_export_stamp_path(app_root),
+        Utc::now().to_rfc3339(),
+    );
 }
 
 fn system_winget_source_refresh_warning(error: &anyhow::Error) -> String {
@@ -5392,6 +5413,7 @@ fn refresh_system_winget_mirror_store(app_root: &Path) -> Result<SourceStore> {
     let mut exported = load_system_winget_source_store()?;
     merge_source_cache_metadata(&mut exported, &prior);
     save_system_winget_mirror_store(app_root, &exported)?;
+    stamp_system_winget_mirror_export(app_root);
     Ok(exported)
 }
 
@@ -11729,11 +11751,15 @@ mod tests {
     }
 
     #[test]
-    fn mirror_freshness_follows_the_store_file() {
+    fn mirror_freshness_follows_the_export_stamp_not_the_store_file() {
         let app_root = temp_app_root("mirror-freshness");
         assert!(!system_winget_mirror_is_fresh(&app_root, StdDuration::from_secs(900)));
 
+        // A pre-indexed metadata save rewrites the mirror store without re-exporting.
         save_system_winget_mirror_store(&app_root, &SourceStore::default()).expect("save mirror");
+        assert!(!system_winget_mirror_is_fresh(&app_root, StdDuration::from_secs(900)));
+
+        stamp_system_winget_mirror_export(&app_root);
         assert!(system_winget_mirror_is_fresh(&app_root, StdDuration::from_secs(900)));
         assert!(!system_winget_mirror_is_fresh(&app_root, StdDuration::ZERO));
 

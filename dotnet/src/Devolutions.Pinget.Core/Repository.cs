@@ -214,6 +214,12 @@ public class Repository : IDisposable
 
     // ── Source management ──
 
+    /// <summary>
+    /// Deliberately not gated by the query refresh interval: a caller asking for the source list
+    /// is looking straight at it, quite possibly right after adding a source through WinGet, so
+    /// this keeps re-exporting on every call as it always has. Only the package queries trade
+    /// that for one spawn per interval.
+    /// </summary>
     public List<SourceRecord> ListSources()
     {
         RefreshSystemWingetSourcesForQuery(TimeSpan.Zero);
@@ -4128,7 +4134,8 @@ public class Repository : IDisposable
                     _store = SystemWingetSourceStore.Load();
                     return null;
                 }
-                catch (Exception ex) when (ex is InvalidOperationException or IOException)
+                catch (Exception ex) when (ex is InvalidOperationException or IOException
+                    or UnauthorizedAccessException or System.Security.SecurityException)
                 {
                     return SystemWingetSourceRefreshWarning(ex);
                 }
@@ -4142,7 +4149,8 @@ public class Repository : IDisposable
                     _store = SourceStoreManager.RefreshSystemWingetMirrorStore(_appRoot);
                     return null;
                 }
-                catch (Exception ex) when (ex is InvalidOperationException or IOException)
+                catch (Exception ex) when (ex is InvalidOperationException or IOException
+                    or UnauthorizedAccessException or System.Security.SecurityException)
                 {
                     return SystemWingetSourceRefreshWarning(ex);
                 }
