@@ -51,6 +51,7 @@ internal static class SourceStoreManager
 
     private const string LegacyStoreFileName = "sources.json";
     private const string SystemWingetMirrorStoreFileName = "system-sources.json";
+    private const string SystemWingetMirrorExportStampFileName = "system-sources.stamp";
     private const string PackagedSourcesFileName = "user_sources";
     private const string PackagedMetadataFileName = "sources_metadata";
     private const string LegacyPinsFileName = "pins.db";
@@ -182,12 +183,49 @@ internal static class SourceStoreManager
         }
     }
 
+    /// <summary>
+    /// Freshness follows a stamp that only a successful <c>winget source export</c> writes. The
+    /// mirror store file itself is rewritten by ordinary pre-indexed metadata saves, so its
+    /// timestamp would let index activity keep a stale source list looking fresh forever.
+    /// </summary>
+    internal static bool SystemWingetMirrorIsFresh(string appRoot, TimeSpan maxAge)
+    {
+        if (!File.Exists(SystemWingetMirrorStorePath(appRoot)))
+            return false;
+
+        var stamp = SystemWingetMirrorExportStampPath(appRoot);
+        if (!File.Exists(stamp))
+            return false;
+
+        var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(stamp);
+        return age >= TimeSpan.Zero && age < maxAge;
+    }
+
+    private static string SystemWingetMirrorExportStampPath(string appRoot) =>
+        Path.Combine(NormalizeAppRoot(appRoot), SystemWingetMirrorExportStampFileName);
+
+    /// <summary>
+    /// A stamp that cannot be written only costs the export gate, so it must not fail the export
+    /// that just succeeded.
+    /// </summary>
+    internal static void StampSystemWingetMirrorExport(string appRoot)
+    {
+        try
+        {
+            File.WriteAllText(SystemWingetMirrorExportStampPath(appRoot), DateTime.UtcNow.ToString("O"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+        }
+    }
+
     internal static SourceStore RefreshSystemWingetMirrorStore(string appRoot)
     {
         var prior = LoadSystemWingetMirrorStore(appRoot) ?? SourceStore.Default();
         var exported = SystemWingetSourceStore.Load();
         MergeSourceCacheMetadata(exported, prior);
         SaveSystemWingetMirrorStore(appRoot, exported);
+        StampSystemWingetMirrorExport(appRoot);
         return exported;
     }
 
