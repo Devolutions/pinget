@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/Devolutions/pinget/compare/pinget-core-v0.11.0...pinget-core-v0.12.0) - 2026-09-09
+
+### Other
+
+- Resolve WinGet source refresh issues and bump version to 0.12.0
+- Address copilot review
+- Bump version to 0.12.0
+- Resolve the system WinGet and survive a failed source refresh
+
 ## [0.11.0](https://github.com/Devolutions/pinget/compare/pinget-core-v0.10.0...pinget-core-v0.11.0) - 2026-09-01
 
 ### Other
