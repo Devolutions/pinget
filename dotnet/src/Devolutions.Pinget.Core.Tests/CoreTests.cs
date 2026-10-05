@@ -3705,6 +3705,53 @@ public class RepositoryEmbeddingTests
     }
 
     [Fact]
+    public void Show_PreindexedUnsafeIdentifier_SanitizesTheCacheSegmentInsideTheAppRoot()
+    {
+        const string packageId = "Test.UnsafeIdentifierCachePackage";
+        const string sourceName = "c:foo";
+        var catalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(catalog.MsixBytes, catalog.Files);
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = TimeSpan.FromDays(1),
+            });
+            ReplaceSources(repo, (sourceName, server.Url, SourceKind.PreIndexed));
+            WritePreindexedIndex(appRoot, repo, sourceName, catalog.IndexBytes);
+
+            var result = repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = sourceName,
+            });
+
+            Assert.Equal("1.0.0", result.PackageVersion);
+            Assert.NotEmpty(result.CachedFiles);
+            Assert.All(result.CachedFiles, file => Assert.StartsWith(
+                Path.GetFullPath(appRoot),
+                Path.GetFullPath(file),
+                StringComparison.OrdinalIgnoreCase));
+
+            var cacheRoot = Path.Combine(appRoot, "Microsoft", "Windows Package Manager");
+            Assert.True(Directory.Exists(cacheRoot));
+            var cached = Directory.GetFiles(cacheRoot, "*", SearchOption.AllDirectories);
+            Assert.Contains(cached, file =>
+                file.Contains(Path.Combine("V2_M", "c_foo"), StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(cached, file =>
+                file.Contains(Path.Combine("V2_PVD", "c_foo"), StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
     public void Show_PreindexedStaleIndex_NotModifiedKeepsLocalIndex()
     {
         const string packageId = "Test.NotModifiedPackage";
