@@ -378,7 +378,7 @@ internal static class PreIndexedSource
 
     // V2 version data: fetch versionData.mszyml from CDN, decompress CK+deflate → YAML
     public static (List<V2VersionDataEntry> Entries, string VersionDataFile) LoadV2VersionData(
-        HttpClient client, SqliteConnection conn, SourceRecord source, long packageRowid, string packageHash, string? appRoot = null)
+        HttpClient client, SqliteConnection conn, SourceRecord source, long packageRowid, string packageHash, string? appRoot)
     {
         // Resolve package id from packages table
         using var idCmd = conn.CreateCommand();
@@ -390,13 +390,13 @@ internal static class PreIndexedSource
         var hashPrefix = packageHash.Length >= 8 ? packageHash[..8].ToLowerInvariant() : packageHash.ToLowerInvariant();
         var relativePath = $"packages/{packageId}/{hashPrefix}/versionData.mszyml";
 
-        var bytes = GetCachedSourceFile(client, "V2_PVD", source, relativePath, packageHash);
+        var bytes = GetCachedSourceFile(client, "V2_PVD", source, relativePath, packageHash, appRoot);
         var yaml = DecompressMszyml(bytes);
 
         var doc = ParseV2VersionDataDocument(yaml)
             ?? throw new InvalidOperationException("Failed to parse versionData.mszyml");
 
-        var cacheDir = TempCachePath("V2_PVD", source.Identifier);
+        var cacheDir = TempCachePath(appRoot, "V2_PVD", source.Identifier);
         return (doc.Versions, Path.Combine(cacheDir, relativePath.Replace('/', '\\')));
     }
 
@@ -541,10 +541,10 @@ internal static class PreIndexedSource
     }
 
     public static byte[] GetCachedSourceFile(
-        HttpClient client, string bucket, SourceRecord source, string relativePath, string? expectedHash)
+        HttpClient client, string bucket, SourceRecord source, string relativePath, string? expectedHash, string? appRoot)
     {
         var normalizedRelative = relativePath.Replace('\\', '/');
-        var cacheDir = TempCachePath(bucket, source.Identifier);
+        var cacheDir = TempCachePath(appRoot, bucket, source.Identifier);
         var cachePath = Path.Combine(cacheDir, normalizedRelative.Replace('/', '\\'));
 
         // Check cache first
@@ -596,18 +596,12 @@ internal static class PreIndexedSource
         throw new InvalidOperationException($"Source file '{relativePath}' not found in MSIX for {source.Name}");
     }
 
-    private static string TempCachePath(string bucket, string sourceIdentifier)
+    private static string TempCachePath(string? appRoot, string bucket, string sourceIdentifier)
     {
-        if (OperatingSystem.IsWindows())
-        {
-            return Path.Combine(
-                SourceStoreManager.GetPackagedFileCacheRoot(null),
-                bucket,
-                sourceIdentifier);
-        }
-
-        var tempDir = Path.GetTempPath();
-        return Path.Combine(tempDir, "pinget", bucket, sourceIdentifier);
+        return Path.Combine(
+            SourceStoreManager.GetPackagedFileCacheRoot(appRoot),
+            bucket,
+            sourceIdentifier);
     }
 
     private static bool HashMatches(string? expected, byte[] data)

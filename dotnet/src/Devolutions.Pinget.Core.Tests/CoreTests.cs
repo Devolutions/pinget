@@ -3659,6 +3659,52 @@ public class RepositoryEmbeddingTests
     }
 
     [Fact]
+    public void Show_Preindexed_CachesSourceFilesInsideTheConfiguredAppRoot()
+    {
+        const string packageId = "Test.AppRootScopedCachePackage";
+        var catalog = PreindexedCatalogFixture.Create(packageId, "1.0.0");
+
+        using var server = new TestPreindexedSourceServer(catalog.MsixBytes, catalog.Files);
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PreIndexedSourceAutoUpdateInterval = TimeSpan.FromDays(1),
+            });
+            ReplaceSources(repo, ("test", server.Url, SourceKind.PreIndexed));
+            WritePreindexedIndex(appRoot, repo, "test", catalog.IndexBytes);
+
+            var result = repo.ShowManifest(new PackageQuery
+            {
+                Id = packageId,
+                Exact = true,
+                Source = "test",
+            });
+
+            Assert.Equal("1.0.0", result.PackageVersion);
+            Assert.NotEmpty(result.CachedFiles);
+            Assert.All(result.CachedFiles, file => Assert.StartsWith(
+                Path.GetFullPath(appRoot),
+                Path.GetFullPath(file),
+                StringComparison.OrdinalIgnoreCase));
+
+            var cacheRoot = Path.Combine(appRoot, "Microsoft", "Windows Package Manager");
+            Assert.True(Directory.Exists(cacheRoot));
+            var cached = Directory.GetFiles(cacheRoot, "*", SearchOption.AllDirectories);
+            Assert.Contains(cached, file =>
+                file.Contains(Path.Combine("V2_M", "test"), StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(cached, file =>
+                file.Contains(Path.Combine("V2_PVD", "test"), StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
     public void Show_PreindexedStaleIndex_NotModifiedKeepsLocalIndex()
     {
         const string packageId = "Test.NotModifiedPackage";
