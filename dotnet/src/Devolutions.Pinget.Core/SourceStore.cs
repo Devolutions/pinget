@@ -642,6 +642,6 @@ internal static class SourceStoreManager
         return value;
     }
 
-    private static string SanitizePathSegment(string value) => string.Concat(value.Select(c =>
+    internal static string SanitizePathSegment(string value) => string.Concat(value.Select(c =>
         @"\/:*?""<>|".Contains(c) ? '_' : c));
 }

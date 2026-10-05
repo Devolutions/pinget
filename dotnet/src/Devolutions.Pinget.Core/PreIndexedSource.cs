@@ -601,7 +601,7 @@ internal static class PreIndexedSource
         return Path.Combine(
             SourceStoreManager.GetPackagedFileCacheRoot(appRoot),
             bucket,
-            sourceIdentifier);
+            SourceStoreManager.SanitizePathSegment(sourceIdentifier));
     }
 
     private static bool HashMatches(string? expected, byte[] data)
