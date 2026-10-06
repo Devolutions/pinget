@@ -1944,7 +1944,7 @@ public class Repository : IDisposable
         var versions = PreIndexedSource.QueryV1Versions(conn, packageRowid);
         var selected = SelectV1Version(versions, query.Version, query.Channel, display.Id, source.Name);
         var relativePath = PreIndexedSource.ResolveV1RelativePath(conn, selected.PathPart);
-        var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V1_M", source, relativePath, selected.ManifestHash);
+        var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V1_M", source, relativePath, selected.ManifestHash, _appRoot);
         var manifest = ParseYamlManifest(bytes);
         var structuredDocument = ParseYamlManifestDocuments(bytes);
         manifest = manifest with { Version = selected.Version, Channel = selected.Channel };
@@ -1993,7 +1993,7 @@ public class Repository : IDisposable
         var source = _store.Sources[sourceIndex];
         var (entries, vdFile) = PreIndexedSource.LoadV2VersionData(_client, conn, source, packageRowid, packageHash, _appRoot);
         var selected = SelectV2Version(entries, query.Version, query.Channel, display.Id, source.Name);
-        var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V2_M", source, selected.ManifestRelativePath, selected.ManifestHash);
+        var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V2_M", source, selected.ManifestRelativePath, selected.ManifestHash, _appRoot);
         var manifest = ParseYamlManifest(bytes);
         var structuredDocument = ParseYamlManifestDocuments(bytes);
         manifest = manifest with { Version = selected.Version };
@@ -3524,7 +3524,7 @@ public class Repository : IDisposable
                     try
                     {
                         var bytes = PreIndexedSource.GetCachedSourceFile(
-                            _client, "V2_M", source, latest.ManifestRelativePath, latest.ManifestHash);
+                            _client, "V2_M", source, latest.ManifestRelativePath, latest.ManifestHash, _appRoot);
                         var manifest = ParseYamlManifest(bytes);
                         installed[idx].CorrelatedRequiresExplicitUpgrade = manifest.RequireExplicitUpgrade;
                         installed[idx].CorrelatedLacksCompatibleInstaller = !ManifestHasCompatibleInstaller(manifest);

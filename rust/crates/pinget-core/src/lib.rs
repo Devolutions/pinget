@@ -6331,15 +6331,7 @@ fn packaged_file_cache_root(app_root: &Path) -> PathBuf {
 }
 
 fn cache_root(app_root: &Path) -> PathBuf {
-    if uses_packaged_layout(app_root) {
-        packaged_file_cache_root(app_root)
-    } else {
-        default_cache_root_fallback()
-    }
-}
-
-fn default_cache_root_fallback() -> PathBuf {
-    std::env::temp_dir().join("cache")
+    packaged_file_cache_root(app_root)
 }
 
 fn packaged_source_type(kind: SourceKind) -> &'static str {
@@ -11321,6 +11313,14 @@ mod tests {
             app_root.join("sources").join("winget_test")
         );
         assert_eq!(pins_db_path(&app_root), app_root.join("pins.db"));
+        assert_eq!(
+            temp_cache_path(&app_root, "V1_M", &source.identifier),
+            app_root
+                .join("Microsoft")
+                .join("Windows Package Manager")
+                .join("V1_M")
+                .join("Test.Source")
+        );
     }
 
     #[cfg(windows)]
