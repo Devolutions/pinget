@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/Devolutions/pinget/compare/pinget-core-v0.12.0...pinget-core-v0.13.0) - 2026-10-06
+
+### Other
+
+- Keep the pre-indexed source file cache inside the configured app root
+- Bump version to 0.13.0
+- Cache pre-indexed source files under the configured app root
+
 ## [0.11.0](https://github.com/Devolutions/pinget/compare/pinget-core-v0.10.0...pinget-core-v0.11.0) - 2026-09-01
 
 ### Other
