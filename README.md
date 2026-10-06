@@ -68,6 +68,18 @@ pinget install --id Devolutions.MsRdpEx --scope user --silent
 pinget uninstall --id Devolutions.MsRdpEx --silent
 ```
 
+### Requirements
+
+The Windows version of Pinget not only works on the same Windows versions as [what Winget does](https://github.com/microsoft/winget-cli#installing-the-client), but since Pinget does not have a hard dependency on MSIX whereas Winget has, Pinget supports several Windows versions that Winget doesn't. However, as with Winget, Pinget has a hard dependency on the [IsWow64Process2](IsWow64Process2) function, and therefore cannot run on for instance Windows 8.1 or earlier, or on ReactOS.
+
+* Windows 11
+* Windows 10 ≥1709 x64/ARM64 (1709 and 1803 are Pinget-exclusive)
+* Windows Server ≥2019
+* Windows Server Core (Pinget-exclusive)
+* Wine on Linux (Pinget-exclusive)
+
+The native Linux version of Pinget lacks support for installing apps or for listing installed apps.
+
 ## PowerShell module
 
 The **`Devolutions.Pinget.Client`** module is available from the PowerShell Gallery:
