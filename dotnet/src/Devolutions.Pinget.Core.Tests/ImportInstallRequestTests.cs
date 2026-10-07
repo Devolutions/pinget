@@ -46,6 +46,20 @@ public class ImportInstallRequestTests
     }
 
     [Fact]
+    public void ImportScopeAndChannelReachPackageSelection()
+    {
+        using var document = JsonDocument.Parse("""{"Scope":"machine","Channel":"preview"}""");
+        var request = ImportInstallRequestFactory.Create(
+            new PackageQuery { Id = "Test.Package", Exact = true },
+            document.RootElement,
+            acceptPackageAgreements: false,
+            noUpgrade: false);
+
+        Assert.Equal("machine", request.Query.InstallScope);
+        Assert.Equal("preview", request.Query.Channel);
+    }
+
+    [Fact]
     public void ImportWithoutOptionsKeepsExistingInstallRequestDefaults()
     {
         using var document = JsonDocument.Parse("""{"PackageIdentifier":"Test.Package"}""");

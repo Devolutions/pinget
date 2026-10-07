@@ -12,7 +12,11 @@ internal static class ImportInstallRequestFactory
         bool noUpgrade) =>
         new()
         {
-            Query = query,
+            Query = query with
+            {
+                Channel = GetString(package, "Channel") ?? query.Channel,
+                InstallScope = GetString(package, "Scope") ?? query.InstallScope,
+            },
             Mode = InstallerMode.SilentWithProgress,
             Custom = GetString(package, "InitialCustomSwitches"),
             Override = GetString(package, "InitialOverrideArguments"),
