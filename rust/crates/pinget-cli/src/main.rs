@@ -2582,9 +2582,12 @@ fn do_import(
                             m.version.as_deref().unwrap_or("?"),
                             source_name
                         );
-                        let mut request = InstallRequest::new(query.clone());
-                        request.accept_package_agreements = accept_package_agreements;
-                        request.no_upgrade = no_upgrade;
+                        let request = create_import_install_request(
+                            query.clone(),
+                            package,
+                            accept_package_agreements,
+                            no_upgrade,
+                        );
                         match repository.install_request(&request) {
                             Ok(r) if r.no_op => {
                                 println!("    NO-OP");
@@ -2628,6 +2631,26 @@ fn do_import(
     Ok(())
 }
 
+fn create_import_install_request(
+    query: PackageQuery,
+    package: &serde_json::Value,
+    accept_package_agreements: bool,
+    no_upgrade: bool,
+) -> InstallRequest {
+    let mut request = InstallRequest::new(query);
+    request.custom = package
+        .get("InitialCustomSwitches")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    request.override_args = package
+        .get("InitialOverrideArguments")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    request.accept_package_agreements = accept_package_agreements;
+    request.no_upgrade = no_upgrade;
+    request
+}
+
 fn can_ignore_unavailable_import_failure(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("no package matched") || message.contains("no applicable installer found")
@@ -2665,6 +2688,41 @@ mod tests {
         assert!(parse_boolean_setting_value("enabled").expect("bool"));
         assert!(!parse_boolean_setting_value("false").expect("bool"));
         assert!(!parse_boolean_setting_value("0").expect("bool"));
+    }
+
+    #[test]
+    fn import_install_request_preserves_custom_switches_and_override_arguments() {
+        let package = serde_json::json!({
+            "InitialCustomSwitches": "/custom-switch",
+            "InitialOverrideArguments": "/override-arguments"
+        });
+        let request = create_import_install_request(
+            PackageQuery::default(),
+            &package,
+            true,
+            true,
+        );
+
+        assert_eq!(request.custom.as_deref(), Some("/custom-switch"));
+        assert_eq!(request.override_args.as_deref(), Some("/override-arguments"));
+        assert!(request.accept_package_agreements);
+        assert!(request.no_upgrade);
+    }
+
+    #[test]
+    fn import_install_request_without_options_keeps_default_install_behavior() {
+        let request = create_import_install_request(
+            PackageQuery::default(),
+            &serde_json::json!({ "PackageIdentifier": "Test.Package" }),
+            false,
+            false,
+        );
+
+        assert_eq!(request.mode, InstallerMode::SilentWithProgress);
+        assert!(request.custom.is_none());
+        assert!(request.override_args.is_none());
+        assert!(!request.accept_package_agreements);
+        assert!(!request.no_upgrade);
     }
 
     #[test]
