@@ -1139,81 +1139,46 @@ importCommand.SetHandler((ctx) =>
     var sources = doc.RootElement.GetProperty("Sources").EnumerateArray().ToList();
 
     using var repo = Repository.Open();
-    int total = 0;
-    int skipped = 0;
-    foreach (var source in sources)
+    var importPackages = sources.SelectMany(source =>
     {
         var sourceName = source.TryGetProperty("SourceDetails", out var sourceDetails)
             ? GetJsonString(sourceDetails, "Name")
             : null;
-        var packages = source.GetProperty("Packages").EnumerateArray().ToList();
-        foreach (var pkg in packages)
-        {
-            var pkgId = pkg.GetProperty("PackageIdentifier").GetString()!;
-            var pkgVersion = ignoreVersions ? null : GetJsonString(pkg, "Version");
-            if (dryRun)
+        return source.GetProperty("Packages").EnumerateArray().Select(pkg => new ImportPackage(
+            pkg.GetProperty("PackageIdentifier").GetString()!,
+            sourceName,
+            ignoreVersions ? null : GetJsonString(pkg, "Version")));
+    }).ToList();
+
+    ctx.ExitCode = ImportCommandHandler.Run(
+        importPackages,
+        dryRun,
+        ignoreUnavailable,
+        noUpgrade,
+        pkg => IsInstalledPackagePresent(repo, pkg.Id, pkg.SourceName),
+        pkg => repo.Install(CreateInstallRequest(
+            new PackageQuery
             {
-                Console.WriteLine($"[dry-run] Would install: {pkgId}");
-            }
-            else if (noUpgrade && IsInstalledPackagePresent(repo, pkgId, sourceName))
-            {
-                Console.WriteLine($"[no-upgrade] Skipping already installed package: {pkgId}");
-                skipped++;
-            }
-            else
-            {
-                try
-                {
-                    Console.Write($"Installing {pkgId}...");
-                    var result = repo.Install(CreateInstallRequest(
-                        new PackageQuery
-                        {
-                            Id = pkgId,
-                            Source = sourceName,
-                            Exact = true,
-                            Version = pkgVersion,
-                        },
-                        null,
-                        InstallerMode.SilentWithProgress,
-                        null,
-                        null,
-                        null,
-                        null,
-                        false,
-                        false,
-                        acceptPackageAgreements,
-                        false,
-                        null,
-                        false,
-                        false,
-                        null,
-                        noUpgrade));
-                    if (result.NoOp)
-                    {
-                        Console.WriteLine(" no-op");
-                        PrintWarnings(result.Warnings);
-                        skipped++;
-                    }
-                    else
-                    {
-                        PrintWarnings(result.Warnings);
-                        Console.WriteLine(result.Success ? " done" : $" failed (exit {result.ExitCode})");
-                    }
-                }
-                catch (Exception ex) when (ignoreUnavailable && CanIgnoreUnavailableImportFailure(ex))
-                {
-                    Console.WriteLine(" unavailable");
-                    Console.Error.WriteLine($"warning: Skipping unavailable package '{pkgId}': {ex.Message}");
-                    skipped++;
-                }
-                catch (Exception ex) { Console.Error.WriteLine($" error: {ex.Message}"); }
-            }
-            total++;
-        }
-    }
-    if (!dryRun && skipped > 0)
-        Console.WriteLine($"Skipped {skipped} package(s).");
-    Console.WriteLine($"{total} package(s) {(dryRun ? "would be installed" : "processed")}.");
+                Id = pkg.Id,
+                Source = pkg.SourceName,
+                Exact = true,
+                Version = pkg.Version,
+            },
+            null,
+            InstallerMode.SilentWithProgress,
+            null,
+            null,
+            null,
+            null,
+            false,
+            false,
+            acceptPackageAgreements,
+            false,
+            null,
+            false,
+            false,
+            null,
+            noUpgrade)));
 });
 
 // ── Add all commands to root ──
@@ -1781,11 +1746,6 @@ static bool IsInstalledPackagePresent(Repository repo, string packageId, string?
         Exact = true,
         Count = 1,
     }).Matches.Count > 0;
-
-static bool CanIgnoreUnavailableImportFailure(Exception ex) =>
-    ex is InvalidOperationException &&
-    (ex.Message.Contains("No package matched the query", StringComparison.OrdinalIgnoreCase) ||
-     ex.Message.Contains("No applicable installer found", StringComparison.OrdinalIgnoreCase));
 
 void WriteJsonNode(JsonNode value, OutputFormat output)
 {

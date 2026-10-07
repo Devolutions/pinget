@@ -2510,8 +2510,23 @@ fn print_json_value(value: &serde_json::Value, output: OutputFormat) -> Result<(
     Ok(())
 }
 
-fn do_import(
-    repository: &mut Repository,
+trait ImportRepository {
+    fn search(&mut self, query: &PackageQuery) -> Result<SearchResponse>;
+    fn install_request(&mut self, request: &InstallRequest) -> Result<InstallResult>;
+}
+
+impl ImportRepository for Repository {
+    fn search(&mut self, query: &PackageQuery) -> Result<SearchResponse> {
+        Repository::search(self, query)
+    }
+
+    fn install_request(&mut self, request: &InstallRequest) -> Result<InstallResult> {
+        Repository::install_request(self, request)
+    }
+}
+
+fn do_import<R: ImportRepository>(
+    repository: &mut R,
     file_path: &str,
     dry_run: bool,
     ignore_unavailable: bool,
@@ -2520,7 +2535,27 @@ fn do_import(
     accept_package_agreements: bool,
 ) -> Result<()> {
     let content = std::fs::read_to_string(file_path)?;
-    let doc: serde_json::Value = serde_json::from_str(&content)?;
+    do_import_from_content(
+        repository,
+        &content,
+        dry_run,
+        ignore_unavailable,
+        ignore_versions,
+        no_upgrade,
+        accept_package_agreements,
+    )
+}
+
+fn do_import_from_content<R: ImportRepository>(
+    repository: &mut R,
+    content: &str,
+    dry_run: bool,
+    ignore_unavailable: bool,
+    ignore_versions: bool,
+    no_upgrade: bool,
+    accept_package_agreements: bool,
+) -> Result<()> {
+    let doc: serde_json::Value = serde_json::from_str(content)?;
 
     let sources = doc
         .get("Sources")
@@ -2531,6 +2566,7 @@ fn do_import(
     let mut found = 0;
     let mut not_found = 0;
     let mut skipped = 0;
+    let mut failures = ImportFailureAccumulator::default();
 
     for source in sources {
         let source_name = source
@@ -2591,25 +2627,49 @@ fn do_import(
                                 print_warnings(&r.warnings);
                                 skipped += 1;
                             }
-                            Ok(r) if r.success => println!("    OK"),
-                            Ok(r) => println!("    FAILED (exit {})", r.exit_code),
+                            Ok(r) if r.success => {
+                                println!("    OK");
+                                failures.record_install_result(true);
+                            }
+                            Ok(r) => {
+                                println!("    FAILED (exit {})", r.exit_code);
+                                failures.record_install_result(false);
+                            }
                             Err(e) if ignore_unavailable && can_ignore_unavailable_import_failure(&e) => {
                                 println!("    UNAVAILABLE");
                                 write_stderr_line(format_args!("warning: Skipping unavailable package '{id}': {e}"));
                                 skipped += 1;
                             }
-                            Err(e) => println!("    ERROR: {e}"),
+                            Err(e) => {
+                                println!("    ERROR: {e}");
+                                failures.record_error(false);
+                            }
                         }
                     }
                     found += 1;
                 }
-                _ => {
+                Ok(_) => {
                     if ignore_unavailable {
                         println!("  [ignored unavailable] {id} ({source_name})");
                         skipped += 1;
                     } else {
                         println!("  [not found] {id} ({source_name})");
                         not_found += 1;
+                        if !dry_run {
+                            failures.record_error(false);
+                        }
+                    }
+                }
+                Err(e) if ignore_unavailable && can_ignore_unavailable_import_failure(&e) => {
+                    failures.record_error(true);
+                    println!("  [ignored unavailable] {id} ({source_name})");
+                    write_stderr_line(format_args!("warning: Skipping unavailable package '{id}': {e}"));
+                    skipped += 1;
+                }
+                Err(e) => {
+                    write_stderr_line(format_args!("  ERROR searching for {id}: {e}"));
+                    if !dry_run {
+                        failures.record_error(false);
                     }
                 }
             }
@@ -2625,7 +2685,29 @@ fn do_import(
             println!("Skipped {skipped} package(s).");
         }
     }
+    if failures.has_failures() {
+        bail!("one or more packages failed during import");
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct ImportFailureAccumulator {
+    has_failures: bool,
+}
+
+impl ImportFailureAccumulator {
+    fn record_install_result(&mut self, success: bool) {
+        self.has_failures |= !success;
+    }
+
+    fn record_error(&mut self, ignored_unavailable: bool) {
+        self.has_failures |= !ignored_unavailable;
+    }
+
+    fn has_failures(&self) -> bool {
+        self.has_failures
+    }
 }
 
 fn can_ignore_unavailable_import_failure(error: &anyhow::Error) -> bool {
@@ -2638,6 +2720,375 @@ mod tests {
     use pinget_core::VersionKey;
 
     use super::*;
+
+    #[derive(Default)]
+    struct FakeImportRepository {
+        searched: Vec<String>,
+        installed: Vec<String>,
+        failed_package: Option<String>,
+        thrown_package: Option<String>,
+        unavailable_package: Option<String>,
+        missing_package: Option<String>,
+        search_error_package: Option<String>,
+        no_op_package: Option<String>,
+    }
+
+    impl ImportRepository for FakeImportRepository {
+        fn search(&mut self, query: &PackageQuery) -> Result<SearchResponse> {
+            let id = query.id.clone().unwrap_or_default();
+            self.searched.push(id.clone());
+            if self.search_error_package.as_deref() == Some(id.as_str()) {
+                return Err(anyhow::anyhow!("source configuration is invalid"));
+            }
+            let matches = if self.missing_package.as_deref() == Some(id.as_str()) {
+                Vec::new()
+            } else {
+                vec![SearchMatch {
+                    source_name: query.source.clone().unwrap_or_default(),
+                    source_kind: SourceKind::Rest,
+                    id: id.clone(),
+                    name: id,
+                    moniker: None,
+                    version: Some("1.0".to_owned()),
+                    channel: None,
+                    match_criteria: None,
+                }]
+            };
+            Ok(SearchResponse {
+                matches,
+                warnings: Vec::new(),
+                truncated: false,
+            })
+        }
+
+        fn install_request(&mut self, request: &InstallRequest) -> Result<InstallResult> {
+            let id = request.query.id.clone().unwrap_or_default();
+            self.installed.push(id.clone());
+            if self.thrown_package.as_deref() == Some(id.as_str()) {
+                return Err(anyhow::anyhow!("synthetic installer error"));
+            }
+            if self.unavailable_package.as_deref() == Some(id.as_str()) {
+                return Err(anyhow::anyhow!("No applicable installer found"));
+            }
+            let success = self.failed_package.as_deref() != Some(id.as_str());
+            let no_op = self.no_op_package.as_deref() == Some(id.as_str());
+            Ok(InstallResult {
+                package_id: id,
+                version: "1.0".to_owned(),
+                installer_path: PathBuf::new(),
+                installer_type: "exe".to_owned(),
+                exit_code: if success { 0 } else { 1 },
+                success,
+                no_op,
+                warnings: Vec::new(),
+            })
+        }
+    }
+
+    fn two_package_import_manifest() -> &'static str {
+        r#"{"Sources":[{"SourceDetails":{"Name":"test"},"Packages":[{"PackageIdentifier":"Failing.Package"},{"PackageIdentifier":"Successful.Package"}]}]}"#
+    }
+
+    #[test]
+    fn import_handler_attempts_success_after_returned_failure_and_returns_error() {
+        let mut repository = FakeImportRepository {
+            failed_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        let result = do_import_from_content(
+            &mut repository,
+            two_package_import_manifest(),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            repository.installed,
+            vec!["Failing.Package".to_owned(), "Successful.Package".to_owned()]
+        );
+    }
+
+    #[test]
+    fn import_handler_attempts_success_after_thrown_error_and_returns_error() {
+        let mut repository = FakeImportRepository {
+            thrown_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        let result = do_import_from_content(
+            &mut repository,
+            two_package_import_manifest(),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            repository.installed,
+            vec!["Failing.Package".to_owned(), "Successful.Package".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ignore_unavailable_omits_classified_failure_from_exit_status() {
+        let mut repository = FakeImportRepository {
+            unavailable_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        let result = do_import_from_content(
+            &mut repository,
+            two_package_import_manifest(),
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            repository.installed,
+            vec!["Failing.Package".to_owned(), "Successful.Package".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ignore_unavailable_does_not_hide_unclassified_installer_error() {
+        let mut repository = FakeImportRepository {
+            thrown_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        let result = do_import_from_content(
+            &mut repository,
+            two_package_import_manifest(),
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            repository.installed,
+            vec!["Failing.Package".to_owned(), "Successful.Package".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ignore_unavailable_skips_missing_packages_but_non_ignored_missing_package_fails() {
+        let manifest =
+            r#"{"Sources":[{"SourceDetails":{"Name":"test"},"Packages":[{"PackageIdentifier":"Missing.Package"}]}]}"#;
+        let mut ignored = FakeImportRepository {
+            missing_package: Some("Missing.Package".to_owned()),
+            ..Default::default()
+        };
+        assert!(do_import_from_content(&mut ignored, manifest, false, true, false, false, false).is_ok());
+        assert!(ignored.installed.is_empty());
+
+        let mut required = FakeImportRepository {
+            missing_package: Some("Missing.Package".to_owned()),
+            ..Default::default()
+        };
+        assert!(do_import_from_content(&mut required, manifest, false, false, false, false, false).is_err());
+    }
+
+    #[test]
+    fn dry_run_searches_all_packages_without_installing_or_failing() {
+        let mut repository = FakeImportRepository {
+            failed_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        let result = do_import_from_content(
+            &mut repository,
+            two_package_import_manifest(),
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            repository.searched,
+            vec!["Failing.Package".to_owned(), "Successful.Package".to_owned()]
+        );
+        assert!(repository.installed.is_empty());
+    }
+
+    #[test]
+    fn dry_run_search_errors_do_not_fail_or_stop_later_searches() {
+        let mut repository = FakeImportRepository {
+            search_error_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(
+            do_import_from_content(
+                &mut repository,
+                two_package_import_manifest(),
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            repository.searched,
+            vec!["Failing.Package".to_owned(), "Successful.Package".to_owned()]
+        );
+        assert!(repository.installed.is_empty());
+    }
+
+    #[test]
+    fn dry_run_missing_packages_do_not_fail() {
+        let mut repository = FakeImportRepository {
+            missing_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(
+            do_import_from_content(
+                &mut repository,
+                two_package_import_manifest(),
+                true,
+                false,
+                false,
+                false,
+                false,
+            )
+            .is_ok()
+        );
+        assert_eq!(repository.searched.len(), 2);
+        assert!(repository.installed.is_empty());
+    }
+
+    #[test]
+    fn ignore_unavailable_does_not_hide_search_errors_or_stop_later_installs() {
+        let mut repository = FakeImportRepository {
+            search_error_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(
+            do_import_from_content(
+                &mut repository,
+                two_package_import_manifest(),
+                false,
+                true,
+                false,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(repository.installed, vec!["Successful.Package".to_owned()]);
+    }
+
+    #[test]
+    fn ignore_unavailable_does_not_hide_returned_installer_failures() {
+        let mut repository = FakeImportRepository {
+            failed_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(
+            do_import_from_content(
+                &mut repository,
+                two_package_import_manifest(),
+                false,
+                true,
+                false,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(repository.installed.len(), 2);
+    }
+
+    #[test]
+    fn no_op_result_does_not_fail_import() {
+        let mut repository = FakeImportRepository {
+            failed_package: Some("Failing.Package".to_owned()),
+            no_op_package: Some("Failing.Package".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(
+            do_import_from_content(
+                &mut repository,
+                two_package_import_manifest(),
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .is_ok()
+        );
+        assert_eq!(repository.installed.len(), 2);
+    }
+
+    #[test]
+    fn later_no_op_does_not_clear_earlier_failure() {
+        let mut repository = FakeImportRepository {
+            failed_package: Some("Failing.Package".to_owned()),
+            no_op_package: Some("Successful.Package".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(
+            do_import_from_content(
+                &mut repository,
+                two_package_import_manifest(),
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(repository.installed.len(), 2);
+    }
+
+    #[test]
+    fn later_ignored_unavailable_package_does_not_clear_earlier_failure() {
+        let mut repository = FakeImportRepository {
+            failed_package: Some("Failing.Package".to_owned()),
+            unavailable_package: Some("Successful.Package".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(
+            do_import_from_content(
+                &mut repository,
+                two_package_import_manifest(),
+                false,
+                true,
+                false,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(repository.installed.len(), 2);
+    }
 
     #[test]
     fn resolve_source_add_value_accepts_option_form() {
