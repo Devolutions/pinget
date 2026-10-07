@@ -8972,6 +8972,8 @@ async fn try_download_installer_to_part(
     let mut offset = metadata.as_ref().map_or(0, |metadata| metadata.offset);
     let mut request = reqwest::Client::builder()
         .user_agent(user_agent)
+        // Match WinINet and .NET: redirects must not synthesize a browser Referer.
+        .referer(false)
         .connect_timeout(INSTALLER_DOWNLOAD_CONNECT_TIMEOUT)
         .timeout(remaining)
         .build()
@@ -13564,6 +13566,120 @@ Installers:
         assert!(should_elevate_msi_shell_execute(&installer));
     }
 
+    fn write_installer_download_manifest(root: &Path, url: &str, sha256: &str) -> PathBuf {
+        let manifest = root.join("installer.yaml");
+        fs::write(
+            &manifest,
+            format!(
+                "PackageIdentifier: Test.Package\nPackageVersion: 1.0.0\nPackageName: Test Package\nManifestType: singleton\nManifestVersion: 1.10.0\nInstallers:\n  - InstallerType: exe\n    InstallerUrl: {url}\n    InstallerSha256: {sha256}\n"
+            ),
+        )
+        .expect("write test manifest");
+        manifest
+    }
+
+    fn download_test_installer(app_root: &Path, manifest_path: &Path) -> Result<DownloadOutput> {
+        let mut repository = Repository::open_with_options(RepositoryOptions::new(app_root.to_path_buf()))?;
+        let mut request = InstallRequest::new(PackageQuery::default());
+        request.manifest_path = Some(manifest_path.to_path_buf());
+        repository.download_installer_for_request(&request, &app_root.join("downloads"))
+    }
+
+    #[test]
+    fn download_installer_follows_redirect_and_verifies_final_bytes() {
+        let server = TestHttpServer::start();
+        let payload = b"valid installer payload".to_vec();
+        let final_url = format!("{}/final.exe", server.url());
+        server.set_redirect("/installer.exe", &final_url);
+        server.set_bytes_without_referer("/final.exe", payload.clone());
+
+        let root = temp_app_root("download_redirect_valid");
+        fs::create_dir_all(&root).expect("create app root");
+        let manifest =
+            write_installer_download_manifest(&root, &format!("{}/installer.exe", server.url()), &sha256_hex(&payload));
+        let result = download_test_installer(&root, &manifest).expect("redirected installer should verify");
+
+        assert_eq!(fs::read(&result.installer_path).expect("read installer"), payload);
+        assert_eq!(server.request_count("/installer.exe"), 1);
+        assert_eq!(server.request_count("/final.exe"), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_reqwest_redirect_referer_receives_html_instead_of_installer() {
+        let server = TestHttpServer::start();
+        let payload = b"valid installer payload".to_vec();
+        server.set_redirect("/installer.exe", &format!("{}/final.exe", server.url()));
+        server.set_bytes_without_referer("/final.exe", payload.clone());
+
+        let response = Client::builder()
+            .user_agent(DEFAULT_USER_AGENT)
+            .build()
+            .expect("build default HTTP client")
+            .get(format!("{}/installer.exe", server.url()))
+            .header(ACCEPT_ENCODING, "identity")
+            .send()
+            .expect("follow redirect");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.bytes().expect("read landing page");
+
+        assert_eq!(bytes.as_ref(), b"<!doctype html><html><body>landing page</body></html>");
+        assert_ne!(sha256_hex(&bytes), sha256_hex(&payload));
+        assert_eq!(server.request_count("/installer.exe"), 1);
+        assert_eq!(server.request_count("/final.exe"), 1);
+    }
+
+    #[test]
+    fn download_installer_omits_referer_across_multiple_redirects_and_hosts() {
+        let origin = TestHttpServer::start();
+        let mirror = TestHttpServer::start();
+        let payload = b"valid installer payload".to_vec();
+        origin.set_redirect_with_status("/installer.msi", "/installer.msi/", 301);
+        origin.set_redirect_with_status("/installer.msi/", "/installer.msi/download", 302);
+        origin.set_redirect_with_status("/installer.msi/download", &format!("{}/mirror.msi", mirror.url()), 303);
+        mirror.set_redirect_with_status("/mirror.msi", "/temporary.msi", 307);
+        mirror.set_redirect_with_status("/temporary.msi", "/final.msi", 308);
+        mirror.set_bytes_without_referer("/final.msi", payload.clone());
+
+        let root = temp_app_root("download_redirect_chain");
+        fs::create_dir_all(&root).expect("create app root");
+        let manifest =
+            write_installer_download_manifest(&root, &format!("{}/installer.msi", origin.url()), &sha256_hex(&payload));
+        let result = download_test_installer(&root, &manifest).expect("redirected installer should verify");
+
+        assert_eq!(fs::read(&result.installer_path).expect("read installer"), payload);
+        assert_eq!(result.installer_path, root.join("downloads").join("installer.msi"));
+        for path in ["/installer.msi", "/installer.msi/", "/installer.msi/download"] {
+            assert_eq!(origin.request_count(path), 1, "original URL must not be rewritten");
+        }
+        for path in ["/mirror.msi", "/temporary.msi", "/final.msi"] {
+            assert_eq!(mirror.request_count(path), 1);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_installer_rejects_hash_mismatch_after_redirect() {
+        let server = TestHttpServer::start();
+        let payload = b"different installer bytes".to_vec();
+        let final_url = format!("{}/final.exe", server.url());
+        server.set_redirect("/installer.exe", &final_url);
+        server.set_bytes_without_referer("/final.exe", payload.clone());
+
+        let root = temp_app_root("download_redirect_hash_mismatch");
+        fs::create_dir_all(&root).expect("create app root");
+        let manifest = write_installer_download_manifest(
+            &root,
+            &format!("{}/installer.exe", server.url()),
+            &sha256_hex(b"expected installer bytes"),
+        );
+        let error = download_test_installer(&root, &manifest).expect_err("hash mismatch must fail");
+
+        assert!(format!("{error:#}").contains("Installer hash mismatch"));
+        assert!(!root.join("downloads").join("installer.exe").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn installer_download_if_range_prefers_strong_etag_and_rejects_weak_etag() {
         let strong = InstallerDownloadMetadata {
@@ -15040,6 +15156,8 @@ Installers:
         source_version: Option<String>,
         etag: Option<String>,
         last_modified: Option<String>,
+        location: Option<String>,
+        reject_referer: bool,
     }
 
     struct TestHttpServer {
@@ -15091,6 +15209,42 @@ Installers:
                     source_version: None,
                     etag: None,
                     last_modified: None,
+                    location: None,
+                    reject_referer: false,
+                },
+            );
+        }
+
+        fn set_redirect(&self, path: &str, location: &str) {
+            self.set_redirect_with_status(path, location, 302);
+        }
+
+        fn set_redirect_with_status(&self, path: &str, location: &str, status: u16) {
+            self.set_response(
+                path,
+                TestHttpResponse {
+                    status,
+                    body: Vec::new(),
+                    source_version: None,
+                    etag: None,
+                    last_modified: None,
+                    location: Some(location.to_owned()),
+                    reject_referer: false,
+                },
+            );
+        }
+
+        fn set_bytes_without_referer(&self, path: &str, body: Vec<u8>) {
+            self.set_response(
+                path,
+                TestHttpResponse {
+                    status: 200,
+                    body,
+                    source_version: None,
+                    etag: None,
+                    last_modified: None,
+                    location: None,
+                    reject_referer: true,
                 },
             );
         }
@@ -15114,6 +15268,8 @@ Installers:
                     source_version: Some(source_version.to_owned()),
                     etag: etag.map(str::to_owned),
                     last_modified: last_modified.map(str::to_owned),
+                    location: None,
+                    reject_referer: false,
                 },
             );
         }
@@ -15127,6 +15283,8 @@ Installers:
                     source_version: None,
                     etag: None,
                     last_modified: None,
+                    location: None,
+                    reject_referer: false,
                 },
             );
         }
@@ -15183,6 +15341,8 @@ Installers:
             source_version: None,
             etag: None,
             last_modified: None,
+            location: None,
+            reject_referer: false,
         });
         let not_modified = response.status == 200
             && (response.etag.as_deref().is_some_and(|etag| {
@@ -15195,12 +15355,19 @@ Installers:
         let status = if not_modified { 304 } else { response.status };
         let body = if not_modified {
             &[][..]
+        } else if response.reject_referer && request_header_value(&request, "Referer").is_some() {
+            b"<!doctype html><html><body>landing page</body></html>".as_slice()
         } else {
             response.body.as_slice()
         };
         let reason = match status {
             200 => "OK",
+            301 => "Moved Permanently",
+            302 => "Found",
+            303 => "See Other",
             304 => "Not Modified",
+            307 => "Temporary Redirect",
+            308 => "Permanent Redirect",
             _ => "Not Found",
         };
         let mut headers = format!(
@@ -15217,6 +15384,9 @@ Installers:
         }
         if let Some(last_modified) = response.last_modified {
             headers.push_str(&format!("Last-Modified: {last_modified}\r\n"));
+        }
+        if let Some(location) = response.location {
+            headers.push_str(&format!("Location: {location}\r\n"));
         }
         headers.push_str("\r\n");
         stream.write_all(headers.as_bytes()).expect("write test HTTP headers");
