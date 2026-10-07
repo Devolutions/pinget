@@ -2354,6 +2354,7 @@ impl Repository {
         let installer_path = self.fetch_installer_for_request(request, &temp_dir)?.installer_path;
 
         let installer_type = installer.installer_type.as_deref().unwrap_or("exe").to_lowercase();
+        let installer_path = prepare_installer_for_execution(&installer_path, &installer_type)?;
 
         self.emit_install_progress(InstallProgress::StartingInstaller {
             installer_type: installer_type.clone(),
@@ -9245,6 +9246,21 @@ fn decode_pin_type(pin_type_int: i64) -> PinType {
     }
 }
 
+fn prepare_installer_for_execution(installer_path: &Path, installer_type: &str) -> Result<PathBuf> {
+    if !(installer_type.eq_ignore_ascii_case("nullsoft") || installer_type.eq_ignore_ascii_case("nsis"))
+        || installer_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return Ok(installer_path.to_path_buf());
+    }
+
+    // Like WinGet, give the verified NSIS payload an executable extension before ShellExecute.
+    let executable_path = installer_path.with_extension("exe");
+    replace_file(installer_path, &executable_path).context("failed to prepare NSIS installer for execution")?;
+    Ok(executable_path)
+}
+
 #[cfg(windows)]
 fn dispatch_installer(
     installer_path: &Path,
@@ -13332,6 +13348,91 @@ Installers:
     }
 
     #[test]
+    fn prepare_installer_for_execution_preserves_verified_nullsoft_bytes() {
+        let root = temp_app_root("nullsoft_execution");
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let payload = b"verified NSIS installer bytes";
+        for installer_type in ["nullsoft", "nsis", "NULLSOFT", "NSIS"] {
+            for filename in ["download", "download.php", "custom", "setup.exe", "setup.EXE"] {
+                let original = root.join(filename);
+                fs::write(&original, payload).expect("write verified installer");
+                let expected = if filename.to_ascii_lowercase().ends_with(".exe") {
+                    original.clone()
+                } else {
+                    let executable = original.with_extension("exe");
+                    fs::write(&executable, b"stale installer").expect("write stale installer");
+                    executable
+                };
+                let prepared = prepare_installer_for_execution(&original, installer_type)
+                    .expect("prepare NSIS installer");
+                assert_eq!(prepared, expected);
+                assert_eq!(fs::read(&prepared).expect("read prepared installer"), payload);
+                if original != prepared {
+                    assert!(!original.exists());
+                }
+                fs::remove_file(prepared).expect("remove prepared installer");
+            }
+        }
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn prepare_installer_for_execution_leaves_other_types_unchanged() {
+        for installer_type in ["exe", "inno", "burn", "msi", "msix", "zip", "portable"] {
+            let path = Path::new("download");
+            assert_eq!(
+                prepare_installer_for_execution(path, installer_type).expect("other types are unchanged"),
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_installer_for_execution_reports_missing_nullsoft_payload() {
+        let path = temp_app_root("nullsoft_missing_payload").join("download");
+        let error = prepare_installer_for_execution(&path, "nullsoft")
+            .expect_err("a missing installer must not be reported as prepared");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to prepare NSIS installer for execution")
+        );
+    }
+
+    #[test]
+    fn installer_switch_arguments_use_nullsoft_silent_default() {
+        let manifest = sample_manifest("Test.Package", "1.0.0", "Test Package");
+        let installer = Installer::default();
+        let mut progress_request = InstallRequest::new(PackageQuery::default());
+        progress_request.mode = InstallerMode::SilentWithProgress;
+        let mut silent_request = InstallRequest::new(PackageQuery::default());
+        silent_request.mode = InstallerMode::Silent;
+
+        for installer_type in ["nullsoft", "nsis"] {
+            assert_eq!(
+                installer_command_arguments(
+                    installer_type,
+                    &progress_request,
+                    &manifest,
+                    Path::new("installer.exe"),
+                    &installer
+                ),
+                vec!["/S".to_owned()]
+            );
+            assert_eq!(
+                installer_command_arguments(
+                    installer_type,
+                    &silent_request,
+                    &manifest,
+                    Path::new("installer.exe"),
+                    &installer
+                ),
+                vec!["/S".to_owned()]
+            );
+        }
+    }
+
+    #[test]
     fn installer_command_arguments_append_manifest_and_cli_switches() {
         let installer = Installer {
             architecture: None,
@@ -13615,6 +13716,129 @@ Installers:
             ]),
             r#"/quiet "INSTALLDIR=C:\Program Files\nodejs" "VALUE=has \"quotes\"""#
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_execute_waits_for_installer_process_not_detached_children() {
+        use std::fs;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        static LIFECYCLE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "pinget-process-lifecycle-{}-{}",
+            std::process::id(),
+            LIFECYCLE_TEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("create lifecycle fixture directory");
+        let child_script = directory.join("child.ps1");
+        let launcher_script = directory.join("launcher.cmd");
+        let child_pid_file = directory.join("child.pid");
+        let quoted_pid_file = child_pid_file.to_string_lossy().replace('\'', "''");
+
+        fs::write(
+            &child_script,
+            format!(
+                "Set-Content -LiteralPath '{quoted_pid_file}' -Value $PID\r\n\
+                 Start-Sleep -Seconds 15\r\n"
+            ),
+        )
+        .expect("write child fixture");
+        fs::write(
+            &launcher_script,
+            format!(
+                "@echo off\r\nstart \"\" /b powershell.exe -NoProfile -File \"{}\"\r\n",
+                child_script.display()
+            ),
+        )
+        .expect("write launcher fixture");
+
+        let command_interpreter = std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
+        let args = vec!["/c".to_owned(), launcher_script.to_string_lossy().into_owned()];
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = shell_execute_installer(Path::new(&command_interpreter), &args, false);
+            let _ = sender.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut child_pid = None;
+        let mut completion = None;
+        while Instant::now() < deadline {
+            if child_pid.is_none() {
+                child_pid = fs::read_to_string(&child_pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+            }
+            if let Ok(result) = receiver.try_recv() {
+                completion = Some(result);
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        while child_pid.is_none() && Instant::now() < marker_deadline {
+            child_pid = fs::read_to_string(&child_pid_file)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok());
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let child_was_alive_after_launcher = child_pid.is_some_and(test_process_is_running);
+        if let Some(pid) = child_pid {
+            terminate_test_process(pid);
+        }
+
+        if completion.is_none() {
+            completion = receiver.recv_timeout(Duration::from_secs(2)).ok();
+        }
+        let _ = fs::remove_dir_all(&directory);
+
+        assert!(
+            completion.is_some(),
+            "waiting for the launched installer exceeded the five-second test bound"
+        );
+        assert!(
+            child_was_alive_after_launcher,
+            "the detached child should still be running after its launcher exits"
+        );
+        assert_eq!(completion.expect("completion received").expect("installer exited"), 0);
+    }
+
+    #[cfg(windows)]
+    fn test_process_is_running(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+
+        // SAFETY: OpenProcess receives a PID from this test's child marker and requests
+        // only synchronization access to that process.
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        // SAFETY: process is a valid handle returned by OpenProcess.
+        let is_running = unsafe { WaitForSingleObject(process, 0) == WAIT_TIMEOUT };
+        // SAFETY: process is the owned handle returned by OpenProcess.
+        let _ = unsafe { CloseHandle(process) };
+        is_running
+    }
+
+    #[cfg(windows)]
+    fn terminate_test_process(pid: u32) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+        // SAFETY: OpenProcess receives only the PID written by this test's child.
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if process.is_null() {
+            return;
+        }
+        // SAFETY: process is the owned handle returned by OpenProcess.
+        let _ = unsafe { TerminateProcess(process, 1) };
+        // SAFETY: process is the owned handle returned by OpenProcess.
+        let _ = unsafe { CloseHandle(process) };
     }
 
     #[test]

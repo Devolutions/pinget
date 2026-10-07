@@ -1877,6 +1877,165 @@ public class RepositoryParityTests
         Assert.Equal(["/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"], InstallerDispatch.BuildArguments("inno", InstallerMode.Silent, installer));
     }
 
+    [Theory]
+    [InlineData("nullsoft")]
+    [InlineData("nsis")]
+    [InlineData("NULLSOFT")]
+    [InlineData("NSIS")]
+    public void PrepareInstallerForExecution_PreservesVerifiedNullsoftBytes(string installerType)
+    {
+        var directory = TestPaths.CreateTempAppRoot();
+        Directory.CreateDirectory(directory);
+        var payload = "verified NSIS installer bytes"u8.ToArray();
+        try
+        {
+            foreach (var filename in new[] { "download", "download.php", "custom", "setup.exe", "setup.EXE" })
+            {
+                var original = Path.Combine(directory, filename);
+                File.WriteAllBytes(original, payload);
+                var expected = filename.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                    ? original
+                    : Path.ChangeExtension(original, ".exe");
+                if (original != expected)
+                    File.WriteAllText(expected, "stale installer");
+
+                var prepared = Repository.PrepareInstallerForExecution(original, installerType);
+                Assert.Equal(expected, prepared);
+                Assert.Equal(payload, File.ReadAllBytes(prepared));
+                if (original != prepared)
+                    Assert.False(File.Exists(original));
+                File.Delete(prepared);
+            }
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(directory);
+        }
+    }
+
+    [Theory]
+    [InlineData("exe")]
+    [InlineData("inno")]
+    [InlineData("burn")]
+    [InlineData("msi")]
+    [InlineData("msix")]
+    [InlineData("zip")]
+    [InlineData("portable")]
+    public void PrepareInstallerForExecution_LeavesOtherTypesUnchanged(string installerType)
+    {
+        Assert.Equal("download", Repository.PrepareInstallerForExecution("download", installerType));
+    }
+
+    [Fact]
+    public void PrepareInstallerForExecution_ReportsMissingNullsoftPayload()
+    {
+        var directory = TestPaths.CreateTempAppRoot();
+        Directory.CreateDirectory(directory);
+        try
+        {
+            Assert.Throws<FileNotFoundException>(() =>
+                Repository.PrepareInstallerForExecution(Path.Combine(directory, "download"), "nullsoft"));
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(directory);
+        }
+    }
+
+    [Fact]
+    public void BuildArguments_UsesNullsoftSilentSwitch()
+    {
+        var installer = new Installer();
+
+        Assert.Equal(["/S"], InstallerDispatch.BuildArguments("nullsoft", InstallerMode.SilentWithProgress, installer));
+        Assert.Equal(["/S"], InstallerDispatch.BuildArguments("nullsoft", InstallerMode.Silent, installer));
+        Assert.Equal(["/S"], InstallerDispatch.BuildArguments("nsis", InstallerMode.SilentWithProgress, installer));
+        Assert.Equal(["/S"], InstallerDispatch.BuildArguments("nsis", InstallerMode.Silent, installer));
+    }
+
+    [Fact]
+    public async Task InstallerCompletion_DoesNotWaitForDetachedChildProcess()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var directory = Path.Combine(Path.GetTempPath(), $"pinget-process-lifecycle-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var childScriptPath = Path.Combine(directory, "child.ps1");
+        var launcherPath = Path.Combine(directory, "launcher.cmd");
+        var childPidPath = Path.Combine(directory, "child.pid");
+        var childPid = 0;
+        Task<int>? installTask = null;
+
+        try
+        {
+            var quotedPidPath = childPidPath.Replace("'", "''", StringComparison.Ordinal);
+            File.WriteAllText(
+                childScriptPath,
+                $"Set-Content -LiteralPath '{quotedPidPath}' -Value $PID{Environment.NewLine}Start-Sleep -Seconds 15");
+            File.WriteAllText(
+                launcherPath,
+                $"@echo off{Environment.NewLine}start \"\" /b powershell.exe -NoProfile -File \"{childScriptPath}\"{Environment.NewLine}");
+
+            var commandInterpreter = Environment.GetEnvironmentVariable("ComSpec")
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
+            var request = new InstallRequest
+            {
+                Query = new PackageQuery(),
+                Mode = InstallerMode.Interactive,
+                Override = $"/c \"{launcherPath}\"",
+            };
+            installTask = Task.Run(() => InstallerDispatch.Execute(
+                commandInterpreter,
+                "exe",
+                request,
+                new Manifest { Id = "Test.Lifecycle", Name = "Lifecycle Test", Version = "1.0" },
+                new Installer()));
+
+            var exitCode = await installTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(0, exitCode);
+
+            var markerDeadline = DateTime.UtcNow.AddSeconds(2);
+            while (childPid == 0 && DateTime.UtcNow < markerDeadline)
+            {
+                if (File.Exists(childPidPath))
+                    int.TryParse(await File.ReadAllTextAsync(childPidPath), out childPid);
+
+                if (childPid == 0)
+                    await Task.Delay(25);
+            }
+
+            Assert.NotEqual(0, childPid);
+            using var child = Process.GetProcessById(childPid);
+            Assert.False(child.HasExited, "The child must outlive the installer process whose exit is awaited.");
+        }
+        finally
+        {
+            if (childPid == 0 && File.Exists(childPidPath))
+                int.TryParse(await File.ReadAllTextAsync(childPidPath), out childPid);
+
+            if (childPid != 0)
+            {
+                try
+                {
+                    using var child = Process.GetProcessById(childPid);
+                    child.Kill(entireProcessTree: true);
+                    child.WaitForExit(3000);
+                }
+                catch (ArgumentException) { }
+                catch (InvalidOperationException) { }
+            }
+
+            if (installTask is { IsCompleted: false })
+            {
+                try { await installTask.WaitAsync(TimeSpan.FromSeconds(2)); }
+                catch (TimeoutException) { }
+            }
+
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     [Fact]
     public void BuildArguments_AppendsManifestAndCliSwitches()
     {

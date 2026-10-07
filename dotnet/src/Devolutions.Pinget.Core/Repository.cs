@@ -1009,6 +1009,7 @@ public class Repository : IDisposable
         var installerPath = FetchInstaller(request, tempDir).InstallerPath;
 
         var installerType = (selectedInstaller.InstallerType ?? "exe").ToLowerInvariant();
+        installerPath = PrepareInstallerForExecution(installerPath, installerType);
         var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller);
 
         return new InstallResult
@@ -1021,6 +1022,19 @@ public class Repository : IDisposable
             Success = exitCode == 0,
             NoOp = false,
         };
+    }
+
+    internal static string PrepareInstallerForExecution(string installerPath, string installerType)
+    {
+        if (!(installerType.Equals("nullsoft", StringComparison.OrdinalIgnoreCase) ||
+              installerType.Equals("nsis", StringComparison.OrdinalIgnoreCase)) ||
+            Path.GetExtension(installerPath).Equals(".exe", StringComparison.OrdinalIgnoreCase))
+            return installerPath;
+
+        // Like WinGet, give the verified NSIS payload an executable extension before ShellExecute.
+        var executablePath = Path.ChangeExtension(installerPath, ".exe");
+        File.Move(installerPath, executablePath, overwrite: true);
+        return executablePath;
     }
 
     public InstallResult Repair(RepairRequest request)
