@@ -26,6 +26,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
 sha2 = "0.11.0"
+tar = "0.4.44"
 tokio = { version = "1.48.0", features = ["rt", "time", "net"] }
 turso = { version = "0.7.0-pre.4", default-features = false }
 zip = "8.5.1"

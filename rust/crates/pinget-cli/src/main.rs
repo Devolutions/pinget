@@ -4,7 +4,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use pinget_core::{
     CacheWarmResult, Documentation, InstallProgress, InstallRequest, InstallResult, InstallerMode, ListMatch,
@@ -142,6 +142,8 @@ struct UpgradeArgs {
     query_option: Option<String>,
     #[arg(long)]
     id: Option<String>,
+    #[arg(long = "agent")]
+    agent: Option<String>,
     #[arg(long)]
     name: Option<String>,
     #[arg(long)]
@@ -328,6 +330,8 @@ struct InstallArgs {
     query: QueryArgs,
     #[arg(long = "manifest")]
     manifest: Option<PathBuf>,
+    #[arg(long = "agent")]
+    agent: Option<String>,
     #[arg(long = "log")]
     log: Option<PathBuf>,
     #[arg(long = "custom")]
@@ -464,6 +468,8 @@ struct SearchArgs {
     query_option: Option<String>,
     #[arg(long)]
     id: Option<String>,
+    #[arg(long = "agent")]
+    agent: Option<String>,
     #[arg(long)]
     name: Option<String>,
     #[arg(long)]
@@ -574,7 +580,22 @@ fn run() -> Result<()> {
         }
         Commands::Search(args) => {
             let mut repository = Repository::open()?;
-            if args.manifests {
+            if let Some(agent) = args.agent.as_deref() {
+                ensure!(
+                    matches!(agent, "github-copilot" | "claude-code" | "codex"),
+                    "--agent must be github-copilot, claude-code, or codex"
+                );
+                ensure!(
+                    !args.manifests && !args.versions,
+                    "AgentSkill search does not support --manifests or --versions"
+                );
+                let result = repository.search_agent_skills(&args.into())?;
+                if output.is_text() {
+                    print_search(result);
+                } else {
+                    print_serialized(&result, output)?;
+                }
+            } else if args.manifests {
                 if output.is_text() {
                     bail!("--manifests requires --output json or yaml");
                 }
@@ -598,6 +619,39 @@ fn run() -> Result<()> {
             }
         }
         Commands::Upgrade(args) => {
+            if let Some(agent) = args.agent.as_deref() {
+                ensure!(
+                    args.id.is_some()
+                        && !args.all
+                        && args.query.is_none()
+                        && args.query_option.is_none()
+                        && args.name.is_none()
+                        && args.moniker.is_none()
+                        && args.locale.is_none()
+                        && args.installer_type.is_none()
+                        && args.installer_architecture.is_none()
+                        && args.platform.is_none()
+                        && args.os_version.is_none()
+                        && args.count.is_none()
+                        && !args.ignore_security_hash
+                        && args.dependency_source.is_none()
+                        && !args.include_unknown
+                        && !args.include_pinned,
+                    "AgentSkill upgrade requires --id and supports only --source and --scope"
+                );
+                let mut repository = Repository::open()?;
+                let mut request = InstallRequest::new(PackageQuery {
+                    id: args.id,
+                    source: args.source,
+                    install_scope: args.install_scope,
+                    exact: true,
+                    ..PackageQuery::default()
+                });
+                request.agent = Some(agent.to_owned());
+                let result = repository.upgrade_agent_skill_request(&request)?;
+                print_package_action_result(&result, "upgraded", "upgrade");
+                return Ok(());
+            }
             let do_install = args.all
                 || args.query.is_some()
                 || args.query_option.is_some()
@@ -673,6 +727,7 @@ fn run() -> Result<()> {
                         match repository.install_request(&InstallRequest {
                             query,
                             manifest_path: None,
+                            agent: None,
                             mode,
                             log_path: None,
                             custom: None,
@@ -969,6 +1024,7 @@ fn run() -> Result<()> {
             let result = repository.install_request(&InstallRequest {
                 query: args.query.into(),
                 manifest_path: args.manifest,
+                agent: args.agent,
                 mode,
                 log_path: args.log,
                 custom: args.custom,
@@ -2355,6 +2411,8 @@ fn parse_source_kind(value: &str) -> Result<SourceKind> {
         Ok(SourceKind::Rest)
     } else if value.eq_ignore_ascii_case("preindexed") || value.eq_ignore_ascii_case("Microsoft.PreIndexed.Package") {
         Ok(SourceKind::PreIndexed)
+    } else if value.eq_ignore_ascii_case("agent-skills") || value.eq_ignore_ascii_case("Pinget.AgentSkills") {
+        Ok(SourceKind::AgentSkills)
     } else {
         bail!("unsupported source type: {value}")
     }
@@ -2364,6 +2422,7 @@ fn format_source_kind(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::Rest => "Microsoft.Rest",
         SourceKind::PreIndexed => "Microsoft.PreIndexed.Package",
+        SourceKind::AgentSkills => "Pinget.AgentSkills",
     }
 }
 
@@ -3134,6 +3193,41 @@ mod tests {
             parse_source_kind("Microsoft.PreIndexed.Package").expect("kind"),
             SourceKind::PreIndexed
         );
+        assert_eq!(
+            parse_source_kind("Pinget.AgentSkills").expect("kind"),
+            SourceKind::AgentSkills
+        );
+    }
+
+    #[test]
+    fn agent_skill_catalog_commands_parse_with_explicit_agent() {
+        let search =
+            Cli::try_parse_from(["pinget", "search", "demo", "--agent", "github-copilot"]).expect("parse skill search");
+        assert!(matches!(
+            search.command,
+            Some(Commands::Search(SearchArgs { agent: Some(ref agent), .. })) if agent == "github-copilot"
+        ));
+        let install = Cli::try_parse_from([
+            "pinget",
+            "install",
+            "--id",
+            "Example.Demo",
+            "--source",
+            "skills",
+            "--agent",
+            "codex",
+        ])
+        .expect("parse catalog install");
+        assert!(matches!(
+            install.command,
+            Some(Commands::Install(InstallArgs { agent: Some(ref agent), .. })) if agent == "codex"
+        ));
+        let upgrade = Cli::try_parse_from(["pinget", "upgrade", "--id", "Example.Demo", "--agent", "claude-code"])
+            .expect("parse catalog upgrade");
+        assert!(matches!(
+            upgrade.command,
+            Some(Commands::Upgrade(UpgradeArgs { agent: Some(ref agent), .. })) if agent == "claude-code"
+        ));
     }
 
     #[test]

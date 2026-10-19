@@ -30,6 +30,9 @@ public class Repository : IDisposable
 
     private readonly string _appRoot;
     private readonly HttpClient _client;
+    private readonly HttpClient _skillClient;
+    private readonly SourceStore _skillStore;
+    private readonly string? _agentSkillProjectRoot;
     private readonly Action<RepositoryWarning>? _diagnostics;
     private readonly TimeSpan? _preIndexedSourceAutoUpdateInterval;
     private SourceStore _store;
@@ -44,13 +47,18 @@ public class Repository : IDisposable
     private Repository(
         string appRoot,
         HttpClient client,
+        HttpClient skillClient,
         SourceStore store,
         EffectiveSourceMode sourceMode,
         Action<RepositoryWarning>? diagnostics,
-        TimeSpan? preIndexedSourceAutoUpdateInterval)
+        TimeSpan? preIndexedSourceAutoUpdateInterval,
+        string? agentSkillProjectRoot)
     {
         _appRoot = appRoot;
         _client = client;
+        _skillClient = skillClient;
+        _skillStore = AgentSkillCatalog.LoadSources(appRoot);
+        _agentSkillProjectRoot = agentSkillProjectRoot;
         _store = store;
         _sourceMode = sourceMode;
         _diagnostics = diagnostics;
@@ -61,6 +69,9 @@ public class Repository : IDisposable
     /// Opens the repository using either the default CLI storage root or the caller-supplied library options.
     /// </summary>
     public static Repository Open(RepositoryOptions? options = null)
+        => Open(options, null);
+
+    internal static Repository Open(RepositoryOptions? options, HttpClient? skillClient, string? agentSkillProjectRoot = null)
     {
         options ??= new RepositoryOptions();
         EnsureSqliteNativeLibraryLoaded();
@@ -76,7 +87,15 @@ public class Repository : IDisposable
         });
         client.Timeout = Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
-        return new Repository(appRoot, client, store, sourceMode, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
+        skillClient ??= new HttpClient(new SocketsHttpHandler
+        {
+            AllowAutoRedirect = false,
+            ConnectTimeout = TimeSpan.FromSeconds(30),
+        })
+        { Timeout = TimeSpan.FromMinutes(2) };
+        skillClient.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
+        return new Repository(appRoot, client, skillClient, store, sourceMode, options.Diagnostics,
+            options.PreIndexedSourceAutoUpdateInterval, agentSkillProjectRoot);
     }
 
     internal static SourceMode ResolveRequestedSourceMode(SourceMode? configuredSourceMode, string? requestedAppRoot) =>
@@ -198,7 +217,11 @@ public class Repository : IDisposable
         }
     }
 
-    public void Dispose() => _client.Dispose();
+    public void Dispose()
+    {
+        _client.Dispose();
+        _skillClient.Dispose();
+    }
     public string AppRoot => _appRoot;
     public static IReadOnlyList<string> SupportedAdminSettings => SettingsStoreManager.SupportedAdminSettings;
 
@@ -223,11 +246,38 @@ public class Repository : IDisposable
     public List<SourceRecord> ListSources()
     {
         RefreshSystemWingetSourcesForQuery(TimeSpan.Zero);
-        return _store.Sources.ToList();
+        return [.. _store.Sources, .. _skillStore.Sources];
     }
 
     public void AddSource(string name, string arg, SourceKind kind, string trustLevel = "None", bool explicitSource = false, int priority = 0)
     {
+        if (kind == SourceKind.AgentSkills)
+        {
+            if (string.IsNullOrWhiteSpace(name) || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                throw new InvalidOperationException("AgentSkills source requires a valid name.");
+            var url = AgentSkillCatalog.RequireHttps(arg);
+            if (url.Query.Length != 0)
+                throw new InvalidOperationException("AgentSkills catalog source URL cannot contain a query or token.");
+            if (_skillStore.Sources.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) ||
+                _store.Sources.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"A source with name '{name}' already exists.");
+            if (_skillStore.Sources.Any(s => s.Arg.Equals(url.AbsoluteUri, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"A source with argument '{arg}' already exists.");
+            _skillStore.Sources.Add(new SourceRecord
+            {
+                Name = name,
+                Kind = kind,
+                Arg = url.AbsoluteUri,
+                Identifier = name,
+                TrustLevel = NormalizeSourceTrustLevel(trustLevel),
+                Explicit = explicitSource,
+                Priority = priority,
+            });
+            AgentSkillCatalog.SaveSources(_appRoot, _skillStore);
+            return;
+        }
+        if (_skillStore.Sources.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException($"A source with name '{name}' already exists.");
         if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.AddSource(name, arg, kind, NormalizeSourceTrustLevel(trustLevel), explicitSource);
@@ -255,6 +305,15 @@ public class Repository : IDisposable
 
     public void EditSource(string name, bool? explicitSource = null, string? trustLevel = null)
     {
+        var skillSource = _skillStore.Sources.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (skillSource is not null)
+        {
+            if (explicitSource.HasValue) skillSource.Explicit = explicitSource.Value;
+            if (!string.IsNullOrWhiteSpace(trustLevel))
+                skillSource.TrustLevel = NormalizeSourceTrustLevel(trustLevel);
+            AgentSkillCatalog.SaveSources(_appRoot, _skillStore);
+            return;
+        }
         if (UsesSystemWingetSources)
             throw new InvalidOperationException("Editing system WinGet sources is not supported by winget source commands.");
 
@@ -272,6 +331,14 @@ public class Repository : IDisposable
 
     public void RemoveSource(string name)
     {
+        var skillSource = _skillStore.Sources.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (skillSource is not null)
+        {
+            _skillStore.Sources.Remove(skillSource);
+            AgentSkillCatalog.SaveSources(_appRoot, _skillStore);
+            AgentSkillCatalog.DeleteCache(_appRoot, skillSource);
+            return;
+        }
         if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.RemoveSource(name);
@@ -291,6 +358,14 @@ public class Repository : IDisposable
 
     public void ResetSource(string name)
     {
+        var skillSource = _skillStore.Sources.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (skillSource is not null)
+        {
+            skillSource.LastUpdate = null;
+            AgentSkillCatalog.SaveSources(_appRoot, _skillStore);
+            AgentSkillCatalog.DeleteCache(_appRoot, skillSource);
+            return;
+        }
         if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.ResetSource(name);
@@ -327,6 +402,10 @@ public class Repository : IDisposable
 
     public void ResetSources()
     {
+        var skillSources = _skillStore.Sources.ToArray();
+        _skillStore.Sources.Clear();
+        AgentSkillCatalog.SaveSources(_appRoot, _skillStore);
+        foreach (var source in skillSources) AgentSkillCatalog.DeleteCache(_appRoot, source);
         if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.ResetSources();
@@ -417,8 +496,26 @@ public class Repository : IDisposable
 
     public List<SourceUpdateResult> UpdateSources(string? sourceName = null)
     {
+        var skillSources = _skillStore.Sources.Where(s => sourceName is null ||
+            s.Name.Equals(sourceName, StringComparison.OrdinalIgnoreCase)).ToList();
+        var skillResults = new List<SourceUpdateResult>();
+        foreach (var source in skillSources)
+        {
+            var catalog = AgentSkillCatalog.Refresh(_skillClient, source, _appRoot);
+            source.LastUpdate = DateTime.UtcNow;
+            skillResults.Add(new SourceUpdateResult
+            {
+                Name = source.Name,
+                Kind = source.Kind,
+                Detail = $"Validated {catalog.Count} AgentSkills catalog entries",
+            });
+        }
+        if (skillResults.Count > 0)
+            AgentSkillCatalog.SaveSources(_appRoot, _skillStore);
+        if (sourceName is not null && skillResults.Count > 0)
+            return skillResults;
         if (_sourceMode == EffectiveSourceMode.SystemWingetDirect)
-            return UpdateSystemWingetSources(sourceName);
+            return [.. skillResults, .. UpdateSystemWingetSources(sourceName)];
 
         if (MirrorsSystemWingetSources)
             RefreshSystemWingetSources();
@@ -440,7 +537,7 @@ public class Repository : IDisposable
         }
 
         SaveStore();
-        return results;
+        return [.. skillResults, .. results];
     }
 
     // ── Search ──
@@ -454,6 +551,90 @@ public class Repository : IDisposable
             Warnings = warnings,
             SourceWarnings = failures.Select(f => f.Warning).ToList(),
             Truncated = truncated
+        };
+    }
+
+    /// <summary>
+    /// Searches Pinget AgentSkills catalogs by package identifier, without downloading skill manifests or artifacts.
+    /// WinGet application search and show do not use these catalogs.
+    /// </summary>
+    public SearchResponse SearchAgentSkills(PackageQuery query)
+    {
+        if (query.Moniker is not null || query.Tag is not null ||
+            query.Command is not null || query.Channel is not null || query.Locale is not null ||
+            query.InstallerType is not null || query.InstallerArchitecture is not null ||
+            query.InstallScope is not null || query.Platform is not null || query.OsVersion is not null)
+            throw new InvalidOperationException("AgentSkills catalog search supports only package identifier, name, query, version, count, exact, and source.");
+        var limit = query.Count ?? 50;
+        if (limit < 1)
+            throw new InvalidOperationException("AgentSkills catalog search --count must be positive.");
+        var sources = ResolveAgentSkillSources(query.Source, includeExplicit: false);
+        if (sources.Count == 0)
+            throw new InvalidOperationException("No Pinget.AgentSkills source is configured; add one or specify --source.");
+        var matches = new List<SearchMatch>();
+        var warnings = new List<string>();
+        var sourceWarnings = new List<RepositoryWarning>();
+        foreach (var source in sources)
+        {
+            try
+            {
+                var entries = AgentSkillCatalog.Read(_skillClient, source, _appRoot)
+                    .Where(entry => query.Id is null ||
+                        (query.Exact
+                            ? entry.Id.Equals(query.Id, StringComparison.OrdinalIgnoreCase)
+                            : entry.Id.Contains(query.Id, StringComparison.OrdinalIgnoreCase)))
+                    .Where(entry => query.Name is null ||
+                        (query.Exact
+                            ? entry.Name.Equals(query.Name, StringComparison.OrdinalIgnoreCase)
+                            : entry.Name.Contains(query.Name, StringComparison.OrdinalIgnoreCase)))
+                    .Where(entry => query.Query is null ||
+                        (query.Exact
+                            ? entry.Id.Equals(query.Query, StringComparison.OrdinalIgnoreCase) ||
+                                entry.Name.Equals(query.Query, StringComparison.OrdinalIgnoreCase)
+                            : entry.Id.Contains(query.Query, StringComparison.OrdinalIgnoreCase) ||
+                                entry.Name.Contains(query.Query, StringComparison.OrdinalIgnoreCase)))
+                    .Where(entry => query.Version is null ||
+                        entry.Version.Equals(query.Version, StringComparison.Ordinal))
+                    .GroupBy(entry => entry.Id, StringComparer.OrdinalIgnoreCase)
+                    .Select(group => group.OrderByDescending(entry => entry.Version,
+                        Comparer<string>.Create(RestSource.CompareVersionStrings)).First());
+                matches.AddRange(entries.Select(entry => new SearchMatch
+                {
+                    SourceName = source.Name,
+                    SourceKind = SourceKind.AgentSkills,
+                    Id = entry.Id,
+                    Name = entry.Name,
+                    Version = entry.Version,
+                    MatchCriteria = "Id",
+                }));
+            }
+            catch (Exception error)
+            {
+                var warning = new RepositoryWarning
+                {
+                    Operation = "search",
+                    SourceName = source.Name,
+                    SourceKind = SourceKind.AgentSkills,
+                    SourceArg = source.Arg,
+                    SourceIdentifier = source.Identifier,
+                    Message = error.Message,
+                    ExceptionType = error.GetType().Name,
+                };
+                sourceWarnings.Add(warning);
+                warnings.Add($"Failed when searching AgentSkills source '{source.Name}'; results will not be included: {error.Message}");
+                _diagnostics?.Invoke(warning);
+            }
+        }
+
+        matches = matches.OrderBy(match => match.Id, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(match => match.SourceName, StringComparer.OrdinalIgnoreCase).ToList();
+        var truncated = matches.Count > limit;
+        return new SearchResponse
+        {
+            Matches = matches.Take(limit).ToList(),
+            Warnings = warnings,
+            SourceWarnings = sourceWarnings,
+            Truncated = truncated,
         };
     }
 
@@ -949,6 +1130,29 @@ public class Repository : IDisposable
 
     public InstallResult Install(InstallRequest request)
     {
+        if (request.Agent is not null && request.ManifestPath is null)
+        {
+            if (string.IsNullOrWhiteSpace(request.Query.Id) ||
+                request.Query.Query is not null || request.Query.Name is not null)
+                throw new InvalidOperationException("AgentSkills catalog install requires --agent and --id; --source selects a Pinget.AgentSkills catalog.");
+            var (source, catalog) = SelectAgentSkillCatalog(request.Query.Id, request.Query.Version, request.Query.Source);
+            var skill = AgentSkillCatalog.Resolve(_skillClient, catalog, request.Query.Id, request.Query.Version, out var manifestSha256);
+            return AgentSkillInstaller.Install(skill, request with
+            {
+                Query = request.Query with { Id = null, Source = null, Version = null, Exact = false },
+            }, _skillClient, projectRoot: _agentSkillProjectRoot, catalogSource: source.Name,
+                catalogManifestSha256: manifestSha256);
+        }
+        if (!string.IsNullOrWhiteSpace(request.ManifestPath))
+        {
+            var resolvedPath = ResolveManifestPath(request.ManifestPath);
+            var skill = AgentSkillInstaller.TryParse(File.ReadAllBytes(resolvedPath));
+            if (skill is not null)
+                return AgentSkillInstaller.Install(skill, request, projectRoot: _agentSkillProjectRoot);
+        }
+        if (request.Agent is not null)
+            throw new InvalidOperationException("--agent requires a pinget.agentSkill manifest.");
+
         var manifest = ResolveManifestForInstall(request);
         if (!OperatingSystem.IsWindows())
         {
@@ -4088,15 +4292,60 @@ public class Repository : IDisposable
     private List<int> ResolveSearchSourceIndexes(string? sourceName)
     {
         if (sourceName is not null)
-            return ResolveSourceIndexes(sourceName);
+        {
+            if (_skillStore.Sources.Any(source => source.Name.Equals(sourceName, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException("AgentSkills sources require search --agent; WinGet Search/Show cannot use them.");
+            return ResolveSourceIndexes(sourceName)
+                .Where(index => _store.Sources[index].Kind != SourceKind.AgentSkills).ToList();
+        }
 
         return _store.Sources
             .Select((source, index) => new { source, index })
-            .Where(entry => !entry.source.Explicit)
+            .Where(entry => !entry.source.Explicit && entry.source.Kind != SourceKind.AgentSkills)
             .OrderByDescending(entry => entry.source.Priority)
             .ThenBy(entry => entry.index)
             .Select(entry => entry.index)
             .ToList();
+    }
+
+    private List<SourceRecord> ResolveAgentSkillSources(string? sourceName, bool includeExplicit)
+    {
+        if (sourceName is not null)
+        {
+            var source = _skillStore.Sources.FirstOrDefault(candidate =>
+                candidate.Name.Equals(sourceName, StringComparison.OrdinalIgnoreCase));
+            return source is null
+                ? throw new InvalidOperationException($"AgentSkills source '{sourceName}' not found; choose a Pinget.AgentSkills source.")
+                : [source];
+        }
+        return _skillStore.Sources.Where(source => includeExplicit || !source.Explicit)
+            .OrderByDescending(source => source.Priority).ThenBy(source => source.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private (SourceRecord Source, List<AgentSkillCatalogEntry> Catalog) SelectAgentSkillCatalog(
+        string id, string? version, string? sourceName)
+    {
+        var sources = ResolveAgentSkillSources(sourceName, includeExplicit: false);
+        if (sources.Count == 0)
+            throw new InvalidOperationException("No Pinget.AgentSkills source is configured; add one or specify --source.");
+        if (sources.Count == 1)
+        {
+            var source = sources[0];
+            return (source, AgentSkillCatalog.Read(_skillClient, source, _appRoot));
+        }
+        var candidates = sources.Select(source =>
+            (Source: source, Catalog: AgentSkillCatalog.Read(_skillClient, source, _appRoot)))
+            .Where(candidate => candidate.Catalog.Any(entry =>
+                entry.Id.Equals(id, StringComparison.OrdinalIgnoreCase) &&
+                (version is null || entry.Version.Equals(version, StringComparison.OrdinalIgnoreCase)))).ToList();
+        if (candidates.Count == 0)
+            throw new InvalidOperationException($"No AgentSkills catalog contains '{id}'" +
+                (version is null ? "." : $" version '{version}'."));
+        if (candidates.Count > 1)
+            throw new InvalidOperationException($"Multiple AgentSkills sources contain '{id}': " +
+                $"{string.Join(", ", candidates.Select(candidate => candidate.Source.Name))}; specify --source.");
+        return candidates[0];
     }
 
     private List<int> ResolveSourceIndexes(string? sourceName)

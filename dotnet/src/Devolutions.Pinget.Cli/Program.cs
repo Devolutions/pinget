@@ -47,9 +47,10 @@ var sqOpt = QueryArg(); var sidOpt = IdOpt(); var snOpt = NameOpt(); var smOpt =
 var ssOpt = SourceOpt(); var seOpt = ExactOpt(); var scOpt = CountOpt();
 var sTagOpt = new Option<string?>("--tag", "Filter by tag");
 var sCmdOpt = new Option<string?>("--command", "Filter by command"); sCmdOpt.AddAlias("--cmd");
+var sAgentOpt = new Option<string?>("--agent", "Search Pinget AgentSkills catalogs for github-copilot, claude-code, or codex");
 var sVersionsOpt = new Option<bool>("--versions", "Show versions");
 var sManifestsOpt = new Option<bool>("--manifests", "Return show-style manifests");
-foreach (var o in new Option[] { sqOpt, sidOpt, snOpt, smOpt, ssOpt, seOpt, scOpt, sTagOpt, sCmdOpt, sVersionsOpt, sManifestsOpt })
+foreach (var o in new Option[] { sqOpt, sidOpt, snOpt, smOpt, ssOpt, seOpt, scOpt, sTagOpt, sCmdOpt, sAgentOpt, sVersionsOpt, sManifestsOpt })
     searchCommand.AddOption(o);
 searchCommand.AddArgument(sqArg);
 
@@ -70,6 +71,19 @@ searchCommand.SetHandler((ctx) =>
     };
 
     using var repo = Repository.Open();
+    var agent = ctx.ParseResult.GetValueForOption(sAgentOpt);
+    if (agent is not null)
+    {
+        if (agent is not ("github-copilot" or "claude-code" or "codex"))
+            throw new InvalidOperationException("AgentSkills search requires --agent github-copilot, claude-code, or codex.");
+        if (ctx.ParseResult.GetValueForOption(sManifestsOpt) ||
+            ctx.ParseResult.GetValueForOption(sVersionsOpt))
+            throw new InvalidOperationException("AgentSkills catalog search does not support --manifests or --versions.");
+        var skillResults = repo.SearchAgentSkills(query);
+        if (output != OutputFormat.Text) WriteStructuredOutput(skillResults, output, PingetJsonContext.Default.SearchResponse);
+        else PrintSearch(skillResults);
+        return;
+    }
     if (ctx.ParseResult.GetValueForOption(sManifestsOpt))
     {
         if (output == OutputFormat.Text)
@@ -192,6 +206,7 @@ var uArg = new Argument<string?>("query", () => null, "Package query");
 var uqOpt = QueryArg(); var uidOpt = IdOpt(); var unOpt = NameOpt(); var umOpt = MonikerOpt();
 var usOpt = SourceOpt(); var ueOpt = ExactOpt(); var ucOpt = CountOpt(); var uvOpt = VersionOpt();
 var uManifestOpt = new Option<string?>("--manifest", "Local manifest file or directory"); uManifestOpt.AddAlias("-m");
+var uAgentOpt = new Option<string?>("--agent", "Agent for a managed AgentSkill upgrade");
 var uLocaleOpt = new Option<string?>("--locale", "Installer locale");
 var uTypeOpt = new Option<string?>("--installer-type", "Installer type");
 var uArchOpt = new Option<string?>("--architecture", "Architecture"); uArchOpt.AddAlias("-a");
@@ -213,7 +228,7 @@ var uForceOpt = new Option<bool>("--force", "Force install behavior");
 var uUninstallPreviousOpt = new Option<bool>("--uninstall-previous", "Uninstall previous versions before installing");
 var uSilentOpt = new Option<bool>("--silent", "Silent install"); uSilentOpt.AddAlias("-h");
 var uInteractiveOpt = new Option<bool>("--interactive", "Interactive install"); uInteractiveOpt.AddAlias("-i");
-foreach (var o in new Option[] { uqOpt, uidOpt, unOpt, umOpt, usOpt, ueOpt, ucOpt, uvOpt, uManifestOpt, uLocaleOpt, uTypeOpt, uArchOpt, uPlatformOpt, uOsVersionOpt, uScopeOpt, uUnknownOpt, uPinnedOpt, uAllOpt, uLogOpt, uCustomOpt, uOverrideOpt, uLocationOpt, uIgnoreSecurityHashOpt, uSkipDependenciesOpt, uDependencySourceOpt, uAcceptPkgAgreementsOpt, uForceOpt, uUninstallPreviousOpt, uSilentOpt, uInteractiveOpt })
+foreach (var o in new Option[] { uqOpt, uidOpt, unOpt, umOpt, usOpt, ueOpt, ucOpt, uvOpt, uManifestOpt, uAgentOpt, uLocaleOpt, uTypeOpt, uArchOpt, uPlatformOpt, uOsVersionOpt, uScopeOpt, uUnknownOpt, uPinnedOpt, uAllOpt, uLogOpt, uCustomOpt, uOverrideOpt, uLocationOpt, uIgnoreSecurityHashOpt, uSkipDependenciesOpt, uDependencySourceOpt, uAcceptPkgAgreementsOpt, uForceOpt, uUninstallPreviousOpt, uSilentOpt, uInteractiveOpt })
     upgradeCommand.AddOption(o);
 upgradeCommand.AddArgument(uArg);
 
@@ -273,6 +288,28 @@ upgradeCommand.SetHandler((ctx) =>
     };
 
     using var repo = Repository.Open();
+    var upgradeAgent = ctx.ParseResult.GetValueForOption(uAgentOpt);
+    if (upgradeAgent is not null)
+    {
+        if (string.IsNullOrWhiteSpace(installQuery.Id) ||
+            manifestPath is not null || ctx.ParseResult.GetValueForOption(uAllOpt))
+            throw new InvalidOperationException("AgentSkill upgrade requires --agent and --id (no --all or --manifest); --source disambiguates catalogs.");
+        var skillRequest = CreateInstallRequest(
+            installQuery, null, InstallerMode.SilentWithProgress,
+            ctx.ParseResult.GetValueForOption(uLogOpt),
+            ctx.ParseResult.GetValueForOption(uCustomOpt),
+            ctx.ParseResult.GetValueForOption(uOverrideOpt),
+            ctx.ParseResult.GetValueForOption(uLocationOpt),
+            ctx.ParseResult.GetValueForOption(uSkipDependenciesOpt), false,
+            ctx.ParseResult.GetValueForOption(uAcceptPkgAgreementsOpt),
+            ctx.ParseResult.GetValueForOption(uForceOpt), null,
+            ctx.ParseResult.GetValueForOption(uUninstallPreviousOpt),
+            ctx.ParseResult.GetValueForOption(uIgnoreSecurityHashOpt),
+            ctx.ParseResult.GetValueForOption(uDependencySourceOpt), false) with
+        { Agent = upgradeAgent, RequireExistingAgentSkill = true };
+        PrintPackageActionResult(repo.Install(skillRequest), "upgrade", "upgraded");
+        return;
+    }
     if (doInstall && !OperatingSystem.IsWindows())
     {
         PrintWarnings([UpgradeUnsupportedWarning]);
@@ -944,6 +981,7 @@ var iplatformOpt = new Option<string?>("--platform", "Target platform");
 var iosVersionOpt = new Option<string?>("--os-version", "Target OS version");
 var iscopeOpt = new Option<string?>("--scope", "Install scope");
 var imanifestOpt = new Option<string?>("--manifest", "Local manifest file or directory"); imanifestOpt.AddAlias("-m");
+var iagentOpt = new Option<string?>("--agent", "Agent for an AgentSkill manifest: github-copilot, claude-code, or codex");
 var ilogOpt = new Option<string?>("--log", "Installer log path");
 var icustomOpt = new Option<string?>("--custom", "Additional installer switches");
 var ioverrideOpt = new Option<string?>("--override", "Override installer arguments");
@@ -960,7 +998,7 @@ var iuninstallPreviousOpt = new Option<bool>("--uninstall-previous", "Uninstall 
 var iSilentOpt = new Option<bool>("--silent", "Silent install"); iSilentOpt.AddAlias("-h");
 var iInteractiveOpt = new Option<bool>("--interactive", "Interactive install"); iInteractiveOpt.AddAlias("-i");
 installCommand.AddArgument(iArg);
-foreach (var o in new Option[] { iqOpt, iidOpt, inameOpt, imonikerOpt, isrcOpt, ieOpt, ivOpt, ichannelOpt, ilocaleOpt, itypeOpt, iarchOpt, iplatformOpt, iosVersionOpt, iscopeOpt, imanifestOpt, ilogOpt, icustomOpt, ioverrideOpt, ilocationOpt, iignoreSecurityHashOpt, iskipDepsOpt, idepsOnlyOpt, idependencySourceOpt, iacceptPkgAgreementsOpt, inoUpgradeOpt, iforceOpt, irenameOpt, iuninstallPreviousOpt, iSilentOpt, iInteractiveOpt }) installCommand.AddOption(o);
+foreach (var o in new Option[] { iqOpt, iidOpt, inameOpt, imonikerOpt, isrcOpt, ieOpt, ivOpt, ichannelOpt, ilocaleOpt, itypeOpt, iarchOpt, iplatformOpt, iosVersionOpt, iscopeOpt, imanifestOpt, iagentOpt, ilogOpt, icustomOpt, ioverrideOpt, ilocationOpt, iignoreSecurityHashOpt, iskipDepsOpt, idepsOnlyOpt, idependencySourceOpt, iacceptPkgAgreementsOpt, inoUpgradeOpt, iforceOpt, irenameOpt, iuninstallPreviousOpt, iSilentOpt, iInteractiveOpt }) installCommand.AddOption(o);
 
 installCommand.SetHandler((ctx) =>
 {
@@ -1003,7 +1041,10 @@ installCommand.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(iuninstallPreviousOpt),
         ctx.ParseResult.GetValueForOption(iignoreSecurityHashOpt),
         ctx.ParseResult.GetValueForOption(idependencySourceOpt),
-        ctx.ParseResult.GetValueForOption(inoUpgradeOpt)));
+        ctx.ParseResult.GetValueForOption(inoUpgradeOpt)) with
+    {
+        Agent = ctx.ParseResult.GetValueForOption(iagentOpt),
+    });
     PrintPackageActionResult(result, "install", "installed");
 });
 
@@ -1515,6 +1556,8 @@ static SourceKind ParseSourceKind(string? value)
     {
         return SourceKind.PreIndexed;
     }
+    if (string.Equals(value, "Pinget.AgentSkills", StringComparison.OrdinalIgnoreCase))
+        return SourceKind.AgentSkills;
 
     throw new InvalidOperationException($"Unsupported source type: {value}");
 }
@@ -1523,6 +1566,7 @@ static string FormatSourceType(SourceKind kind) => kind switch
 {
     SourceKind.Rest => "Microsoft.Rest",
     SourceKind.PreIndexed => "Microsoft.PreIndexed.Package",
+    SourceKind.AgentSkills => "Pinget.AgentSkills",
     _ => kind.ToString(),
 };
 

@@ -898,6 +898,7 @@ fn source_kind_name(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::PreIndexed => "Microsoft.PreIndexed.Package",
         SourceKind::Rest => "Microsoft.Rest",
+        SourceKind::AgentSkills => "Pinget.AgentSkills",
     }
 }
 

@@ -328,6 +328,138 @@ Notes:
 - `Microsoft.PreIndexed.Package` maps to the preindexed source kind.
 - `--trust-level`, `--explicit`, and source priority metadata are persisted as source metadata and influence source selection behavior.
 
+## Pinget AgentSkill manifests
+
+Pinget can install an agent skill from a **Pinget-only** manifest with WinGet-style
+package identity fields. This does not change the WinGet manifest schema or turn
+skills into Windows installers: `winget.exe` cannot consume this manifest type.
+The original HTTPS ZIP form remains supported: Pinget verifies its SHA-256
+digest and `SKILL.md`, then installs the selected skill into one agent directory.
+
+```yaml
+ManifestType: pinget.agentSkill
+PingetManifestVersion: 1
+PackageIdentifier: Example.AgentSkills.Demo
+PackageVersion: 1.0.0
+PackageName: demo
+AgentSkill:
+  ArtifactUrl: https://example.test/demo-1.0.0.zip
+  ArtifactSha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  SkillPath: skills/demo
+```
+
+`SkillPath` is optional when `SKILL.md` is at the archive root. `PackageName`
+must be a lowercase skill slug matching the `name` in `SKILL.md`. `Publisher` is
+optional. For other distribution methods, replace `ArtifactUrl` and
+`ArtifactSha256` with a typed `Source` mapping:
+
+```yaml
+AgentSkill:
+  Source:
+    Type: git
+    Url: https://github.com/example/agent-skills.git
+    Commit: 0123456789abcdef0123456789abcdef01234567
+  SkillPath: skills/demo
+```
+
+| `Source.Type` | Required source fields | What Pinget fetches |
+| --- | --- | --- |
+| `archive` | `Url`, `Sha256`, `Format: zip\|tar.gz\|skill-md` | An HTTPS archive or direct `SKILL.md`; SHA-256 is mandatory. |
+| `git` | `Url`, `Commit` | A specific 40-character commit from an HTTPS Git repository; only the selected tree is archived. Requires `git` on `PATH`. |
+| `notion-skill` | `Id`, `VersionId` | A Notion skill page's versioned directory from `GET /v1/ai/skills/{id}`. |
+| `notion-plugin` | `Id`, `VersionId` | A Notion plugin pack's versioned directory from `GET /v1/ai/plugins/{id}`; requires `PluginPath`. |
+| `well-known` | `IndexUrl`, `Sha256` | The named artifact in an Agent Skills discovery v0.2.0 JSON index; its digest must match the manifest. |
+
+For Notion sources, use a canonical page or plugin UUID as `Id`, its 64-character
+`version_id` as `VersionId`, and set `NOTION_API_KEY` at runtime to a read-only
+Notion connection token. The workspace must have the Notion Agent Skills API
+enabled and grant the connection Read content. Pinget uses Notion's
+[skill-directory](https://developers.notion.com/reference/agent-skills/get-skill-directory)
+or [plugin-directory](https://developers.notion.com/reference/agent-skills/get-plugin-directory)
+endpoint to request a fresh short-lived signed archive URL for each install;
+neither that URL nor the token belongs in the manifest or installed provenance.
+Notion directory downloads are `.tar.gz`; single top-level wrapper directories
+are normalized.
+
+To select a skill from an [Agent Plugins v1.0.0](https://agent-plugins.org/specification)
+directory, add `PluginPath: .` (or a relative plugin directory) and
+`SkillPath: skills/<PackageName>` to any applicable source. Pinget checks that
+directory's `plugin.json` schema identifier and name, then installs **only the
+selected Agent Skill**. Agent Plugins does not define a registry, download
+format, or installer; Pinget's source and integrity fields supply those. Pinget
+does not install or activate other plugin components.
+
+`--agent` is required; currently supported
+values are `github-copilot`, `codex`, and `claude-code`. The default is a
+project install in the current working directory; `--scope user` installs to
+the agent's user directory. Both implementations record package identity,
+source digest, agent, installed file-tree digest, and destination in
+`<project-or-home>/.pinget/agent-skills/<agent>/<skill-name>.json`; this
+provenance is separate from the standalone skills-manager lock files.
+
+```powershell
+pinget install --manifest .\demo.yaml --agent github-copilot
+pinget install --manifest .\demo.yaml --agent claude-code --scope user
+```
+
+### AgentSkill catalogs and updates
+
+A Pinget-owned `Pinget.AgentSkills` source indexes *manifest versions*, not
+downloads. One catalog can point to manifests for Git-backed skills, direct
+archives, Notion directories, and Agent Plugins. Publish a UTF-8 JSON index
+over HTTPS with this format (substitute real hashes and URLs):
+
+```json
+{
+  "schemaVersion": 1,
+  "packages": [
+    {
+      "packageIdentifier": "Example.AgentSkills.Demo",
+      "packageVersion": "1.0.0",
+      "packageName": "demo",
+      "manifestUrl": "manifests/demo-1.0.0.yaml",
+      "manifestSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  ]
+}
+```
+
+`manifestUrl` resolves relative to the index URL (or is an absolute HTTPS
+URL). Its SHA-256 pins the Pinget manifest; that manifest separately pins the
+skill source. Catalog and manifest URLs cannot contain query strings or
+embedded credentials; keep API keys in runtime configuration instead of
+registry entries. Catalogs are limited to 1 MiB and 1,000 versions. Pinget caches
+the index until `source update`, so publishing a new version requires a source
+refresh before it becomes visible locally. A refresh rejects changes to an
+existing package version's name, manifest URL, or digest; publish a new version
+instead of repointing an existing one.
+
+```powershell
+pinget source add --name skills --arg https://example.org/skills/index.json --type Pinget.AgentSkills
+pinget source update skills
+pinget search demo --agent github-copilot --source skills
+pinget install --id Example.AgentSkills.Demo --agent github-copilot --source skills
+pinget upgrade --id Example.AgentSkills.Demo --agent github-copilot --source skills
+```
+
+For updates, publish a new `PackageVersion` with its new manifest hash and
+immutable source pin, then refresh the catalog. Installing or upgrading an
+existing *managed* skill installs a newer version only: the same version is a
+no-op, a downgrade is rejected, and an unmanaged destination or locally
+modified skill is not overwritten. Pinget validates the replacement in a
+staging directory and restores the previous skill and provenance if publication
+fails. A skill installed from one catalog cannot be silently replaced from a
+different catalog. Older installs without an installed file-tree digest need a manual
+remove/reinstall before managed updates.
+
+The existing `Microsoft.Rest` and `Microsoft.PreIndexed.Package` sources remain
+application-only. `Pinget.AgentSkills` sources are Pinget-owned, not registered
+with `winget.exe`; official WinGet clients cannot read these manifests or
+catalogs. This is not skills.sh search or automatic Git/Notion workspace
+discovery: manifests and version pins must be published to the catalog.
+Installed skill inventory, bulk skill upgrades, and plugin runtime components
+remain outside this slice. No `npx` or MCP integration is required.
+
 ## Build and test
 
 From the parent `winget-cli` repository root:

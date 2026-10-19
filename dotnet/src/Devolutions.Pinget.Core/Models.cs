@@ -6,7 +6,8 @@ namespace Devolutions.Pinget.Core;
 public enum SourceKind
 {
     PreIndexed,
-    Rest
+    Rest,
+    AgentSkills
 }
 
 public enum PinType
@@ -402,6 +403,8 @@ public record InstallRequest
 {
     public required PackageQuery Query { get; init; }
     public string? ManifestPath { get; init; }
+    public string? Agent { get; init; }
+    public bool RequireExistingAgentSkill { get; init; }
     public InstallerMode Mode { get; init; } = InstallerMode.SilentWithProgress;
     public string? LogPath { get; init; }
     public string? Custom { get; init; }

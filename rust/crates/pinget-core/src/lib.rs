@@ -1,3 +1,7 @@
+mod agent_skill;
+mod agent_skill_catalog;
+mod agent_skill_git;
+mod agent_skill_source;
 mod name_normalization;
 
 use std::cmp::Ordering;
@@ -14,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
@@ -95,6 +99,8 @@ pub enum SourceKind {
     PreIndexed,
     #[serde(rename = "Rest", alias = "rest")]
     Rest,
+    #[serde(rename = "AgentSkills", alias = "agentSkills")]
+    AgentSkills,
 }
 
 impl Display for SourceKind {
@@ -102,6 +108,7 @@ impl Display for SourceKind {
         match self {
             SourceKind::PreIndexed => f.write_str("preindexed"),
             SourceKind::Rest => f.write_str("rest"),
+            SourceKind::AgentSkills => f.write_str("agent-skills"),
         }
     }
 }
@@ -545,6 +552,7 @@ pub enum InstallerMode {
 pub struct InstallRequest {
     pub query: PackageQuery,
     pub manifest_path: Option<PathBuf>,
+    pub agent: Option<String>,
     pub mode: InstallerMode,
     pub log_path: Option<PathBuf>,
     pub custom: Option<String>,
@@ -566,6 +574,7 @@ impl InstallRequest {
         Self {
             query,
             manifest_path: None,
+            agent: None,
             mode: InstallerMode::SilentWithProgress,
             log_path: None,
             custom: None,
@@ -975,6 +984,7 @@ pub struct Repository {
     user_agent: String,
     client: Client,
     store: SourceStore,
+    skill_sources: Vec<SourceRecord>,
     source_mode: EffectiveSourceMode,
     install_progress: Option<fn(&InstallProgress)>,
     pre_indexed_source_auto_update_interval: Option<Duration>,
@@ -1040,6 +1050,7 @@ impl Repository {
     pub fn open_with_options(options: RepositoryOptions) -> Result<Self> {
         ensure_app_dirs(&options.app_root)?;
         let (source_mode, store) = load_effective_source_store(&options.app_root, options.source_mode)?;
+        let skill_sources = agent_skill_catalog::load_sources(&options.app_root)?;
         let client = Client::builder()
             .user_agent(&options.user_agent)
             .timeout(StdDuration::from_secs(30 * 60))
@@ -1050,6 +1061,7 @@ impl Repository {
             user_agent: options.user_agent,
             client,
             store,
+            skill_sources,
             source_mode,
             install_progress: options.install_progress,
             pre_indexed_source_auto_update_interval: options.pre_indexed_source_auto_update_interval,
@@ -1076,7 +1088,7 @@ impl Repository {
     }
 
     pub fn list_sources(&self) -> Vec<SourceRecord> {
-        self.store.sources.clone()
+        self.store.sources.iter().chain(&self.skill_sources).cloned().collect()
     }
 
     pub fn add_source(&mut self, name: &str, arg: &str, kind: SourceKind) -> Result<()> {
@@ -1092,16 +1104,40 @@ impl Repository {
         explicit: bool,
         priority: i32,
     ) -> Result<()> {
+        if kind == SourceKind::AgentSkills {
+            agent_skill_catalog::catalog_url(arg)?;
+            ensure!(
+                !self
+                    .list_sources()
+                    .iter()
+                    .any(|source| source.name.eq_ignore_ascii_case(name) || source.arg == arg),
+                "an AgentSkill source with this name or URL already exists"
+            );
+            self.skill_sources.push(SourceRecord {
+                name: name.to_owned(),
+                kind,
+                arg: arg.to_owned(),
+                identifier: name.to_owned(),
+                trust_level: normalize_source_trust_level(trust_level)?,
+                explicit,
+                priority,
+                last_update: None,
+                source_version: None,
+                etag: None,
+                last_modified: None,
+            });
+            return agent_skill_catalog::save_sources(&self.app_root, &self.skill_sources);
+        }
         if self.uses_system_winget_sources() {
             system_winget_add_source(name, arg, kind, &normalize_source_trust_level(trust_level)?, explicit)?;
             self.refresh_system_winget_sources()?;
             return Ok(());
         }
 
-        if self.store.sources.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
+        if self.list_sources().iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
             bail!("A source with name '{name}' already exists.");
         }
-        if self.store.sources.iter().any(|s| s.arg == arg) {
+        if self.list_sources().iter().any(|s| s.arg == arg) {
             bail!("A source with argument '{arg}' already exists.");
         }
         let identifier = name.to_owned();
@@ -1125,6 +1161,19 @@ impl Repository {
     }
 
     pub fn edit_source(&mut self, name: &str, explicit: Option<bool>, trust_level: Option<&str>) -> Result<()> {
+        if let Some(source) = self
+            .skill_sources
+            .iter_mut()
+            .find(|source| source.name.eq_ignore_ascii_case(name))
+        {
+            if let Some(value) = explicit {
+                source.explicit = value;
+            }
+            if trust_level.is_some() {
+                source.trust_level = normalize_source_trust_level(trust_level)?;
+            }
+            return agent_skill_catalog::save_sources(&self.app_root, &self.skill_sources);
+        }
         if self.uses_system_winget_sources() {
             bail!("Editing system WinGet sources is not supported by winget source commands.");
         }
@@ -1149,6 +1198,22 @@ impl Repository {
     }
 
     pub fn remove_source(&mut self, name: &str) -> Result<()> {
+        if let Some(index) = self
+            .skill_sources
+            .iter()
+            .position(|source| source.name.eq_ignore_ascii_case(name))
+        {
+            let source = self.skill_sources.remove(index);
+            agent_skill_catalog::save_sources(&self.app_root, &self.skill_sources)?;
+            let cache = self
+                .app_root
+                .join("agent-skill-catalogs")
+                .join(format!("{}.json", sha256_hex(source.name.as_bytes())));
+            if cache.exists() {
+                fs::remove_file(cache)?;
+            }
+            return Ok(());
+        }
         if self.uses_system_winget_sources() {
             system_winget_remove_source(name)?;
             self.refresh_system_winget_sources()?;
@@ -1172,6 +1237,21 @@ impl Repository {
     }
 
     pub fn reset_source(&mut self, name: &str) -> Result<()> {
+        if let Some(source) = self
+            .skill_sources
+            .iter_mut()
+            .find(|source| source.name.eq_ignore_ascii_case(name))
+        {
+            source.last_update = None;
+            let cache = self
+                .app_root
+                .join("agent-skill-catalogs")
+                .join(format!("{}.json", sha256_hex(source.name.as_bytes())));
+            if cache.exists() {
+                fs::remove_file(cache)?;
+            }
+            return agent_skill_catalog::save_sources(&self.app_root, &self.skill_sources);
+        }
         if self.uses_system_winget_sources() {
             system_winget_reset_source(name)?;
             self.refresh_system_winget_sources()?;
@@ -1209,6 +1289,14 @@ impl Repository {
     }
 
     pub fn reset_sources(&mut self) -> Result<()> {
+        let skill_names = self
+            .skill_sources
+            .iter()
+            .map(|source| source.name.clone())
+            .collect::<Vec<_>>();
+        for name in skill_names {
+            self.reset_source(&name)?;
+        }
         if self.uses_system_winget_sources() {
             system_winget_reset_sources()?;
             self.refresh_system_winget_sources()?;
@@ -1323,8 +1411,30 @@ impl Repository {
     }
 
     pub fn update_sources(&mut self, source_name: Option<&str>) -> Result<Vec<SourceUpdateResult>> {
+        if source_name.is_some_and(|name| {
+            self.skill_sources
+                .iter()
+                .any(|source| source.name.eq_ignore_ascii_case(name))
+        }) {
+            return Ok(vec![
+                self.update_agent_skill_source(source_name.context("missing source name")?)?,
+            ]);
+        }
+        let mut skill_updates = Vec::new();
+        if source_name.is_none() {
+            let names = self
+                .skill_sources
+                .iter()
+                .map(|source| source.name.clone())
+                .collect::<Vec<_>>();
+            for name in names {
+                skill_updates.push(self.update_agent_skill_source(&name)?);
+            }
+        }
         if self.source_mode == EffectiveSourceMode::SystemWingetDirect {
-            return self.update_system_winget_sources(source_name);
+            let mut updates = self.update_system_winget_sources(source_name)?;
+            updates.extend(skill_updates);
+            return Ok(updates);
         }
 
         if self.mirrors_system_winget_sources() {
@@ -1338,6 +1448,7 @@ impl Repository {
             let detail = match self.store.sources[index].kind {
                 SourceKind::PreIndexed => self.update_preindexed(index)?,
                 SourceKind::Rest => self.update_rest(index)?,
+                SourceKind::AgentSkills => bail!("AgentSkill sources must use Pinget-owned storage"),
             };
 
             results.push(SourceUpdateResult {
@@ -1348,6 +1459,7 @@ impl Repository {
         }
 
         self.save_store()?;
+        results.extend(skill_updates);
         Ok(results)
     }
 
@@ -2288,6 +2400,50 @@ impl Repository {
     }
 
     pub fn install_request(&mut self, request: &InstallRequest) -> Result<InstallResult> {
+        self.install_request_with_agent_upgrade(request, false)
+    }
+
+    pub fn upgrade_agent_skill_request(&mut self, request: &InstallRequest) -> Result<InstallResult> {
+        ensure!(
+            request.agent.is_some() && request.manifest_path.is_none() && request.query.id.is_some(),
+            "AgentSkill upgrade requires --agent and --id without --manifest"
+        );
+        self.install_request_with_agent_upgrade(request, true)
+    }
+
+    fn install_request_with_agent_upgrade(
+        &mut self,
+        request: &InstallRequest,
+        agent_upgrade: bool,
+    ) -> Result<InstallResult> {
+        if let Some(path) = &request.manifest_path {
+            let resolved = resolve_manifest_path(path)?;
+            let bytes =
+                fs::read(&resolved).with_context(|| format!("failed to read manifest {}", resolved.display()))?;
+            if let Some(manifest) = agent_skill::parse(&bytes)? {
+                let agent = request
+                    .agent
+                    .as_deref()
+                    .context("AgentSkill installation requires --agent")?;
+                let global = match request.query.install_scope.as_deref() {
+                    None => false,
+                    Some(scope) if scope.eq_ignore_ascii_case("user") => true,
+                    Some(scope) => {
+                        bail!("unsupported AgentSkill scope: {scope}; use --scope user or omit it for project scope")
+                    }
+                };
+                return agent_skill::install(self, manifest, request, agent, global, agent_upgrade);
+            }
+        }
+        if let Some(agent) = request.agent.as_deref() {
+            let manifest = self.resolve_agent_skill_from_catalog(&request.query)?;
+            let global = match request.query.install_scope.as_deref() {
+                None => false,
+                Some(scope) if scope.eq_ignore_ascii_case("user") => true,
+                _ => bail!("AgentSkill --scope supports only user (the default is project)"),
+            };
+            return agent_skill::install(self, manifest, request, agent, global, agent_upgrade);
+        }
         self.emit_install_progress(InstallProgress::ResolvingManifest);
         let manifest = self.resolve_manifest_for_install(request)?;
         self.emit_install_progress(InstallProgress::ResolvedManifest {
@@ -2684,6 +2840,7 @@ impl Repository {
         InstallRequest {
             query,
             manifest_path: request.manifest_path.clone(),
+            agent: None,
             mode: request.mode,
             log_path: request.log_path.clone(),
             custom: None,
@@ -2856,6 +3013,7 @@ impl Repository {
         match self.store.sources[source_index].kind {
             SourceKind::PreIndexed => self.search_preindexed(source_index, query, semantics),
             SourceKind::Rest => self.search_rest(source_index, query, semantics),
+            SourceKind::AgentSkills => bail!("AgentSkill sources require search_agent_skills"),
         }
     }
 
@@ -6339,6 +6497,7 @@ fn packaged_source_type(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::PreIndexed => "Microsoft.PreIndexed.Package",
         SourceKind::Rest => "Microsoft.Rest",
+        SourceKind::AgentSkills => "Pinget.AgentSkills",
     }
 }
 
