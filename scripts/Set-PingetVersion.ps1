@@ -65,11 +65,17 @@ Set-VersionInFile `
     -Pattern '^(version\s*=\s*")[^"]+(")' `
     -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
 
-foreach ($crateName in @('pinget-core', 'pinget-cli', 'pinget-com')) {
-    Set-VersionInFile `
-        -RelativePath 'rust\Cargo.lock' `
-        -Pattern "(\[\[package\]\]\r?\nname = `"$crateName`"\r?\nversion = `")[^`"]+(`")" `
-        -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
+$cargoLockPath = Join-Path $repoRoot 'rust\Cargo.lock'
+if (Test-Path -Path $cargoLockPath) {
+    foreach ($crateName in @('pinget-core', 'pinget-cli', 'pinget-com')) {
+        Set-VersionInFile `
+            -RelativePath 'rust\Cargo.lock' `
+            -Pattern "(\[\[package\]\]\r?\nname = `"$crateName`"\r?\nversion = `")[^`"]+(`")" `
+            -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
+    }
+}
+else {
+    Write-Host 'Skipping rust\Cargo.lock because it is not present.'
 }
 
 Set-VersionInFile `
