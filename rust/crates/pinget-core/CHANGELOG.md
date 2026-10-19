@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/Devolutions/pinget/compare/pinget-core-v0.13.0...pinget-core-v0.14.0) - 2026-10-19
+
+### Other
+
+- Prepare 0.14.0 release ([#56](https://github.com/Devolutions/pinget/pull/56))
+- Fix NSIS installer launch preparation and document lifecycle behavior ([#54](https://github.com/Devolutions/pinget/pull/54))
+- Stop adding Referer headers to installer redirects ([#53](https://github.com/Devolutions/pinget/pull/53))
+
 ## [0.11.0](https://github.com/Devolutions/pinget/compare/pinget-core-v0.10.0...pinget-core-v0.11.0) - 2026-09-01
 
 ### Other
