@@ -1165,7 +1165,7 @@ importCommand.SetHandler((ctx) =>
                 try
                 {
                     Console.Write($"Installing {pkgId}...");
-                    var result = repo.Install(CreateInstallRequest(
+                    var result = repo.Install(ImportInstallRequestFactory.Create(
                         new PackageQuery
                         {
                             Id = pkgId,
@@ -1173,20 +1173,8 @@ importCommand.SetHandler((ctx) =>
                             Exact = true,
                             Version = pkgVersion,
                         },
-                        null,
-                        InstallerMode.SilentWithProgress,
-                        null,
-                        null,
-                        null,
-                        null,
-                        false,
-                        false,
+                        pkg,
                         acceptPackageAgreements,
-                        false,
-                        null,
-                        false,
-                        false,
-                        null,
                         noUpgrade));
                     if (result.NoOp)
                     {
