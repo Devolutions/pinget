@@ -13664,7 +13664,7 @@ Installers:
         let payload = b"different installer bytes".to_vec();
         let final_url = format!("{}/final.exe", server.url());
         server.set_redirect("/installer.exe", &final_url);
-        server.set_bytes_without_referer("/final.exe", payload.clone());
+        server.set_bytes_without_referer("/final.exe", payload);
 
         let root = temp_app_root("download_redirect_hash_mismatch");
         fs::create_dir_all(&root).expect("create app root");
