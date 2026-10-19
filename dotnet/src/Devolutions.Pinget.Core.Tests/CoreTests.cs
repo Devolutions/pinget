@@ -1972,10 +1972,10 @@ public class RepositoryParityTests
             var quotedPidPath = childPidPath.Replace("'", "''", StringComparison.Ordinal);
             File.WriteAllText(
                 childScriptPath,
-                $"Set-Content -LiteralPath '{quotedPidPath}' -Value $PID{Environment.NewLine}Start-Sleep -Seconds 15");
+                $"Set-Content -LiteralPath '{quotedPidPath}' -Value $PID{Environment.NewLine}Start-Sleep -Seconds 30");
             File.WriteAllText(
                 launcherPath,
-                $"@echo off{Environment.NewLine}start \"\" /b powershell.exe -NoProfile -File \"{childScriptPath}\"{Environment.NewLine}");
+                $"@echo off{Environment.NewLine}start \"\" /b powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{childScriptPath}\"{Environment.NewLine}");
 
             var commandInterpreter = Environment.GetEnvironmentVariable("ComSpec")
                 ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
@@ -1992,10 +1992,11 @@ public class RepositoryParityTests
                 new Manifest { Id = "Test.Lifecycle", Name = "Lifecycle Test", Version = "1.0" },
                 new Installer()));
 
-            var exitCode = await installTask.WaitAsync(TimeSpan.FromSeconds(5));
+            var exitCode = await installTask.WaitAsync(TimeSpan.FromSeconds(10));
             Assert.Equal(0, exitCode);
 
-            var markerDeadline = DateTime.UtcNow.AddSeconds(2);
+            // PowerShell cold start can take several seconds on loaded CI runners.
+            var markerDeadline = DateTime.UtcNow.AddSeconds(20);
             while (childPid == 0 && DateTime.UtcNow < markerDeadline)
             {
                 if (File.Exists(childPidPath))

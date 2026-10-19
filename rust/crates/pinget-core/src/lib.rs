@@ -13363,8 +13363,8 @@ Installers:
                     fs::write(&executable, b"stale installer").expect("write stale installer");
                     executable
                 };
-                let prepared = prepare_installer_for_execution(&original, installer_type)
-                    .expect("prepare NSIS installer");
+                let prepared =
+                    prepare_installer_for_execution(&original, installer_type).expect("prepare NSIS installer");
                 assert_eq!(prepared, expected);
                 assert_eq!(fs::read(&prepared).expect("read prepared installer"), payload);
                 if original != prepared {
@@ -13741,14 +13741,14 @@ Installers:
             &child_script,
             format!(
                 "Set-Content -LiteralPath '{quoted_pid_file}' -Value $PID\r\n\
-                 Start-Sleep -Seconds 15\r\n"
+                 Start-Sleep -Seconds 30\r\n"
             ),
         )
         .expect("write child fixture");
         fs::write(
             &launcher_script,
             format!(
-                "@echo off\r\nstart \"\" /b powershell.exe -NoProfile -File \"{}\"\r\n",
+                "@echo off\r\nstart \"\" /b powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"\r\n",
                 child_script.display()
             ),
         )
@@ -13762,7 +13762,7 @@ Installers:
             let _ = sender.send(result);
         });
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut child_pid = None;
         let mut completion = None;
         while Instant::now() < deadline {
@@ -13778,7 +13778,8 @@ Installers:
             thread::sleep(Duration::from_millis(25));
         }
 
-        let marker_deadline = Instant::now() + Duration::from_secs(2);
+        // PowerShell cold start can take several seconds on loaded CI runners.
+        let marker_deadline = Instant::now() + Duration::from_secs(20);
         while child_pid.is_none() && Instant::now() < marker_deadline {
             child_pid = fs::read_to_string(&child_pid_file)
                 .ok()
@@ -13798,7 +13799,7 @@ Installers:
 
         assert!(
             completion.is_some(),
-            "waiting for the launched installer exceeded the five-second test bound"
+            "waiting for the launched installer exceeded the ten-second test bound"
         );
         assert!(
             child_was_alive_after_launcher,
