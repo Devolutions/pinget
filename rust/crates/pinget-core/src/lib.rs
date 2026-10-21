@@ -9944,8 +9944,9 @@ fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Resul
                             continue;
                         }
 
-                        if let Some(exit_code) =
-                            try_run_msi_uninstall(installed, &subkey_name, product_code.as_deref(), request)?
+                        if is_msi_arp_entry(read_reg_dword(&subkey, "WindowsInstaller"))
+                            && let Some(exit_code) =
+                                try_run_msi_uninstall(installed, &subkey_name, product_code.as_deref(), request)?
                         {
                             return Ok(Some(exit_code));
                         }
@@ -10193,6 +10194,10 @@ fn build_msix_uninstall_script(package_full_name: Option<&str>, package_family_n
          if (-not $targets) {{ exit 1 }}; \
          $targets | Remove-AppxPackage"
     )
+}
+
+fn is_msi_arp_entry(windows_installer: Option<u32>) -> bool {
+    windows_installer == Some(1)
 }
 
 #[cfg(windows)]
@@ -15270,6 +15275,14 @@ Installers:
             None,
             &installed
         ));
+    }
+
+    #[test]
+    fn msi_arp_dispatch_requires_windows_installer_dword() {
+        // A GUID-shaped Burn/EXE key must not be treated as an MSI ProductCode.
+        assert!(!is_msi_arp_entry(None));
+        assert!(!is_msi_arp_entry(Some(0)));
+        assert!(is_msi_arp_entry(Some(1)));
     }
 
     #[test]
