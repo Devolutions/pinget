@@ -83,7 +83,8 @@ internal static class InstallerDispatch
                     if (!RegistryEntryMatchesInstalledPackage(subkeyName, displayName, productCode, installed))
                         continue;
 
-                    if (TryRunMsiUninstall(installed, subkeyName, productCode, request, out exitCode))
+                    if (IsMsiArpEntry(subkey.GetValue("WindowsInstaller")) &&
+                        TryRunMsiUninstall(installed, subkeyName, productCode, request, out exitCode))
                         return true;
 
                     var quietUninstallCmd = subkey.GetValue("QuietUninstallString") as string;
@@ -1013,7 +1014,15 @@ internal static class InstallerDispatch
                "$targets | Remove-AppxPackage";
     }
 
-    private static bool TryRunMsiUninstall(ListMatch installed, string subkeyName, string? productCode, UninstallRequest request, out int exitCode)
+    internal static bool IsMsiArpEntry(object? windowsInstaller)
+        => windowsInstaller is int value && value == 1;
+
+    private static bool TryRunMsiUninstall(
+        ListMatch installed,
+        string subkeyName,
+        string? productCode,
+        UninstallRequest request,
+        out int exitCode)
     {
         exitCode = 0;
         var uninstallCode = installed.ProductCodes
