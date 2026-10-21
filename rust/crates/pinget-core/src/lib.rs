@@ -10196,6 +10196,7 @@ fn build_msix_uninstall_script(package_full_name: Option<&str>, package_family_n
     )
 }
 
+#[cfg(any(windows, test))]
 fn is_msi_arp_entry(windows_installer: Option<u32>) -> bool {
     windows_installer == Some(1)
 }
