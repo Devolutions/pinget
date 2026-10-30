@@ -2203,6 +2203,16 @@ public class RepositoryParityTests
         Assert.False(InstallerDispatch.RegistryEntryMatchesInstalledPackage("ShareX.ShareX", "ShareX.ShareX", null, installed));
     }
 
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData(0, false)]
+    [InlineData(1, true)]
+    public void IsMsiArpEntry_RequiresWindowsInstallerDword(int? windowsInstaller, bool expected)
+    {
+        // A GUID-shaped Burn/EXE key must not be treated as an MSI ProductCode.
+        Assert.Equal(expected, InstallerDispatch.IsMsiArpEntry(windowsInstaller));
+    }
+
     [Fact]
     public void CorrelateInstalledPackage_TiebreaksOnUnnormalizedNamePrefix()
     {
