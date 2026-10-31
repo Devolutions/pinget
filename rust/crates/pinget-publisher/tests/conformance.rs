@@ -1132,6 +1132,7 @@ fn publish_semantic_metadata_promotion_failure_preserves_old_feed_then_retry_suc
 }
 
 #[test]
+#[cfg(windows)]
 fn publish_destination_lock_serializes_different_state_roots_and_allows_retry() {
     use std::os::windows::fs::OpenOptionsExt;
 

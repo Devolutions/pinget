@@ -196,8 +196,11 @@ Failure tests cover packaging/signing errors, update promotion rollback and
 destination locking. The .NET publisher also has an end-to-end regression
 for initial publication failure after metadata copying: a controlled MSIX
 identity mismatch leaves the destination empty and no publication recorded,
-then a valid retry succeeds. The equivalent Rust post-copy failure path
-remains unverified; Rust verifies the staged MSIX before copying metadata.
+then a valid retry succeeds. The Rust regression uses a private deterministic
+post-copy callback to verify the copied artifact hashes, inject a failure,
+assert complete cleanup and unchanged publication state, then verify a normal
+retry. Rust still verifies the staged MSIX before copying metadata; the
+public API adds no failure-injection option.
 
 Stock-client acceptance and signature trust checks belong in a fresh Windows
 Sandbox or an ephemeral Windows CI runner. They must not register test sources

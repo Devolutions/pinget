@@ -660,6 +660,10 @@ pub fn verify_published_destination(destination: &Path, signtool_path: Option<&P
 /// Returns an error for unsupported hosts, invalid package identity/version,
 /// missing tools, failed signatures, unsafe destinations, or conflicting immutable files.
 pub fn publish(options: &PublishOptions) -> Result<PublishReport> {
+    publish_after_copy(options, |_| Ok(()))
+}
+
+fn publish_after_copy(options: &PublishOptions, after_copy: impl FnOnce(&Path) -> Result<()>) -> Result<PublishReport> {
     if !cfg!(windows) {
         return Err(PublisherError::Tool(
             "MSIX packaging and signing are currently supported only on Windows".to_owned(),
@@ -771,8 +775,8 @@ pub fn publish(options: &PublishOptions) -> Result<PublishReport> {
         &destination,
         options,
         &build_id,
-        unsigned_development,
         prior,
+        after_copy,
     );
     if result.is_err() {
         let _ = fs::remove_dir_all(&temporary);
@@ -2110,9 +2114,10 @@ fn package_and_publish(
     destination: &Path,
     options: &PublishOptions,
     build_id: &str,
-    unsigned_development: bool,
     prior: Option<OwnerMarker>,
+    after_copy: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<PublishReport> {
+    let unsigned_development = matches!(options.signing, Signing::UnsignedDevelopment);
     let metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
     let package_root = temporary.join("package");
     fs::create_dir_all(package_root.join("Public"))?;
@@ -2219,6 +2224,7 @@ fn package_and_publish(
             }
         }
     }
+    after_copy(destination)?;
     let target_msix = destination.join("source2.msix");
     let staged_package = stage_package(&msix, destination, build_id)?;
     rollback.files.push(staged_package.clone());
@@ -3827,6 +3833,110 @@ mod tests {
         }
         assert!(!root.join("new").exists(), "new directory tree must be removed");
         assert_eq!(fs::read(existing.join("keep")).expect("existing artifact"), b"old");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn initial_publish_post_copy_failure_cleans_destination_and_allows_retry() {
+        let makeappx = doctor().makeappx_path.expect("Windows SDK MakeAppx is required");
+        let root = unit_directory("initial-publish");
+        let input = root.join("input");
+        let state = root.join("state");
+        let destination = root.join("destination");
+        fs::create_dir(&input).expect("manifest input");
+        fs::write(
+            input.join("package.yaml"),
+            concat!(
+                "PackageIdentifier: Pinget.Test.InitialRollback\n",
+                "PackageVersion: 1.0.0\nPackageLocale: en-US\n",
+                "Publisher: Pinget Test\nPackageName: Initial Rollback\n",
+                "License: MIT\nShortDescription: Initial publication rollback regression\n",
+                "Installers:\n  - Architecture: x64\n    InstallerType: exe\n",
+                "    InstallerUrl: https://example.invalid/unused.exe\n",
+                "    InstallerSha256: 1111111111111111111111111111111111111111111111111111111111111111\n",
+                "ManifestType: singleton\nManifestVersion: 1.9.0\n",
+            ),
+        )
+        .expect("manifest");
+        let build_report = build(&BuildOptions {
+            input,
+            state: state.clone(),
+        })
+        .expect("build snapshot");
+        let metadata: SnapshotMetadata = serde_json::from_slice(
+            &fs::read(build_report.snapshot_directory.join("snapshot.json")).expect("snapshot metadata"),
+        )
+        .expect("snapshot");
+        assert!(
+            metadata.artifacts.len() >= 2,
+            "manifest and version sidecar must be copied"
+        );
+        let options = PublishOptions {
+            state: state.clone(),
+            destination: destination.clone(),
+            build_id: Some(build_report.build_id.clone()),
+            name: "Pinget.Test.InitialRollback".to_owned(),
+            publisher: "CN=Pinget Initial Rollback Test".to_owned(),
+            version: "1.0.0.0".to_owned(),
+            signing: Signing::UnsignedDevelopment,
+            makeappx: Some(makeappx),
+            signtool: None,
+            timestamp_url: None,
+        };
+        let mut reached_after_copy = false;
+        let error = publish_after_copy(&options, |feed| {
+            reached_after_copy = true;
+            for (relative, expected) in &metadata.artifacts {
+                let path = safe_join(feed, relative).expect("copied artifact path");
+                assert!(
+                    path.is_file(),
+                    "artifact must exist before injected failure: {relative}"
+                );
+                assert_eq!(sha256_hex(&fs::read(path).expect("copied artifact")), *expected);
+            }
+            assert!(
+                !feed.join(".pinget-publisher.json").exists(),
+                "no ownership marker before promotion"
+            );
+            assert!(!feed.join("source2.msix").exists(), "no root package before promotion");
+            Err(PublisherError::Invalid("injected initial post-copy failure".to_owned()))
+        })
+        .expect_err("injected post-copy failure");
+        assert!(reached_after_copy, "failure must occur after actual verified copies");
+        assert!(error.to_string().contains("injected initial post-copy failure"));
+        assert_eq!(
+            fs::read_dir(&destination).expect("destination").count(),
+            0,
+            "initial failure must leave no files, directories, marker, package or staging"
+        );
+        let failed_status = status(&state).expect("state after failure");
+        assert_eq!(failed_status.last_published_build_id, None);
+        assert!(!failed_status.last_build_published);
+        verify(&state, Some(&build_report.build_id), None).expect("snapshot preserved after failure");
+
+        let published = publish(&options).expect("normal initial retry");
+        assert!(published.valid);
+        assert!(
+            !published.reused,
+            "retry must perform publication rather than reuse a false commit"
+        );
+        assert_eq!(published.build_id, build_report.build_id);
+        let verified = verify_published_destination(&destination, None).expect("destination verification");
+        assert!(verified.valid);
+        assert_eq!(verified.build_id.as_deref(), Some(build_report.build_id.as_str()));
+        assert_eq!(
+            verified.artifact_count,
+            metadata.artifacts.len() + 1,
+            "feed artifacts plus root package"
+        );
+        let published_status = status(&state).expect("published state");
+        assert_eq!(
+            published_status.last_published_build_id.as_deref(),
+            Some(build_report.build_id.as_str())
+        );
+        assert!(published_status.last_build_published);
+        verify(&state, Some(&build_report.build_id), None).expect("snapshot preserved after retry");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
