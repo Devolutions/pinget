@@ -274,6 +274,84 @@ public sealed class PublisherPackagingTests
     }
 
     [Fact]
+    public void Publish_InitialPostCopyMsixVerificationFailure_CleansArtifactsAndAllowsRetry()
+    {
+        using var temp = new TempDirectory();
+        var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
+        var state = Path.Combine(temp.Path, "state");
+        var destination = Path.Combine(temp.Path, "published");
+        var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
+        var makeAppx = PublisherPackaging.Doctor().MakeAppxPath;
+        Assert.False(string.IsNullOrWhiteSpace(makeAppx), "Windows SDK MakeAppx is required for the controlled post-copy failure case.");
+
+        var wrapper = Path.Combine(temp.Path, "makeappx-fail-msix-identity.cmd");
+        var manifestMutator = Path.Combine(temp.Path, "mutate-msix-identity.ps1");
+        File.WriteAllText(
+            manifestMutator,
+            """
+            $ErrorActionPreference = 'Stop'
+            $manifestPath = Join-Path $env:PINGET_PUBLISHER_TEST_PACKAGE_DIR 'AppxManifest.xml'
+            [xml]$manifest = Get-Content -LiteralPath $manifestPath -Raw
+            $identity = $manifest.SelectSingleNode('/*[local-name()=''Package'']/*[local-name()=''Identity'']')
+            if ($null -eq $identity) {
+                throw 'Generated package manifest does not contain an Identity element.'
+            }
+            $identity.SetAttribute('Name', 'Pinget.Publisher.WrongIdentity')
+            $manifest.Save($manifestPath)
+            """,
+            new UTF8Encoding(false));
+        File.WriteAllText(
+            wrapper,
+            string.Join(
+                "\r\n",
+                [
+                    "@echo off",
+                    "setlocal",
+                    $"set \"REAL_MAKEAPPX={makeAppx}\"",
+                    "set \"PINGET_PUBLISHER_TEST_PACKAGE_DIR=%~3\"",
+                    "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0mutate-msix-identity.ps1\"",
+                    "if errorlevel 1 exit /b 91",
+                    "\"%REAL_MAKEAPPX%\" %*",
+                    "exit /b %errorlevel%",
+                ]) + "\r\n",
+            new UTF8Encoding(false));
+
+        var failedPublish = new PublisherPublishOptions(
+            state,
+            destination,
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            UnsignedDevelopment: true,
+            MakeAppxPath: wrapper,
+            BuildId: build.BuildId);
+        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(failedPublish));
+
+        Assert.Contains("MSIX identity does not match", error.Message, StringComparison.Ordinal);
+        Assert.True(Directory.Exists(destination));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(destination));
+        Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
+
+        var snapshotFeed = Path.Combine(build.SnapshotDirectory, "feed");
+        var copiedArtifactPaths = Directory.EnumerateFiles(snapshotFeed, "*", SearchOption.AllDirectories)
+            .Select(path => Path.GetRelativePath(snapshotFeed, path))
+            .ToArray();
+        Assert.NotEmpty(copiedArtifactPaths);
+        foreach (var relativePath in copiedArtifactPaths)
+        {
+            var destinationPath = Path.Combine(destination, relativePath.Replace('/', Path.DirectorySeparatorChar));
+            Assert.False(File.Exists(destinationPath), $"Failed initial publication left copied artifact '{relativePath}'.");
+        }
+
+        var retry = PublisherPackaging.Publish(UnsignedOptions(state, destination, "1.0.0.0", build.BuildId));
+
+        Assert.True(retry.Valid);
+        Assert.Equal(build.BuildId, retry.BuildId);
+        Assert.True(PublisherPackaging.VerifyDestination(destination).Valid);
+        Assert.Equal(build.BuildId, new PublisherWorkspace(state).Status().LastPublishedBuildId);
+    }
+
+    [Fact]
     public void Publish_FailedSignatureTool_DoesNotExposeAnIndexOrRecordPublication()
     {
         using var temp = new TempDirectory();

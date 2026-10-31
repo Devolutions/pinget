@@ -193,8 +193,11 @@ the local exact-byte comparison and independent SQLite/MSZIP checks, but
 have not received a fresh signed stock-client acceptance run.
 
 Failure tests cover packaging/signing errors, update promotion rollback and
-destination locking. Initial publication failure after metadata copying,
-followed by cleanup and retry, remains an end-to-end coverage gap.
+destination locking. The .NET publisher also has an end-to-end regression
+for initial publication failure after metadata copying: a controlled MSIX
+identity mismatch leaves the destination empty and no publication recorded,
+then a valid retry succeeds. The equivalent Rust post-copy failure path
+remains unverified; Rust verifies the staged MSIX before copying metadata.
 
 Stock-client acceptance and signature trust checks belong in a fresh Windows
 Sandbox or an ephemeral Windows CI runner. They must not register test sources
