@@ -27,6 +27,10 @@ Structured manifest output is also supported:
 - `show --output json|yaml`
 - `search --manifests --output json|yaml`
 
+For authoring a static Windows package source, see
+[Publishing a static WinGet source](docs/repository-publishing.md). The
+`repository` commands are separate from client-side `source` management.
+
 The C# implementation also ships the **`Devolutions.Pinget.Client` PowerShell 7 module** that mirrors the upstream `Microsoft.WinGet.Client` cmdlet family with renamed `Pinget` nouns, backed by `Devolutions.Pinget.Core`.
 
 ## Pinget CLI

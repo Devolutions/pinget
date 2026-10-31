@@ -70,6 +70,12 @@ jobs:
       - name: Test pinget-cli
         run: cargo test -p pinget-cli --manifest-path rust/Cargo.toml
 
+      - name: Test pinget-publisher
+        run: cargo test -p pinget-publisher --manifest-path rust/Cargo.toml
+
+      - name: Check publisher documentation
+        run: cargo doc -p pinget-publisher --manifest-path rust/Cargo.toml --no-deps
+
       - name: Build pinget-cli
         run: cargo build -p pinget-cli --manifest-path rust/Cargo.toml
 
@@ -107,6 +113,27 @@ jobs:
       - name: Run core tests
         run: dotnet test dotnet/src/Devolutions.Pinget.Core.Tests/Devolutions.Pinget.Core.Tests.csproj -c Release --no-build
 
+      - name: Run publisher tests
+        run: dotnet test dotnet/src/Devolutions.Pinget.Publisher.Tests/Devolutions.Pinget.Publisher.Tests.csproj -c Release
+
+      - name: Check Rust and .NET publisher interoperability
+        shell: pwsh
+        run: |
+          cargo build --manifest-path rust/Cargo.toml -p pinget-cli --release
+          if ($LASTEXITCODE -ne 0) { throw 'Rust publisher CLI build failed.' }
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $makeAppx = Get-ChildItem -LiteralPath $sdkRoot -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64\makeappx.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $makeAppx) { throw 'Windows SDK MakeAppx was not found.' }
+          & .\tests\publisher\run-production-conformance.ps1 `
+            -RustCli .\rust\target\release\pinget.exe `
+            -DotnetAssembly .\dotnet\src\Devolutions.Pinget.Cli\bin\Release\net10.0\pinget.dll `
+            -MakeAppxPath $makeAppx
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher interoperability checks failed.' }
+
       - name: Build native COM DLLs
         shell: pwsh
         env:
@@ -124,6 +151,7 @@ jobs:
         run: |
           New-Item -Path artifacts/ci-nuget -ItemType Directory -Force | Out-Null
           dotnet pack dotnet/src/Devolutions.Pinget.Core/Devolutions.Pinget.Core.csproj -c Release --no-build -o artifacts/ci-nuget
+          dotnet pack dotnet/src/Devolutions.Pinget.Publisher/Devolutions.Pinget.Publisher.csproj -c Release --no-build -o artifacts/ci-nuget
           dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Engine/Devolutions.Pinget.PowerShell.Engine.csproj -c Release --no-build -o artifacts/ci-nuget
 
       - name: Validate PowerShell module packaging

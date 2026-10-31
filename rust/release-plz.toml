@@ -6,11 +6,15 @@ semver_check = true
 pr_branch_prefix = "release-plz/"
 pr_name = "chore(release): prepare for publishing"
 
-# For now, only publish pinget-core to crates.io.
+# Publish the reusable core and publisher crates to crates.io.
 [[package]]
 name = "pinget-cli"
 publish = false
 release = false
+
+[[package]]
+name = "pinget-publisher"
+publish = true
 
 [[package]]
 name = "pinget-com"

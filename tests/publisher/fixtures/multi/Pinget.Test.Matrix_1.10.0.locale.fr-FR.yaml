@@ -1,0 +1,10 @@
+PackageIdentifier: Pinget.Test.Matrix
+PackageVersion: 1.10.0
+PackageLocale: fr-FR
+Publisher: Pinget Localization Lab
+PackageName: Matrice
+ShortDescription: Fixture localisee pour verifier les manifestes de langue
+Tags:
+  - matrice
+ManifestType: locale
+ManifestVersion: 1.9.0

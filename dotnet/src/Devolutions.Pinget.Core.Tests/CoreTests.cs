@@ -4294,25 +4294,34 @@ public class RepositoryEmbeddingTests
     {
         var root = FindRepositoryRoot();
         var cliProject = Path.Combine(root, "dotnet", "src", "Devolutions.Pinget.Cli", "Devolutions.Pinget.Cli.csproj");
-        var cliDll = Path.Combine(root, "dotnet", "src", "Devolutions.Pinget.Cli", "bin", "Release", "net10.0", "pinget.dll");
+        var artifacts = Path.Combine(root, "artifacts", "cli-embedding-tests", Guid.NewGuid().ToString("N"));
+        var cliDll = Path.Combine(artifacts, "bin", "Devolutions.Pinget.Cli", "release", "pinget.dll");
+        try
+        {
+            var build = RunProcess("dotnet",
+                ["build", cliProject, "-c", "Release", "--artifacts-path", artifacts, "-v:q"], appRoot);
+            Assert.True(build.ExitCode == 0, $"CLI build failed:{Environment.NewLine}{build.Stdout}{Environment.NewLine}{build.Stderr}");
+            Assert.True(File.Exists(cliDll));
 
-        var build = RunProcess("dotnet", ["build", cliProject, "-c", "Release", "-v:q"], appRoot);
-        Assert.Equal(0, build.ExitCode);
-        Assert.True(File.Exists(cliDll));
+            var run = RunProcess("dotnet",
+            [
+                cliDll,
+                "show",
+                "--id", TesslPackageId,
+                "--exact",
+                "--source", "test",
+                "--architecture", "x64",
+                "--output", "json",
+            ], appRoot);
 
-        var run = RunProcess("dotnet",
-        [
-            cliDll,
-            "show",
-            "--id", TesslPackageId,
-            "--exact",
-            "--source", "test",
-            "--architecture", "x64",
-            "--output", "json",
-        ], appRoot);
-
-        Assert.Equal(0, run.ExitCode);
-        return JsonDocument.Parse(run.Stdout);
+            Assert.Equal(0, run.ExitCode);
+            return JsonDocument.Parse(run.Stdout);
+        }
+        finally
+        {
+            if (Directory.Exists(artifacts))
+                Directory.Delete(artifacts, recursive: true);
+        }
     }
 
     private static (int ExitCode, string Stdout, string Stderr) RunProcess(string fileName, IReadOnlyList<string> arguments, string appRoot)

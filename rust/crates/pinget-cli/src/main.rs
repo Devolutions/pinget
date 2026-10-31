@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
@@ -12,6 +12,7 @@ use pinget_core::{
     SearchMatch, SearchResponse, ShowResult, SourceKind, SourceRecord, SourceUpdateResult, UninstallRequest,
     VersionsResult,
 };
+use pinget_publisher::{BuildOptions as PublisherBuildOptions, PublishOptions as PublisherPublishOptions, Signing};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const UPGRADE_UNSUPPORTED_WARNING: &str = "Upgrading packages is not supported on this platform; no changes were made.";
@@ -91,6 +92,86 @@ enum Commands {
     #[command(alias = "fix")]
     Repair(RepairArgs),
     Import(ImportArgs),
+    Repository {
+        #[command(subcommand)]
+        command: RepositoryCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepositoryCommands {
+    Build(RepositoryBuildArgs),
+    Diff(RepositoryBuildArgs),
+    Status(RepositoryStateArgs),
+    Verify(RepositoryVerifyArgs),
+    Publish(RepositoryPublishArgs),
+    Doctor(RepositoryDoctorArgs),
+}
+
+#[derive(Args, Clone)]
+struct RepositoryBuildArgs {
+    #[arg(long = "input", visible_alias = "manifests")]
+    input: PathBuf,
+    #[arg(long)]
+    state: PathBuf,
+}
+
+#[derive(Args)]
+struct RepositoryStateArgs {
+    #[arg(long)]
+    state: PathBuf,
+}
+
+#[derive(Args)]
+struct RepositoryVerifyArgs {
+    #[arg(long, required_unless_present = "destination", conflicts_with = "destination")]
+    state: Option<PathBuf>,
+    #[arg(long)]
+    build: Option<String>,
+    #[arg(long, conflicts_with = "build")]
+    destination: Option<PathBuf>,
+    #[arg(long)]
+    signtool: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct RepositoryPublishArgs {
+    #[arg(long)]
+    state: PathBuf,
+    #[arg(long)]
+    destination: PathBuf,
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    publisher: String,
+    #[arg(long = "version")]
+    package_version: String,
+    #[arg(long)]
+    build: Option<String>,
+    #[arg(long = "pfx", requires = "password_env", conflicts_with = "unsigned_development")]
+    pfx: Option<PathBuf>,
+    #[arg(long = "password-env", requires = "pfx", value_name = "ENVIRONMENT_VARIABLE")]
+    password_env: Option<String>,
+    #[arg(
+        long = "unsigned-development",
+        required_unless_present = "pfx",
+        conflicts_with_all = ["pfx", "password_env"]
+    )]
+    unsigned_development: bool,
+    #[arg(long)]
+    makeappx: Option<PathBuf>,
+    #[arg(long)]
+    signtool: Option<PathBuf>,
+    #[arg(long, requires = "pfx", conflicts_with = "unsigned_development")]
+    timestamp_url: Option<String>,
+}
+
+#[derive(Args)]
+struct RepositoryDoctorArgs {
+    #[arg(long)]
+    makeappx: Option<PathBuf>,
+    #[arg(long)]
+    signtool: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -1041,8 +1122,155 @@ fn run() -> Result<()> {
                 args.accept_package_agreements,
             )?;
         }
+        Commands::Repository { command } => run_repository_command(command, output)?,
     }
 
+    Ok(())
+}
+
+fn run_repository_command(command: RepositoryCommands, output: OutputFormat) -> Result<()> {
+    match command {
+        RepositoryCommands::Build(args) => {
+            let result = pinget_publisher::build(&PublisherBuildOptions {
+                input: args.input,
+                state: args.state,
+            })?;
+            if output.is_text() {
+                println!(
+                    "Built {} package(s) into snapshot {} ({} manifest(s), {} file(s)).",
+                    result.packages, result.build_id, result.manifests, result.files
+                );
+            } else {
+                print_serialized(&result, output)?;
+            }
+        }
+        RepositoryCommands::Diff(args) => {
+            let result = pinget_publisher::diff(&PublisherBuildOptions {
+                input: args.input,
+                state: args.state,
+            })?;
+            if output.is_text() {
+                println!(
+                    "Added: {}; changed: {}; removed: {}; last build published: {}.",
+                    result.added.len(),
+                    result.changed.len(),
+                    result.removed.len(),
+                    result.last_build_published
+                );
+                for path in &result.added {
+                    println!("  added   {path}");
+                }
+                for path in &result.changed {
+                    println!("  changed {path}");
+                }
+                for path in &result.removed {
+                    println!("  removed {path}");
+                }
+            } else {
+                print_serialized(&result, output)?;
+            }
+        }
+        RepositoryCommands::Status(args) => {
+            let result = pinget_publisher::status(args.state)?;
+            if output.is_text() {
+                match &result.last_build {
+                    Some(build) => println!(
+                        "Latest build {}: {} package(s), {} manifest(s); published: {}.",
+                        build.build_id, build.packages, build.manifests, result.last_build_published
+                    ),
+                    None => println!("No successful repository builds are recorded."),
+                }
+            } else {
+                print_serialized(&result, output)?;
+            }
+        }
+        RepositoryCommands::Verify(args) => {
+            let result = if let Some(destination) = args.destination.as_deref() {
+                pinget_publisher::verify_published_destination(destination, args.signtool.as_deref())?
+            } else {
+                pinget_publisher::verify(
+                    args.state.as_deref().unwrap_or_else(|| Path::new(".")),
+                    args.build.as_deref(),
+                    None,
+                )?
+            };
+            if output.is_text() {
+                println!(
+                    "Verified {} ({} artifact(s)){}.",
+                    result.subject,
+                    result.artifact_count,
+                    result
+                        .build_id
+                        .as_deref()
+                        .map(|id| format!(" for build {id}"))
+                        .unwrap_or_default()
+                );
+            } else {
+                print_serialized(&result, output)?;
+            }
+        }
+        RepositoryCommands::Publish(args) => {
+            let signing = if args.unsigned_development {
+                Signing::UnsignedDevelopment
+            } else {
+                Signing::Pfx {
+                    path: args.pfx.ok_or_else(|| anyhow!("normal publication requires --pfx"))?,
+                    password_env: args
+                        .password_env
+                        .ok_or_else(|| anyhow!("normal publication requires --password-env"))?,
+                }
+            };
+            let result = pinget_publisher::publish(&PublisherPublishOptions {
+                state: args.state,
+                build_id: args.build,
+                destination: args.destination,
+                name: args.name,
+                publisher: args.publisher,
+                version: args.package_version,
+                signing,
+                makeappx: args.makeappx,
+                signtool: args.signtool,
+                timestamp_url: args.timestamp_url,
+            })?;
+            if output.is_text() {
+                println!(
+                    "Published snapshot {} to {}{}.",
+                    result.build_id,
+                    result.destination.display(),
+                    if result.unsigned_development {
+                        " (unsigned development package)"
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                print_serialized(&result, output)?;
+            }
+        }
+        RepositoryCommands::Doctor(args) => {
+            let result = pinget_publisher::doctor_with_tools(args.makeappx.as_deref(), args.signtool.as_deref());
+            if output.is_text() {
+                println!(
+                    "Native MSZIP: {}; makeappx: {}; signtool: {}; signed publishing available: {}.",
+                    result.native_mszip_available,
+                    result
+                        .makeappx_path
+                        .as_deref()
+                        .map_or_else(|| "not found".to_owned(), |path| path.display().to_string()),
+                    result
+                        .signtool_path
+                        .as_deref()
+                        .map_or_else(|| "not found".to_owned(), |path| path.display().to_string()),
+                    result.signed_publish
+                );
+                if !result.native_mszip_available {
+                    println!("  Note: MSZIP build output is currently supported only on Windows.");
+                }
+            } else {
+                print_serialized(&result, output)?;
+            }
+        }
+    }
     Ok(())
 }
 

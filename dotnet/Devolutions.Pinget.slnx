@@ -3,6 +3,8 @@
     <Project Path="src/Devolutions.Pinget.Cli/Devolutions.Pinget.Cli.csproj" />
     <Project Path="src/Devolutions.Pinget.ComInterop.Net48/Devolutions.Pinget.ComInterop.Net48.csproj" />
     <Project Path="src/Devolutions.Pinget.Core/Devolutions.Pinget.Core.csproj" />
+    <Project Path="src/Devolutions.Pinget.Publisher/Devolutions.Pinget.Publisher.csproj" />
+    <Project Path="src/Devolutions.Pinget.Publisher.Tests/Devolutions.Pinget.Publisher.Tests.csproj" />
     <Project Path="src/Devolutions.Pinget.PowerShell.Engine/Devolutions.Pinget.PowerShell.Engine.csproj" />
     <Project Path="src/Devolutions.Pinget.PowerShell.Cmdlets/Devolutions.Pinget.PowerShell.Cmdlets.csproj" />
   </Folder>

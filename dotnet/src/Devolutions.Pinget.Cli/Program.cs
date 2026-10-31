@@ -1189,6 +1189,7 @@ rootCommand.AddCommand(installCommand);
 rootCommand.AddCommand(uninstallCommand);
 rootCommand.AddCommand(repairCommand);
 rootCommand.AddCommand(importCommand);
+rootCommand.AddCommand(PublisherCommands.Create(outputOption));
 
 rootCommand.SetHandler((ctx) =>
 {

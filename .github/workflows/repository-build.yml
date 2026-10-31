@@ -1,0 +1,53 @@
+name: Repository source build
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifests:
+        description: Repository-relative directory containing WinGet manifests
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build an unsigned source snapshot
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build publisher CLI
+        run: cargo build --manifest-path rust/Cargo.toml --package pinget-cli --release
+
+      - name: Build and verify snapshot
+        shell: pwsh
+        env:
+          MANIFEST_INPUT: ${{ inputs.manifests }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inputRoot = [System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE $env:MANIFEST_INPUT))
+          $checkoutPrefix = [System.IO.Path]::TrimEndingDirectorySeparator($env:GITHUB_WORKSPACE) + [System.IO.Path]::DirectorySeparatorChar
+          if (-not $inputRoot.StartsWith($checkoutPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Manifest directory must be inside the checkout.'
+          }
+          $stateRoot = Join-Path $env:RUNNER_TEMP 'publisher-state'
+          & .\rust\target\release\pinget.exe repository build --input $inputRoot --state $stateRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Source build failed.' }
+          & .\rust\target\release\pinget.exe repository verify --state $stateRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Snapshot verification failed.' }
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-source-snapshot
+          path: ${{ runner.temp }}/publisher-state/builds
+          if-no-files-found: error
