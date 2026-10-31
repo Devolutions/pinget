@@ -1,16 +1,21 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pinget_publisher::{
-    BuildOptions, PublishOptions, Signing, build, diff, doctor, publish, status, verify, verify_published_destination,
-};
+#[cfg(not(windows))]
+use pinget_publisher::PublisherError;
+use pinget_publisher::{BuildOptions, build, diff, status, verify};
+#[cfg(windows)]
+use pinget_publisher::{PublishOptions, Signing, doctor, publish, verify_published_destination};
 use rusqlite::Connection;
+#[cfg(windows)]
 use serde_json::Value;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+#[cfg(windows)]
 fn build_multifile_manifest_set_emits_complete_v2_index_and_feed() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
@@ -200,6 +205,7 @@ fn build_multifile_manifest_set_emits_complete_v2_index_and_feed() {
 }
 
 #[test]
+#[cfg(windows)]
 fn build_uses_declared_default_locale_and_embeds_other_localizations_once() {
     let temp = TempDirectory::new();
     let input = temp.path.join("manifests");
@@ -250,6 +256,7 @@ fn build_uses_declared_default_locale_and_embeds_other_localizations_once() {
 }
 
 #[test]
+#[cfg(windows)]
 fn build_preserves_schema_string_scalars_in_canonical_manifest_output() {
     let temp = TempDirectory::new();
     let input = temp.path.join("manifests");
@@ -311,6 +318,7 @@ ManifestVersion: 1.9.0
 }
 
 #[test]
+#[cfg(windows)]
 fn equivalent_input_trees_produce_the_same_build_identifier() {
     let temp = TempDirectory::new();
     let first_input = copy_fixture("multi", &temp.path.join("first"));
@@ -334,11 +342,8 @@ fn diff_reports_raw_content_additions_changes_and_removals() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
     let state = temp.path.join("state");
-    build(&BuildOptions {
-        input: input.clone(),
-        state: state.clone(),
-    })
-    .expect("initial fixture should build");
+    let build_id = create_inventory_state(&input, &state);
+    let original_database = fs::read(state.join("publisher.db")).expect("inventory state");
     let unchanged = diff(&BuildOptions {
         input: input.clone(),
         state: state.clone(),
@@ -347,6 +352,7 @@ fn diff_reports_raw_content_additions_changes_and_removals() {
     assert!(unchanged.added.is_empty());
     assert!(unchanged.changed.is_empty());
     assert!(unchanged.removed.is_empty());
+    assert_eq!(unchanged.last_build_id.as_deref(), Some(build_id.as_str()));
 
     let changed_manifest = input.join("Pinget.Test.Matrix_1.10.0.locale.en-US.yaml");
     let mut changed_content = fs::read_to_string(&changed_manifest).expect("fixture should be readable");
@@ -359,11 +365,81 @@ fn diff_reports_raw_content_additions_changes_and_removals() {
     .expect("new manifest should be written");
     fs::remove_file(input.join("Pinget.Test.Matrix_1.9.0.yaml")).expect("old version fixture should be removed");
 
-    let changes = diff(&BuildOptions { input, state }).expect("changed input should diff");
+    let changes = diff(&BuildOptions {
+        input,
+        state: state.clone(),
+    })
+    .expect("changed input should diff");
     assert_eq!(changes.added, ["Pinget.Test.Added.yaml"]);
     assert_eq!(changes.changed, ["Pinget.Test.Matrix_1.10.0.locale.en-US.yaml"]);
     assert_eq!(changes.removed, ["Pinget.Test.Matrix_1.9.0.yaml"]);
     assert!(!changes.last_build_published);
+    assert_eq!(
+        fs::read(state.join("publisher.db")).expect("unchanged inventory state"),
+        original_database
+    );
+    assert!(
+        !state.join("builds").exists(),
+        "diff must not require or generate native artifacts"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn non_windows_build_rejects_native_compression_while_diff_succeeds() {
+    let temp = TempDirectory::new();
+    let input = copy_fixture("multi", &temp.path.join("manifests"));
+    let failed_state = temp.path.join("native-state");
+    let error = build(&BuildOptions {
+        input: input.clone(),
+        state: failed_state.clone(),
+    })
+    .expect_err("native writer must not claim support on a non-Windows host");
+    match error {
+        PublisherError::Tool(message) => {
+            assert!(message.contains("native WinGet MSZIP compression"));
+            assert!(message.contains("only on Windows"));
+        }
+        other => panic!("expected native capability error, got {other}"),
+    }
+    assert!(
+        !failed_state.join("publisher.db").exists(),
+        "failed native build must not record a snapshot"
+    );
+    assert_eq!(
+        fs::read_dir(failed_state.join("builds"))
+            .expect("snapshot directory")
+            .count(),
+        0,
+        "failed native build must clean private staging"
+    );
+    let state = temp.path.join("inventory-state");
+    create_empty_state(&state);
+    let original = fs::read(state.join("publisher.db")).expect("inventory state");
+    let changes = diff(&BuildOptions {
+        input,
+        state: state.clone(),
+    })
+    .expect("diff must not call native compression");
+    assert_eq!(
+        changes.added,
+        [
+            "Pinget.Test.Matrix_1.10.0.installer.yaml",
+            "Pinget.Test.Matrix_1.10.0.locale.en-US.yaml",
+            "Pinget.Test.Matrix_1.10.0.locale.fr-FR.yaml",
+            "Pinget.Test.Matrix_1.10.0.version.yaml",
+            "Pinget.Test.Matrix_1.9.0.yaml",
+        ]
+    );
+    assert!(changes.changed.is_empty());
+    assert!(changes.removed.is_empty());
+    assert_eq!(changes.last_build_id, None);
+    assert!(!changes.last_build_published);
+    assert_eq!(
+        fs::read(state.join("publisher.db")).expect("inventory state preserved"),
+        original
+    );
+    assert!(!state.join("builds").exists());
 }
 
 #[test]
@@ -386,18 +462,17 @@ fn readonly_state_commands_do_not_initialize_missing_state() {
 
 #[test]
 fn read_only_operations_reject_reparse_points_and_state_overlap() {
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as symlink_dir;
+        #[cfg(windows)]
         use std::os::windows::fs::symlink_dir;
 
         let temp = TempDirectory::new();
         let input = copy_fixture("multi", &temp.path.join("manifests"));
         let state = temp.path.join("state");
-        let report = build(&BuildOptions {
-            input: input.clone(),
-            state: state.clone(),
-        })
-        .expect("fixture should build before reparse checks");
+        create_empty_state(&state);
         let input_link = temp.path.join("manifests-link");
         let state_link = temp.path.join("state-link");
         symlink_dir(&input, &input_link).expect("input directory symlink should be available");
@@ -406,29 +481,45 @@ fn read_only_operations_reject_reparse_points_and_state_overlap() {
             input: input_link,
             state,
         };
-        assert!(diff(&diff_options).is_err());
-        assert!(status(&state_link).is_err());
-        assert!(verify(&state_link, Some(&report.build_id), None).is_err());
-        fs::remove_dir(&diff_options.input).expect("input symlink should be removed");
-        fs::remove_dir(state_link).expect("state symlink should be removed");
+        for error in [
+            diff(&diff_options).expect_err("diff must reject symlink input"),
+            status(&state_link).expect_err("status must reject symlink state"),
+            verify(&state_link, None, None).expect_err("verify must reject symlink state"),
+        ] {
+            assert!(
+                error.to_string().contains("reparse points"),
+                "unexpected symlink rejection: {error}"
+            );
+        }
+        #[cfg(windows)]
+        {
+            fs::remove_dir(&diff_options.input).expect("input directory symlink should be removed");
+            fs::remove_dir(state_link).expect("state directory symlink should be removed");
+        }
+        #[cfg(unix)]
+        {
+            fs::remove_file(&diff_options.input).expect("input symlink should be unlinked");
+            fs::remove_file(state_link).expect("state symlink should be unlinked");
+        }
     }
 
     let temp = TempDirectory::new();
-    let input = copy_fixture("multi", &temp.path.join("manifests"));
     let state = temp.path.join("state");
-    let report = build(&BuildOptions {
-        input,
-        state: state.clone(),
-    })
-    .expect("fixture should build before overlap check");
-    let nested_input = state.join("builds").join(&report.build_id).join("feed");
+    create_empty_state(&state);
+    let original_database = fs::read(state.join("publisher.db")).expect("state database");
+    let nested_input = state.join("nested-input");
+    fs::create_dir(&nested_input).expect("overlapping input directory");
     let error = diff(&BuildOptions {
         input: nested_input,
         state: state.clone(),
     })
     .expect_err("diff must reject an input root nested inside its state root");
     assert!(error.to_string().to_ascii_lowercase().contains("overlap"));
-    assert!(verify(&state, Some(&report.build_id), None).is_ok());
+    assert_eq!(
+        fs::read(state.join("publisher.db")).expect("preserved state"),
+        original_database
+    );
+    assert_eq!(status(&state).expect("preserved valid state").build_count, 0);
 }
 
 #[test]
@@ -436,11 +527,7 @@ fn build_rejects_future_sqlite_user_version_without_mutating_state() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
     let state = temp.path.join("state");
-    build(&BuildOptions {
-        input: input.clone(),
-        state: state.clone(),
-    })
-    .expect("initial fixture should create state");
+    create_empty_state(&state);
     let database_path = state.join("publisher.db");
     {
         let database = Connection::open(&database_path).expect("state database should open");
@@ -466,11 +553,7 @@ fn build_rejects_legacy_artifact_format_state_without_mutating_it() {
         let temp = TempDirectory::new();
         let input = copy_fixture("multi", &temp.path.join("manifests"));
         let state = temp.path.join("state");
-        build(&BuildOptions {
-            input: input.clone(),
-            state: state.clone(),
-        })
-        .expect("current-format fixture should create state");
+        create_empty_state(&state);
         let database_path = state.join("publisher.db");
         {
             let database = Connection::open(&database_path).expect("state database should open");
@@ -509,6 +592,7 @@ fn build_rejects_legacy_artifact_format_state_without_mutating_it() {
 }
 
 #[test]
+#[cfg(windows)]
 fn verify_rejects_legacy_artifact_format_snapshot_without_mutating_it() {
     for format_version in [None, Some(1), Some(999)] {
         let temp = TempDirectory::new();
@@ -578,6 +662,7 @@ fn build_rejects_foreign_sqlite_state_without_mutating_it() {
 }
 
 #[test]
+#[cfg(windows)]
 fn build_preserves_stale_staging_owned_by_another_attempt_and_completes_snapshot() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
@@ -731,6 +816,7 @@ fn existing_writer_lock_prevents_build_mutation() {
 }
 
 #[test]
+#[cfg(windows)]
 fn publish_unsigned_is_idempotent_and_excludes_staging_files_from_inventory() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
@@ -788,6 +874,7 @@ fn publish_unsigned_is_idempotent_and_excludes_staging_files_from_inventory() {
 }
 
 #[test]
+#[cfg(windows)]
 fn publish_rejects_downgrade_and_retains_immutable_artifacts_on_update() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
@@ -872,6 +959,7 @@ fn publish_rejects_downgrade_and_retains_immutable_artifacts_on_update() {
 }
 
 #[test]
+#[cfg(windows)]
 fn publish_rejects_unowned_destination_without_overwriting_unrelated_file() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
@@ -911,6 +999,7 @@ fn publish_rejects_unowned_destination_without_overwriting_unrelated_file() {
 }
 
 #[test]
+#[cfg(windows)]
 fn publish_rejects_identity_change_and_untracked_artifact_without_mutation() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
@@ -988,6 +1077,7 @@ fn publish_rejects_identity_change_and_untracked_artifact_without_mutation() {
 }
 
 #[test]
+#[cfg(windows)]
 fn publish_failed_packaging_tool_does_not_publish_or_record_build() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
@@ -1221,6 +1311,7 @@ fn publish_destination_lock_serializes_different_state_roots_and_allows_retry() 
 }
 
 #[test]
+#[cfg(windows)]
 fn verify_rejects_corrupted_snapshot_sidecar_and_index() {
     for (component, location) in [
         ("snapshot", ""),
@@ -1259,13 +1350,8 @@ fn verify_rejects_corrupted_snapshot_sidecar_and_index() {
 #[test]
 fn status_rejects_corrupted_state_database_without_reinitializing_it() {
     let temp = TempDirectory::new();
-    let input = copy_fixture("multi", &temp.path.join("manifests"));
     let state = temp.path.join("state");
-    build(&BuildOptions {
-        input,
-        state: state.clone(),
-    })
-    .expect("fixture should build before state corruption");
+    create_empty_state(&state);
     let database = state.join("publisher.db");
     let corrupted = b"not a sqlite database";
     fs::write(&database, corrupted).expect("state database should be corrupted");
@@ -1275,6 +1361,54 @@ fn status_rejects_corrupted_state_database_without_reinitializing_it() {
         fs::read(&database).expect("corrupted database should remain in place"),
         corrupted
     );
+}
+
+fn create_empty_state(state: &Path) {
+    fs::create_dir_all(state).expect("inventory state directory");
+    let database = Connection::open(state.join("publisher.db")).expect("inventory state database");
+    // Read-only inventory operations require state records, not native index/feed artifacts.
+    database
+        .execute_batch(
+            "PRAGMA user_version=1;
+         CREATE TABLE metadata(name TEXT PRIMARY KEY NOT NULL,value TEXT NOT NULL) WITHOUT ROWID;
+         CREATE TABLE builds(id TEXT PRIMARY KEY NOT NULL,inventory TEXT NOT NULL,summary TEXT NOT NULL) WITHOUT ROWID;
+         INSERT INTO metadata VALUES('schemaVersion','1'),('artifactFormatVersion','2');",
+        )
+        .expect("independent state fixture schema");
+}
+
+fn create_inventory_state(input: &Path, state: &Path) -> String {
+    create_empty_state(state);
+    let initial = diff(&BuildOptions {
+        input: input.to_path_buf(),
+        state: state.to_path_buf(),
+    })
+    .expect("scan manifest inventory without compression");
+    let inventory: BTreeMap<_, _> = initial
+        .added
+        .into_iter()
+        .map(|relative| {
+            let hash = sha256_file(&input.join(&relative));
+            (relative, hash)
+        })
+        .collect();
+    let inventory = serde_json::to_string(&inventory).expect("inventory JSON");
+    let build_id = sha256_hex(format!("pinget-publisher-state-v2\n{inventory}").as_bytes());
+    let database = Connection::open(state.join("publisher.db")).expect("inventory database");
+    database
+        .execute(
+            "INSERT INTO builds(id,inventory,summary) VALUES(?1,?2,?3)",
+            rusqlite::params![
+                build_id,
+                inventory,
+                r#"{"createdUtc":"2026-01-01T00:00:00Z","manifestCount":5,"packageCount":1}"#
+            ],
+        )
+        .expect("independent inventory record");
+    database
+        .execute("INSERT INTO metadata VALUES('lastBuildId',?1)", [&build_id])
+        .expect("latest inventory record");
+    build_id
 }
 
 fn apply_mutation(input: &Path, mutation: &str) {
@@ -1346,6 +1480,7 @@ fn apply_mutation(input: &Path, mutation: &str) {
     }
 }
 
+#[cfg(windows)]
 fn unsigned_publish_options(state: &Path, destination: &Path, version: &str, build_id: &str) -> PublishOptions {
     let makeappx = makeappx_tool();
     PublishOptions {
@@ -1362,6 +1497,7 @@ fn unsigned_publish_options(state: &Path, destination: &Path, version: &str, bui
     }
 }
 
+#[cfg(windows)]
 fn makeappx_tool() -> PathBuf {
     if let Some(path) = doctor().makeappx_path.filter(|path| path.is_file()) {
         return path;
@@ -1404,6 +1540,7 @@ fn singleton_manifest(id: &str, version: &str) -> String {
     )
 }
 
+#[cfg(windows)]
 fn write_locale_order_manifests(input: &Path, id: &str) {
     for (suffix, locale, publisher, name, kind) in [
         (
@@ -1487,6 +1624,7 @@ fn copy_directory(source: &Path, destination: &Path) {
     }
 }
 
+#[cfg(windows)]
 fn find_first_file(directory: &Path) -> PathBuf {
     let mut pending = vec![directory.to_path_buf()];
     while let Some(current) = pending.pop() {
@@ -1502,6 +1640,7 @@ fn find_first_file(directory: &Path) -> PathBuf {
     panic!("expected at least one snapshot file");
 }
 
+#[cfg(windows)]
 fn count_files_with_extension(directory: &Path, extension: &str) -> usize {
     let mut pending = vec![directory.to_path_buf()];
     let mut count = 0;
@@ -1528,6 +1667,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     encode_hex(&Sha256::digest(bytes))
 }
 
+#[cfg(windows)]
 fn read_correlations(database: &Connection, table: &str, column: &str) -> Vec<String> {
     let query = format!(
         "SELECT {column} FROM {table} AS valuesTable \
@@ -1542,6 +1682,7 @@ fn read_correlations(database: &Connection, table: &str, column: &str) -> Vec<St
         .expect("correlation rows should decode")
 }
 
+#[cfg(windows)]
 fn read_mapped_values(
     database: &Connection,
     value_table: &str,
