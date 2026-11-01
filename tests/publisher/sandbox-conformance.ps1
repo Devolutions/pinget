@@ -8,6 +8,7 @@ param(
     [string] $ExecutionTarget = 'EphemeralHost',
     [switch] $AllowEphemeralHostMutations,
     [string] $ExpectedWinGetVersion = '1.29.380.0',
+    [string] $ExpectedWinGetClientVersion,
     [string] $PublisherCliPath,
     [string] $PublisherStateDirectory,
     [string] $PublisherInputDirectory,
@@ -643,7 +644,11 @@ try {
         $script:winget = $command.Source
     }
     $versionOutput = & $script:winget --version 2>&1
-    $expectedClientVersion = $ExpectedWinGetVersion -replace '\.0$', ''
+    $expectedClientVersion = if ([string]::IsNullOrWhiteSpace($ExpectedWinGetClientVersion)) {
+        $ExpectedWinGetVersion -replace '\.0$', ''
+    } else {
+        $ExpectedWinGetClientVersion
+    }
     if ($LASTEXITCODE -ne 0 -or ($versionOutput -join '') -notmatch [regex]::Escape($expectedClientVersion)) {
         throw "Unexpected WinGet client version: $($versionOutput -join ' ')"
     }

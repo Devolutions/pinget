@@ -42,6 +42,12 @@ $wingetCommand = Get-Command winget.exe -ErrorAction SilentlyContinue
 if ($null -eq $wingetCommand) {
     throw 'The GitHub-hosted Windows runner does not expose the stock winget.exe execution alias.'
 }
+$clientVersionOutput = & $wingetCommand.Source --version 2>&1
+if ($LASTEXITCODE -ne 0 -or ($clientVersionOutput -join '').Trim() -notmatch '^v(\d+\.\d+\.\d+)$') {
+    throw "Could not identify the stock WinGet client version: $($clientVersionOutput -join ' ')"
+}
+$clientVersion = $Matches[1]
+Write-Output "Stock App Installer package $($appInstaller.Version); WinGet client $clientVersion."
 
 $workRoot = Join-Path $env:RUNNER_TEMP "pinget-stock-gate-$([Guid]::NewGuid().ToString('N'))"
 $signerPfxPath = Join-Path $workRoot 'publisher-signing.pfx'
@@ -272,6 +278,7 @@ try {
             -ExecutionTarget EphemeralHost `
             -AllowEphemeralHostMutations `
             -ExpectedWinGetVersion $appInstaller.Version.ToString() `
+            -ExpectedWinGetClientVersion $clientVersion `
             -SignerCertificatePath $signerCertificatePath `
             -PublisherCliPath $publisher.Cli `
             -PublisherStateDirectory $stateDirectory `
