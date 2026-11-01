@@ -189,8 +189,14 @@ readers consumed both publishers' 500-version feeds and selected `1.0.499`,
 exercising multi-block MSZIP sidecars end to end. These results establish the
 tested client/toolchain baseline, not universal compatibility with older
 clients or every manifest field. Current artifact-format-v2 outputs passed
-the local exact-byte comparison and independent SQLite/MSZIP checks, but
-have not received a fresh signed stock-client acceptance run.
+the local exact-byte comparison and independent SQLite/MSZIP checks.
+Hardened signed outputs from both publishers also passed stock WinGet
+**1.11.510** (App Installer **1.26.510.0**) on a disposable GitHub-hosted
+Windows runner. That gate covers source add/update, search/show, multi-block
+version data, hash-verified download, version bumps, package additions/removals
+and cached-index metadata retention. It generates short-lived signing and TLS
+credentials under runner temporary storage, then verifies temporary source and
+certificate cleanup. No Sandbox or developer-host trust changes are needed.
 
 Failure tests cover packaging/signing errors, update promotion rollback and
 destination locking. The .NET publisher also has an end-to-end regression

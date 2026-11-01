@@ -304,7 +304,7 @@ try {
     }
 
     $gateSucceeded = $true
-    Write-Output "PASS signed stock WinGet conformance for Rust and .NET on GitHub runner with WinGet $($appInstaller.Version)."
+    Write-Output "PASS signed stock WinGet conformance for Rust and .NET on GitHub runner with WinGet $clientVersion (App Installer $($appInstaller.Version))."
 }
 finally {
     $cleanupErrors = [System.Collections.Generic.List[string]]::new()
