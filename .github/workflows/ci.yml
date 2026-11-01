@@ -70,6 +70,12 @@ jobs:
       - name: Test pinget-cli
         run: cargo test -p pinget-cli --manifest-path rust/Cargo.toml
 
+      - name: Test pinget-publisher
+        run: cargo test -p pinget-publisher --manifest-path rust/Cargo.toml
+
+      - name: Check publisher documentation
+        run: cargo doc -p pinget-publisher --manifest-path rust/Cargo.toml --no-deps
+
       - name: Build pinget-cli
         run: cargo build -p pinget-cli --manifest-path rust/Cargo.toml
 
@@ -107,6 +113,27 @@ jobs:
       - name: Run core tests
         run: dotnet test dotnet/src/Devolutions.Pinget.Core.Tests/Devolutions.Pinget.Core.Tests.csproj -c Release --no-build
 
+      - name: Run publisher tests
+        run: dotnet test dotnet/src/Devolutions.Pinget.Publisher.Tests/Devolutions.Pinget.Publisher.Tests.csproj -c Release
+
+      - name: Run Rust and .NET publisher interoperability
+        shell: pwsh
+        run: |
+          cargo build --manifest-path rust/Cargo.toml -p pinget-cli --release
+          if ($LASTEXITCODE -ne 0) { throw 'Rust publisher CLI build failed.' }
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $makeAppx = Get-ChildItem -LiteralPath $sdkRoot -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64\makeappx.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+          if (-not $makeAppx) { throw 'Windows SDK MakeAppx was not found.' }
+          & .\tests\publisher\run-production-conformance.ps1 `
+            -RustCli .\rust\target\release\pinget.exe `
+            -DotnetAssembly .\dotnet\src\Devolutions.Pinget.Cli\bin\Release\net10.0\pinget.dll `
+            -MakeAppxPath $makeAppx
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher interoperability checks failed.' }
+
       - name: Build native COM DLLs
         shell: pwsh
         env:
@@ -124,8 +151,77 @@ jobs:
         run: |
           New-Item -Path artifacts/ci-nuget -ItemType Directory -Force | Out-Null
           dotnet pack dotnet/src/Devolutions.Pinget.Core/Devolutions.Pinget.Core.csproj -c Release --no-build -o artifacts/ci-nuget
+          dotnet pack dotnet/src/Devolutions.Pinget.Publisher/Devolutions.Pinget.Publisher.csproj -c Release --no-build -o artifacts/ci-nuget
           dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Engine/Devolutions.Pinget.PowerShell.Engine.csproj -c Release --no-build -o artifacts/ci-nuget
 
       - name: Validate PowerShell module packaging
         shell: pwsh
         run: pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts/Build-PowerShellModule.ps1') -NoBuild -OutputRoot artifacts/ci-powershell -Clean
+
+  stock-winget-acceptance:
+    name: Signed stock WinGet acceptance (ephemeral runner)
+    runs-on: windows-latest
+    needs:
+      - dotnet
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          rustup default stable
+
+      - name: Build disposable x64 publisher CLIs
+        shell: pwsh
+        run: |
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'scripts/Build-CliNativeNuGetPackages.ps1') `
+            -Package All `
+            -RustRuntimeIdentifiers 'win-x64' `
+            -DotNetRuntimeIdentifiers 'win-x64' `
+            -NoPack `
+            -Clean `
+            -StagingRoot artifacts/ci-stock-winget `
+            -OutputRoot artifacts/ci-stock-winget-packages
+          if ($LASTEXITCODE -ne 0) { throw 'Building the disposable x64 publisher CLIs failed.' }
+
+      - name: Run signed stock WinGet acceptance with runner-local credentials
+        shell: pwsh
+        run: |
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $sdkTools = Get-ChildItem -LiteralPath $sdkRoot -Directory |
+            Sort-Object Name -Descending |
+            ForEach-Object {
+              [pscustomobject]@{
+                MakeAppx = Join-Path $_.FullName 'x64\makeappx.exe'
+                SignTool = Join-Path $_.FullName 'x64\signtool.exe'
+              }
+            } |
+            Where-Object {
+              (Test-Path -LiteralPath $_.MakeAppx) -and
+              (Test-Path -LiteralPath $_.SignTool)
+            } |
+            Select-Object -First 1
+          if (-not $sdkTools) { throw 'Windows SDK MakeAppx and SignTool were not found.' }
+
+          pwsh -NoLogo -NoProfile -File (Resolve-Path 'tests/publisher/run-ephemeral-host-publisher-gate.ps1') `
+            -RustCliPath (Resolve-Path 'artifacts/ci-stock-winget/rust/win-x64/pinget.exe') `
+            -DotnetCliPath (Resolve-Path 'artifacts/ci-stock-winget/dotnet-nativeaot/win-x64/pinget.exe') `
+            -MakeAppxPath $sdkTools.MakeAppx `
+            -SignToolPath $sdkTools.SignTool
+          if ($LASTEXITCODE -ne 0) { throw 'Signed stock WinGet acceptance failed.' }
+
+      - name: Remove disposable build outputs
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath 'artifacts/ci-stock-winget' -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath 'artifacts/ci-stock-winget-packages' -Recurse -Force -ErrorAction SilentlyContinue

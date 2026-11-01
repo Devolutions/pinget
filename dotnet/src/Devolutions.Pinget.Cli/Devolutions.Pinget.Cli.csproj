@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Devolutions.Pinget.Core\Devolutions.Pinget.Core.csproj" />
+    <ProjectReference Include="..\Devolutions.Pinget.Publisher\Devolutions.Pinget.Publisher.csproj" />
   </ItemGroup>
 
   <ItemGroup>

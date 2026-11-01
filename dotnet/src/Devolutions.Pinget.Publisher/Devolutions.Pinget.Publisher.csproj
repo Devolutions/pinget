@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>true</IsPackable>
+    <AssemblyName>Devolutions.Pinget.Publisher</AssemblyName>
+    <RootNamespace>Pinget.Publisher</RootNamespace>
+    <PackageId>Devolutions.Pinget.Publisher</PackageId>
+    <Description>Native WinGet v2 preindexed source publisher for Pinget.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Devolutions.Pinget.Core\Devolutions.Pinget.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.7" />
+    <PackageReference Include="YamlDotNet" Version="17.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Sql\*.sql" />
+  </ItemGroup>
+
+</Project>

@@ -43,6 +43,34 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use winreg::{RegKey, enums::*};
 use zip::ZipArchive;
 
+/// Normalized fields used by WinGet's installed-package identity correlation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogNameNormalization {
+    /// Name value used by the v2 `norm_names2` correlation table.
+    pub name: String,
+    /// Architecture suffix recognized by the normalizer, when present.
+    pub architecture: String,
+    /// Locale suffix recognized by the normalizer, when present.
+    pub locale: String,
+}
+
+/// Normalizes a package display name with Pinget's WinGet-compatible algorithm.
+#[must_use]
+pub fn normalize_catalog_name(value: &str) -> CatalogNameNormalization {
+    let normalized = name_normalization::normalize_name(value);
+    CatalogNameNormalization {
+        name: normalized.name,
+        architecture: format!("{:?}", normalized.architecture).to_ascii_lowercase(),
+        locale: normalized.locale,
+    }
+}
+
+/// Normalizes a publisher with Pinget's WinGet-compatible algorithm.
+#[must_use]
+pub fn normalize_catalog_publisher(value: &str) -> String {
+    name_normalization::normalize_publisher(value)
+}
+
 const DEFAULT_MARKET: &str = "US";
 const DEFAULT_MAX_RESULTS: usize = 50;
 const LIST_LOOKUP_MAX_RESULTS: usize = 500;
@@ -8317,7 +8345,20 @@ fn extract_zip_member(bytes: &[u8], member_name: &str) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Signature of the Windows Compression API buffer framing used by WinGet `.mszyml` files.
+const COMPRESSION_API_SIGNATURE: [u8; 4] = [0x0a, 0x51, 0xe5, 0xc0];
+/// Size of the Compression API header: signature, 4 header bytes, u64 content size, u64 block size.
+const COMPRESSION_API_HEADER_LEN: usize = 24;
+/// MSZIP limits each block to 32 KiB of output and keeps a 32 KiB history window across blocks.
+const MSZIP_BLOCK_SIZE: usize = 32 * 1024;
+/// Upper bound on decoded version-data sidecars, including legacy unframed input.
+const MAX_MSZYML_SIZE: usize = 64 * 1024 * 1024;
+
 fn decompress_mszyml(bytes: &[u8]) -> Result<String> {
+    if bytes.starts_with(&COMPRESSION_API_SIGNATURE) {
+        let output = decompress_compression_api_mszip(bytes)?;
+        return String::from_utf8(output).context("MSZIP payload is not valid UTF-8");
+    }
     if let Ok(output) = decompress_mszyml_payload(if bytes.starts_with(b"CK") { &bytes[2..] } else { bytes }) {
         return Ok(output);
     }
@@ -8331,10 +8372,80 @@ fn decompress_mszyml(bytes: &[u8]) -> Result<String> {
     decompress_mszyml_payload(bytes).context("failed to decompress MSZIP payload")
 }
 
+/// Decodes every `[u32 length]["CK" + deflate]` block of a Compression API MSZIP buffer.
+///
+/// Each block may back-reference the previous block's output, so the history window is
+/// replayed ahead of the block as an uncompressed deflate block.
+fn decompress_compression_api_mszip(bytes: &[u8]) -> Result<Vec<u8>> {
+    let read_u64 = |offset: usize| -> Result<usize> {
+        let field: [u8; 8] = bytes
+            .get(offset..offset + 8)
+            .and_then(|slice| slice.try_into().ok())
+            .context("truncated MSZIP header")?;
+        usize::try_from(u64::from_le_bytes(field)).context("MSZIP header size is too large")
+    };
+    let expected_len = read_u64(8)?;
+    if expected_len > MAX_MSZYML_SIZE {
+        bail!("MSZIP payload exceeds the 64 MiB decoded size limit");
+    }
+    let block_size = read_u64(16)?;
+    if block_size == 0 || block_size > MSZIP_BLOCK_SIZE {
+        bail!("unsupported MSZIP block size {block_size}");
+    }
+    let mut output = Vec::with_capacity(expected_len.min(MSZIP_BLOCK_SIZE));
+    let mut offset = COMPRESSION_API_HEADER_LEN;
+    while offset < bytes.len() {
+        let length_field: [u8; 4] = bytes
+            .get(offset..offset + 4)
+            .and_then(|slice| slice.try_into().ok())
+            .context("truncated MSZIP block length")?;
+        let block_len = usize::try_from(u32::from_le_bytes(length_field)).context("MSZIP block length is too large")?;
+        offset += 4;
+        let end = offset.checked_add(block_len).context("MSZIP block length overflow")?;
+        let block = bytes.get(offset..end).context("truncated MSZIP block")?;
+        offset = end;
+        let deflate = block
+            .strip_prefix(b"CK")
+            .context("MSZIP block is missing its CK signature")?;
+
+        let history = &output[output.len().saturating_sub(MSZIP_BLOCK_SIZE)..];
+        let history_len = u16::try_from(history.len()).context("MSZIP history window is too large")?;
+        let mut stream = Vec::with_capacity(5 + history.len());
+        stream.push(0x00);
+        stream.extend_from_slice(&history_len.to_le_bytes());
+        stream.extend_from_slice(&(!history_len).to_le_bytes());
+        stream.extend_from_slice(history);
+
+        let mut decoded = Vec::with_capacity(history.len() + block_size);
+        flate2::read::DeflateDecoder::new(stream.as_slice().chain(deflate))
+            .take((history.len() + block_size + 1) as u64)
+            .read_to_end(&mut decoded)
+            .context("failed to decompress MSZIP block")?;
+        let produced = decoded.len() - history.len();
+        if produced == 0 || produced > block_size {
+            bail!("MSZIP block produced {produced} bytes; expected 1..={block_size}");
+        }
+        if output.len() + produced > expected_len {
+            bail!("MSZIP payload exceeds its declared size of {expected_len} bytes");
+        }
+        output.extend_from_slice(&decoded[history.len()..]);
+    }
+    if output.len() != expected_len {
+        bail!(
+            "MSZIP payload produced {} bytes; header declares {expected_len}",
+            output.len()
+        );
+    }
+    Ok(output)
+}
+
 fn decompress_mszyml_payload(payload: &[u8]) -> Result<String> {
-    let mut decoder = flate2::read::DeflateDecoder::new(payload);
+    let mut decoder = flate2::read::DeflateDecoder::new(payload).take((MAX_MSZYML_SIZE + 1) as u64);
     let mut output = String::new();
     decoder.read_to_string(&mut output)?;
+    if output.len() > MAX_MSZYML_SIZE {
+        bail!("MSZIP payload exceeds the 64 MiB decoded size limit");
+    }
     Ok(output)
 }
 
@@ -13976,6 +14087,99 @@ Installers:
         let decompressed = decompress_mszyml(&mszip).expect("decompress");
         let parsed = serde_yaml::from_str::<PackageVersionDataDocument>(&decompressed).expect("parse");
         assert_eq!(parsed.versions[0].version, "1.2.3");
+    }
+
+    /// Native Windows Compression API MSZIP output with three blocks whose later blocks
+    /// back-reference the previous block's history.
+    const NATIVE_MULTI_BLOCK_MSZIP_HEX: &[&str] = &[
+        "0a51e5c018005202b03001000000000000800000000000009f010000434bedd4bb8d10410044419f2808819d9dcf6e40",
+        "08e19c30c85fa7f31e1221547bed3dabfefcfef8f5f3eff71f5ffb9673f58c9ebb67f6ac9edd737a9e9e37e76ac1d582",
+        "ab05570bae165c2db85a70b5e06ac1d582d182d182d182d182d182d182d182d182d182d182bb05770bee16dc2db85b70",
+        "b7e06ec1dd82bb05770b660b660b660b660b660b660b660b660b660b660b560b560b560b560b560b560b560b560b560b",
+        "560b760b760b760b760b760b760b760b760b760b760b4e0b4e0b4e0b4e0b4e0b4e0b4e0b4e0b4e0b4e0b9e163c2d785a",
+        "f0b4e069c1d382a7054f0b9e163c2d785bf0b6e06dc1db82b7056f0bde7f44821dec60073bd8c10e76b0831dec60073b",
+        "d8c10e76b0831dec60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8c10e76",
+        "b0831dec60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8c10e76b0831dec",
+        "60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8",
+        "c10e76b0831decfe87dd27c3000000434bedd42101000000c3a0bc37eb2f5f0442203bd9c94e76b2939dec64273bd9c9",
+        "4e76b2939dec64273bd9c94e76b2939dec64273bd9c94e76b2939dec64273bd9c94e76b2939dec64273bd9c94e76b293",
+        "9dec64273bd9c94e76b2939dec64273bd9c94e76b2939dec64273bd9c94e76b2939dec64273bd9c94e76b2939dec6427",
+        "3bd9c94e76b2939dec64273bd9c94e76b2939dec64273bd9c94e76b2939dec64273bd9c94e76b2939dec64273bd9c94e",
+        "76b2939dec64273bd9c94e76b2939decd60157000000434bedd6310d00000080a0fead2de1490906ec60073bd8991dec",
+        "60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8c10e76b0831dec60073bd8",
+        "c10e76b0831dec6007bb1bbb00",
+    ];
+
+    #[test]
+    fn decompresses_native_multi_block_mszyml() {
+        let hex: String = NATIVE_MULTI_BLOCK_MSZIP_HEX.concat();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("valid hex"))
+            .collect();
+        let expected: String = (0..6000).map(|index| format!("pinget {:05}\n", index % 97)).collect();
+        assert_eq!(expected.len(), 78_000);
+
+        let output = decompress_mszyml(&bytes).expect("decompress multi-block payload");
+        assert_eq!(output, expected);
+
+        let truncated = &bytes[..bytes.len() - 10];
+        assert!(decompress_mszyml(truncated).is_err(), "truncated stream must fail");
+        assert!(
+            decompress_mszyml(&bytes[..COMPRESSION_API_HEADER_LEN - 4]).is_err(),
+            "truncated header must fail"
+        );
+
+        let mut wrong_size = bytes.clone();
+        wrong_size[8] ^= 1;
+        assert!(
+            decompress_mszyml(&wrong_size).is_err(),
+            "declared size mismatch must fail"
+        );
+
+        let mut oversized_block = bytes.clone();
+        oversized_block[16..24].copy_from_slice(&(64u64 * 1024).to_le_bytes());
+        assert!(
+            decompress_mszyml(&oversized_block).is_err(),
+            "block size above 32 KiB must fail"
+        );
+
+        let mut missing_ck = bytes.clone();
+        missing_ck[COMPRESSION_API_HEADER_LEN + 4] = b'X';
+        assert!(
+            decompress_mszyml(&missing_ck).is_err(),
+            "missing CK signature must fail"
+        );
+
+        let mut bad_block_length = bytes;
+        bad_block_length[COMPRESSION_API_HEADER_LEN..COMPRESSION_API_HEADER_LEN + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            decompress_mszyml(&bad_block_length).is_err(),
+            "block length past end must fail"
+        );
+    }
+
+    #[test]
+    fn mszyml_size_limit_rejects_hostile_header_before_allocation() {
+        let mut header = [0u8; COMPRESSION_API_HEADER_LEN];
+        header[..4].copy_from_slice(&COMPRESSION_API_SIGNATURE);
+        header[16..24].copy_from_slice(&(MSZIP_BLOCK_SIZE as u64).to_le_bytes());
+        header[8..16].copy_from_slice(&(MAX_MSZYML_SIZE as u64).to_le_bytes());
+        let boundary = decompress_mszyml(&header).expect_err("missing blocks");
+        assert!(
+            !boundary.to_string().contains("64 MiB"),
+            "boundary accepted; absent output rejected"
+        );
+        header[8..16].copy_from_slice(&((MAX_MSZYML_SIZE as u64) + 1).to_le_bytes());
+        assert!(
+            decompress_mszyml(&header)
+                .expect_err("size limit")
+                .to_string()
+                .contains("64 MiB")
+        );
+        header[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decompress_mszyml(&header).is_err(), "hostile size must not allocate");
     }
 
     #[test]

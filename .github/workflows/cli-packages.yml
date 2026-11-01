@@ -41,10 +41,10 @@ jobs:
             os: windows-latest
             rust-target: aarch64-pc-windows-msvc
           - rid: osx-x64
-            os: macos-14
+            os: macos-15
             rust-target: x86_64-apple-darwin
           - rid: osx-arm64
-            os: macos-14
+            os: macos-15
             rust-target: aarch64-apple-darwin
 
     steps:

@@ -61,13 +61,28 @@ Set-VersionInFile `
     -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
 
 Set-VersionInFile `
+    -RelativePath 'rust\crates\pinget-publisher\Cargo.toml' `
+    -Pattern '^(version\s*=\s*")[^"]+(")' `
+    -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
+
+Set-VersionInFile `
+    -RelativePath 'rust\crates\pinget-publisher\Cargo.toml' `
+    -Pattern '(pinget-core\s*=\s*\{\s*version\s*=\s*")[^"]+(")' `
+    -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
+
+Set-VersionInFile `
+    -RelativePath 'rust\crates\pinget-cli\Cargo.toml' `
+    -Pattern '(pinget-publisher\s*=\s*\{\s*version\s*=\s*")[^"]+(")' `
+    -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
+
+Set-VersionInFile `
     -RelativePath 'rust\crates\pinget-com\Cargo.toml' `
     -Pattern '^(version\s*=\s*")[^"]+(")' `
     -Replacement { param($match) "$($match.Groups[1].Value)$Version$($match.Groups[2].Value)" }
 
 $cargoLockPath = Join-Path $repoRoot 'rust\Cargo.lock'
 if (Test-Path -Path $cargoLockPath) {
-    foreach ($crateName in @('pinget-core', 'pinget-cli', 'pinget-com')) {
+    foreach ($crateName in @('pinget-core', 'pinget-cli', 'pinget-com', 'pinget-publisher')) {
         Set-VersionInFile `
             -RelativePath 'rust\Cargo.lock' `
             -Pattern "(\[\[package\]\]\r?\nname = `"$crateName`"\r?\nversion = `")[^`"]+(`")" `

@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Devolutions.Pinget.Core.Tests" />
+    <InternalsVisibleTo Include="Devolutions.Pinget.Publisher" />
   </ItemGroup>
 
   <ItemGroup>

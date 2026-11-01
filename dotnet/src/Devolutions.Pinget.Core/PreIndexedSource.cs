@@ -614,7 +614,14 @@ internal static class PreIndexedSource
 
     internal static string DecompressMszyml(byte[] bytes)
     {
-        // .mszyml files start with "CK" header then deflate-compressed data
+        // Windows framing carries block boundaries and MSZIP dictionary history.
+        if (bytes.AsSpan().StartsWith(new byte[] { 0x0a, 0x51, 0xe5, 0xc0 }))
+        {
+            var decompressed = NativeMsZip.DecompressManaged(bytes);
+            return System.Text.Encoding.UTF8.GetString(decompressed);
+        }
+
+        // Preserve support for legacy single-block CK/raw-deflate sources.
         byte[] payload;
         if (bytes.Length >= 2 && bytes[0] == (byte)'C' && bytes[1] == (byte)'K')
             payload = bytes[2..];

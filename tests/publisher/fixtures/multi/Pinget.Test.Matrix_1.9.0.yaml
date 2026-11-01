@@ -1,0 +1,17 @@
+PackageIdentifier: Pinget.Test.Matrix
+PackageVersion: 1.9.0
+PackageLocale: en-US
+Publisher: Pinget Test Fixtures
+PublisherUrl: https://example.invalid/
+PackageName: Matrix Package
+License: MIT
+ShortDescription: Previous version used to distinguish numeric version ordering
+AppsAndFeaturesEntries:
+  - DisplayVersion: 1.9.0
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.invalid/matrix-1.9.0.exe
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+ManifestType: singleton
+ManifestVersion: 1.9.0

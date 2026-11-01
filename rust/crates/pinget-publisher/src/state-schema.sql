@@ -1,0 +1,10 @@
+PRAGMA user_version=1;
+CREATE TABLE metadata(
+    name TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE builds(
+    id TEXT PRIMARY KEY NOT NULL,
+    inventory TEXT NOT NULL,
+    summary TEXT NOT NULL
+) WITHOUT ROWID;

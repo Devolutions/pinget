@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/pinget-core",
+    "crates/pinget-publisher",
     "crates/pinget-cli",
     "crates/pinget-com",
 ]

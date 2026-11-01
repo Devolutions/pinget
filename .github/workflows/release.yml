@@ -120,18 +120,20 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($Version)) {
             $coreVersion = Select-String -Path 'rust/crates/pinget-core/Cargo.toml' -Pattern '^version = "([^"]+)"$' | Select-Object -First 1
             $cliVersion = Select-String -Path 'rust/crates/pinget-cli/Cargo.toml' -Pattern '^version = "([^"]+)"$' | Select-Object -First 1
+            $publisherVersion = Select-String -Path 'rust/crates/pinget-publisher/Cargo.toml' -Pattern '^version = "([^"]+)"$' | Select-Object -First 1
             $dotnetVersion = Select-String -Path 'dotnet/src/Devolutions.Pinget.Cli/Program.cs' -Pattern '^const string Version = "([^"]+)";$' | Select-Object -First 1
 
-            if (($null -eq $coreVersion) -or ($null -eq $cliVersion) -or ($null -eq $dotnetVersion)) {
+            if (($null -eq $coreVersion) -or ($null -eq $cliVersion) -or ($null -eq $publisherVersion) -or ($null -eq $dotnetVersion)) {
               throw 'Unable to detect version from source files'
             }
 
             $coreVersionValue = $coreVersion.Matches[0].Groups[1].Value
             $cliVersionValue = $cliVersion.Matches[0].Groups[1].Value
+            $publisherVersionValue = $publisherVersion.Matches[0].Groups[1].Value
             $dotnetVersionValue = $dotnetVersion.Matches[0].Groups[1].Value
 
-            if (($coreVersionValue -ne $cliVersionValue) -or ($coreVersionValue -ne $dotnetVersionValue)) {
-              throw "Version mismatch detected: pinget-core=$coreVersionValue pinget-cli=$cliVersionValue dotnet=$dotnetVersionValue"
+            if (($coreVersionValue -ne $cliVersionValue) -or ($coreVersionValue -ne $publisherVersionValue) -or ($coreVersionValue -ne $dotnetVersionValue)) {
+              throw "Version mismatch detected: pinget-core=$coreVersionValue pinget-cli=$cliVersionValue pinget-publisher=$publisherVersionValue dotnet=$dotnetVersionValue"
             }
 
             $Version = $coreVersionValue
@@ -188,12 +190,12 @@ jobs:
             archive_name: pinget-windows-arm64.zip
             binary_name: pinget.exe
           - name: macos-x64
-            os: macos-14
+            os: macos-15
             target: x86_64-apple-darwin
             archive_name: pinget-macos-x64.zip
             binary_name: pinget
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             archive_name: pinget-macos-arm64.zip
             binary_name: pinget
@@ -374,6 +376,9 @@ jobs:
       - name: Run core tests
         run: dotnet test dotnet/src/Devolutions.Pinget.Core.Tests/Devolutions.Pinget.Core.Tests.csproj -c Release --no-build
 
+      - name: Run publisher tests
+        run: dotnet test dotnet/src/Devolutions.Pinget.Publisher.Tests/Devolutions.Pinget.Publisher.Tests.csproj -c Release
+
       - name: Build native COM DLLs
         shell: pwsh
         env:
@@ -443,6 +448,7 @@ jobs:
 
           $BinaryRoots = @(
             'dotnet/src/Devolutions.Pinget.Core/bin/Release',
+            'dotnet/src/Devolutions.Pinget.Publisher/bin/Release',
             'dotnet/src/Devolutions.Pinget.PowerShell.Engine/bin/Release',
             'dotnet/src/Devolutions.Pinget.PowerShell.Cmdlets/bin/Release',
             'rust/target/x86_64-pc-windows-msvc/release',
@@ -477,6 +483,7 @@ jobs:
           New-Item -Path dist/nuget -ItemType Directory -Force | Out-Null
           $packArgs = @('-c', 'Release', '--no-build', '-p:ContinuousIntegrationBuild=true', "-p:Version=$env:PACKAGE_VERSION", '-p:IncludeSymbols=true', '-p:SymbolPackageFormat=snupkg', '-o', 'dist/nuget')
           dotnet pack dotnet/src/Devolutions.Pinget.Core/Devolutions.Pinget.Core.csproj @packArgs
+          dotnet pack dotnet/src/Devolutions.Pinget.Publisher/Devolutions.Pinget.Publisher.csproj @packArgs
           dotnet pack dotnet/src/Devolutions.Pinget.PowerShell.Engine/Devolutions.Pinget.PowerShell.Engine.csproj @packArgs
 
       - name: Package PowerShell module

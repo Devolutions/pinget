@@ -1,0 +1,37 @@
+PackageIdentifier: Pinget.Test.Matrix
+PackageVersion: 1.10.0
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.invalid/matrix-1.10.0.exe
+    InstallerSha256: 1111111111111111111111111111111111111111111111111111111111111111
+    Scope: user
+    InstallerSwitches:
+      Silent: /quiet
+      SilentWithProgress: /quiet-progress
+      Interactive: /interactive
+    Dependencies:
+      PackageDependencies:
+        - PackageIdentifier: Pinget.Test.Runtime
+          MinimumVersion: 3.2.0
+    PackageFamilyName: pinget.matrix_1234567890abc
+    Commands:
+      - OtherCmd
+      - othercmd
+      - matrix
+      - ''
+    ProductCode: '{00112233-4455-6677-8899-aabbccddeeff}'
+    UpgradeCode: '{11223344-5566-7788-99aa-bbccddeeff00}'
+    AppsAndFeaturesEntries:
+      - DisplayName: Matrix Desktop
+        Publisher: Pinget Test Fixtures
+        DisplayVersion: 1.10.0
+        ProductCode: '{00112233-4455-6677-8899-AABBCCDDEEFF}'
+        UpgradeCode: '{11223344-5566-7788-99AA-BBCCDDEEFF00}'
+  - Architecture: x64
+    InstallerType: portable
+    InstallerUrl: https://example.invalid/matrix-portable-1.10.0.zip
+    InstallerSha256: 2222222222222222222222222222222222222222222222222222222222222222
+    PortableCommandAlias: matrix-portable
+ManifestType: installer
+ManifestVersion: 1.9.0

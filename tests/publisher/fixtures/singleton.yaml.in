@@ -1,0 +1,19 @@
+PackageIdentifier: Pinget.Contract.Singleton
+PackageVersion: 1.0.0
+PackageLocale: en-US
+Publisher: Pinget Test Fixtures
+PublisherUrl: https://example.invalid/
+PackageName: Pinget Contract Fixture
+License: MIT
+ShortDescription: Harmless locally authored publisher compatibility fixture
+Moniker: pinget-contract
+Tags:
+  - publisher-contract
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: {{INSTALLER_URL}}
+    InstallerSha256: {{INSTALLER_SHA256}}
+    Scope: user
+ManifestType: singleton
+ManifestVersion: 1.9.0
