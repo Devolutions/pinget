@@ -76,9 +76,10 @@ fixture signer in the Sandbox machine `Root` store; trusting it only in the
 Sandbox user's `TrustedPeople`/`Root` stores was insufficient (`0x800B0109`).
 The host certificate stores were not changed. The test adds/updates the source,
 searches and shows the fixture package, then downloads the harmless payload
-and verifies its expected SHA-256 without installing it. A Python SQLite read
-and native MSZIP round trip establish additional independent checks, but
-neither substitutes for the stock client.
+and verifies its expected SHA-256 without installing it. Independent
+PowerShell helpers inspect SQLite through the native SQLite API and perform a
+Windows Compression API MSZIP round trip. These additional checks do not
+substitute for the stock client.
 
 ## Non-upstream publisher policy (separate from the independent fixture gate)
 
@@ -140,8 +141,11 @@ schema and does not require this snapshot-format field.
 
 Cross-language comparisons pin canonical manifest bytes, raw input inventory,
 logical SQLite index contents, version-data sidecars and their hashes, and the
-snapshot `indexHash`. They also validate the resulting SQLite tables with
-Python's `sqlite3` and the sidecar bytes with the Windows native MSZIP API.
+index digest recorded by each snapshot against that snapshot's exact
+`Public/index.db` bytes (the two SQLite files are not required to be bytewise
+identical). The helpers independently inspect SQLite tables through the native
+SQLite API and validate sidecar bytes with the Windows native MSZIP API. The
+YAML helpers use the existing YamlDotNet assembly from the .NET CLI build.
 These checks establish the tested outputs and interoperability; the private
 state schema remains governed by the embedded production schemas.
 

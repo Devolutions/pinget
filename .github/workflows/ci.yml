@@ -116,14 +116,6 @@ jobs:
       - name: Run publisher tests
         run: dotnet test dotnet/src/Devolutions.Pinget.Publisher.Tests/Devolutions.Pinget.Publisher.Tests.csproj -c Release
 
-      - name: Setup Python for independent publisher validation
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-
-      - name: Install independent publisher validator dependency
-        run: python -m pip install "PyYAML>=6,<7"
-
       - name: Run Rust and .NET publisher interoperability
         shell: pwsh
         run: |

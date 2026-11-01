@@ -6,7 +6,8 @@ param(
     [string] $InputDirectory = (Join-Path $PSScriptRoot 'fixtures\multi'),
     [string] $WorkDirectory = (Join-Path $env:TEMP ('PingetPublisherConformance-' + [Guid]::NewGuid().ToString('N'))),
     [string] $ExpectedPackageId = 'Pinget.Test.Matrix',
-    [string] $Python = 'python',
+    [string] $SqliteLibraryPath = '',
+    [string] $YamlDotNetPath = '',
     [string] $MakeAppxPath = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe',
     [string] $PackageName = 'Pinget.Publisher.Conformance',
     [string] $Publisher = 'CN=Pinget Publisher Conformance Test'
@@ -23,8 +24,52 @@ $dotnetExecutablePath = if ([string]::IsNullOrWhiteSpace($DotnetExecutable)) {
 } else {
     [System.IO.Path]::GetFullPath($DotnetExecutable)
 }
-$validator = Join-Path $PSScriptRoot 'validate_production_snapshot.py'
-$comparer = Join-Path $PSScriptRoot 'compare_production_snapshots.py'
+$validator = Join-Path $PSScriptRoot 'validate_production_snapshot.ps1'
+$comparer = Join-Path $PSScriptRoot 'compare_production_snapshots.ps1'
+
+function Resolve-PublisherDependency {
+    param([string] $ExplicitPath, [string] $FileName, [string[]] $SearchRoots)
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
+        $resolved = [System.IO.Path]::GetFullPath($ExplicitPath)
+        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+            throw "Required validation dependency does not exist: $resolved"
+        }
+        return $resolved
+    }
+    foreach ($root in $SearchRoots | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_ -PathType Container) }) {
+        $candidate = Join-Path $root $FileName
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+        $nestedFiles = @(Get-ChildItem -LiteralPath $root -Filter $FileName -File -Recurse -ErrorAction SilentlyContinue)
+        if ($FileName -eq 'e_sqlite3.dll') {
+            $runtime = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
+                'X64' { 'win-x64' }
+                'Arm64' { 'win-arm64' }
+                'X86' { 'win-x86' }
+                default { throw "Unsupported architecture for native SQLite inspection: $([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)" }
+            }
+            $preferred = $nestedFiles | Where-Object {
+                $_.FullName -match ([regex]::Escape("\runtimes\$runtime\native\e_sqlite3.dll") + '$')
+            } | Select-Object -First 1
+            if ($null -ne $preferred) { return $preferred.FullName }
+        }
+        $nested = $nestedFiles | Select-Object -First 1
+        if ($null -ne $nested) { return $nested.FullName }
+    }
+    throw "Could not locate $FileName in the existing .NET CLI build outputs. Pass its path explicitly."
+}
+
+$dotnetOutputDirectory = if (-not [string]::IsNullOrWhiteSpace($dotnetExecutablePath)) {
+    Split-Path -Parent $dotnetExecutablePath
+} else {
+    Split-Path -Parent $dotnetPath
+}
+$managedCliDependencies = Join-Path $repositoryRoot 'dotnet\src\Devolutions.Pinget.Cli\bin\Release\net10.0'
+$validationRoots = @($dotnetOutputDirectory, $managedCliDependencies) |
+    Select-Object -Unique
+$sqlitePath = Resolve-PublisherDependency $SqliteLibraryPath 'e_sqlite3.dll' $validationRoots
+$yamlPath = Resolve-PublisherDependency $YamlDotNetPath 'YamlDotNet.dll' $validationRoots
+. (Join-Path $PSScriptRoot 'publisher-validation.ps1')
+Initialize-PublisherValidation -SqliteLibraryPath $sqlitePath -YamlDotNetPath $yamlPath
 
 foreach ($required in @($inputPath, $rustPath, $validator, $comparer, $MakeAppxPath)) {
     if (-not (Test-Path -LiteralPath $required)) {
@@ -168,8 +213,20 @@ foreach ($implementation in @('Rust', 'Dotnet')) {
                 }
             }
             'yaml' {
-                if ($formatted.Text -notmatch "(?m)^lastBuildId:\s*['""]?$([regex]::Escape($rustBuildId))['""]?\s*$") {
-                    throw "$implementation YAML status omitted the current build id: $($formatted.Text)"
+                $yamlDocuments = ConvertFrom-YamlDocuments $formatted.Text
+                if ($yamlDocuments.Count -ne 1 -or
+                    $yamlDocuments[0] -isnot [System.Collections.IDictionary]) {
+                    throw "$implementation YAML status is not one mapping document: $($formatted.Text)"
+                }
+                $yamlStatus = $yamlDocuments[0]
+                $expectedYamlFields = @('buildCount', 'lastBuildId', 'lastBuildTimestamp', 'lastPublishedBuildId')
+                if ((@($yamlStatus.Keys | Sort-Object) -join "`n") -cne
+                    (@($expectedYamlFields | Sort-Object) -join "`n") -or
+                    $yamlStatus.lastBuildId -cne $rustBuildId -or
+                    $null -ne $yamlStatus.lastPublishedBuildId -or
+                    $yamlStatus.buildCount -cne '1' -or
+                    [string]::IsNullOrWhiteSpace([string]$yamlStatus.lastBuildTimestamp)) {
+                    throw "$implementation YAML status has unexpected fields or values: $($formatted.Text)"
                 }
             }
             'text' {
@@ -218,15 +275,11 @@ foreach ($doctorReport in @($rustDoctor, $dotnetDoctor)) {
 $rustSnapshot = Join-Path (Join-Path $rustState 'builds') $rustBuildId
 $dotnetSnapshot = Join-Path (Join-Path $dotnetState 'builds') $dotnetBuildId
 foreach ($snapshot in @($rustSnapshot, $dotnetSnapshot)) {
-    & $Python -B $validator --snapshot $snapshot --expect-package $ExpectedPackageId
-    if ($LASTEXITCODE -ne 0) {
-        throw "Independent SQLite/MSZIP snapshot validation failed for $snapshot (exit $LASTEXITCODE)."
-    }
+    & $validator -Snapshot $snapshot -ExpectPackage $ExpectedPackageId `
+        -SqliteLibraryPath $sqlitePath -YamlDotNetPath $yamlPath
 }
-& $Python -B $comparer --rust-snapshot $rustSnapshot --dotnet-snapshot $dotnetSnapshot
-if ($LASTEXITCODE -ne 0) {
-    throw "Cross-language logical snapshot comparison failed (exit $LASTEXITCODE)."
-}
+& $comparer -RustSnapshot $rustSnapshot -DotnetSnapshot $dotnetSnapshot `
+    -SqliteLibraryPath $sqlitePath -YamlDotNetPath $yamlPath
 
 $rustDiff = ConvertFrom-PingetJson `
     (Invoke-Pinget 'Rust' ($common + @('diff', '--input', $inputPath, '--state', $rustState))) 'Rust diff'
@@ -278,7 +331,7 @@ Assert-VerifiedReport $rustVerifyDotnetDestination $dotnetBuildId 'Rust destinat
     WorkDirectory = $workPath
     RequiredArtifacts = @(
         'Rust and .NET status/verify can reopen each other''s state'
-        'Python sqlite3 and native Windows MSZIP validation passed for both snapshots'
+        'Independent native SQLite and Windows MSZIP validation passed for both snapshots'
         'Canonicalized package, correlation, manifest and input-inventory data matched'
         'Rust and .NET reciprocal destination verification passed for unsigned MSIX outputs'
     )
