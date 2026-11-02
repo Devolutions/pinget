@@ -48,7 +48,7 @@ internal static class MsZipCompressor
     public static byte[] Decompress(byte[] input)
     {
         if (!OperatingSystem.IsWindows())
-            throw new PublisherException("WinGet v2 MSZIP verification currently requires Windows Compression API support.");
+            return DecompressPortable(input);
         if (!CreateDecompressor(CompressAlgorithmMsZip, IntPtr.Zero, out var decompressor))
             throw new PublisherException("Windows Compression API could not create an MSZIP decompressor.", LastError());
         try
@@ -68,6 +68,22 @@ internal static class MsZipCompressor
         finally
         {
             _ = CloseDecompressor(decompressor);
+        }
+    }
+
+    /// <summary>
+    /// Decodes a Windows Compression API MSZIP buffer with the managed client decoder,
+    /// so verification and publication work on hosts without cabinet.dll.
+    /// </summary>
+    internal static byte[] DecompressPortable(byte[] input)
+    {
+        try
+        {
+            return Devolutions.Pinget.Core.NativeMsZip.DecompressManaged(input);
+        }
+        catch (Exception ex) when (ex is InvalidDataException or OverflowException or ArgumentException)
+        {
+            throw new PublisherException($"invalid MSZIP version data: {ex.Message}", ex);
         }
     }
 

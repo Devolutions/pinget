@@ -67,12 +67,14 @@ internal static class PublisherCommands
         var stateVerify = new Option<string?>("--state", "Publisher working directory");
         var buildVerify = new Option<string?>("--build", "Build snapshot ID");
         var destinationVerify = new Option<string?>("--destination", "Published static source directory");
-        var signToolVerify = new Option<string?>("--signtool", "Path to signtool.exe");
+        var psignToolVerify = PsignToolOption();
+        var trustedCaVerify = TrustedCaOption();
         var verify = new Command("verify", "Verify a build snapshot or published directory");
         verify.AddOption(stateVerify);
         verify.AddOption(buildVerify);
         verify.AddOption(destinationVerify);
-        verify.AddOption(signToolVerify);
+        verify.AddOption(psignToolVerify);
+        verify.AddOption(trustedCaVerify);
         verify.SetHandler(context => Run(context, outputOption, () =>
         {
             var state = context.ParseResult.GetValueForOption(stateVerify);
@@ -81,8 +83,12 @@ internal static class PublisherCommands
                 throw new PublisherException("Provide exactly one of --state or --destination.");
             if (destination is not null && context.ParseResult.GetValueForOption(buildVerify) is not null)
                 throw new PublisherException("--build cannot be combined with --destination.");
+            var psignTool = context.ParseResult.GetValueForOption(psignToolVerify);
+            var trustedCa = context.ParseResult.GetValueForOption(trustedCaVerify) ?? [];
+            if (destination is null && (psignTool is not null || trustedCa.Length > 0))
+                throw new PublisherException("--psign-tool and --trusted-ca require --destination.");
             var result = destination is not null
-                ? PublisherPackaging.VerifyDestination(destination, context.ParseResult.GetValueForOption(signToolVerify))
+                ? PublisherPackaging.VerifyDestination(destination, psignTool, trustedCa)
                 : new PublisherWorkspace(state!).Verify(context.ParseResult.GetValueForOption(buildVerify));
             return (Object(
                 ("valid", JsonValue.Create(result.Valid)),
@@ -92,22 +98,17 @@ internal static class PublisherCommands
                 $"Verified {result.Subject}; artifacts: {result.ArtifactCount}.");
         }));
 
-        var makeAppxDoctor = new Option<string?>("--makeappx", "Path to makeappx.exe");
-        var signToolDoctor = new Option<string?>("--signtool", "Path to signtool.exe");
-        var doctor = new Command("doctor", "Check local publisher capabilities and packaging tools");
-        doctor.AddOption(makeAppxDoctor);
-        doctor.AddOption(signToolDoctor);
+        var psignToolDoctor = PsignToolOption();
+        var doctor = new Command("doctor", "Check local publisher capabilities and signing tools");
+        doctor.AddOption(psignToolDoctor);
         doctor.SetHandler(context => Run(context, outputOption, () =>
         {
-            var result = PublisherPackaging.Doctor(
-                context.ParseResult.GetValueForOption(makeAppxDoctor),
-                context.ParseResult.GetValueForOption(signToolDoctor));
+            var result = PublisherPackaging.Doctor(context.ParseResult.GetValueForOption(psignToolDoctor));
             return (Object(
                 ("operatingSystem", JsonValue.Create(result.OperatingSystem)),
-                ("makeAppxPath", JsonValue.Create(result.MakeAppxPath)),
-                ("signToolPath", JsonValue.Create(result.SignToolPath)),
+                ("psignToolPath", JsonValue.Create(result.PsignToolPath)),
                 ("nativeMsZipAvailable", JsonValue.Create(result.NativeMsZipAvailable))),
-                $"MSZIP: {(result.NativeMsZipAvailable ? "available" : "unavailable")}; makeappx: {result.MakeAppxPath ?? "not found"}; signtool: {result.SignToolPath ?? "not found"}.");
+                $"MSZIP: {(result.NativeMsZipAvailable ? "available" : "unavailable")}; psign-tool: {result.PsignToolPath ?? "not found"}; signed publishing available: {(result.SignedPublishAvailable ? "yes" : "no")}.");
         }));
 
         var statePublish = new Option<string>("--state", "Publisher working directory") { IsRequired = true };
@@ -118,15 +119,15 @@ internal static class PublisherCommands
         var pfxPublish = new Option<string?>("--pfx", "PFX file used to sign the source MSIX");
         var passwordEnvPublish = new Option<string?>("--password-env", "Environment variable containing the PFX password");
         var unsignedPublish = new Option<bool>("--unsigned-development", "Allow explicitly unsigned development publishing");
-        var makeAppxPublish = new Option<string?>("--makeappx", "Path to makeappx.exe");
-        var signToolPublish = new Option<string?>("--signtool", "Path to signtool.exe");
+        var psignToolPublish = PsignToolOption();
+        var trustedCaPublish = TrustedCaOption();
         var timestampPublish = new Option<string?>("--timestamp-url", "HTTPS RFC 3161 timestamp service URL");
         var buildPublish = new Option<string?>("--build", "Build snapshot ID (defaults to latest)");
         var publish = new Command("publish", "Package and publish a source2.msix and immutable artifacts");
         foreach (var option in new Option[]
                  {
                      statePublish, destinationPublish, namePublish, publisherPublish, versionPublish,
-                     pfxPublish, passwordEnvPublish, unsignedPublish, makeAppxPublish, signToolPublish, buildPublish, timestampPublish,
+                     pfxPublish, passwordEnvPublish, unsignedPublish, psignToolPublish, trustedCaPublish, buildPublish, timestampPublish,
                  })
             publish.AddOption(option);
         publish.SetHandler(context => Run(context, outputOption, () =>
@@ -140,10 +141,10 @@ internal static class PublisherCommands
                 context.ParseResult.GetValueForOption(pfxPublish),
                 context.ParseResult.GetValueForOption(passwordEnvPublish),
                 context.ParseResult.GetValueForOption(unsignedPublish),
-                context.ParseResult.GetValueForOption(makeAppxPublish),
-                context.ParseResult.GetValueForOption(signToolPublish),
+                context.ParseResult.GetValueForOption(psignToolPublish),
                 context.ParseResult.GetValueForOption(buildPublish),
-                context.ParseResult.GetValueForOption(timestampPublish)));
+                context.ParseResult.GetValueForOption(timestampPublish),
+                context.ParseResult.GetValueForOption(trustedCaPublish)));
             return (Object(
                 ("valid", JsonValue.Create(result.Valid)),
                 ("subject", JsonValue.Create(result.Subject)),
@@ -160,6 +161,16 @@ internal static class PublisherCommands
         root.AddCommand(publish);
         return root;
     }
+
+    private static Option<string?> PsignToolOption() =>
+        new("--psign-tool", "Path to psign-tool (searched on PATH and in the .NET global tool directory when omitted)");
+
+    private static Option<string[]> TrustedCaOption() =>
+        new("--trusted-ca", "Certificate trusted as a signature anchor instead of the platform default (repeatable)")
+        {
+            ArgumentHelpName = "certificate",
+            AllowMultipleArgumentsPerToken = false,
+        };
 
     private static Option<string> InputOption()
     {

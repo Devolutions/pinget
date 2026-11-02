@@ -4,9 +4,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $DotnetCliPath,
     [Parameter(Mandatory = $true)]
-    [string] $MakeAppxPath,
-    [Parameter(Mandatory = $true)]
-    [string] $SignToolPath
+    [string] $PsignToolPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,9 +26,9 @@ if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Adm
     throw 'The GitHub-hosted Windows runner must permit runner-local LocalMachine Root certificate trust.'
 }
 
-foreach ($path in @($RustCliPath, $DotnetCliPath, $MakeAppxPath, $SignToolPath)) {
+foreach ($path in @($RustCliPath, $DotnetCliPath, $PsignToolPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "Required publisher or Windows SDK tool was not found: $path"
+        throw "Required publisher or psign-tool was not found: $path"
     }
 }
 
@@ -290,8 +288,7 @@ try {
             -PublisherName 'Pinget.Publisher.Conformance' `
             -PublisherIdentity $publisherSubject `
             -InitialPackageVersion '1.0.0.0' `
-            -MakeAppxPath $MakeAppxPath `
-            -SignToolPath $SignToolPath
+            -PsignToolPath $PsignToolPath
 
         Remove-RunWinGetSource
         $gateStarted = $false

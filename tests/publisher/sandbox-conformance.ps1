@@ -19,8 +19,7 @@ param(
     [string] $PublisherName = 'Pinget.Publisher.Conformance',
     [string] $PublisherIdentity = 'CN=Pinget Publisher Conformance Test',
     [string] $InitialPackageVersion = '1.0.0.0',
-    [string] $MakeAppxPath,
-    [string] $SignToolPath
+    [string] $PsignToolPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,11 +31,11 @@ if ($ExecutionTarget -eq 'Sandbox' -and $AllowEphemeralHostMutations) {
 }
 $publisherArguments = @(
     $PublisherCliPath, $PublisherStateDirectory, $PublisherInputDirectory,
-    $PfxPath, $PfxPasswordEnvironmentVariable, $MakeAppxPath, $SignToolPath
+    $PfxPath, $PfxPasswordEnvironmentVariable, $PsignToolPath
 )
 if ($publisherArguments.Where({ -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0 -and
     $publisherArguments.Where({ [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
-    throw 'Production publisher validation requires CLI, state, input, PFX, password environment variable, MakeAppx, and SignTool paths together.'
+    throw 'Production publisher validation requires CLI, state, input, PFX, password environment variable, and psign-tool paths together.'
 }
 $readerArguments = @($RustReaderCliPath, $DotnetReaderCliPath)
 if ($readerArguments.Where({ -not [string]::IsNullOrWhiteSpace($_) }).Count -notin @(0, 2)) {
@@ -135,7 +134,7 @@ function Publish-ProductionInput {
         '--destination', $script:feed, '--name', $script:PublisherName,
         '--publisher', $script:PublisherIdentity, '--version', $PackageVersion,
         '--pfx', $script:PfxPath, '--password-env', $script:PfxPasswordEnvironmentVariable,
-        '--makeappx', $script:MakeAppxPath, '--signtool', $script:SignToolPath,
+        '--psign-tool', $script:PsignToolPath,
         '--build', $build.buildId
     )
     if (-not $published.valid) {
@@ -538,7 +537,7 @@ function Test_StockWinGet_SourceVersionBumpAddRemove {
         throw 'The removal publication did not retain the previously published immutable manifest.'
     }
     $verified = Invoke-PublisherCommand @(
-        'verify', '--destination', $script:feed, '--signtool', $script:SignToolPath
+        'verify', '--destination', $script:feed, '--psign-tool', $script:PsignToolPath
     )
     if (-not $verified.valid) {
         throw 'Published destination did not verify after add/remove updates.'
@@ -563,8 +562,7 @@ $script:ReaderCliPaths = @(
 )
 $script:PublisherName = $PublisherName
 $script:PublisherIdentity = $PublisherIdentity
-$script:MakeAppxPath = $MakeAppxPath
-$script:SignToolPath = $SignToolPath
+$script:PsignToolPath = $PsignToolPath
 $script:SourceName = $SourceName
 $script:BaseUrl = $BaseUrl
 $script:packageId = $packageId
@@ -575,11 +573,11 @@ $server = $null
 try {
     $publisherArguments = @(
         $script:PublisherCliPath, $script:PublisherStateDirectory, $script:PublisherInputDirectory,
-        $script:PfxPath, $script:PfxPasswordEnvironmentVariable, $script:MakeAppxPath, $script:SignToolPath
+        $script:PfxPath, $script:PfxPasswordEnvironmentVariable, $script:PsignToolPath
     )
     $presentCount = @($publisherArguments | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
     if ($presentCount -ne 0 -and $presentCount -ne $publisherArguments.Count) {
-        throw 'Production publisher validation requires CLI, state, input, PFX, password environment variable, MakeAppx, and SignTool paths together.'
+        throw 'Production publisher validation requires CLI, state, input, PFX, password environment variable, and psign-tool paths together.'
     }
 
     foreach ($requiredPath in @($serverScript, $serverCertificate)) {
@@ -606,9 +604,8 @@ try {
         if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($script:PfxPasswordEnvironmentVariable))) {
             throw "The PFX password environment variable '$script:PfxPasswordEnvironmentVariable' is not set."
         }
-        if (-not (Test-Path -LiteralPath $script:MakeAppxPath) -or
-            -not (Test-Path -LiteralPath $script:SignToolPath)) {
-            throw 'The supplied MakeAppx or SignTool path does not exist on the selected test machine.'
+        if (-not (Test-Path -LiteralPath $script:PsignToolPath)) {
+            throw 'The supplied psign-tool path does not exist on the selected test machine.'
         }
         if (Test-Path -LiteralPath (Join-Path $feed 'source2.msix')) {
             throw "Refusing to publish over an existing feed: $feed"

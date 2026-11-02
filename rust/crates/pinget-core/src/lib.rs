@@ -8372,6 +8372,15 @@ fn decompress_mszyml(bytes: &[u8]) -> Result<String> {
     decompress_mszyml_payload(bytes).context("failed to decompress MSZIP payload")
 }
 
+/// Decodes a Windows Compression API MSZIP buffer such as a WinGet `versionData.mszyml` sidecar.
+///
+/// # Errors
+///
+/// Returns an error for malformed framing, invalid deflate data, or output above 64 MiB.
+pub fn decompress_mszip_buffer(bytes: &[u8]) -> Result<Vec<u8>> {
+    decompress_compression_api_mszip(bytes)
+}
+
 /// Decodes every `[u32 length]["CK" + deflate]` block of a Compression API MSZIP buffer.
 ///
 /// Each block may back-reference the previous block's output, so the history window is

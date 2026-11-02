@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pinget_publisher::PublisherError;
 use pinget_publisher::{BuildOptions, build, diff, status, verify};
 #[cfg(windows)]
-use pinget_publisher::{PublishOptions, Signing, doctor, publish, verify_published_destination};
+use pinget_publisher::{PublishOptions, Signing, publish, verify_published_destination};
 use rusqlite::Connection;
 #[cfg(windows)]
 use serde_json::Value;
@@ -866,8 +866,8 @@ fn publish_unsigned_is_idempotent_and_excludes_staging_files_from_inventory() {
     assert!(retry.valid);
     assert!(retry.reused);
     assert_eq!(retry.artifact_count, artifacts.len());
-    let verified =
-        verify_published_destination(&destination, None).expect("published destination should verify independently");
+    let verified = verify_published_destination(&destination, None, &[])
+        .expect("published destination should verify independently");
     assert!(verified.valid);
     assert_eq!(verified.build_id.as_deref(), Some(build_report.build_id.as_str()));
     assert_eq!(verified.artifact_count, artifacts.len());
@@ -951,7 +951,7 @@ fn publish_rejects_downgrade_and_retains_immutable_artifacts_on_update() {
         );
     }
     assert!(
-        verify_published_destination(&destination, None)
+        verify_published_destination(&destination, None, &[])
             .expect("updated destination should verify")
             .valid
     );
@@ -1035,7 +1035,7 @@ fn publish_rejects_identity_change_and_untracked_artifact_without_mutation() {
     let unrelated = destination.join("keep-me.txt");
     let unrelated_bytes = b"untracked owned-destination content";
     fs::write(&unrelated, unrelated_bytes).expect("untracked file should be written");
-    let verify_error = verify_published_destination(&destination, None)
+    let verify_error = verify_published_destination(&destination, None, &[])
         .expect_err("destination verification must reject untracked artifacts");
     assert!(
         verify_error.to_string().to_ascii_lowercase().contains("untracked"),
@@ -1092,14 +1092,21 @@ fn publish_failed_packaging_tool_does_not_publish_or_record_build() {
         .join("System32")
         .join("where.exe");
     assert!(where_tool.is_file(), "where.exe should be available on Windows");
+    let pfx = temp.path.join("placeholder.pfx");
+    fs::write(&pfx, b"not a certificate").expect("placeholder PFX");
     let mut options = unsigned_publish_options(&state, &destination, "1.0.0.0", &build_report.build_id);
-    options.makeappx = Some(where_tool);
+    options.signing = Signing::Pfx {
+        path: pfx,
+        // Any set variable works: the controlled failing signing tool never reads it.
+        password_env: "WINDIR".to_owned(),
+    };
+    options.psign_tool = Some(where_tool);
 
-    let error = publish(&options).expect_err("the controlled failing pack tool must fail");
+    let error = publish(&options).expect_err("the controlled failing signing tool must fail");
 
     assert!(
         error.to_string().contains("failed"),
-        "unexpected packaging diagnostic: {error}"
+        "unexpected signing diagnostic: {error}"
     );
     assert!(!destination.join("source2.msix").exists());
     assert!(!destination.join(".pinget-publisher.json").exists());
@@ -1110,12 +1117,13 @@ fn publish_failed_packaging_tool_does_not_publish_or_record_build() {
             .is_none()
     );
 
-    options.makeappx = doctor().makeappx_path;
-    let retry = publish(&options).expect("retry with the discovered SDK packager should succeed");
+    options.signing = Signing::UnsignedDevelopment;
+    options.psign_tool = None;
+    let retry = publish(&options).expect("retry without the failing tool should succeed");
     assert!(retry.valid);
     assert_eq!(retry.build_id, build_report.build_id);
     assert!(
-        verify_published_destination(&destination, None)
+        verify_published_destination(&destination, None, &[])
             .expect("retried destination should verify")
             .valid
     );
@@ -1184,7 +1192,7 @@ fn publish_semantic_metadata_promotion_failure_preserves_old_feed_then_retry_suc
         original_marker
     );
     assert!(
-        verify_published_destination(&destination, None)
+        verify_published_destination(&destination, None, &[])
             .expect("rolled-back destination should remain verifiable")
             .valid
     );
@@ -1209,7 +1217,7 @@ fn publish_semantic_metadata_promotion_failure_preserves_old_feed_then_retry_suc
         fs::read(destination.join(".pinget-publisher.json")).expect("retry should update ownership metadata")
     );
     assert!(
-        verify_published_destination(&destination, None)
+        verify_published_destination(&destination, None, &[])
             .expect("retried destination should verify")
             .valid
     );
@@ -1282,7 +1290,7 @@ fn publish_destination_lock_serializes_different_state_roots_and_allows_retry() 
         old_marker
     );
     assert!(
-        verify_published_destination(&destination, None)
+        verify_published_destination(&destination, None, &[])
             .expect("destination should remain valid during lock rejection")
             .valid
     );
@@ -1298,7 +1306,7 @@ fn publish_destination_lock_serializes_different_state_roots_and_allows_retry() 
     assert!(retry.valid);
     assert_eq!(retry.build_id, second_build.build_id);
     assert!(
-        verify_published_destination(&destination, None)
+        verify_published_destination(&destination, None, &[])
             .expect("retried destination should verify")
             .valid
     );
@@ -1482,7 +1490,6 @@ fn apply_mutation(input: &Path, mutation: &str) {
 
 #[cfg(windows)]
 fn unsigned_publish_options(state: &Path, destination: &Path, version: &str, build_id: &str) -> PublishOptions {
-    let makeappx = makeappx_tool();
     PublishOptions {
         state: state.to_path_buf(),
         build_id: Some(build_id.to_owned()),
@@ -1491,34 +1498,10 @@ fn unsigned_publish_options(state: &Path, destination: &Path, version: &str, bui
         publisher: "CN=Pinget Publisher Conformance Test".to_owned(),
         version: version.to_owned(),
         signing: Signing::UnsignedDevelopment,
-        makeappx: Some(makeappx),
-        signtool: None,
+        psign_tool: None,
+        trusted_ca: Vec::new(),
         timestamp_url: None,
     }
-}
-
-#[cfg(windows)]
-fn makeappx_tool() -> PathBuf {
-    if let Some(path) = doctor().makeappx_path.filter(|path| path.is_file()) {
-        return path;
-    }
-
-    let program_files = std::env::var_os("ProgramFiles(x86)")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)"));
-    let sdk_root = program_files.join("Windows Kits").join("10").join("bin");
-    let mut sdk_versions = fs::read_dir(&sdk_root)
-        .unwrap_or_else(|error| panic!("Windows SDK bin directory is unavailable: {error}"))
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    sdk_versions.sort();
-    sdk_versions.reverse();
-    sdk_versions
-        .into_iter()
-        .map(|version| version.join("x64").join("makeappx.exe"))
-        .find(|path| path.is_file())
-        .expect("Windows SDK MakeAppx must be available to test publication")
 }
 
 fn singleton_manifest(id: &str, version: &str) -> String {

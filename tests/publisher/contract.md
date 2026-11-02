@@ -159,7 +159,7 @@ do not return a success report):
 | `repository diff` | `lastBuildId`, `published`, `added`, `changed`, `removed` |
 | `repository status` | `lastBuildId`, `lastPublishedBuildId`, `buildCount`, `lastBuildTimestamp` |
 | `repository verify` / successful `repository publish` | `valid`, `subject`, `artifactCount`, `buildId` |
-| `repository doctor` | `operatingSystem`, `makeAppxPath`, `signToolPath`, `nativeMsZipAvailable` |
+| `repository doctor` | `operatingSystem`, `psignToolPath`, `nativeMsZipAvailable` |
 
 `doctor.operatingSystem` is informational and is intentionally not compared
 between platforms/implementations. `snapshotDirectory` is absolute. Build

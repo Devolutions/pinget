@@ -25,9 +25,12 @@ public sealed record PublisherStatusResult(
 
 public sealed record PublisherDoctorResult(
     string OperatingSystem,
-    string? MakeAppxPath,
-    string? SignToolPath,
-    bool NativeMsZipAvailable);
+    string? PsignToolPath,
+    bool NativeMsZipAvailable)
+{
+    /// <summary>Signed MSIX publication is available when psign-tool was found.</summary>
+    public bool SignedPublishAvailable => PsignToolPath is not null;
+}
 
 public sealed record PublisherPublishOptions(
     string StateDirectory,
@@ -38,10 +41,10 @@ public sealed record PublisherPublishOptions(
     string? PfxPath = null,
     string? PasswordEnvironmentVariable = null,
     bool UnsignedDevelopment = false,
-    string? MakeAppxPath = null,
-    string? SignToolPath = null,
+    string? PsignToolPath = null,
     string? BuildId = null,
-    string? TimestampUrl = null);
+    string? TimestampUrl = null,
+    IReadOnlyList<string>? TrustedCertificateAuthorities = null);
 
 public sealed record PublisherVerifyResult(
     bool Valid,

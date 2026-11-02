@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -17,20 +16,23 @@ public static partial class PublisherPackaging
     private static readonly byte[] LogoPng = Convert.FromHexString(
         "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c636000020000050001a5f645400000000049454e44ae426082");
 
-    public static PublisherDoctorResult Doctor(string? makeAppxPath = null, string? signToolPath = null)
-    {
-        var makeAppx = FindTool(makeAppxPath, "makeappx.exe");
-        var signTool = FindTool(signToolPath, "signtool.exe");
-        return new PublisherDoctorResult(
+    public static PublisherDoctorResult Doctor(string? psignToolPath = null) =>
+        new(
             System.Runtime.InteropServices.RuntimeInformation.OSDescription,
-            makeAppx,
-            signTool,
+            PsignTool.Find(psignToolPath),
             MsZipCompressor.IsAvailable());
-    }
 
+    /// <summary>
+    /// Verifies a published static source and, unless unsigned-development, its MSIX signature.
+    /// </summary>
+    /// <remarks>
+    /// Signature trust uses <paramref name="trustedCertificateAuthorities"/> when given; otherwise the
+    /// Windows trust store on Windows and Microsoft AuthRoot anchors elsewhere.
+    /// </remarks>
     public static PublisherVerifyResult VerifyDestination(
         string destinationDirectory,
-        string? signToolPath = null)
+        string? psignToolPath = null,
+        IReadOnlyList<string>? trustedCertificateAuthorities = null)
     {
         var destination = Path.GetFullPath(destinationDirectory);
         if (!Directory.Exists(destination))
@@ -83,19 +85,23 @@ public static partial class PublisherPackaging
         var unsigned = marker["unsignedDevelopment"]?.GetValue<bool>() ?? false;
         if (!unsigned)
         {
-            if (!OperatingSystem.IsWindows())
-                throw new PublisherException("MSIX signature verification requires Windows signtool on this platform.");
-            var signtool = FindTool(signToolPath, "signtool.exe")
-                ?? throw new PublisherException("signtool.exe was not found. Use --signtool to specify it.");
-            RunTool(signtool, ["verify", "/pa", "/v", packagePath], "MSIX signature verification");
+            var psignTool = PsignTool.Require(psignToolPath);
+            var publisher = marker["publisher"]?.GetValue<string>()
+                ?? throw new PublisherException("Publisher ownership marker has no publisher.");
+            PsignTool.Verify(psignTool, packagePath, publisher, TrustedAnchors(trustedCertificateAuthorities));
         }
         return new PublisherVerifyResult(true, "published WinGet v2 static source", inventory.Count, marker["buildId"]?.GetValue<string>());
     }
 
-    public static PublisherVerifyResult Publish(PublisherPublishOptions options)
+    public static PublisherVerifyResult Publish(PublisherPublishOptions options) =>
+        Publish(options, afterCopy: null);
+
+    /// <summary>
+    /// Publishes with a test hook invoked after feed artifacts are copied and before the staged
+    /// package is verified and promoted; it receives the destination and staged package paths.
+    /// </summary>
+    internal static PublisherVerifyResult Publish(PublisherPublishOptions options, Action<string, string>? afterCopy)
     {
-        if (!OperatingSystem.IsWindows())
-            throw new PublisherException("MSIX packaging and signing are supported only on Windows in this build.");
         var state = Path.GetFullPath(options.StateDirectory);
         var destination = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.DestinationDirectory));
         PublisherWorkspace.EnsureDisjoint(state, destination, "state", "destination");
@@ -126,11 +132,8 @@ public static partial class PublisherPackaging
             throw new PublisherException("Destination lock cannot be a reparse point.");
         using var destinationLock = new FileStream(destinationLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
 
-        var doctor = Doctor(options.MakeAppxPath, options.SignToolPath);
-        var makeappx = doctor.MakeAppxPath ?? throw new PublisherException("makeappx.exe was not found. Use --makeappx to specify it.");
-        var signTool = options.UnsignedDevelopment
-            ? null
-            : doctor.SignToolPath ?? throw new PublisherException("signtool.exe was not found. Use --signtool to specify it.");
+        var trustedAnchors = TrustedAnchors(options.TrustedCertificateAuthorities);
+        var psignTool = options.UnsignedDevelopment ? null : PsignTool.Require(options.PsignToolPath);
 
         var workspace = new PublisherWorkspace(state);
         var buildId = options.BuildId ?? workspace.Status().LastBuildId
@@ -143,7 +146,7 @@ public static partial class PublisherPackaging
         var markerPath = Path.Combine(destination, MarkerName);
         var marker = ExistingDestinationMarker(destination, markerPath);
         if (marker is not null)
-            _ = VerifyDestination(destination, signTool);
+            _ = VerifyDestination(destination, options.PsignToolPath, trustedAnchors);
         var oldBuildId = marker?["buildId"]?.GetValue<string>();
         var oldVersionText = marker?["packageVersion"]?.GetValue<string>();
         if (marker is not null)
@@ -163,7 +166,7 @@ public static partial class PublisherPackaging
                 if (!string.Equals(oldBuildId, buildId, StringComparison.Ordinal)
                     || (marker["unsignedDevelopment"]?.GetValue<bool>() ?? false) != options.UnsignedDevelopment)
                     throw new PublisherException("The source package version has already been used for different build content or signing mode.");
-                var existing = VerifyDestination(destination, signTool);
+                var existing = VerifyDestination(destination, options.PsignToolPath, trustedAnchors);
                 PublisherWorkspace.RecordPublished(state, buildId);
                 return existing;
             }
@@ -171,35 +174,29 @@ public static partial class PublisherPackaging
 
         var buildPath = Path.Combine(state, "builds", buildId);
         var stagingRoot = Path.Combine(state, $".publish-{Guid.NewGuid():N}");
-        var packageStage = Path.Combine(stagingRoot, "package");
-        Directory.CreateDirectory(packageStage);
+        Directory.CreateDirectory(stagingRoot);
         var createdArtifacts = new List<string>();
         var createdDirectories = new List<string>();
         var promoted = false;
         try
         {
-            File.Copy(Path.Combine(buildPath, "Public", "index.db"), Path.Combine(Directory.CreateDirectory(Path.Combine(packageStage, "Public")).FullName, "index.db"));
-            var assets = Directory.CreateDirectory(Path.Combine(packageStage, "Assets"));
-            foreach (var asset in new[] { "StoreLogo.png", "Logo150.png", "Logo44.png" })
-                File.WriteAllBytes(Path.Combine(assets.FullName, asset), LogoPng);
-            WriteAppxManifest(Path.Combine(packageStage, "AppxManifest.xml"), options, version);
-
             var stagedPackage = Path.Combine(stagingRoot, "source2.msix");
-            RunTool(makeappx, ["pack", "/d", packageStage, "/p", stagedPackage, "/o"], "MSIX packaging");
-            if (!File.Exists(stagedPackage))
-                throw new PublisherException("makeappx completed without producing source2.msix.");
+            File.WriteAllBytes(stagedPackage, MsixPackageWriter.Write(
+            [
+                ("AppxManifest.xml", AppxManifest(options, version)),
+                ("Assets/StoreLogo.png", LogoPng),
+                ("Assets/Logo150.png", LogoPng),
+                ("Assets/Logo44.png", LogoPng),
+                ("Public/index.db", File.ReadAllBytes(Path.Combine(buildPath, "Public", "index.db"))),
+            ]));
             if (!options.UnsignedDevelopment)
             {
                 var password = Environment.GetEnvironmentVariable(options.PasswordEnvironmentVariable!);
                 if (string.IsNullOrEmpty(password))
                     throw new PublisherException($"Signing password environment variable '{options.PasswordEnvironmentVariable}' is not set or empty.");
                 ValidateCertificate(options.PfxPath!, password, options.Publisher);
-                var signingArguments = new List<string> { "sign", "/fd", "SHA256", "/f", Path.GetFullPath(options.PfxPath!), "/p", password };
-                if (options.TimestampUrl is not null)
-                    signingArguments.AddRange(["/tr", options.TimestampUrl, "/td", "SHA256"]);
-                signingArguments.Add(stagedPackage);
-                RunTool(signTool!, signingArguments, "MSIX signing", password);
-                RunTool(signTool!, ["verify", "/pa", "/v", stagedPackage], "MSIX signature verification");
+                PsignTool.Sign(psignTool!, stagedPackage, Path.GetFullPath(options.PfxPath!), password, options.TimestampUrl);
+                PsignTool.Verify(psignTool!, stagedPackage, options.Publisher, trustedAnchors);
             }
 
             var existingArtifacts = marker?["artifacts"]?.DeepClone() as JsonObject ?? new JsonObject();
@@ -237,6 +234,7 @@ public static partial class PublisherPackaging
                 existingArtifacts[item.Key] = artifactHash;
             }
 
+            afterCopy?.Invoke(destination, stagedPackage);
             var packageHash = HashFile(stagedPackage);
             existingArtifacts["source2.msix"] = packageHash;
             var updatedMarker = new JsonObject
@@ -269,7 +267,7 @@ public static partial class PublisherPackaging
             }
             promoted = true;
             PublisherWorkspace.RecordPublished(state, buildId);
-            return VerifyDestination(destination, signTool);
+            return VerifyDestination(destination, options.PsignToolPath, trustedAnchors);
         }
         finally
         {
@@ -413,7 +411,10 @@ public static partial class PublisherPackaging
         catch (Exception ex) { throw new PublisherException($"Could not load PFX certificate: {ex.Message}", ex); }
     }
 
-    private static void WriteAppxManifest(string path, PublisherPublishOptions options, Version version)
+    private static IReadOnlyList<string> TrustedAnchors(IReadOnlyList<string>? trustedCertificateAuthorities) =>
+        trustedCertificateAuthorities?.Select(Path.GetFullPath).ToArray() ?? [];
+
+    private static byte[] AppxManifest(PublisherPublishOptions options, Version version)
     {
         var name = System.Security.SecurityElement.Escape(options.PackageName);
         var publisher = System.Security.SecurityElement.Escape(options.Publisher);
@@ -448,7 +449,7 @@ public static partial class PublisherPackaging
               <Resources><Resource Language="und" /></Resources>
             </Package>
             """;
-        File.WriteAllText(path, xml.Replace("\r\n", "\n", StringComparison.Ordinal), new UTF8Encoding(false));
+        return new UTF8Encoding(false).GetBytes(xml.Replace("\r\n", "\n", StringComparison.Ordinal));
     }
 
     private static void CopyAtomically(string source, string destination, bool overwrite = true)
@@ -481,76 +482,8 @@ public static partial class PublisherPackaging
         }
     }
 
-    private static void RunTool(string executable, IReadOnlyList<string> arguments, string operation, string? sensitiveValue = null)
-    {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = executable,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-        };
-        foreach (var argument in arguments)
-            startInfo.ArgumentList.Add(argument);
-        using var process = new Process { StartInfo = startInfo };
-        try
-        {
-            process.Start();
-            var stdoutTask = process.StandardOutput.ReadToEndAsync();
-            var stderrTask = process.StandardError.ReadToEndAsync();
-            process.WaitForExit();
-            var stdout = stdoutTask.GetAwaiter().GetResult();
-            var stderr = stderrTask.GetAwaiter().GetResult();
-            if (process.ExitCode != 0)
-            {
-                var output = stderr + stdout;
-                if (!string.IsNullOrEmpty(sensitiveValue))
-                    output = output.Replace(sensitiveValue, "[REDACTED]", StringComparison.Ordinal);
-                throw new PublisherException($"{operation} failed with exit code {process.ExitCode}: {Limit(output)}");
-            }
-        }
-        catch (PublisherException) { throw; }
-        catch (Exception ex) { throw new PublisherException($"Could not start {operation}: {ex.Message}", ex); }
-    }
-
-    private static string? FindTool(string? explicitPath, string executable)
-    {
-        if (!string.IsNullOrWhiteSpace(explicitPath))
-        {
-            var path = Path.GetFullPath(explicitPath);
-            if (!File.Exists(path))
-                throw new PublisherException($"Tool does not exist: {path}");
-            return path;
-        }
-        var pathValue = Environment.GetEnvironmentVariable("PATH") ?? "";
-        foreach (var directory in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
-        {
-            var candidate = Path.Combine(directory.Trim('"'), executable);
-            if (File.Exists(candidate))
-                return candidate;
-        }
-        var kits = Environment.GetEnvironmentVariable("ProgramFiles(x86)");
-        if (OperatingSystem.IsWindows() && kits is not null)
-        {
-            var root = Path.Combine(kits, "Windows Kits", "10", "bin");
-            if (Directory.Exists(root))
-            {
-                var architecture = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant();
-                foreach (var candidate in Directory.EnumerateFiles(root, executable, SearchOption.AllDirectories)
-                             .Where(path => string.Equals(Path.GetFileName(Path.GetDirectoryName(path)), architecture, StringComparison.OrdinalIgnoreCase))
-                             .OrderByDescending(path => Version.TryParse(Path.GetFileName(Path.GetDirectoryName(Path.GetDirectoryName(path))), out var version) ? version : new Version())
-                             .ThenBy(path => path, StringComparer.Ordinal))
-                    return candidate;
-            }
-        }
-        return null;
-    }
-
     private static string HashFile(string path) =>
         Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant();
-
-    private static string Limit(string text) => text.Length <= 4000 ? text.Trim() : text[..4000].Trim();
 
     private static void TryDeleteDirectory(string path)
     {
