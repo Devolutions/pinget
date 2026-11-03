@@ -8,7 +8,6 @@ param(
     [string] $ExpectedPackageId = 'Pinget.Test.Matrix',
     [string] $SqliteLibraryPath = '',
     [string] $YamlDotNetPath = '',
-    [string] $MakeAppxPath = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe',
     [string] $PackageName = 'Pinget.Publisher.Conformance',
     [string] $Publisher = 'CN=Pinget Publisher Conformance Test'
 )
@@ -71,7 +70,7 @@ $yamlPath = Resolve-PublisherDependency $YamlDotNetPath 'YamlDotNet.dll' $valida
 . (Join-Path $PSScriptRoot 'publisher-validation.ps1')
 Initialize-PublisherValidation -SqliteLibraryPath $sqlitePath -YamlDotNetPath $yamlPath
 
-foreach ($required in @($inputPath, $rustPath, $validator, $comparer, $MakeAppxPath)) {
+foreach ($required in @($inputPath, $rustPath, $validator, $comparer)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required publisher conformance input does not exist: $required"
     }
@@ -266,7 +265,7 @@ Assert-VerifiedReport $rustVerifyDotnet $dotnetBuildId 'Rust verify of .NET snap
 $rustDoctor = ConvertFrom-PingetJson (Invoke-Pinget 'Rust' ($common + @('doctor'))) 'Rust doctor'
 $dotnetDoctor = ConvertFrom-PingetJson (Invoke-Pinget 'Dotnet' ($common + @('doctor'))) '.NET doctor'
 foreach ($doctorReport in @($rustDoctor, $dotnetDoctor)) {
-    Assert-ReportFields $doctorReport @('operatingSystem', 'makeAppxPath', 'signToolPath', 'nativeMsZipAvailable') 'doctor'
+    Assert-ReportFields $doctorReport @('operatingSystem', 'psignToolPath', 'nativeMsZipAvailable') 'doctor'
     if ([string]::IsNullOrWhiteSpace($doctorReport.operatingSystem) -or -not $doctorReport.nativeMsZipAvailable) {
         throw "Unexpected doctor report: $($doctorReport | ConvertTo-Json -Compress)"
     }
@@ -299,18 +298,42 @@ $dotnetDestination = Join-Path $workPath 'dotnet-unsigned-feed'
 $rustPublish = ConvertFrom-PingetJson (Invoke-Pinget 'Rust' ($common + @(
     'publish', '--state', $rustState, '--destination', $rustDestination,
     '--name', $PackageName, '--publisher', $Publisher, '--version', '1.0.0.0',
-    '--unsigned-development', '--makeappx', $MakeAppxPath
+    '--unsigned-development'
 ))) 'Rust publish'
 $dotnetPublish = ConvertFrom-PingetJson (Invoke-Pinget 'Dotnet' ($common + @(
     'publish', '--state', $dotnetState, '--destination', $dotnetDestination,
     '--name', $PackageName, '--publisher', $Publisher, '--version', '1.0.0.0',
-    '--unsigned-development', '--makeappx', $MakeAppxPath
+    '--unsigned-development'
 ))) '.NET publish'
 Assert-VerifiedReport $rustPublish $rustBuildId 'Rust publish'
 Assert-VerifiedReport $dotnetPublish $dotnetBuildId '.NET publish'
 if ($rustPublish.subject -ne $dotnetPublish.subject -or
     $rustPublish.artifactCount -ne $dotnetPublish.artifactCount) {
     throw 'Rust and .NET publish reports differ in verified subject or artifact count.'
+}
+# index.db records its build time, and the block map hashes it; every other part must match.
+function Get-PackagePartHashes([string] $Package) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($Package)
+    try {
+        foreach ($entry in $archive.Entries) {
+            if ($entry.FullName -in @('Public/index.db', 'AppxBlockMap.xml')) { continue }
+            $stream = $entry.Open()
+            try {
+                $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream))
+            } finally {
+                $stream.Dispose()
+            }
+            "$($entry.FullName)=$hash"
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+$rustParts = @(Get-PackagePartHashes (Join-Path $rustDestination 'source2.msix')) -join "`n"
+$dotnetParts = @(Get-PackagePartHashes (Join-Path $dotnetDestination 'source2.msix')) -join "`n"
+if ($rustParts -cne $dotnetParts) {
+    throw "Rust and .NET source2.msix packages differ outside the index:`n$rustParts`nvs`n$dotnetParts"
 }
 $dotnetVerifyRustDestination = ConvertFrom-PingetJson (Invoke-Pinget 'Dotnet' ($common + @(
     'verify', '--destination', $rustDestination

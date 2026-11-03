@@ -130,8 +130,10 @@ struct RepositoryVerifyArgs {
     build: Option<String>,
     #[arg(long, conflicts_with = "build")]
     destination: Option<PathBuf>,
-    #[arg(long)]
-    signtool: Option<PathBuf>,
+    #[arg(long = "psign-tool", requires = "destination")]
+    psign_tool: Option<PathBuf>,
+    #[arg(long = "trusted-ca", requires = "destination", value_name = "CERTIFICATE")]
+    trusted_ca: Vec<PathBuf>,
 }
 
 #[derive(Args)]
@@ -158,20 +160,18 @@ struct RepositoryPublishArgs {
         conflicts_with_all = ["pfx", "password_env"]
     )]
     unsigned_development: bool,
-    #[arg(long)]
-    makeappx: Option<PathBuf>,
-    #[arg(long)]
-    signtool: Option<PathBuf>,
+    #[arg(long = "psign-tool")]
+    psign_tool: Option<PathBuf>,
+    #[arg(long = "trusted-ca", value_name = "CERTIFICATE")]
+    trusted_ca: Vec<PathBuf>,
     #[arg(long, requires = "pfx", conflicts_with = "unsigned_development")]
     timestamp_url: Option<String>,
 }
 
 #[derive(Args)]
 struct RepositoryDoctorArgs {
-    #[arg(long)]
-    makeappx: Option<PathBuf>,
-    #[arg(long)]
-    signtool: Option<PathBuf>,
+    #[arg(long = "psign-tool")]
+    psign_tool: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -1186,7 +1186,11 @@ fn run_repository_command(command: RepositoryCommands, output: OutputFormat) -> 
         }
         RepositoryCommands::Verify(args) => {
             let result = if let Some(destination) = args.destination.as_deref() {
-                pinget_publisher::verify_published_destination(destination, args.signtool.as_deref())?
+                pinget_publisher::verify_published_destination(
+                    destination,
+                    args.psign_tool.as_deref(),
+                    &args.trusted_ca,
+                )?
             } else {
                 pinget_publisher::verify(
                     args.state.as_deref().unwrap_or_else(|| Path::new(".")),
@@ -1228,8 +1232,8 @@ fn run_repository_command(command: RepositoryCommands, output: OutputFormat) -> 
                 publisher: args.publisher,
                 version: args.package_version,
                 signing,
-                makeappx: args.makeappx,
-                signtool: args.signtool,
+                psign_tool: args.psign_tool,
+                trusted_ca: args.trusted_ca,
                 timestamp_url: args.timestamp_url,
             })?;
             if output.is_text() {
@@ -1248,17 +1252,13 @@ fn run_repository_command(command: RepositoryCommands, output: OutputFormat) -> 
             }
         }
         RepositoryCommands::Doctor(args) => {
-            let result = pinget_publisher::doctor_with_tools(args.makeappx.as_deref(), args.signtool.as_deref());
+            let result = pinget_publisher::doctor_with_tools(args.psign_tool.as_deref());
             if output.is_text() {
                 println!(
-                    "Native MSZIP: {}; makeappx: {}; signtool: {}; signed publishing available: {}.",
+                    "Native MSZIP: {}; psign-tool: {}; signed publishing available: {}.",
                     result.native_mszip_available,
                     result
-                        .makeappx_path
-                        .as_deref()
-                        .map_or_else(|| "not found".to_owned(), |path| path.display().to_string()),
-                    result
-                        .signtool_path
+                        .psign_tool_path
                         .as_deref()
                         .map_or_else(|| "not found".to_owned(), |path| path.display().to_string()),
                     result.signed_publish

@@ -121,17 +121,9 @@ jobs:
         run: |
           cargo build --manifest-path rust/Cargo.toml -p pinget-cli --release
           if ($LASTEXITCODE -ne 0) { throw 'Rust publisher CLI build failed.' }
-          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-          $makeAppx = Get-ChildItem -LiteralPath $sdkRoot -Directory |
-            Sort-Object Name -Descending |
-            ForEach-Object { Join-Path $_.FullName 'x64\makeappx.exe' } |
-            Where-Object { Test-Path -LiteralPath $_ } |
-            Select-Object -First 1
-          if (-not $makeAppx) { throw 'Windows SDK MakeAppx was not found.' }
           & .\tests\publisher\run-production-conformance.ps1 `
             -RustCli .\rust\target\release\pinget.exe `
-            -DotnetAssembly .\dotnet\src\Devolutions.Pinget.Cli\bin\Release\net10.0\pinget.dll `
-            -MakeAppxPath $makeAppx
+            -DotnetAssembly .\dotnet\src\Devolutions.Pinget.Cli\bin\Release\net10.0\pinget.dll
           if ($LASTEXITCODE -ne 0) { throw 'Publisher interoperability checks failed.' }
 
       - name: Build native COM DLLs
@@ -193,30 +185,22 @@ jobs:
             -OutputRoot artifacts/ci-stock-winget-packages
           if ($LASTEXITCODE -ne 0) { throw 'Building the disposable x64 publisher CLIs failed.' }
 
+      - name: Install psign-tool
+        shell: pwsh
+        run: |
+          # 0.8.2 is the first release whose portable MSIX signatures verify on Windows.
+          dotnet tool install Devolutions.Psign.Tool --version $env:PSIGN_VERSION --tool-path artifacts/psign
+          if ($LASTEXITCODE -ne 0) { throw 'psign-tool installation failed.' }
+        env:
+          PSIGN_VERSION: 0.8.2
+
       - name: Run signed stock WinGet acceptance with runner-local credentials
         shell: pwsh
         run: |
-          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-          $sdkTools = Get-ChildItem -LiteralPath $sdkRoot -Directory |
-            Sort-Object Name -Descending |
-            ForEach-Object {
-              [pscustomobject]@{
-                MakeAppx = Join-Path $_.FullName 'x64\makeappx.exe'
-                SignTool = Join-Path $_.FullName 'x64\signtool.exe'
-              }
-            } |
-            Where-Object {
-              (Test-Path -LiteralPath $_.MakeAppx) -and
-              (Test-Path -LiteralPath $_.SignTool)
-            } |
-            Select-Object -First 1
-          if (-not $sdkTools) { throw 'Windows SDK MakeAppx and SignTool were not found.' }
-
           pwsh -NoLogo -NoProfile -File (Resolve-Path 'tests/publisher/run-ephemeral-host-publisher-gate.ps1') `
             -RustCliPath (Resolve-Path 'artifacts/ci-stock-winget/rust/win-x64/pinget.exe') `
             -DotnetCliPath (Resolve-Path 'artifacts/ci-stock-winget/dotnet-nativeaot/win-x64/pinget.exe') `
-            -MakeAppxPath $sdkTools.MakeAppx `
-            -SignToolPath $sdkTools.SignTool
+            -PsignToolPath (Resolve-Path 'artifacts/psign/psign-tool.cmd')
           if ($LASTEXITCODE -ne 0) { throw 'Signed stock WinGet acceptance failed.' }
 
       - name: Remove disposable build outputs
@@ -225,3 +209,4 @@ jobs:
         run: |
           Remove-Item -LiteralPath 'artifacts/ci-stock-winget' -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -LiteralPath 'artifacts/ci-stock-winget-packages' -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath 'artifacts/psign' -Recurse -Force -ErrorAction SilentlyContinue

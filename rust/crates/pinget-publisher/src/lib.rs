@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -22,6 +21,9 @@ use serde_yaml::{Mapping, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zip::ZipArchive;
+
+mod msix;
+mod psign;
 
 const SUPPORTED_MANIFEST_VERSIONS: &[&str] = &[
     "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0",
@@ -183,10 +185,10 @@ pub struct PublishOptions {
     pub version: String,
     /// Signing policy.
     pub signing: Signing,
-    /// Optional path to `makeappx.exe`; PATH and installed Windows SDKs are searched when omitted.
-    pub makeappx: Option<PathBuf>,
-    /// Optional path to `signtool.exe`; PATH and installed Windows SDKs are searched when omitted.
-    pub signtool: Option<PathBuf>,
+    /// Optional path to `psign-tool`; `PATH` and the .NET global tool directory are searched when omitted.
+    pub psign_tool: Option<PathBuf>,
+    /// Certificates trusted as signature anchors instead of the platform default.
+    pub trusted_ca: Vec<PathBuf>,
     /// Optional RFC 3161 timestamp URL used for signed publication.
     pub timestamp_url: Option<String>,
 }
@@ -225,12 +227,9 @@ pub struct PublishReport {
 pub struct DoctorReport {
     /// Informational host operating-system description.
     pub operating_system: String,
-    /// Resolved `makeappx.exe`, if found.
-    #[serde(rename = "makeAppxPath")]
-    pub makeappx_path: Option<PathBuf>,
-    /// Resolved `signtool.exe`, if found.
-    #[serde(rename = "signToolPath")]
-    pub signtool_path: Option<PathBuf>,
+    /// Resolved `psign-tool`, if found.
+    #[serde(rename = "psignToolPath")]
+    pub psign_tool_path: Option<PathBuf>,
     /// Host can generate the native WinGet MSZIP stream.
     #[serde(rename = "nativeMsZipAvailable")]
     pub native_mszip_available: bool,
@@ -626,31 +625,35 @@ pub fn verify(state: impl AsRef<Path>, build_id: Option<&str>, destination: Opti
 /// Reports packaging tools available on the current host.
 #[must_use]
 pub fn doctor() -> DoctorReport {
-    doctor_with_tools(None, None)
+    doctor_with_tools(None)
 }
 
-/// Reports publisher capabilities using optional explicit tool paths.
+/// Reports publisher capabilities using an optional explicit `psign-tool` path.
 #[must_use]
-pub fn doctor_with_tools(makeappx_path: Option<&Path>, signtool_path: Option<&Path>) -> DoctorReport {
-    let makeappx = find_tool("makeappx.exe", makeappx_path);
-    let signtool = find_tool("signtool.exe", signtool_path);
-    let powershell = find_tool("powershell.exe", None).is_some();
+pub fn doctor_with_tools(psign_tool_path: Option<&Path>) -> DoctorReport {
+    let psign_tool = psign::find_psign_tool(psign_tool_path);
     DoctorReport {
         operating_system: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-        signed_publish: cfg!(windows) && makeappx.is_some() && signtool.is_some() && powershell,
-        makeappx_path: makeappx.map(|path| display_path(&path)),
-        signtool_path: signtool.map(|path| display_path(&path)),
+        signed_publish: psign_tool.is_some(),
+        psign_tool_path: psign_tool.map(|path| display_path(&path)),
         native_mszip_available: cfg!(windows),
     }
 }
 
 /// Verifies a published static source and, unless unsigned-development, its MSIX signature.
 ///
+/// Signature trust uses `trusted_ca` when given; otherwise the Windows trust store on
+/// Windows and Microsoft AuthRoot anchors elsewhere.
+///
 /// # Errors
 ///
 /// Returns an error when the ownership inventory, MSIX contents, or signature is invalid.
-pub fn verify_published_destination(destination: &Path, signtool_path: Option<&Path>) -> Result<VerifyReport> {
-    verify_destination_with_tool(destination, signtool_path)
+pub fn verify_published_destination(
+    destination: &Path,
+    psign_tool: Option<&Path>,
+    trusted_ca: &[PathBuf],
+) -> Result<VerifyReport> {
+    verify_destination_with_tool(destination, psign_tool, trusted_ca)
 }
 
 /// Packages, signs when requested, verifies and publishes one immutable snapshot.
@@ -664,11 +667,6 @@ pub fn publish(options: &PublishOptions) -> Result<PublishReport> {
 }
 
 fn publish_after_copy(options: &PublishOptions, after_copy: impl FnOnce(&Path) -> Result<()>) -> Result<PublishReport> {
-    if !cfg!(windows) {
-        return Err(PublisherError::Tool(
-            "MSIX packaging and signing are currently supported only on Windows".to_owned(),
-        ));
-    }
     reject_reparse_components(&options.state)?;
     reject_reparse_components(&options.destination)?;
     validate_package_identity(&options.name, &options.publisher)?;
@@ -709,7 +707,7 @@ fn publish_after_copy(options: &PublishOptions, after_copy: impl FnOnce(&Path) -
     let prior = read_owner_marker(&marker_path)?;
     let unsigned_development = matches!(options.signing, Signing::UnsignedDevelopment);
     if let Some(owner) = prior.as_ref() {
-        let verified = verify_destination_with_tool(&destination, options.signtool.as_deref())?;
+        let verified = verify_destination_with_tool(&destination, options.psign_tool.as_deref(), &options.trusted_ca)?;
         if owner.package_name != options.name || owner.publisher != options.publisher {
             return Err(PublisherError::Invalid(
                 "destination is owned by a different package identity".to_owned(),
@@ -2119,28 +2117,13 @@ fn package_and_publish(
 ) -> Result<PublishReport> {
     let unsigned_development = matches!(options.signing, Signing::UnsignedDevelopment);
     let metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
-    let package_root = temporary.join("package");
-    fs::create_dir_all(package_root.join("Public"))?;
-    fs::copy(
-        snapshot.join("Public").join("index.db"),
-        package_root.join("Public").join("index.db"),
-    )?;
-    create_appx_assets(&package_root, &options.name, &options.publisher, &options.version)?;
+    let mut package_files = appx_assets(&options.name, &options.publisher, &options.version)?;
+    package_files.push((
+        "Public/index.db".to_owned(),
+        fs::read(snapshot.join("Public").join("index.db"))?,
+    ));
     let msix = temporary.join("source2.msix");
-    let makeappx = find_tool("makeappx.exe", options.makeappx.as_deref()).ok_or_else(|| {
-        PublisherError::Tool("makeappx.exe was not found; pass --makeappx or add it to PATH".to_owned())
-    })?;
-    run_tool(
-        &makeappx,
-        [
-            "pack",
-            "/d",
-            &package_root.to_string_lossy(),
-            "/p",
-            &msix.to_string_lossy(),
-            "/o",
-        ],
-    )?;
+    write_relative(temporary, "source2.msix", &msix::write_package(&package_files)?)?;
     match &options.signing {
         Signing::Pfx { path, password_env } => {
             if !path.is_file() {
@@ -2149,27 +2132,12 @@ fn package_and_publish(
                     path.display()
                 )));
             }
-            if std::env::var_os(password_env).is_none() {
-                return Err(PublisherError::Invalid(format!(
-                    "password environment variable {password_env} is not set"
-                )));
-            }
-            validate_certificate_publisher(path, password_env, &options.publisher)?;
             let password = std::env::var(password_env).map_err(|_| {
                 PublisherError::Invalid(format!("password environment variable {password_env} is not set"))
             })?;
-            let signtool = find_tool("signtool.exe", options.signtool.as_deref()).ok_or_else(|| {
-                PublisherError::Tool("signtool.exe was not found; pass --signtool or add it to PATH".to_owned())
-            })?;
-            let pfx_path = path.to_string_lossy();
-            let msix_path = msix.to_string_lossy();
-            let mut arguments = vec!["sign", "/fd", "SHA256", "/f", &pfx_path, "/p", &password];
-            if let Some(url) = &options.timestamp_url {
-                arguments.extend(["/tr", url, "/td", "SHA256"]);
-            }
-            arguments.push(&msix_path);
-            run_sign_tool(&signtool, &arguments, Some(&password))?;
-            run_tool(&signtool, ["verify", "/pa", "/v", &msix.to_string_lossy()])?;
+            let psign_tool = psign::require_psign_tool(options.psign_tool.as_deref())?;
+            psign::sign(&psign_tool, &msix, path, &password, options.timestamp_url.as_deref())?;
+            psign::verify(&psign_tool, &msix, &options.publisher, &options.trusted_ca)?;
         }
         Signing::UnsignedDevelopment => {}
     }
@@ -2267,7 +2235,7 @@ fn package_and_publish(
     let state = options.state.canonicalize()?;
     mark_published(&state, build_id)?;
     fs::remove_dir_all(temporary)?;
-    let verified = verify_destination_with_tool(destination, options.signtool.as_deref())?;
+    let verified = verify_destination_with_tool(destination, options.psign_tool.as_deref(), &options.trusted_ca)?;
     Ok(PublishReport {
         valid: true,
         subject: verified.subject,
@@ -2491,10 +2459,14 @@ fn xml_attributes<R: std::io::BufRead>(
 }
 
 fn verify_destination(destination: &Path) -> Result<VerifyReport> {
-    verify_destination_with_tool(destination, None)
+    verify_destination_with_tool(destination, None, &[])
 }
 
-fn verify_destination_with_tool(destination: &Path, signtool_path: Option<&Path>) -> Result<VerifyReport> {
+fn verify_destination_with_tool(
+    destination: &Path,
+    psign_tool: Option<&Path>,
+    trusted_ca: &[PathBuf],
+) -> Result<VerifyReport> {
     reject_reparse_components(destination)?;
     let destination = fs::canonicalize(destination)?;
     let marker = read_owner_marker(&destination.join(".pinget-publisher.json"))?
@@ -2522,15 +2494,13 @@ fn verify_destination_with_tool(destination: &Path, signtool_path: Option<&Path>
     }
     verify_msix_contents(&destination.join("source2.msix"), &marker)?;
     if !marker.unsigned_development {
-        if !cfg!(windows) {
-            return Err(PublisherError::Tool(
-                "MSIX signature verification requires Windows signtool on this platform".to_owned(),
-            ));
-        }
-        let signtool = find_tool("signtool.exe", signtool_path)
-            .ok_or_else(|| PublisherError::Tool("signtool.exe was not found on PATH".to_owned()))?;
-        let package_path = destination.join("source2.msix");
-        run_tool(&signtool, ["verify", "/pa", "/v", &package_path.to_string_lossy()])?;
+        let psign_tool = psign::require_psign_tool(psign_tool)?;
+        psign::verify(
+            &psign_tool,
+            &destination.join("source2.msix"),
+            &marker.publisher,
+            trusted_ca,
+        )?;
     }
     Ok(VerifyReport {
         valid: true,
@@ -2626,17 +2596,54 @@ fn published_inventory_excluding(root: &Path, excluded: &[&Path]) -> Result<BTre
     Ok(inventory)
 }
 
-fn create_appx_assets(root: &Path, name: &str, publisher: &str, version: &str) -> Result<()> {
-    fs::create_dir_all(root.join("Assets"))?;
-    let escaped_publisher = escape_xml(publisher);
+/// A 1x1 blue PNG used for every required logo; the source package has no app list entry.
+const LOGO_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0b, 0x49,
+    0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00, 0x00, 0x05, 0x00, 0x01, 0xa5, 0xf6, 0x45, 0x40, 0x00,
+    0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// Builds the source package manifest and logos, byte-identical to the .NET publisher's.
+fn appx_assets(name: &str, publisher: &str, version: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let name = escape_xml(name);
+    let publisher = escape_xml(publisher);
     let manifest = format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\" xmlns:uap=\"http://schemas.microsoft.com/appx/manifest/uap/windows10\" xmlns:uap3=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/3\" IgnorableNamespaces=\"uap uap3\"><Identity Name=\"{name}\" Publisher=\"{escaped_publisher}\" Version=\"{version}\" ProcessorArchitecture=\"neutral\"/><Properties><DisplayName>Pinget preindexed source</DisplayName><PublisherDisplayName>{escaped_publisher}</PublisherDisplayName><Logo>Assets/StoreLogo.png</Logo></Properties><Dependencies><TargetDeviceFamily Name=\"Windows.Universal\" MinVersion=\"10.0.17763.0\" MaxVersionTested=\"10.0.22621.0\"/></Dependencies><Applications><Application Id=\"SourceData\"><uap:VisualElements DisplayName=\"Pinget preindexed source\" Description=\"Pinget static package source\" BackgroundColor=\"#0078d7\" Square150x150Logo=\"Assets/Logo150.png\" Square44x44Logo=\"Assets/Logo44.png\" AppListEntry=\"none\"/><Extensions><uap3:Extension Category=\"windows.appExtension\"><uap3:AppExtension Name=\"com.microsoft.winget.source\" Id=\"IndexDB\" DisplayName=\"Pinget preindexed source\" Description=\"Pinget static package source\" PublicFolder=\"Public\"/></uap3:Extension></Extensions></Application></Applications><Resources><Resource Language=\"und\"/></Resources></Package>\n"
+        r##"<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+         IgnorableNamespaces="uap uap3">
+  <Identity Name="{name}" ProcessorArchitecture="neutral" Publisher="{publisher}" Version="{version}" />
+  <Properties>
+    <DisplayName>Pinget preindexed source</DisplayName>
+    <PublisherDisplayName>Pinget source publisher</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Applications>
+    <Application Id="SourceData">
+      <uap:VisualElements DisplayName="Pinget preindexed source" Square150x150Logo="Assets\Logo150.png" Square44x44Logo="Assets\Logo44.png" Description="Pinget WinGet v2 package source" BackgroundColor="#0078d7" AppListEntry="none">
+        <uap:DefaultTile />
+      </uap:VisualElements>
+      <Extensions>
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension Name="com.microsoft.winget.source" Id="IndexDB" DisplayName="Pinget preindexed source" Description="Pinget WinGet v2 package source" PublicFolder="Public" />
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Resources><Resource Language="und" /></Resources>
+</Package>"##
     );
-    fs::write(root.join("AppxManifest.xml"), manifest)?;
-    write_png_logo(&root.join("Assets").join("StoreLogo.png"), 50)?;
-    write_png_logo(&root.join("Assets").join("Logo150.png"), 150)?;
-    write_png_logo(&root.join("Assets").join("Logo44.png"), 44)?;
-    Ok(())
+    Ok(vec![
+        ("AppxManifest.xml".to_owned(), manifest.into_bytes()),
+        ("Assets/StoreLogo.png".to_owned(), LOGO_PNG.to_vec()),
+        ("Assets/Logo150.png".to_owned(), LOGO_PNG.to_vec()),
+        ("Assets/Logo44.png".to_owned(), LOGO_PNG.to_vec()),
+    ])
 }
 
 fn escape_xml(value: &str) -> String {
@@ -2646,180 +2653,6 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
-}
-
-fn write_png_logo(path: &Path, size: usize) -> Result<()> {
-    use flate2::Compression;
-    use flate2::write::ZlibEncoder;
-
-    let mut row = Vec::with_capacity(size * 4 + 1);
-    row.push(0);
-    for _ in 0..size {
-        row.extend_from_slice(&[0x00, 0x78, 0xd7, 0xff]);
-    }
-    let mut scanlines = Vec::with_capacity(size * (size * 4 + 1));
-    for _ in 0..size {
-        scanlines.extend_from_slice(&row);
-    }
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&scanlines)?;
-    let compressed = encoder.finish()?;
-
-    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut header = Vec::with_capacity(13);
-    let size = u32::try_from(size)
-        .map_err(|_| PublisherError::Invalid("generated PNG dimensions are too large".to_owned()))?;
-    header.extend_from_slice(&size.to_be_bytes());
-    header.extend_from_slice(&size.to_be_bytes());
-    header.extend_from_slice(&[8, 6, 0, 0, 0]);
-    append_png_chunk(&mut png, b"IHDR", &header)?;
-    append_png_chunk(&mut png, b"IDAT", &compressed)?;
-    append_png_chunk(&mut png, b"IEND", &[])?;
-    fs::write(path, png)?;
-    Ok(())
-}
-
-fn append_png_chunk(output: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) -> Result<()> {
-    let length = u32::try_from(data.len())
-        .map_err(|_| PublisherError::Invalid("generated PNG chunk is too large".to_owned()))?;
-    output.extend_from_slice(&length.to_be_bytes());
-    output.extend_from_slice(kind);
-    output.extend_from_slice(data);
-    let mut checksum = kind.to_vec();
-    checksum.extend_from_slice(data);
-    output.extend_from_slice(&crc32(&checksum).to_be_bytes());
-    Ok(())
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
-        }
-    }
-    !crc
-}
-
-fn run_tool<const N: usize>(tool: &Path, args: [&str; N]) -> Result<()> {
-    let output = Command::new(tool).args(args).output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(PublisherError::Tool(format!(
-        "{} failed ({}): {}",
-        tool.display(),
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
-}
-
-fn run_sign_tool(tool: &Path, args: &[&str], secret: Option<&str>) -> Result<()> {
-    let output = Command::new(tool).args(args).output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = secret.map_or_else(|| stderr.to_string(), |secret| stderr.replace(secret, "<redacted>"));
-    Err(PublisherError::Tool(format!(
-        "{} failed ({}): {}",
-        tool.display(),
-        output.status,
-        stderr.trim()
-    )))
-}
-
-fn validate_certificate_publisher(path: &Path, password_env: &str, publisher: &str) -> Result<()> {
-    let powershell = find_tool("powershell.exe", None).ok_or_else(|| {
-        PublisherError::Tool("Windows PowerShell is required to inspect the signing certificate".to_owned())
-    })?;
-    let script = "$ErrorActionPreference='Stop'; try { $p=[Environment]::GetEnvironmentVariable($env:PINGET_PUBLISHER_PASSWORD_NAME); $c=[System.Security.Cryptography.X509Certificates.X509Certificate2]::new($env:PINGET_PUBLISHER_PFX_PATH,$p,[System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet); $now=[DateTime]::UtcNow; $eku=$c.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] }; $codeSigning=$false; if ($eku) { $codeSigning=@($eku.EnhancedKeyUsages | Where-Object { $_.Value -eq '1.3.6.1.5.5.7.3.3' }).Count -gt 0 }; $result=@{ subject=$c.Subject; hasPrivateKey=$c.HasPrivateKey; validNow=($now -ge $c.NotBefore.ToUniversalTime() -and $now -le $c.NotAfter.ToUniversalTime()); codeSigning=$codeSigning }; [Console]::Out.Write((ConvertTo-Json -InputObject $result -Compress)) } catch { [Console]::Error.WriteLine('Unable to inspect the signing certificate.'); exit 1 }";
-    let output = Command::new(powershell)
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
-        .env("PINGET_PUBLISHER_PFX_PATH", path)
-        .env("PINGET_PUBLISHER_PASSWORD_NAME", password_env)
-        .output()?;
-    if !output.status.success() {
-        return Err(PublisherError::Invalid(
-            "unable to inspect the PFX signing certificate; confirm its password and certificate contents".to_owned(),
-        ));
-    }
-    let certificate: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| PublisherError::Invalid("unable to parse signing certificate details".to_owned()))?;
-    let subject = certificate["subject"].as_str().unwrap_or_default();
-    if !subject.eq_ignore_ascii_case(publisher) {
-        return Err(PublisherError::Invalid(format!(
-            "PFX certificate subject does not match --publisher (expected {publisher:?}, found {subject:?})"
-        )));
-    }
-    if certificate["hasPrivateKey"] != true {
-        return Err(PublisherError::Invalid(
-            "PFX certificate does not contain a private key".to_owned(),
-        ));
-    }
-    if certificate["validNow"] != true {
-        return Err(PublisherError::Invalid(
-            "PFX certificate is not currently valid".to_owned(),
-        ));
-    }
-    if certificate["codeSigning"] != true {
-        return Err(PublisherError::Invalid(
-            "PFX certificate must include the Code Signing enhanced key usage".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn find_tool(name: &str, explicit: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = explicit {
-        return path.is_file().then(|| path.to_path_buf());
-    }
-    if let Some(path_env) = std::env::var_os("PATH")
-        && let Some(path) = std::env::split_paths(&path_env)
-            .map(|directory| directory.join(name))
-            .find(|path| path.is_file())
-    {
-        return Some(path);
-    }
-    if !cfg!(windows) || !["makeappx.exe", "signtool.exe"].contains(&name) {
-        return None;
-    }
-    let root = PathBuf::from(std::env::var_os("ProgramFiles(x86)")?)
-        .join("Windows Kits")
-        .join("10")
-        .join("bin");
-    let host_arch = std::env::var("PROCESSOR_ARCHITEW6432")
-        .or_else(|_| std::env::var("PROCESSOR_ARCHITECTURE"))
-        .unwrap_or_default();
-    let architectures: &[&str] = if host_arch.eq_ignore_ascii_case("ARM64") || cfg!(target_arch = "aarch64") {
-        &["arm64", "x64", "x86"]
-    } else {
-        &["x64", "x86"]
-    };
-    find_sdk_tool(&root, name, architectures)
-}
-
-fn find_sdk_tool(root: &Path, name: &str, architectures: &[&str]) -> Option<PathBuf> {
-    let mut versions: Vec<_> = fs::read_dir(root)
-        .ok()?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            let version: Vec<u32> = entry
-                .file_name()
-                .to_str()?
-                .split('.')
-                .map(str::parse)
-                .collect::<std::result::Result<_, _>>()
-                .ok()?;
-            (version.len() == 4).then_some((version, entry.path()))
-        })
-        .collect();
-    versions.sort_by(|left, right| right.0.cmp(&left.0));
-    versions
-        .into_iter()
-        .flat_map(|(_, directory)| architectures.iter().map(move |arch| directory.join(arch).join(name)))
-        .find(|path| path.is_file())
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -2975,7 +2808,11 @@ fn validate_package_identity(name: &str, publisher: &str) -> Result<()> {
     {
         return Err(PublisherError::Invalid("invalid MSIX package identity name".to_owned()));
     }
-    if publisher.is_empty() || publisher.contains(['<', '>']) || publisher.chars().any(char::is_control) {
+    if publisher.trim().is_empty()
+        || publisher.trim() != publisher
+        || publisher.contains(['<', '>'])
+        || publisher.chars().any(char::is_control)
+    {
         return Err(PublisherError::Invalid("invalid MSIX package publisher".to_owned()));
     }
     Ok(())
@@ -3629,9 +3466,8 @@ fn compress_mszip(_input: &[u8]) -> Result<Vec<u8>> {
 #[cfg(not(windows))]
 fn decompress_mszip(input: &[u8]) -> Result<Vec<u8>> {
     validate_mszip_size(input)?;
-    Err(PublisherError::Tool(
-        "native WinGet MSZIP decompression is currently supported only on Windows".to_owned(),
-    ))
+    pinget_core::decompress_mszip_buffer(input)
+        .map_err(|error| PublisherError::Invalid(format!("invalid MSZIP version data: {error:#}")))
 }
 
 #[cfg(test)]
@@ -3839,7 +3675,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn initial_publish_post_copy_failure_cleans_destination_and_allows_retry() {
-        let makeappx = doctor().makeappx_path.expect("Windows SDK MakeAppx is required");
         let root = unit_directory("initial-publish");
         let input = root.join("input");
         let state = root.join("state");
@@ -3880,8 +3715,8 @@ mod tests {
             publisher: "CN=Pinget Initial Rollback Test".to_owned(),
             version: "1.0.0.0".to_owned(),
             signing: Signing::UnsignedDevelopment,
-            makeappx: Some(makeappx),
-            signtool: None,
+            psign_tool: None,
+            trusted_ca: Vec::new(),
             timestamp_url: None,
         };
         let mut reached_after_copy = false;
@@ -3922,7 +3757,7 @@ mod tests {
             "retry must perform publication rather than reuse a false commit"
         );
         assert_eq!(published.build_id, build_report.build_id);
-        let verified = verify_published_destination(&destination, None).expect("destination verification");
+        let verified = verify_published_destination(&destination, None, &[]).expect("destination verification");
         assert!(verified.valid);
         assert_eq!(verified.build_id.as_deref(), Some(build_report.build_id.as_str()));
         assert_eq!(
@@ -3955,25 +3790,17 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn sdk_discovery_prefers_numeric_newest_version_and_host_architecture() {
-        let root = unit_directory("sdk");
-        for (version, architecture) in [("10.0.9.0", "x64"), ("10.0.10.0", "x86"), ("10.0.10.0", "x64")] {
-            let directory = root.join(version).join(architecture);
-            fs::create_dir_all(&directory).expect("SDK directory");
-            fs::write(directory.join("makeappx.exe"), b"fixture").expect("SDK tool");
-        }
+    fn portable_mszip_decoder_reads_native_compressor_output() {
+        let input: Vec<u8> = (0..200_000u32)
+            .flat_map(|value| format!("  - v: \"{}\"\n", value % 977).into_bytes())
+            .collect();
+        let compressed = compress_mszip(&input).expect("native MSZIP");
         assert_eq!(
-            find_sdk_tool(&root, "makeappx.exe", &["x64", "x86"]),
-            Some(root.join("10.0.10.0").join("x64").join("makeappx.exe"))
+            pinget_core::decompress_mszip_buffer(&compressed).expect("portable decode"),
+            input
         );
-        fs::remove_file(root.join("10.0.10.0").join("x64").join("makeappx.exe")).expect("remove native tool");
-        assert_eq!(
-            find_sdk_tool(&root, "makeappx.exe", &["x64", "x86"]),
-            Some(root.join("10.0.10.0").join("x86").join("makeappx.exe"))
-        );
-        assert!(find_sdk_tool(&root, "signtool.exe", &["x64"]).is_none());
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

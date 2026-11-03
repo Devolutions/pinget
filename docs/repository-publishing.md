@@ -19,17 +19,22 @@ URLs; the build does not download or execute them.
   sets (version, installer, default locale and optional additional locales).
 - Separate directories for inputs, publisher state and published files.
   Do not put one inside another or use symlinks/reparse points in them.
-- For publication on Windows, the Windows SDK's `makeappx.exe` and
-  `signtool.exe`. `repository doctor` reports tool availability; explicit tool
-  paths can be supplied when they are not discoverable.
+- For signed publication, [`psign-tool`](https://github.com/Devolutions/psign)
+  **0.8.2 or later**, a cross-platform Authenticode signer: `dotnet tool
+  install -g Devolutions.Psign.Tool`. Earlier versions produce MSIX signatures
+  that Windows rejects. `repository doctor` reports whether it was found on
+  `PATH` or in the .NET global tool directory; `--psign-tool` supplies an
+  explicit path. The Windows SDK (`makeappx.exe`, `signtool.exe`) is not used:
+  the publisher writes the MSIX container itself.
 - A code-signing certificate with its private key in a PFX, and a publisher
-  distinguished name matching that certificate.
+  distinguished name matching that certificate's subject.
 
-Building, verification and publication currently require Windows because
-sidecars use the native Windows Compression API. `status` and `diff` can
-inspect state on other platforms; `doctor` reports the missing capability.
-Do not infer publishing support from the availability of the CLI on a platform.
-Unsupported toolchains fail rather than silently produce unsigned output.
+Building requires Windows because sidecars are compressed with the native
+Windows Compression API. `publish`, `verify`, `status` and `diff` also run on
+Linux and macOS, so a snapshot built on Windows can be signed and published
+elsewhere. Do not infer publishing support from the availability of the CLI on
+a platform. A missing signing tool fails rather than silently producing
+unsigned output.
 
 ## Build, inspect and publish
 
@@ -92,12 +97,19 @@ For local format development only, replace the signing options with
 publisher does not install certificates, configure WinGet source trust or
 change the caller's sources.
 
-The PFX password is not stored in publisher state or normal diagnostics.
-`signtool`'s PFX interface requires passing it to the signing child process;
-privileged local process inspection can therefore observe it. Use a protected
-build agent and restrict access to both that agent and the PFX. The password
-environment-variable indirection is not a guarantee of process-level secret
-isolation.
+The PFX password is not stored in publisher state or normal diagnostics. The
+publisher hands it to `psign-tool` through a response file in a private
+temporary directory, deleted after signing, rather than on the command line.
+It is still present briefly on disk and in the signing process, so use a
+protected build agent and restrict access to both that agent and the PFX.
+
+After signing, the publisher checks the package digests, that the signer
+certificate subject matches `--publisher` and carries the Code Signing usage,
+and that the signature chains to a trusted root. On Windows the root must be
+trusted by the machine, like `signtool verify /pa`; on Linux and macOS psign's
+Microsoft AuthRoot anchors are used. For a private or self-signed root, pass
+its certificate with `--trusted-ca` (repeatable) to `publish` and
+`verify --destination`.
 
 ## Host the result
 

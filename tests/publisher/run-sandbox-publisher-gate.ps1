@@ -47,8 +47,7 @@ try {
 
     $harness = Join-Path $StageRoot 'tests\sandbox-conformance.ps1'
     $feedServer = Join-Path $StageRoot 'tests\serve-feed.ps1'
-    $makeAppx = Join-Path $StageRoot 'tools\sdk-x64\makeappx.exe'
-    $signTool = Join-Path $StageRoot 'tools\sdk-x64\signtool.exe'
+    $psignTool = Join-Path $StageRoot 'tools\psign-tool.exe'
     $publishers = @(
         [pscustomobject]@{
             Name = 'Rust'
@@ -92,8 +91,7 @@ try {
             -PublisherName 'Pinget.Publisher.Conformance' `
             -PublisherIdentity 'CN=Pinget Publisher Conformance Test' `
             -InitialPackageVersion '1.0.0.0' `
-            -MakeAppxPath $makeAppx `
-            -SignToolPath $signTool
+            -PsignToolPath $psignTool
 
         $runSummary.Add([pscustomobject]@{
             publisher = $publisher.Name

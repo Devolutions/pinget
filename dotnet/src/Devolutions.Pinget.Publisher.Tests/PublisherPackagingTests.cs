@@ -232,45 +232,48 @@ public sealed class PublisherPackagingTests
     }
 
     [Fact]
-    public void Publish_FailedPackagingTool_DoesNotExposeAnIndexOrRecordPublication()
+    public void Publish_MissingSigningTool_DoesNotExposeAnIndexOrRecordPublication()
     {
         using var temp = new TempDirectory();
         var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
         var state = Path.Combine(temp.Path, "state");
         var destination = Path.Combine(temp.Path, "published");
         var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
-        var where = Path.Combine(Environment.SystemDirectory, "where.exe");
-        Assert.True(File.Exists(where), "Windows where.exe is required for the controlled failing-tool case.");
-        var options = new PublisherPublishOptions(
-            state,
-            destination,
-            PackageName,
-            Publisher,
-            "1.0.0.0",
-            UnsignedDevelopment: true,
-            MakeAppxPath: where,
-            BuildId: build.BuildId);
+        const string password = "safe-test-password";
+        var pfx = CreateSigningPfx(Path.Combine(temp.Path, "signer.pfx"), Publisher, password);
+        const string passwordVariable = "PINGET_PUBLISHER_TEST_MISSING_TOOL_PASSWORD";
+        var previousPassword = Environment.GetEnvironmentVariable(passwordVariable);
+        Environment.SetEnvironmentVariable(passwordVariable, password);
+        try
+        {
+            var options = new PublisherPublishOptions(
+                state,
+                destination,
+                PackageName,
+                Publisher,
+                "1.0.0.0",
+                PfxPath: pfx,
+                PasswordEnvironmentVariable: passwordVariable,
+                PsignToolPath: Path.Combine(temp.Path, "missing", "psign-tool.exe"),
+                BuildId: build.BuildId);
 
-        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
+            var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
 
-        Assert.Contains("MSIX packaging failed", error.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.False(File.Exists(Path.Combine(destination, "source2.msix")));
-        Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
+            Assert.Contains("psign-tool does not exist at", error.Message, StringComparison.Ordinal);
+            Assert.False(File.Exists(Path.Combine(destination, "source2.msix")));
+            Assert.False(File.Exists(Path.Combine(destination, ".pinget-publisher.json")));
+            Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
+            Assert.Empty(Directory.EnumerateDirectories(state, ".publish-*"));
 
-        var usableMakeAppx = PublisherPackaging.Doctor().MakeAppxPath;
-        Assert.False(string.IsNullOrWhiteSpace(usableMakeAppx));
-        var retry = PublisherPackaging.Publish(new PublisherPublishOptions(
-            state,
-            destination,
-            PackageName,
-            Publisher,
-            "1.0.0.0",
-            UnsignedDevelopment: true,
-            MakeAppxPath: usableMakeAppx,
-            BuildId: build.BuildId));
-        Assert.True(retry.Valid);
-        Assert.True(PublisherPackaging.VerifyDestination(destination).Valid);
-        Assert.Equal(build.BuildId, new PublisherWorkspace(state).Status().LastPublishedBuildId);
+            var retry = PublisherPackaging.Publish(UnsignedOptions(state, destination, "1.0.0.0", build.BuildId));
+            Assert.True(retry.Valid);
+            Assert.True(PublisherPackaging.VerifyDestination(destination).Valid);
+            Assert.Equal(build.BuildId, new PublisherWorkspace(state).Status().LastPublishedBuildId);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(passwordVariable, previousPassword);
+        }
     }
 
     [Fact]
@@ -281,62 +284,36 @@ public sealed class PublisherPackagingTests
         var state = Path.Combine(temp.Path, "state");
         var destination = Path.Combine(temp.Path, "published");
         var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
-        var makeAppx = PublisherPackaging.Doctor().MakeAppxPath;
-        Assert.False(string.IsNullOrWhiteSpace(makeAppx), "Windows SDK MakeAppx is required for the controlled post-copy failure case.");
-
-        var wrapper = Path.Combine(temp.Path, "makeappx-fail-msix-identity.cmd");
-        var manifestMutator = Path.Combine(temp.Path, "mutate-msix-identity.ps1");
-        File.WriteAllText(
-            manifestMutator,
-            """
-            $ErrorActionPreference = 'Stop'
-            $manifestPath = Join-Path $env:PINGET_PUBLISHER_TEST_PACKAGE_DIR 'AppxManifest.xml'
-            [xml]$manifest = Get-Content -LiteralPath $manifestPath -Raw
-            $identity = $manifest.SelectSingleNode('/*[local-name()=''Package'']/*[local-name()=''Identity'']')
-            if ($null -eq $identity) {
-                throw 'Generated package manifest does not contain an Identity element.'
-            }
-            $identity.SetAttribute('Name', 'Pinget.Publisher.WrongIdentity')
-            $manifest.Save($manifestPath)
-            """,
-            new UTF8Encoding(false));
-        File.WriteAllText(
-            wrapper,
-            string.Join(
-                "\r\n",
-                [
-                    "@echo off",
-                    "setlocal",
-                    $"set \"REAL_MAKEAPPX={makeAppx}\"",
-                    "set \"PINGET_PUBLISHER_TEST_PACKAGE_DIR=%~3\"",
-                    "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0mutate-msix-identity.ps1\"",
-                    "if errorlevel 1 exit /b 91",
-                    "\"%REAL_MAKEAPPX%\" %*",
-                    "exit /b %errorlevel%",
-                ]) + "\r\n",
-            new UTF8Encoding(false));
-
-        var failedPublish = new PublisherPublishOptions(
-            state,
-            destination,
-            PackageName,
-            Publisher,
-            "1.0.0.0",
-            UnsignedDevelopment: true,
-            MakeAppxPath: wrapper,
-            BuildId: build.BuildId);
-        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(failedPublish));
-
-        Assert.Contains("MSIX identity does not match", error.Message, StringComparison.Ordinal);
-        Assert.True(Directory.Exists(destination));
-        Assert.Empty(Directory.EnumerateFileSystemEntries(destination));
-        Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
-
         var snapshotFeed = Path.Combine(build.SnapshotDirectory, "feed");
         var copiedArtifactPaths = Directory.EnumerateFiles(snapshotFeed, "*", SearchOption.AllDirectories)
             .Select(path => Path.GetRelativePath(snapshotFeed, path))
             .ToArray();
         Assert.NotEmpty(copiedArtifactPaths);
+
+        var reachedAfterCopy = false;
+        var failedPublish = UnsignedOptions(state, destination, "1.0.0.0", build.BuildId);
+        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(failedPublish, (feed, stagedPackage) =>
+        {
+            reachedAfterCopy = true;
+            foreach (var relativePath in copiedArtifactPaths)
+            {
+                var copied = Path.Combine(feed, relativePath);
+                Assert.True(File.Exists(copied), $"Artifact must exist before the injected failure: {relativePath}");
+                Assert.Equal(File.ReadAllBytes(Path.Combine(snapshotFeed, relativePath)), File.ReadAllBytes(copied));
+            }
+            Assert.False(File.Exists(Path.Combine(feed, ".pinget-publisher.json")), "No ownership marker before promotion.");
+            Assert.False(File.Exists(Path.Combine(feed, "source2.msix")), "No root package before promotion.");
+            // Swap the staged package for one whose identity disagrees with the ownership marker,
+            // so the real post-copy MSIX verification fails.
+            RewriteStagedPackageIdentity(stagedPackage, "Pinget.Publisher.WrongIdentity");
+        }));
+
+        Assert.True(reachedAfterCopy, "The failure must occur after the verified artifact copies.");
+        Assert.Contains("MSIX identity does not match", error.Message, StringComparison.Ordinal);
+        Assert.True(Directory.Exists(destination));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(destination));
+        Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
+        Assert.Empty(Directory.EnumerateDirectories(state, ".publish-*"));
         foreach (var relativePath in copiedArtifactPaths)
         {
             var destinationPath = Path.Combine(destination, relativePath.Replace('/', Path.DirectorySeparatorChar));
@@ -359,8 +336,6 @@ public sealed class PublisherPackagingTests
         var state = Path.Combine(temp.Path, "state");
         var destination = Path.Combine(temp.Path, "published");
         var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
-        var makeAppx = PublisherPackaging.Doctor().MakeAppxPath;
-        Assert.False(string.IsNullOrWhiteSpace(makeAppx), "Windows SDK MakeAppx is required for the signing failure case.");
         var where = Path.Combine(Environment.SystemDirectory, "where.exe");
         Assert.True(File.Exists(where), "Windows where.exe is required for the controlled failing-tool case.");
         const string password = "safe-test-password";
@@ -378,13 +353,13 @@ public sealed class PublisherPackagingTests
                 "1.0.0.0",
                 PfxPath: pfx,
                 PasswordEnvironmentVariable: passwordVariable,
-                MakeAppxPath: makeAppx,
-                SignToolPath: where,
+                PsignToolPath: where,
                 BuildId: build.BuildId);
 
             var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
 
-            Assert.Contains("MSIX signing failed", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("MSIX signing with psign-tool failed", error.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain(password, error.Message, StringComparison.Ordinal);
             Assert.False(File.Exists(Path.Combine(destination, "source2.msix")));
             Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
 
@@ -531,6 +506,32 @@ public sealed class PublisherPackagingTests
         Assert.Equal(
             "windows.appExtension",
             (string?)extension.Parent?.Attribute("Category"));
+    }
+
+    private static void RewriteStagedPackageIdentity(string packagePath, string identityName)
+    {
+        var parts = new List<(string Name, byte[] Data)>();
+        using (var archive = ZipFile.OpenRead(packagePath))
+        {
+            foreach (var entry in archive.Entries)
+            {
+                if (entry.FullName is "AppxBlockMap.xml" or "[Content_Types].xml")
+                    continue;
+                using var stream = entry.Open();
+                using var buffer = new MemoryStream();
+                stream.CopyTo(buffer);
+                var data = buffer.ToArray();
+                if (entry.FullName == "AppxManifest.xml")
+                {
+                    var manifest = XDocument.Parse(Encoding.UTF8.GetString(data));
+                    XNamespace foundation = "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+                    manifest.Root!.Element(foundation + "Identity")!.SetAttributeValue("Name", identityName);
+                    data = Encoding.UTF8.GetBytes(manifest.ToString(SaveOptions.DisableFormatting));
+                }
+                parts.Add((entry.FullName, data));
+            }
+        }
+        File.WriteAllBytes(packagePath, MsixPackageWriter.Write(parts));
     }
 
     private static string CreateSigningPfx(string path, string subject, string password)
