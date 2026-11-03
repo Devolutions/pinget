@@ -259,7 +259,7 @@ public sealed class PublisherPackagingTests
 
             var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
 
-            Assert.Contains("psign-tool was not found", error.Message, StringComparison.Ordinal);
+            Assert.Contains("psign-tool does not exist at", error.Message, StringComparison.Ordinal);
             Assert.False(File.Exists(Path.Combine(destination, "source2.msix")));
             Assert.False(File.Exists(Path.Combine(destination, ".pinget-publisher.json")));
             Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);

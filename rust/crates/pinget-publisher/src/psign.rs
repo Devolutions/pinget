@@ -8,8 +8,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -48,6 +49,12 @@ pub(crate) fn find_psign_tool(explicit: Option<&Path>) -> Option<PathBuf> {
 
 /// Resolves `psign-tool` or explains how to install it.
 pub(crate) fn require_psign_tool(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit.filter(|path| !path.is_file()) {
+        return Err(PublisherError::Tool(format!(
+            "psign-tool does not exist at {}",
+            path.display()
+        )));
+    }
     find_psign_tool(explicit).ok_or_else(|| {
         PublisherError::Tool(
             "psign-tool was not found; install it with `dotnet tool install -g Devolutions.Psign.Tool` or pass --psign-tool"
@@ -173,7 +180,7 @@ pub(crate) fn check_signing_certificate(der: &[u8], publisher: &str) -> Result<(
         .map_err(|_| PublisherError::Invalid("signing certificate could not be parsed".to_owned()))?;
     let tbs = &certificate.tbs_certificate;
     let subject = windows_name(&tbs.subject);
-    if !subject.eq_ignore_ascii_case(publisher.trim()) {
+    if !subject.eq_ignore_ascii_case(publisher) {
         return Err(PublisherError::Invalid(format!(
             "signing certificate subject does not match --publisher (expected {publisher:?}, found {subject:?})"
         )));
@@ -212,7 +219,7 @@ fn windows_name(name: &x509_cert::name::Name) -> String {
                     format!(
                         "{}={}",
                         attribute_name(&attribute.oid),
-                        quote_value(&attribute_value(&attribute.value))
+                        attribute_value(&attribute.value)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -245,9 +252,10 @@ fn attribute_name(oid: &ObjectIdentifier) -> String {
     name.to_owned()
 }
 
+/// Renders a string value, quoted as needed, or any other ASN.1 value as unquoted `#<DER hex>`.
 fn attribute_value(value: &x509_cert::attr::AttributeValue) -> String {
     let bytes = value.value();
-    match value.tag() {
+    let text = match value.tag() {
         Tag::Utf8String | Tag::PrintableString | Tag::Ia5String | Tag::VisibleString => {
             String::from_utf8_lossy(bytes).into_owned()
         }
@@ -263,12 +271,13 @@ fn attribute_value(value: &x509_cert::attr::AttributeValue) -> String {
         }
         _ => {
             let encoded = x509_cert::der::Encode::to_der(value).unwrap_or_default();
-            format!(
+            return format!(
                 "#{}",
                 encoded.iter().map(|byte| format!("{byte:02X}")).collect::<String>()
-            )
+            );
         }
-    }
+    };
+    quote_value(&text)
 }
 
 fn quote_value(value: &str) -> String {
@@ -298,33 +307,43 @@ fn path_argument(path: &Path) -> Result<String> {
 /// Runs `psign-tool @<response file>` and returns standard output.
 fn run(tool: &Path, operation: &str, arguments: &[String], secret: Option<&str>) -> Result<Vec<u8>> {
     let workspace = Workspace::create()?;
-    let mut response = String::new();
-    for argument in arguments {
-        // One quoted argument per line; doubled quotes encode a literal quote.
-        response.push('"');
-        response.push_str(&argument.replace('"', "\"\""));
-        response.push_str("\"\n");
-    }
-    let response_path = workspace.write("arguments.rsp", response.as_bytes())?;
+    let response_path = workspace.write("arguments.rsp", response_file(arguments).as_bytes())?;
+    // `Command` escapes arguments for `cmd.exe` when `tool` is a `.cmd` shim.
     let output = Command::new(tool)
         .arg(format!("@{}", path_argument(&response_path)?))
+        .stdin(Stdio::null())
         .output()
         .map_err(|error| PublisherError::Tool(format!("could not start {}: {error}", tool.display())))?;
     drop(workspace);
     if output.status.success() {
         return Ok(output.stdout);
     }
-    let mut message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(PublisherError::Tool(format!(
+        "{operation} with psign-tool failed ({}): {}",
+        output.status,
+        failure_message(&output.stdout, &output.stderr, secret)
+    )))
+}
+
+/// Formats arguments as a psign-tool response file: one quoted argument per line,
+/// with doubled quotes encoding a literal quote.
+fn response_file(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .map(|argument| format!("\"{}\"\n", argument.replace('"', "\"\"")))
+        .collect()
+}
+
+/// Uses standard error, or standard output when it is empty, with `secret` redacted.
+fn failure_message(stdout: &[u8], stderr: &[u8], secret: Option<&str>) -> String {
+    let mut message = String::from_utf8_lossy(stderr).trim().to_owned();
     if message.is_empty() {
-        message = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        message = String::from_utf8_lossy(stdout).trim().to_owned();
     }
     if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
         message = message.replace(secret, "<redacted>");
     }
-    Err(PublisherError::Tool(format!(
-        "{operation} with psign-tool failed ({}): {message}",
-        output.status
-    )))
+    message
 }
 
 /// A private temporary directory removed on drop.
@@ -334,11 +353,14 @@ struct Workspace {
 
 impl Workspace {
     fn create() -> Result<Self> {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        // The clock separates processes that reuse a PID; the sequence separates calls within one.
         let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|error| PublisherError::Invalid(format!("system clock is before Unix epoch: {error}")))?
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("pinget-psign-{}-{nonce}", std::process::id()));
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("pinget-psign-{}-{nonce}-{sequence}", std::process::id()));
         #[cfg_attr(not(unix), allow(unused_mut, reason = "permissions are only set on Unix"))]
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -380,10 +402,158 @@ mod tests {
         assert!(find_psign_tool(Some(Path::new("definitely-missing-psign-tool"))).is_none());
     }
 
+    // Self-signed P-256 certificates for `CN=Pinget Signer, O="Example, Inc."`, generated with
+    // .NET `CertificateRequest`: Code Signing EKU valid 2020-2120, Server Authentication EKU
+    // valid 2020-2120, and Code Signing EKU valid only 2000-2001.
+    const CODE_SIGNING_CERTIFICATE: &str = "MIIBbjCCARWgAwIBAgIILqeVB9jlmbYwCgYIKoZIzj0EAwIwMDEWMBQGA1UEChMNRXhhbXBsZSwgSW5jLjEWMBQGA1UEAxMNUGluZ2V0IFNpZ25lcjAgFw0yMDAxMDEwMDAwMDBaGA8yMTIwMDEwMTAwMDAwMFowMDEWMBQGA1UEChMNRXhhbXBsZSwgSW5jLjEWMBQGA1UEAxMNUGluZ2V0IFNpZ25lcjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABAnEqQFwHpVKOl9KXaBEHZZr/3uyj75uoYRvoyeSLE/T364LUGS6tscLdMf65OEncne+oq7/NPDPApiIuP3GGpCjFzAVMBMGA1UdJQQMMAoGCCsGAQUFBwMDMAoGCCqGSM49BAMCA0cAMEQCIB+T6jLBcFE+sLQ17Y6SOugN2mSGYRhURMXLA+xIbuRxAiBpsyRI+uTH4IkxsS9aNQAC0NW6CiVuGCH/EY3au63pfg==";
+    const SERVER_AUTH_CERTIFICATE: &str = "MIIBbzCCARWgAwIBAgIIEcWCzfgUnKAwCgYIKoZIzj0EAwIwMDEWMBQGA1UEChMNRXhhbXBsZSwgSW5jLjEWMBQGA1UEAxMNUGluZ2V0IFNpZ25lcjAgFw0yMDAxMDEwMDAwMDBaGA8yMTIwMDEwMTAwMDAwMFowMDEWMBQGA1UEChMNRXhhbXBsZSwgSW5jLjEWMBQGA1UEAxMNUGluZ2V0IFNpZ25lcjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKBu+enic0Ebfmn+xAqWK4e9V17B+pWu+7/cWri2CgRxjRmPps6/WPvFhm4QlNAAnvnObDPt+ovB/C7aIXtk976jFzAVMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0gAMEUCID49A9CYbbocTNdecVkarzIutEztnOE5AQGqbkOcHjceAiEAhZIZcmSkS29PGfms/PkTBj+i/5uXDKQ97pMgz1xcxTc=";
+    const EXPIRED_CERTIFICATE: &str = "MIIBbTCCAROgAwIBAgIIWdNsT75jefAwCgYIKoZIzj0EAwIwMDEWMBQGA1UEChMNRXhhbXBsZSwgSW5jLjEWMBQGA1UEAxMNUGluZ2V0IFNpZ25lcjAeFw0wMDAxMDEwMDAwMDBaFw0wMTAxMDEwMDAwMDBaMDAxFjAUBgNVBAoTDUV4YW1wbGUsIEluYy4xFjAUBgNVBAMTDVBpbmdldCBTaWduZXIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARRKZtwV+hYyLwxUZn5XEnvBH/hwn57hHWYcaIyVw3eq0cMwi2MknSjL3sK6siSDerWZawJUSaLKRNaBwznveAyoxcwFTATBgNVHSUEDDAKBggrBgEFBQcDAzAKBggqhkjOPQQDAgNIADBFAiBY4yzGE/tbmppuHreYTvBHR/EdQcMr503haoE/pAwSWwIhAJUuSdHf5t+k4Mrw2IC88vy8UnTdNjZ1CGmsNo1GsR5U";
+    const SUBJECT: &str = "CN=Pinget Signer, O=\"Example, Inc.\"";
+
+    fn der(base64: &str) -> Vec<u8> {
+        BASE64.decode(base64).expect("fixture is valid base64")
+    }
+
+    fn invalid_message(result: Result<()>) -> String {
+        match result {
+            Err(PublisherError::Invalid(message)) => message,
+            other => panic!("expected an invalid-certificate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_explicit_tool_reports_the_path() {
+        let missing = Path::new("definitely-missing-psign-tool");
+        let Err(PublisherError::Tool(message)) = require_psign_tool(Some(missing)) else {
+            panic!("missing explicit tool must fail");
+        };
+        assert!(
+            message.contains("psign-tool does not exist at definitely-missing-psign-tool"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn signing_certificate_requires_matching_subject_code_signing_and_validity() {
+        let valid = der(CODE_SIGNING_CERTIFICATE);
+        check_signing_certificate(&valid, SUBJECT).expect("matching code-signing certificate");
+        check_signing_certificate(&valid, "cn=pinget signer, o=\"example, inc.\"").expect("case-insensitive match");
+
+        assert!(
+            invalid_message(check_signing_certificate(&valid, "CN=Someone Else"))
+                .contains("does not match --publisher")
+        );
+        assert!(
+            invalid_message(check_signing_certificate(&valid, &format!("{SUBJECT} ")))
+                .contains("does not match --publisher")
+        );
+        assert!(
+            invalid_message(check_signing_certificate(&der(SERVER_AUTH_CERTIFICATE), SUBJECT)).contains("Code Signing")
+        );
+        assert!(
+            invalid_message(check_signing_certificate(&der(EXPIRED_CERTIFICATE), SUBJECT))
+                .contains("not currently valid")
+        );
+        assert!(invalid_message(check_signing_certificate(&[1, 2, 3], SUBJECT)).contains("could not be parsed"));
+    }
+
     #[test]
     fn quoting_matches_windows_subject_format() {
         assert_eq!(quote_value("Example, Inc."), "\"Example, Inc.\"");
         assert_eq!(quote_value("Pinget Source"), "Pinget Source");
         assert_eq!(quote_value("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn non_string_attribute_values_are_unquoted_der_hex() {
+        let integer = x509_cert::attr::AttributeValue::from_der(&[0x02, 0x01, 0x05]).expect("INTEGER 5");
+        assert_eq!(attribute_value(&integer), "#020105");
+        let text = x509_cert::attr::AttributeValue::from_der(&[0x0c, 0x02, b'#', b'x']).expect("UTF8String");
+        assert_eq!(attribute_value(&text), "\"#x\"");
+    }
+
+    #[test]
+    fn response_file_quotes_every_argument_on_its_own_line() {
+        assert_eq!(
+            response_file(&[
+                "--password=p@ss \"word\" %PATH%".to_owned(),
+                "C:\\a b\\c.msix".to_owned(),
+                String::new(),
+            ]),
+            "\"--password=p@ss \"\"word\"\" %PATH%\"\n\"C:\\a b\\c.msix\"\n\"\"\n"
+        );
+    }
+
+    #[test]
+    fn failure_message_prefers_stderr_and_redacts_the_secret() {
+        assert_eq!(
+            failure_message(b"ignored", b" bad password s3cret\n", Some("s3cret")),
+            "bad password <redacted>"
+        );
+        assert_eq!(
+            failure_message(b"stdout s3cret", b"  ", Some("s3cret")),
+            "stdout <redacted>"
+        );
+        assert_eq!(failure_message(b"", b"no secret", None), "no secret");
+    }
+
+    #[test]
+    fn workspaces_created_back_to_back_are_distinct() {
+        let first = Workspace::create().expect("first workspace");
+        let second = Workspace::create().expect("second workspace");
+        assert_ne!(first.path, second.path);
+        let path = first.path.clone();
+        drop(first);
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_shim_receives_response_file_through_paths_with_spaces() {
+        let root = tempfile_root();
+        let directory = root.join("fake psign & (tool)");
+        fs::create_dir_all(&directory).expect("tool directory");
+        let tool = directory.join("fake-psign-tool.cmd");
+        let captured = root.join("captured.rsp");
+        fs::write(
+            &tool,
+            format!(
+                "@echo off\r\nsetlocal DisableDelayedExpansion\r\nset \"RSP=%~1\"\r\ncopy /y \"%RSP:~1%\" \"{}\" >nul\r\necho signing failed for s3cret 1>&2\r\nexit /b 7\r\n",
+                captured.display()
+            ),
+        )
+        .expect("fake tool");
+
+        let error = sign(
+            &tool,
+            Path::new("C:\\a b\\source2.msix"),
+            Path::new("signer.pfx"),
+            "s3cret",
+            None,
+        )
+        .expect_err("fake tool fails");
+        let PublisherError::Tool(message) = error else {
+            panic!("expected tool error");
+        };
+        assert!(message.starts_with("MSIX signing with psign-tool failed"), "{message}");
+        assert!(
+            message.contains("<redacted>") && !message.contains("s3cret"),
+            "{message}"
+        );
+        let response = fs::read_to_string(&captured).expect("captured response file");
+        assert!(response.contains("\"--password=s3cret\"\n"), "{response}");
+        assert!(response.ends_with("\"C:\\a b\\source2.msix\"\n"), "{response}");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    fn tempfile_root() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("pinget-psign-test-{}-{nanos}", std::process::id()));
+        fs::create_dir(&path).expect("test root");
+        path
     }
 }

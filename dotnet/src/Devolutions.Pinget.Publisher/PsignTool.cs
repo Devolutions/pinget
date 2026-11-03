@@ -53,9 +53,13 @@ internal static class PsignTool
     }
 
     /// <summary>Resolves <c>psign-tool</c> or explains how to install it.</summary>
-    public static string Require(string? explicitPath) =>
-        Find(explicitPath) ?? throw new PublisherException(
+    public static string Require(string? explicitPath)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitPath) && !File.Exists(Path.GetFullPath(explicitPath)))
+            throw new PublisherException($"psign-tool does not exist at {Path.GetFullPath(explicitPath)}");
+        return Find(explicitPath) ?? throw new PublisherException(
             "psign-tool was not found; install it with `dotnet tool install -g Devolutions.Psign.Tool` or pass --psign-tool");
+    }
 
     /// <summary>Signs <paramref name="package"/> in place with a PFX, using portable Authenticode signing.</summary>
     public static void Sign(string tool, string package, string pfx, string password, string? timestampUrl)
@@ -165,7 +169,7 @@ internal static class PsignTool
         {
             // X509Certificate2.Subject is the Windows format that MSIX Identity/@Publisher must match.
             var subject = certificate.Subject;
-            if (!string.Equals(subject, publisher.Trim(), StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(subject, publisher, StringComparison.OrdinalIgnoreCase))
                 throw new PublisherException(
                     $"signing certificate subject does not match --publisher (expected \"{publisher}\", found \"{subject}\")");
             var now = DateTime.UtcNow;
@@ -211,7 +215,6 @@ internal static class PsignTool
             var responsePath = workspace.Write("arguments.rsp", new UTF8Encoding(false).GetBytes(ResponseFile(arguments)));
             var startInfo = new ProcessStartInfo
             {
-                FileName = tool,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -220,7 +223,7 @@ internal static class PsignTool
                 StandardErrorEncoding = Encoding.UTF8,
                 CreateNoWindow = true,
             };
-            startInfo.ArgumentList.Add("@" + PathArgument(responsePath));
+            SetCommand(startInfo, tool, "@" + PathArgument(responsePath));
             using var process = new Process { StartInfo = startInfo };
             try
             {
@@ -251,6 +254,33 @@ internal static class PsignTool
         if (failureHint is not null)
             error += "\n" + failureHint;
         throw new PublisherException(error);
+    }
+
+    /// <summary>Sets the process to run <paramref name="tool"/> with one argument.</summary>
+    /// <remarks>
+    /// Windows starts <c>.cmd</c> and <c>.bat</c> files through <c>cmd.exe</c>, which re-parses the
+    /// command line and does not understand the quoting <see cref="ProcessStartInfo.ArgumentList"/>
+    /// produces. Run such shims explicitly with <c>/s /c</c> so the outer quotes are stripped as a
+    /// pair, disable AutoRun and delayed expansion, and reject the characters <c>cmd.exe</c> still
+    /// interprets inside quotes.
+    /// </remarks>
+    internal static void SetCommand(ProcessStartInfo startInfo, string tool, string argument)
+    {
+        var extension = Path.GetExtension(tool);
+        if (!OperatingSystem.IsWindows()
+            || !(extension.Equals(".cmd", StringComparison.OrdinalIgnoreCase) || extension.Equals(".bat", StringComparison.OrdinalIgnoreCase)))
+        {
+            startInfo.FileName = tool;
+            startInfo.ArgumentList.Add(argument);
+            return;
+        }
+        foreach (var value in new[] { tool, argument })
+        {
+            if (value.Contains('"') || value.Contains('%'))
+                throw new PublisherException($"cannot pass \"{value}\" to a batch-file psign-tool; use psign-tool.exe or a path without '%' or '\"'");
+        }
+        startInfo.FileName = Path.Combine(Environment.SystemDirectory, "cmd.exe");
+        startInfo.Arguments = $"/d /v:off /s /c \"\"{tool}\" \"{argument}\"\"";
     }
 
     /// <summary>A private temporary directory removed on dispose.</summary>

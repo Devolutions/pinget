@@ -167,7 +167,25 @@ public sealed class MsixPackageWriterTests
         Assert.Null(PsignTool.Find(Path.Combine(Path.GetTempPath(), $"missing-psign-tool-{Guid.NewGuid():N}.exe")));
         var error = Assert.Throws<PublisherException>(() =>
             PsignTool.Require(Path.Combine(Path.GetTempPath(), $"missing-psign-tool-{Guid.NewGuid():N}.exe")));
-        Assert.Contains("dotnet tool install -g Devolutions.Psign.Tool", error.Message, StringComparison.Ordinal);
+        Assert.Contains("psign-tool does not exist at", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SetCommand_RunsBatchShimsThroughCmdWithPairedQuotes()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+        var startInfo = new System.Diagnostics.ProcessStartInfo();
+        PsignTool.SetCommand(startInfo, @"C:\Tools & More\psign-tool.cmd", @"@C:\Temp (x)\arguments.rsp");
+        Assert.Equal(Path.Combine(Environment.SystemDirectory, "cmd.exe"), startInfo.FileName);
+        Assert.Equal(@"/d /v:off /s /c """"C:\Tools & More\psign-tool.cmd"" ""@C:\Temp (x)\arguments.rsp""""", startInfo.Arguments);
+        Assert.Throws<PublisherException>(() =>
+            PsignTool.SetCommand(new System.Diagnostics.ProcessStartInfo(), @"C:\Tools\psign-tool.cmd", @"@C:\%TMP%\arguments.rsp"));
+
+        var exe = new System.Diagnostics.ProcessStartInfo();
+        PsignTool.SetCommand(exe, @"C:\Tools\psign-tool.exe", @"@C:\%TMP%\arguments.rsp");
+        Assert.Equal(@"C:\Tools\psign-tool.exe", exe.FileName);
+        Assert.Equal([@"@C:\%TMP%\arguments.rsp"], exe.ArgumentList);
     }
 
     [Fact]
@@ -178,7 +196,9 @@ public sealed class MsixPackageWriterTests
         using var temp = new TempDirectory();
         var captured = Path.Combine(temp.Path, "captured.rsp");
         var commandLine = Path.Combine(temp.Path, "command-line.txt");
-        var tool = Path.Combine(temp.Path, "fake-psign-tool.cmd");
+        // A space and cmd.exe metacharacters in the shim path must survive the cmd.exe re-parse.
+        var toolDirectory = Directory.CreateDirectory(Path.Combine(temp.Path, "fake psign & (tool)")).FullName;
+        var tool = Path.Combine(toolDirectory, "fake-psign-tool.cmd");
         File.WriteAllText(
             tool,
             string.Join(
@@ -228,7 +248,8 @@ public sealed class MsixPackageWriterTests
         const string subject = "CN=Pinget Signer, O=\"Example, Inc.\"";
         var valid = CreateCertificate(subject, codeSigning: true, DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
         PsignTool.CheckSigningCertificate(valid, subject);
-        PsignTool.CheckSigningCertificate(valid, "cn=pinget signer, o=\"example, inc.\" ");
+        PsignTool.CheckSigningCertificate(valid, "cn=pinget signer, o=\"example, inc.\"");
+        Assert.Throws<PublisherException>(() => PsignTool.CheckSigningCertificate(valid, subject + " "));
 
         var mismatch = Assert.Throws<PublisherException>(() => PsignTool.CheckSigningCertificate(valid, "CN=Someone Else"));
         Assert.Contains("does not match --publisher", mismatch.Message, StringComparison.Ordinal);

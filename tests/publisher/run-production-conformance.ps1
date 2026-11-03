@@ -311,6 +311,30 @@ if ($rustPublish.subject -ne $dotnetPublish.subject -or
     $rustPublish.artifactCount -ne $dotnetPublish.artifactCount) {
     throw 'Rust and .NET publish reports differ in verified subject or artifact count.'
 }
+# index.db records its build time, and the block map hashes it; every other part must match.
+function Get-PackagePartHashes([string] $Package) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($Package)
+    try {
+        foreach ($entry in $archive.Entries) {
+            if ($entry.FullName -in @('Public/index.db', 'AppxBlockMap.xml')) { continue }
+            $stream = $entry.Open()
+            try {
+                $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream))
+            } finally {
+                $stream.Dispose()
+            }
+            "$($entry.FullName)=$hash"
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+$rustParts = @(Get-PackagePartHashes (Join-Path $rustDestination 'source2.msix')) -join "`n"
+$dotnetParts = @(Get-PackagePartHashes (Join-Path $dotnetDestination 'source2.msix')) -join "`n"
+if ($rustParts -cne $dotnetParts) {
+    throw "Rust and .NET source2.msix packages differ outside the index:`n$rustParts`nvs`n$dotnetParts"
+}
 $dotnetVerifyRustDestination = ConvertFrom-PingetJson (Invoke-Pinget 'Dotnet' ($common + @(
     'verify', '--destination', $rustDestination
 ))) '.NET destination verify of Rust output'

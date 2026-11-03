@@ -121,7 +121,7 @@ internal static class PublisherCommands
         var unsignedPublish = new Option<bool>("--unsigned-development", "Allow explicitly unsigned development publishing");
         var psignToolPublish = PsignToolOption();
         var trustedCaPublish = TrustedCaOption();
-        var timestampPublish = new Option<string?>("--timestamp-url", "HTTPS RFC 3161 timestamp service URL");
+        var timestampPublish = new Option<string?>("--timestamp-url", "HTTP(S) RFC 3161 timestamp service URL");
         var buildPublish = new Option<string?>("--build", "Build snapshot ID (defaults to latest)");
         var publish = new Command("publish", "Package and publish a source2.msix and immutable artifacts");
         foreach (var option in new Option[]

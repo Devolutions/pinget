@@ -2596,16 +2596,53 @@ fn published_inventory_excluding(root: &Path, excluded: &[&Path]) -> Result<BTre
     Ok(inventory)
 }
 
+/// A 1x1 blue PNG used for every required logo; the source package has no app list entry.
+const LOGO_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0b, 0x49,
+    0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00, 0x00, 0x05, 0x00, 0x01, 0xa5, 0xf6, 0x45, 0x40, 0x00,
+    0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// Builds the source package manifest and logos, byte-identical to the .NET publisher's.
 fn appx_assets(name: &str, publisher: &str, version: &str) -> Result<Vec<(String, Vec<u8>)>> {
-    let escaped_publisher = escape_xml(publisher);
+    let name = escape_xml(name);
+    let publisher = escape_xml(publisher);
     let manifest = format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Package xmlns=\"http://schemas.microsoft.com/appx/manifest/foundation/windows10\" xmlns:uap=\"http://schemas.microsoft.com/appx/manifest/uap/windows10\" xmlns:uap3=\"http://schemas.microsoft.com/appx/manifest/uap/windows10/3\" IgnorableNamespaces=\"uap uap3\"><Identity Name=\"{name}\" Publisher=\"{escaped_publisher}\" Version=\"{version}\" ProcessorArchitecture=\"neutral\"/><Properties><DisplayName>Pinget preindexed source</DisplayName><PublisherDisplayName>{escaped_publisher}</PublisherDisplayName><Logo>Assets/StoreLogo.png</Logo></Properties><Dependencies><TargetDeviceFamily Name=\"Windows.Universal\" MinVersion=\"10.0.17763.0\" MaxVersionTested=\"10.0.22621.0\"/></Dependencies><Applications><Application Id=\"SourceData\"><uap:VisualElements DisplayName=\"Pinget preindexed source\" Description=\"Pinget static package source\" BackgroundColor=\"#0078d7\" Square150x150Logo=\"Assets/Logo150.png\" Square44x44Logo=\"Assets/Logo44.png\" AppListEntry=\"none\"/><Extensions><uap3:Extension Category=\"windows.appExtension\"><uap3:AppExtension Name=\"com.microsoft.winget.source\" Id=\"IndexDB\" DisplayName=\"Pinget preindexed source\" Description=\"Pinget static package source\" PublicFolder=\"Public\"/></uap3:Extension></Extensions></Application></Applications><Resources><Resource Language=\"und\"/></Resources></Package>\n"
+        r##"<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+         IgnorableNamespaces="uap uap3">
+  <Identity Name="{name}" ProcessorArchitecture="neutral" Publisher="{publisher}" Version="{version}" />
+  <Properties>
+    <DisplayName>Pinget preindexed source</DisplayName>
+    <PublisherDisplayName>Pinget source publisher</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Applications>
+    <Application Id="SourceData">
+      <uap:VisualElements DisplayName="Pinget preindexed source" Square150x150Logo="Assets\Logo150.png" Square44x44Logo="Assets\Logo44.png" Description="Pinget WinGet v2 package source" BackgroundColor="#0078d7" AppListEntry="none">
+        <uap:DefaultTile />
+      </uap:VisualElements>
+      <Extensions>
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension Name="com.microsoft.winget.source" Id="IndexDB" DisplayName="Pinget preindexed source" Description="Pinget WinGet v2 package source" PublicFolder="Public" />
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Resources><Resource Language="und" /></Resources>
+</Package>"##
     );
     Ok(vec![
         ("AppxManifest.xml".to_owned(), manifest.into_bytes()),
-        ("Assets/StoreLogo.png".to_owned(), png_logo(50)?),
-        ("Assets/Logo150.png".to_owned(), png_logo(150)?),
-        ("Assets/Logo44.png".to_owned(), png_logo(44)?),
+        ("Assets/StoreLogo.png".to_owned(), LOGO_PNG.to_vec()),
+        ("Assets/Logo150.png".to_owned(), LOGO_PNG.to_vec()),
+        ("Assets/Logo44.png".to_owned(), LOGO_PNG.to_vec()),
     ])
 }
 
@@ -2616,59 +2653,6 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
-}
-
-fn png_logo(size: usize) -> Result<Vec<u8>> {
-    use flate2::Compression;
-    use flate2::write::ZlibEncoder;
-
-    let mut row = Vec::with_capacity(size * 4 + 1);
-    row.push(0);
-    for _ in 0..size {
-        row.extend_from_slice(&[0x00, 0x78, 0xd7, 0xff]);
-    }
-    let mut scanlines = Vec::with_capacity(size * (size * 4 + 1));
-    for _ in 0..size {
-        scanlines.extend_from_slice(&row);
-    }
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&scanlines)?;
-    let compressed = encoder.finish()?;
-
-    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut header = Vec::with_capacity(13);
-    let size = u32::try_from(size)
-        .map_err(|_| PublisherError::Invalid("generated PNG dimensions are too large".to_owned()))?;
-    header.extend_from_slice(&size.to_be_bytes());
-    header.extend_from_slice(&size.to_be_bytes());
-    header.extend_from_slice(&[8, 6, 0, 0, 0]);
-    append_png_chunk(&mut png, b"IHDR", &header)?;
-    append_png_chunk(&mut png, b"IDAT", &compressed)?;
-    append_png_chunk(&mut png, b"IEND", &[])?;
-    Ok(png)
-}
-
-fn append_png_chunk(output: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) -> Result<()> {
-    let length = u32::try_from(data.len())
-        .map_err(|_| PublisherError::Invalid("generated PNG chunk is too large".to_owned()))?;
-    output.extend_from_slice(&length.to_be_bytes());
-    output.extend_from_slice(kind);
-    output.extend_from_slice(data);
-    let mut checksum = kind.to_vec();
-    checksum.extend_from_slice(data);
-    output.extend_from_slice(&crc32(&checksum).to_be_bytes());
-    Ok(())
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
-        }
-    }
-    !crc
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -2824,7 +2808,11 @@ fn validate_package_identity(name: &str, publisher: &str) -> Result<()> {
     {
         return Err(PublisherError::Invalid("invalid MSIX package identity name".to_owned()));
     }
-    if publisher.is_empty() || publisher.contains(['<', '>']) || publisher.chars().any(char::is_control) {
+    if publisher.trim().is_empty()
+        || publisher.trim() != publisher
+        || publisher.contains(['<', '>'])
+        || publisher.chars().any(char::is_control)
+    {
         return Err(PublisherError::Invalid("invalid MSIX package publisher".to_owned()));
     }
     Ok(())

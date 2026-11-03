@@ -117,8 +117,11 @@ public static partial class PublisherPackaging
         if (options.UnsignedDevelopment && options.PasswordEnvironmentVariable is not null)
             throw new PublisherException("--unsigned-development cannot be combined with --password-env.");
         if (options.TimestampUrl is not null
-            && (!Uri.TryCreate(options.TimestampUrl, UriKind.Absolute, out var timestampUri) || timestampUri.Scheme != Uri.UriSchemeHttps))
-            throw new PublisherException("--timestamp-url must be an absolute HTTPS URL.");
+            && (options.UnsignedDevelopment
+                || !Uri.TryCreate(options.TimestampUrl, UriKind.Absolute, out var timestampUri)
+                || (timestampUri.Scheme != Uri.UriSchemeHttps && timestampUri.Scheme != Uri.UriSchemeHttp)
+                || options.TimestampUrl.Any(char.IsWhiteSpace)))
+            throw new PublisherException("--timestamp-url requires signed publication and an HTTP(S) URL.");
         using (var existingState = PublisherWorkspace.OpenState(state, create: false))
         {
         }
@@ -194,7 +197,8 @@ public static partial class PublisherPackaging
                 var password = Environment.GetEnvironmentVariable(options.PasswordEnvironmentVariable!);
                 if (string.IsNullOrEmpty(password))
                     throw new PublisherException($"Signing password environment variable '{options.PasswordEnvironmentVariable}' is not set or empty.");
-                ValidateCertificate(options.PfxPath!, password, options.Publisher);
+                if (!File.Exists(Path.GetFullPath(options.PfxPath!)))
+                    throw new PublisherException($"PFX file does not exist: {Path.GetFullPath(options.PfxPath!)}");
                 PsignTool.Sign(psignTool!, stagedPackage, Path.GetFullPath(options.PfxPath!), password, options.TimestampUrl);
                 PsignTool.Verify(psignTool!, stagedPackage, options.Publisher, trustedAnchors);
             }
@@ -371,8 +375,9 @@ public static partial class PublisherPackaging
     {
         if (!PackageNamePattern().IsMatch(packageName))
             throw new PublisherException("Package identity name must contain only letters, digits, and periods.");
-        if (string.IsNullOrWhiteSpace(publisher) || publisher.Any(char.IsControl) || publisher.Contains('<') || publisher.Contains('>'))
-            throw new PublisherException("Publisher must be a non-empty certificate subject without control or XML delimiter characters.");
+        if (string.IsNullOrWhiteSpace(publisher) || publisher.Any(char.IsControl) || publisher.Contains('<') || publisher.Contains('>')
+            || publisher.Trim().Length != publisher.Length)
+            throw new PublisherException("Publisher must be a non-empty certificate subject without control or XML delimiter characters or surrounding whitespace.");
     }
 
     private static Version ParsePackageVersion(string value)
@@ -382,33 +387,6 @@ public static partial class PublisherPackaging
             || !Version.TryParse(value, out var version) || version.Build < 0 || version.Revision < 0)
             throw new PublisherException("Source MSIX package version must have four numeric components (for example 1.0.0.0).");
         return version;
-    }
-
-    private static void ValidateCertificate(string pfxPath, string password, string publisher)
-    {
-        var fullPath = Path.GetFullPath(pfxPath);
-        if (!File.Exists(fullPath))
-            throw new PublisherException($"PFX file does not exist: {fullPath}");
-        if (new FileInfo(fullPath).Length > 16 * 1024 * 1024)
-            throw new PublisherException("PFX file exceeds the 16 MiB limit.");
-        try
-        {
-#pragma warning disable SYSLIB0057
-            using var certificate = new X509Certificate2(fullPath, password, X509KeyStorageFlags.EphemeralKeySet);
-#pragma warning restore SYSLIB0057
-            var now = DateTime.UtcNow;
-            if (!certificate.HasPrivateKey)
-                throw new PublisherException("The PFX certificate has no private key.");
-            if (now < certificate.NotBefore.ToUniversalTime() || now > certificate.NotAfter.ToUniversalTime())
-                throw new PublisherException("The signing certificate is not currently valid.");
-            if (!string.Equals(certificate.Subject, publisher, StringComparison.OrdinalIgnoreCase))
-                throw new PublisherException($"Signing certificate subject '{certificate.Subject}' does not match publisher '{publisher}'.");
-            var eku = certificate.Extensions.OfType<X509EnhancedKeyUsageExtension>().FirstOrDefault();
-            if (eku is null || !eku.EnhancedKeyUsages.Cast<Oid>().Any(oid => oid.Value == "1.3.6.1.5.5.7.3.3"))
-                throw new PublisherException("The signing certificate must include the Code Signing enhanced key usage.");
-        }
-        catch (PublisherException) { throw; }
-        catch (Exception ex) { throw new PublisherException($"Could not load PFX certificate: {ex.Message}", ex); }
     }
 
     private static IReadOnlyList<string> TrustedAnchors(IReadOnlyList<string>? trustedCertificateAuthorities) =>
