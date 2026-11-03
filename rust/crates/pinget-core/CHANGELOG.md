@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/Devolutions/pinget/compare/pinget-core-v0.14.0...pinget-core-v0.14.1) - 2026-11-03
+
+### Other
+
+- Replace makeappx and signtool with in-process MSIX writing and psign-tool ([#60](https://github.com/Devolutions/pinget/pull/60))
+- Add native WinGet preindexed repository publishers in Rust and C# ([#59](https://github.com/Devolutions/pinget/pull/59))
+- Fixes uninstall dispatch for EXE/Burn ARP entries whose registry subkey is GUID-shaped. ([#57](https://github.com/Devolutions/pinget/pull/57))
+
 ## [0.11.0](https://github.com/Devolutions/pinget/compare/pinget-core-v0.10.0...pinget-core-v0.11.0) - 2026-09-01
 
 ### Other
