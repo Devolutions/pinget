@@ -346,6 +346,8 @@ internal static class InstallerDispatch
         {
             if (!string.IsNullOrEmpty(file.PortableCommandAlias))
                 return file.PortableCommandAlias;
+            else if (!string.IsNullOrEmpty(file.RelativeFilePath))
+                return Path.GetFileNameWithoutExtension(file.RelativeFilePath);
         }
         return installer.Commands.Count > 0 ? installer.Commands[0] : null;
     }
