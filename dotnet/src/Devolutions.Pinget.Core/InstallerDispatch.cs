@@ -18,7 +18,7 @@ internal static class InstallerDispatch
             "msix" or "appx" => RunMsix(installerPath),
             "zip" when IsPortableZipInstaller(installer) => InstallPortable(installerPath, request, manifest, installer),
             "portable" => InstallPortable(installerPath, request, manifest, installer),
-            "zip" => ExtractZip(installerPath),
+            "zip" => ExtractZip(installerPath, request.Scope),
             _ => RunExe(installerPath, installerType, request, manifest, installer)
         };
     }
@@ -196,11 +196,18 @@ internal static class InstallerDispatch
         return proc.ExitCode;
     }
 
-    private static int ExtractZip(string path)
+    private static int ExtractZip(string path, string? scope = null)
     {
-        var target = Path.Combine(
+        var target = string.Equals(scope, "machine", StringComparison.InvariantCultureIgnoreCase)
+        ? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "WinGet",
+            "Programs"
+          )
+        : Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Programs");
+            "Programs"
+          );
         Directory.CreateDirectory(target);
         ZipFile.ExtractToDirectory(path, target, overwriteFiles: true);
         return 0;
@@ -237,12 +244,12 @@ internal static class InstallerDispatch
     private static int InstallPortable(string installerPath, InstallRequest request, Manifest manifest, Installer installer)
     {
         var sourceIdentifier = PortableSourceIdentifier(request.Query);
-        var existingEntry = ReadExistingPortableEntry(manifest.Id);
+        var existingEntry = ReadExistingPortableEntry(manifest.Id, request.Scope);
         // Reuse the existing subkey name on upgrade so we don't orphan the prior
         // entry by writing to a different one.
         var subkeyName = existingEntry?.SubkeyName ?? PortableSubkeyName(manifest.Id, sourceIdentifier);
 
-        var targetDir = ResolvePortableInstallLocation(request, existingEntry, subkeyName);
+        var targetDir = ResolvePortableInstallLocation(request, existingEntry, subkeyName, request.Scope);
 
         // If we created this directory on a previous install, wipe it clean so the
         // new version doesn't co-exist with leftovers from the previous one. We
@@ -290,23 +297,28 @@ internal static class InstallerDispatch
         var alias = DeterminePortableAlias(installer);
         var symlinkFullPath = string.IsNullOrEmpty(alias)
             ? null
-            : TryCreatePortableSymlink(portableTargetFullPath, alias!);
+            : TryCreatePortableSymlink(portableTargetFullPath, alias!, request.Scope);
 
         // Ensure %LOCALAPPDATA%\Microsoft\WinGet\Links is on user PATH so the
         // symlink we just created is resolvable from new shells. Tracks whether
         // we added it this round so uninstall can decide whether to take it
         // back out.
-        var addedToPath = symlinkFullPath is not null && TryAddLinksDirToUserPath();
+        var addedToPath = symlinkFullPath is not null && TryAddLinksDirToPath(request.Scope);
 
-        WritePortableArpEntry(new PortableArpEntry(
-            SubkeyName: subkeyName,
-            InstallLocation: targetDir,
-            PortableTargetFullPath: portableTargetFullPath,
-            PortableSymlinkFullPath: symlinkFullPath,
-            InstallDirectoryCreated: installDirectoryCreated,
-            AddedToPath: addedToPath,
-            SourceIdentifier: sourceIdentifier,
-            Manifest: manifest));
+        WritePortableArpEntry(
+            new PortableArpEntry(
+                SubkeyName: subkeyName,
+                InstallLocation: targetDir,
+                PortableTargetFullPath: portableTargetFullPath,
+                PortableSymlinkFullPath: symlinkFullPath,
+                InstallDirectoryCreated: installDirectoryCreated,
+                AddedToPath: addedToPath,
+                SourceIdentifier: sourceIdentifier,
+                Manifest: manifest
+            ),
+            request.Scope
+        );
+
         return 0;
     }
 
@@ -338,9 +350,13 @@ internal static class InstallerDispatch
         return installer.Commands.Count > 0 ? installer.Commands[0] : null;
     }
 
-    private static string WingetLinksDir() => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Microsoft", "WinGet", "Links");
+    private static string WingetLinksDir(string? scope = null) => string.Equals(scope, "machine", StringComparison.InvariantCultureIgnoreCase)
+        ? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "WinGet", "Links")
+        : Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Microsoft", "WinGet", "Links");
 
     /// <summary>
     /// Creates (or replaces) <c>Links\&lt;alias&gt;.exe</c> as a symlink
@@ -350,11 +366,11 @@ internal static class InstallerDispatch
     /// complete without the shim.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static string? TryCreatePortableSymlink(string target, string alias)
+    private static string? TryCreatePortableSymlink(string target, string alias, string? scope = null)
     {
         try
         {
-            var linksDir = WingetLinksDir();
+            var linksDir = WingetLinksDir(scope);
             Directory.CreateDirectory(linksDir);
             var linkPath = Path.Combine(linksDir, $"{alias}.exe");
 
@@ -384,12 +400,14 @@ internal static class InstallerDispatch
     /// actually appended this call.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static bool TryAddLinksDirToUserPath()
+    private static bool TryAddLinksDirToPath(string? scope = null)
     {
         try
         {
-            var linksDir = WingetLinksDir();
-            using var envKey = Microsoft.Win32.Registry.CurrentUser.OpenSubKey("Environment", writable: true);
+            var linksDir = WingetLinksDir(scope);
+            using var envKey = string.Equals(scope, "machine", StringComparison.InvariantCultureIgnoreCase)
+                ? Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", writable: true)
+                : Microsoft.Win32.Registry.CurrentUser.OpenSubKey("Environment", writable: true);
             if (envKey is null) return false;
 
             var existing = envKey.GetValue("Path") as string ?? "";
@@ -496,9 +514,11 @@ internal static class InstallerDispatch
     private sealed record ExistingPortableEntry(string SubkeyName, string? InstallLocation, int? InstallDirectoryCreated);
 
     [SupportedOSPlatform("windows")]
-    private static ExistingPortableEntry? ReadExistingPortableEntry(string packageId)
+    private static ExistingPortableEntry? ReadExistingPortableEntry(string packageId, string? scope = null)
     {
-        using var uninstall = Microsoft.Win32.Registry.CurrentUser
+        var baseKey = string.Equals(scope, "machine", StringComparison.InvariantCultureIgnoreCase) ? Microsoft.Win32.Registry.LocalMachine : Microsoft.Win32.Registry.CurrentUser;
+
+        using var uninstall = baseKey
             .OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall");
         if (uninstall is null) return null;
 
@@ -525,12 +545,12 @@ internal static class InstallerDispatch
         return null;
     }
 
-    private static string ResolvePortableInstallLocation(InstallRequest request, ExistingPortableEntry? existing, string subkeyName) =>
+    private static string ResolvePortableInstallLocation(InstallRequest request, ExistingPortableEntry? existing, string subkeyName, string? scope = null) =>
         ResolvePortableInstallLocationPure(
             request.InstallLocation,
             existing?.InstallLocation,
             subkeyName,
-            DefaultUserPortableRoot());
+            DefaultPortableRoot(scope));
 
     /// <summary>
     /// Pure resolution rule for the portable install directory. Priority:
@@ -551,9 +571,18 @@ internal static class InstallerDispatch
         return Path.Combine(defaultUserPortableRoot, subkeyName);
     }
 
-    private static string DefaultUserPortableRoot() => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Microsoft", "WinGet", "Packages");
+    private static string DefaultPortableRoot(string? scope = null) => string.Equals(scope, "machine", StringComparison.InvariantCultureIgnoreCase)
+        ? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "WinGet",
+            "Packages"
+        )
+        : Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Microsoft",
+            "WinGet",
+            "Packages"
+        );
 
     internal static void CleanDirectoryContents(string dir)
     {
@@ -573,9 +602,13 @@ internal static class InstallerDispatch
     /// installed-package discovery actually read.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static void WritePortableArpEntry(PortableArpEntry entry)
+    private static void WritePortableArpEntry(PortableArpEntry entry, string? scope = null)
     {
-        using var subkey = Microsoft.Win32.Registry.CurrentUser
+        var baseKey = string.Equals(scope, "machine", StringComparison.InvariantCultureIgnoreCase)
+            ? Microsoft.Win32.Registry.LocalMachine
+            : Microsoft.Win32.Registry.CurrentUser;
+
+        using var subkey = baseKey
             .CreateSubKey($@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{entry.SubkeyName}")
             ?? throw new InvalidOperationException("failed to create portable ARP registry subkey");
 
