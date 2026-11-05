@@ -1,6 +1,6 @@
 [package]
 name = "pinget-publisher"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 description = "Native WinGet v2 preindexed source publisher for Pinget"
 license = "MIT"
