@@ -272,7 +272,7 @@ upgradeCommand.SetHandler((ctx) =>
         InstallScope = query.InstallScope,
     };
 
-    using var repo = Repository.Open();
+    using var repo = doInstall ? OpenRepositoryForPackageAction() : Repository.Open();
     if (doInstall && !OperatingSystem.IsWindows())
     {
         PrintWarnings([UpgradeUnsupportedWarning]);
@@ -985,7 +985,7 @@ installCommand.SetHandler((ctx) =>
     var interactive = ctx.ParseResult.GetValueForOption(iInteractiveOpt);
     if (silent && interactive)
         throw new InvalidOperationException("--silent and --interactive cannot be used together.");
-    using var repo = Repository.Open();
+    using var repo = OpenRepositoryForPackageAction();
     var mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress;
     var result = repo.Install(CreateInstallRequest(
         query,
@@ -1087,7 +1087,7 @@ repairCommand.SetHandler((ctx) =>
     if (silent && interactive)
         throw new InvalidOperationException("--silent and --interactive cannot be used together.");
 
-    using var repo = Repository.Open();
+    using var repo = OpenRepositoryForPackageAction();
     var mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress;
     var result = repo.Repair(CreateRepairRequest(
         new PackageQuery
@@ -1138,7 +1138,7 @@ importCommand.SetHandler((ctx) =>
     using var doc = JsonDocument.Parse(jsonText);
     var sources = doc.RootElement.GetProperty("Sources").EnumerateArray().ToList();
 
-    using var repo = Repository.Open();
+    using var repo = OpenRepositoryForPackageAction();
     var importPackages = sources.SelectMany(source =>
     {
         var sourceName = source.TryGetProperty("SourceDetails", out var sourceDetails)
@@ -1346,6 +1346,7 @@ static void PrintShow(ShowResult result)
     }
 
     if (m.Tags.Count > 0) { Console.WriteLine("Tags:"); foreach (var t in m.Tags) Console.WriteLine($"  {t}"); }
+    PrintAgreements(m.Agreements);
 
     if (result.SelectedInstaller is Installer inst)
     {
@@ -1357,12 +1358,85 @@ static void PrintShow(ShowResult result)
         PrintOpt("  Url", inst.Url);
         PrintOpt("  Sha256", inst.Sha256);
         PrintOpt("  ProductCode", inst.ProductCode);
+        PrintOpt("  Store Product Id", inst.MSStoreProductIdentifier);
         PrintOpt("  ReleaseDate", inst.ReleaseDate);
     }
     else if (m.Installers.Count > 0)
     {
         Console.WriteLine("Installer:");
         Console.WriteLine("  No applicable installer found; see logs for more details.");
+    }
+}
+
+static Repository OpenRepositoryForPackageAction() =>
+    Repository.Open(!Console.IsInputRedirected && !Console.IsErrorRedirected
+        ? new RepositoryOptions { PackageAgreementsPrompt = PromptPackageAgreements }
+        : null);
+
+static bool PromptPackageAgreements(Manifest m)
+{
+    Console.WriteLine($"Agreements for {m.Name} [{m.Id}] Version {m.Version}");
+    Console.WriteLine($"Version: {m.Version}");
+    PrintOpt("Publisher", m.Publisher);
+    PrintOpt("Publisher Url", m.PublisherUrl);
+    PrintOpt("Publisher Support Url", m.PublisherSupportUrl);
+    PrintOpt("Author", m.Author);
+    PrintOpt("Homepage", m.PackageUrl);
+    PrintOpt("License", m.License);
+    PrintOpt("License Url", m.LicenseUrl);
+    PrintOpt("Privacy Url", m.PrivacyUrl);
+    PrintOpt("Copyright", m.Copyright);
+    PrintOpt("Copyright Url", m.CopyrightUrl);
+    PrintAgreements(m.Agreements);
+    Console.WriteLine();
+    Console.WriteLine("Do you agree to all the application agreements terms?");
+    Console.Write("[Y] Yes  [N] No: ");
+    var answer = Console.ReadLine()?.Trim();
+    return string.Equals(answer, "y", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(answer, "yes", StringComparison.OrdinalIgnoreCase);
+}
+
+static void PrintAgreements(IReadOnlyList<PackageAgreement> agreements)
+{
+    if (agreements.Count == 0)
+        return;
+
+    Console.WriteLine("Agreements:");
+    foreach (var agreement in agreements)
+    {
+        var label = string.IsNullOrEmpty(agreement.Label) ? null : agreement.Label;
+        var text = string.IsNullOrEmpty(agreement.Text) ? null : agreement.Text;
+        var url = string.IsNullOrEmpty(agreement.Url) ? null : agreement.Url;
+        if (label is not null && text is not null && url is not null)
+        {
+            Console.WriteLine($"  {label}: {text}");
+            Console.WriteLine($"  {label} Url: {url}");
+        }
+        else if (label is not null && text is not null)
+        {
+            Console.WriteLine($"  {label}: {text}");
+        }
+        else if (label is not null && url is not null)
+        {
+            Console.WriteLine($"  {label}: {url}");
+        }
+        else if (text is not null && url is not null)
+        {
+            Console.WriteLine($"  {text}");
+            Console.WriteLine($"  {url}");
+        }
+        else if (text is not null)
+        {
+            Console.WriteLine($"  {text}");
+        }
+        else if (url is not null)
+        {
+            Console.WriteLine($"  {url}");
+        }
+        else if (label is not null)
+        {
+            Console.WriteLine($"  {label}");
+        }
     }
 }
 
@@ -1481,7 +1555,7 @@ static (string Symbol, string Description)? LookupHresult(long code)
 }
 
 static void PrintWarnings(List<string> warnings) { foreach (var w in warnings) Console.Error.WriteLine($"warning: {w}"); }
-static void PrintOpt(string label, string? value) { if (value is not null) Console.WriteLine($"{label}: {value}"); }
+static void PrintOpt(string label, string? value) { if (!string.IsNullOrEmpty(value)) Console.WriteLine($"{label}: {value}"); }
 static string Trunc(string s, int max) => s.Length <= max ? s : s[..(max - 1)] + ".";
 
 static string ResolveSourceAddValue(string? positionalValue, string? optionValue, string label)
