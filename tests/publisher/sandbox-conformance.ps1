@@ -667,10 +667,10 @@ try {
         -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $serverStdout -RedirectStandardError $serverStderr
     $ready = $false
-    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
         try {
             $response = Invoke-WebRequest -Uri ($script:BaseUrl + 'source2.msix') `
-                -UseBasicParsing -TimeoutSec 2
+                -UseBasicParsing -TimeoutSec 5
             if ($response.StatusCode -eq 200) {
                 $ready = $true
                 break
