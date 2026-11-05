@@ -949,6 +949,7 @@ public class Repository : IDisposable
 
     public InstallResult Install(InstallRequest request)
     {
+        request = ApplyInstallScope(request);
         var manifest = ResolveManifestForInstall(request);
         if (!OperatingSystem.IsWindows())
         {
@@ -962,6 +963,7 @@ public class Repository : IDisposable
         if (noOpResult is not null)
             return noOpResult;
 
+        request = ApplyInstallScope(request, existingMatch?.Scope);
         EnsurePackageAgreementsAccepted(manifest, request);
         InstallDependencies(manifest, request);
 
@@ -1010,7 +1012,8 @@ public class Repository : IDisposable
 
         var installerType = (selectedInstaller.InstallerType ?? "exe").ToLowerInvariant();
         installerPath = PrepareInstallerForExecution(installerPath, installerType);
-        var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller);
+        var warnings = new List<string>();
+        var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
 
         return new InstallResult
         {
@@ -1021,6 +1024,34 @@ public class Repository : IDisposable
             ExitCode = exitCode,
             Success = exitCode == 0,
             NoOp = false,
+            Warnings = warnings,
+        };
+    }
+
+    internal static InstallRequest ApplyInstallScope(InstallRequest request, string? installedScope = null)
+    {
+        var queryScope = request.Query.InstallScope;
+        var requestScope = request.Scope;
+        if (!string.IsNullOrWhiteSpace(queryScope) &&
+            !string.IsNullOrWhiteSpace(requestScope) &&
+            !queryScope.Trim().Equals(requestScope.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("The install request contains conflicting scope values.");
+        }
+
+        var scope = !string.IsNullOrWhiteSpace(queryScope) ? queryScope
+            : !string.IsNullOrWhiteSpace(requestScope) ? requestScope
+            : installedScope;
+        if (string.IsNullOrWhiteSpace(scope))
+            return request with { Query = request.Query with { InstallScope = null } };
+
+        var resolved = InstallerDispatch.ResolvePortableScope(scope, null, null);
+        return request with
+        {
+            Query = request.Query with
+            {
+                InstallScope = resolved == InstallerDispatch.PortableScope.Machine ? "machine" : "user",
+            },
         };
     }
 
@@ -1088,10 +1119,11 @@ public class Repository : IDisposable
 
         var matches = ResolveUninstallMatches(request);
         var exitCode = 0;
+        var warnings = new List<string>();
 
         foreach (var installed in matches)
         {
-            exitCode = InstallerDispatch.Uninstall(installed, request);
+            exitCode = InstallerDispatch.Uninstall(installed, request, warnings);
             if (exitCode != 0 && !request.AllVersions)
                 break;
         }
@@ -1106,6 +1138,7 @@ public class Repository : IDisposable
             ExitCode = exitCode,
             Success = exitCode == 0,
             NoOp = false,
+            Warnings = warnings,
         };
     }
 

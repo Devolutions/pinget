@@ -7,24 +7,44 @@ namespace Devolutions.Pinget.Core;
 
 internal static class InstallerDispatch
 {
-    public static int Execute(string installerPath, string installerType, InstallRequest request, Manifest manifest, Installer installer)
+    internal enum PortableScope
+    {
+        User,
+        Machine,
+    }
+
+    internal static PortableScope ResolvePortableScope(string? requestedScope, string? installedScope, string? installerScope)
+    {
+        var scope = new[] { requestedScope, installedScope, installerScope }
+            .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim();
+        if (scope is null || scope.Equals("user", StringComparison.OrdinalIgnoreCase))
+            return PortableScope.User;
+        if (scope.Equals("machine", StringComparison.OrdinalIgnoreCase))
+            return PortableScope.Machine;
+        throw new InvalidOperationException($"Unsupported install scope '{scope}'.");
+    }
+
+    public static int Execute(string installerPath, string installerType, InstallRequest request, Manifest manifest, Installer installer, List<string>? warnings = null)
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             throw new PlatformNotSupportedException("Installing packages is only supported on Windows");
 
+        warnings ??= [];
         return installerType.ToLowerInvariant() switch
         {
             "msi" or "wix" => RunMsi(installerPath, request, manifest, installer),
             "msix" or "appx" => RunMsix(installerPath),
-            "zip" when IsPortableZipInstaller(installer) => InstallPortable(installerPath, request, manifest, installer),
-            "portable" => InstallPortable(installerPath, request, manifest, installer),
-            "zip" => ExtractZip(installerPath),
+            "zip" when IsPortableZipInstaller(installer) => InstallPortable(installerPath, request, manifest, installer,
+                ResolvePortableScope(request.Query.InstallScope ?? request.Scope, null, installer.Scope), warnings),
+            "portable" => InstallPortable(installerPath, request, manifest, installer,
+                ResolvePortableScope(request.Query.InstallScope ?? request.Scope, null, installer.Scope), warnings),
+            "zip" => ExtractZip(installerPath, ResolvePortableScope(request.Query.InstallScope ?? request.Scope, null, installer.Scope)),
             _ => RunExe(installerPath, installerType, request, manifest, installer)
         };
     }
 
     [SupportedOSPlatform("windows")]
-    public static int Uninstall(ListMatch installed, UninstallRequest request)
+    public static int Uninstall(ListMatch installed, UninstallRequest request, List<string>? warnings = null)
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             throw new PlatformNotSupportedException("Uninstalling packages is only supported on Windows");
@@ -32,8 +52,9 @@ internal static class InstallerDispatch
         if (request.Purge && request.Preserve)
             throw new InvalidOperationException("--purge and --preserve cannot be used together.");
 
+        warnings ??= [];
         if (string.Equals(installed.InstallerCategory, "portable", StringComparison.OrdinalIgnoreCase))
-            return UninstallPortable(installed, request);
+            return UninstallPortable(installed, request, warnings);
 
         if ((request.Purge || request.Preserve) && !request.Force)
             throw new InvalidOperationException("--purge and --preserve are currently only supported for portable packages.");
@@ -196,11 +217,18 @@ internal static class InstallerDispatch
         return proc.ExitCode;
     }
 
-    private static int ExtractZip(string path)
+    private static int ExtractZip(string path, PortableScope scope)
     {
-        var target = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Programs");
+        var target = scope == PortableScope.Machine
+        ? Path.Combine(
+            PortableKnownFolder(Environment.SpecialFolder.ProgramFiles),
+            "WinGet",
+            "Programs"
+          )
+        : Path.Combine(
+            PortableKnownFolder(Environment.SpecialFolder.LocalApplicationData),
+            "Programs"
+          );
         Directory.CreateDirectory(target);
         ZipFile.ExtractToDirectory(path, target, overwriteFiles: true);
         return 0;
@@ -208,6 +236,14 @@ internal static class InstallerDispatch
 
     internal static bool IsPortableZipInstaller(Installer installer) =>
         string.Equals(installer.NestedInstallerType, "portable", StringComparison.OrdinalIgnoreCase);
+
+    private static string PortableKnownFolder(Environment.SpecialFolder folder)
+    {
+        var path = Environment.GetFolderPath(folder);
+        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
+            throw new InvalidOperationException($"The {folder} known folder is unavailable.");
+        return path;
+    }
 
     /// <summary>
     /// Installs (or upgrades) a portable WinGet package natively. Mirrors the
@@ -219,13 +255,13 @@ internal static class InstallerDispatch
     /// shape every portable in the community winget catalog uses).
     ///
     /// Behavior follows winget's portable workflow closely enough that the
-    /// resulting HKCU ARP entry is recognized by <c>winget list</c> and by
-    /// pinget's own list view:
+    /// resulting user or machine ARP entry is recognized by <c>winget list</c>
+    /// and by pinget's own list view:
     /// <list type="bullet">
     ///   <item>Resolves the target install directory in this priority order:
     ///   <c>request.InstallLocation</c>, existing <c>InstallLocation</c> from
     ///   the registry ARP entry (so upgrades preserve a user's custom path),
-    ///   then WinGet's default user portable root.</item>
+    ///   then WinGet's default portable root for the selected scope.</item>
     ///   <item>If an existing pinget-owned install lives in that directory
     ///   (<c>InstallDirectoryCreated=1</c>), cleans its contents before
     ///   extracting the new version.</item>
@@ -234,21 +270,53 @@ internal static class InstallerDispatch
     /// </list>
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static int InstallPortable(string installerPath, InstallRequest request, Manifest manifest, Installer installer)
+    private static int InstallPortable(string installerPath, InstallRequest request, Manifest manifest, Installer installer, PortableScope scope, List<string> warnings)
     {
         var sourceIdentifier = PortableSourceIdentifier(request.Query);
-        var existingEntry = ReadExistingPortableEntry(manifest.Id);
+        var existingEntry = ReadExistingPortableEntry(manifest.Id, scope);
         // Reuse the existing subkey name on upgrade so we don't orphan the prior
         // entry by writing to a different one.
         var subkeyName = existingEntry?.SubkeyName ?? PortableSubkeyName(manifest.Id, sourceIdentifier);
+        if (subkeyName.Contains('\\') || subkeyName.Contains('/') || NormalizePortableRelativePath(subkeyName) != subkeyName)
+            throw new InvalidOperationException($"Invalid portable package identifier: {subkeyName}");
 
-        var targetDir = ResolvePortableInstallLocation(request, existingEntry, subkeyName);
+        if (string.IsNullOrWhiteSpace(request.InstallLocation) &&
+            !string.IsNullOrWhiteSpace(existingEntry?.InstallLocation) &&
+            !Path.IsPathFullyQualified(existingEntry.InstallLocation))
+            throw new InvalidOperationException("The previous portable install location is relative; specify an absolute install location.");
+        var targetDir = Path.GetFullPath(ResolvePortableInstallLocation(request, existingEntry, subkeyName, scope));
 
         // If we created this directory on a previous install, wipe it clean so the
         // new version doesn't co-exist with leftovers from the previous one. We
         // do not touch a directory we don't own (InstallDirectoryCreated != 1).
-        var prevDirCreated = existingEntry?.InstallDirectoryCreated == 1;
+        var prevDirCreated = IsOwnedPortableDirectory(
+            existingEntry?.InstallDirectoryCreated == 1, existingEntry?.InstallLocation, targetDir);
         var dirExisted = Directory.Exists(targetDir);
+        var installerType = installer.InstallerType ?? "";
+        var payload = ReadPortablePayload(installerPath, string.Equals(installerType, "zip", StringComparison.OrdinalIgnoreCase));
+        var nestedPath = string.Equals(installerType, "zip", StringComparison.OrdinalIgnoreCase) && installer.NestedInstallerFiles.Count > 0
+            ? NormalizePortableRelativePath(installer.NestedInstallerFiles[0].RelativeFilePath)
+            : null;
+        if (nestedPath is not null && !payload.Files.Contains(nestedPath, StringComparer.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Portable target '{nestedPath}' is not present in the installer archive.");
+        var sameExistingLocation = IsOwnedPortableDirectory(true, existingEntry?.InstallLocation, targetDir);
+        IReadOnlyList<string> previousFiles = sameExistingLocation ? existingEntry?.Files ?? [] : [];
+        var previousDirectories = sameExistingLocation ? existingEntry?.Directories ?? [] : [];
+        if (sameExistingLocation && !prevDirCreated && existingEntry?.Files is null)
+        {
+            if (!string.IsNullOrWhiteSpace(existingEntry?.PortableTargetFullPath) &&
+                Path.IsPathFullyQualified(existingEntry.PortableTargetFullPath))
+            {
+                var previousTarget = Path.GetRelativePath(targetDir, existingEntry.PortableTargetFullPath);
+                if (previousTarget != ".")
+                    previousFiles = [NormalizePortableRelativePath(previousTarget)];
+            }
+            warnings.Add("The previous portable install did not track all files; unrecognized files in its existing directory will be preserved.");
+        }
+        var createdDirectories = PlanPortablePayload(payload, targetDir, prevDirCreated, previousFiles, previousDirectories);
+
+        if (prevDirCreated && PathStartsWithCaseInsensitive(Path.GetFullPath(installerPath), Path.GetFullPath(targetDir)))
+            throw new InvalidOperationException("The portable installer is inside the directory that would be cleaned.");
         if (prevDirCreated && dirExisted)
             CleanDirectoryContents(targetDir);
 
@@ -258,7 +326,6 @@ internal static class InstallerDispatch
         // dir already existed this round.
         var installDirectoryCreated = !dirExisted || prevDirCreated;
 
-        var installerType = installer.InstallerType ?? "";
         string portableTargetFullPath;
         if (string.Equals(installerType, "zip", StringComparison.OrdinalIgnoreCase))
         {
@@ -267,8 +334,8 @@ internal static class InstallerDispatch
             // the manifest declares. Record the first one as
             // PortableTargetFullPath so winget's portable uninstall workflow can
             // identify which file to remove.
-            portableTargetFullPath = installer.NestedInstallerFiles.Count > 0
-                ? Path.Combine(targetDir, installer.NestedInstallerFiles[0].RelativeFilePath)
+            portableTargetFullPath = nestedPath is not null
+                ? Path.Combine(targetDir, nestedPath)
                 : targetDir;
         }
         else
@@ -283,6 +350,12 @@ internal static class InstallerDispatch
             File.Copy(installerPath, portableTargetFullPath, overwrite: true);
         }
 
+        if (!prevDirCreated && sameExistingLocation && previousFiles.Count > 0)
+        {
+            var currentFiles = new HashSet<string>(payload.Files, StringComparer.OrdinalIgnoreCase);
+            RemoveTrackedPortableFiles(targetDir, previousFiles.Where(file => !currentFiles.Contains(file)).ToArray(), []);
+        }
+
         // Create the Links\<alias>.exe shim so users can invoke the portable from
         // any shell, matching winget's portable workflow. Failures are non-fatal —
         // when the user lacks SeCreateSymbolicLink (no Developer Mode, not admin)
@@ -290,24 +363,228 @@ internal static class InstallerDispatch
         var alias = DeterminePortableAlias(installer);
         var symlinkFullPath = string.IsNullOrEmpty(alias)
             ? null
-            : TryCreatePortableSymlink(portableTargetFullPath, alias!);
+            : TryCreatePortableSymlink(portableTargetFullPath, alias!, scope, existingEntry, warnings);
 
-        // Ensure %LOCALAPPDATA%\Microsoft\WinGet\Links is on user PATH so the
-        // symlink we just created is resolvable from new shells. Tracks whether
-        // we added it this round so uninstall can decide whether to take it
-        // back out.
-        var addedToPath = symlinkFullPath is not null && TryAddLinksDirToUserPath();
+        if (!string.IsNullOrWhiteSpace(existingEntry?.PortableSymlinkFullPath) &&
+            !string.Equals(existingEntry.PortableSymlinkFullPath, symlinkFullPath, StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                RemoveOwnedPortableLink(existingEntry.PortableSymlinkFullPath, WingetLinksDir(scope),
+                    PortableLinkTargetBoundary(existingEntry, existingEntry.InstallLocation));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                       InvalidOperationException or System.Security.SecurityException)
+            {
+                warnings.Add($"Could not remove the previous portable command link: {ex.Message}");
+            }
+        }
 
-        WritePortableArpEntry(new PortableArpEntry(
-            SubkeyName: subkeyName,
-            InstallLocation: targetDir,
-            PortableTargetFullPath: portableTargetFullPath,
-            PortableSymlinkFullPath: symlinkFullPath,
-            InstallDirectoryCreated: installDirectoryCreated,
-            AddedToPath: addedToPath,
-            SourceIdentifier: sourceIdentifier,
-            Manifest: manifest));
+        // Add the scope's links directory to PATH when a command link exists.
+        var addedToPath = symlinkFullPath is not null && TryAddLinksDirToPath(scope, warnings);
+
+        WritePortableArpEntry(
+            new PortableArpEntry(
+                SubkeyName: subkeyName,
+                InstallLocation: targetDir,
+                PortableTargetFullPath: portableTargetFullPath,
+                PortableSymlinkFullPath: symlinkFullPath,
+                InstallDirectoryCreated: installDirectoryCreated,
+                AddedToPath: addedToPath,
+                Files: payload.Files,
+                Directories: createdDirectories,
+                SourceIdentifier: sourceIdentifier,
+                Manifest: manifest
+            ),
+            scope
+        );
+
+        CleanupPreviousPortableInstall(existingEntry, targetDir, warnings);
         return 0;
+    }
+
+    private static void CleanupPreviousPortableInstall(ExistingPortableEntry? previous, string currentLocation, List<string> warnings)
+    {
+        var oldLocation = previous?.InstallLocation;
+        if (string.IsNullOrWhiteSpace(oldLocation))
+            return;
+        if (!Path.IsPathFullyQualified(oldLocation))
+        {
+            warnings.Add($"The previous portable directory '{oldLocation}' is relative and was preserved; remove any remaining package files manually.");
+            return;
+        }
+        if (IsOwnedPortableDirectory(true, oldLocation, currentLocation) ||
+            !Directory.Exists(oldLocation))
+            return;
+
+        var oldPath = Path.GetFullPath(oldLocation);
+        var newPath = Path.GetFullPath(currentLocation);
+        if (PathStartsWithCaseInsensitive(oldPath, newPath) || PathStartsWithCaseInsensitive(newPath, oldPath))
+        {
+            warnings.Add($"The previous portable directory '{oldLocation}' overlaps the new location and was preserved; remove any remaining package files manually.");
+            return;
+        }
+        try
+        {
+            RemovePortableDirectory(oldLocation, previous, warnings);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                   InvalidOperationException or System.Security.SecurityException)
+        {
+            warnings.Add($"Could not clean the previous portable directory '{oldLocation}': {ex.Message}");
+        }
+    }
+
+    internal sealed record PortablePayload(IReadOnlyList<string> Files, IReadOnlyList<string> Directories);
+
+    internal static PortablePayload ReadPortablePayload(string installerPath, bool isZip)
+    {
+        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void AddPath(string path, bool isDirectory)
+        {
+            var normalized = NormalizePortableRelativePath(path);
+            if (isDirectory)
+                directories.Add(normalized);
+            else if (!files.Add(normalized))
+                throw new InvalidOperationException($"The portable installer contains duplicate files: {normalized}");
+
+            var parent = Path.GetDirectoryName(normalized);
+            while (!string.IsNullOrEmpty(parent))
+            {
+                directories.Add(parent);
+                parent = Path.GetDirectoryName(parent);
+            }
+        }
+
+        if (isZip)
+        {
+            using var archive = ZipFile.OpenRead(installerPath);
+            foreach (var entry in archive.Entries)
+            {
+                if (((entry.ExternalAttributes >> 16) & 0xF000) == 0xA000)
+                    throw new InvalidOperationException($"Portable installer contains a symbolic link: {entry.FullName}");
+                var isDirectory = entry.FullName.EndsWith('/') || entry.FullName.EndsWith('\\');
+                var name = entry.FullName.TrimEnd('/', '\\');
+                if (isDirectory && name == ".")
+                    continue;
+                AddPath(name, isDirectory);
+            }
+        }
+        else
+        {
+            AddPath(Path.GetFileName(installerPath), false);
+        }
+
+        if (files.Count == 0)
+            throw new InvalidOperationException("The portable installer contains no files.");
+        if (files.Overlaps(directories))
+            throw new InvalidOperationException("The portable installer contains conflicting file and directory paths.");
+        return new PortablePayload(files.ToArray(), directories.ToArray());
+    }
+
+    internal static IReadOnlyList<string> PlanPortablePayload(
+        PortablePayload payload, string targetDir, bool directoryOwned,
+        IReadOnlyList<string> previousFiles, IReadOnlyList<string> previousDirectories)
+    {
+        var previousFileSet = new HashSet<string>(previousFiles.Select(NormalizePortableRelativePath), StringComparer.OrdinalIgnoreCase);
+        foreach (var relativePath in payload.Files)
+        {
+            var destination = SafePortablePath(targetDir, relativePath);
+            if (!directoryOwned && Directory.Exists(destination))
+                throw new IOException($"Portable file conflicts with an existing directory: {destination}");
+            if (!directoryOwned && File.Exists(destination) && !previousFileSet.Contains(relativePath))
+                throw new IOException($"Portable file conflicts with an existing file: {destination}");
+        }
+
+        var createdDirectories = new HashSet<string>(previousDirectories.Select(NormalizePortableRelativePath), StringComparer.OrdinalIgnoreCase);
+        foreach (var relativePath in payload.Directories)
+        {
+            var directory = SafePortablePath(targetDir, relativePath);
+            if (!directoryOwned && File.Exists(directory))
+                throw new IOException($"Portable directory conflicts with an existing file: {directory}");
+            if (!Directory.Exists(directory))
+                createdDirectories.Add(relativePath);
+        }
+        return createdDirectories.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static string NormalizePortableRelativePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || Path.IsPathRooted(path) || path.StartsWith('\\') ||
+            path.StartsWith('/') || path.Contains(':'))
+            throw new InvalidOperationException($"Invalid portable relative path: {path}");
+        var parts = path.Replace('/', '\\').Split('\\', StringSplitOptions.RemoveEmptyEntries)
+            .Where(part => part != ".").ToArray();
+        if (parts.Length == 0 || parts.Any(part => part == ".." ||
+                              part.EndsWith(' ') || part.EndsWith('.') ||
+                              part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+                              part.Any(ch => ch <= '\u001f' || "<>\"|?*".Contains(ch)) ||
+                              IsReservedPortableName(part)))
+            throw new InvalidOperationException($"Invalid portable relative path: {path}");
+        return Path.Combine(parts);
+    }
+
+    private static bool IsReservedPortableName(string part)
+    {
+        var name = part.Split('.')[0];
+        if (name.Equals("CON", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("PRN", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("AUX", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("NUL", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return name.Length == 4 &&
+               (name.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || name.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) &&
+               name[3] is >= '1' and <= '9';
+    }
+
+    private static string SafePortablePath(string root, string relativePath)
+    {
+        var normalized = NormalizePortableRelativePath(relativePath);
+        var rootPath = Path.GetFullPath(root);
+        var current = rootPath;
+        var parts = normalized.Split(Path.DirectorySeparatorChar);
+        foreach (var part in new[] { "" }.Concat(parts))
+        {
+            if (part.Length > 0)
+                current = Path.Combine(current, part);
+            EnsureNotPortableReparsePoint(current);
+        }
+        return current;
+    }
+
+    private static void EnsureNotPortableReparsePoint(string path)
+    {
+        try
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException($"Portable path contains a symbolic link or reparse point: {path}");
+        }
+        catch (FileNotFoundException) { }
+        catch (DirectoryNotFoundException) { }
+    }
+
+    internal static void RemoveTrackedPortableFiles(string root, IReadOnlyList<string> files, IReadOnlyList<string> directories)
+    {
+        var filePaths = files.Select(path => SafePortablePath(root, path)).ToArray();
+        var directoryPaths = directories.Select(path => SafePortablePath(root, path))
+            .OrderByDescending(path => path.Length).ToArray();
+        foreach (var path in filePaths)
+        {
+            if (Directory.Exists(path))
+                throw new IOException($"Tracked portable file is now a directory: {path}");
+        }
+        foreach (var path in filePaths)
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        foreach (var path in directoryPaths)
+        {
+            if (Directory.Exists(path) && !Directory.EnumerateFileSystemEntries(path).Any())
+                Directory.Delete(path);
+        }
     }
 
     private sealed record PortableArpEntry(
@@ -317,6 +594,8 @@ internal static class InstallerDispatch
         string? PortableSymlinkFullPath,
         bool InstallDirectoryCreated,
         bool AddedToPath,
+        IReadOnlyList<string> Files,
+        IReadOnlyList<string> Directories,
         string SourceIdentifier,
         Manifest Manifest);
 
@@ -334,13 +613,19 @@ internal static class InstallerDispatch
         {
             if (!string.IsNullOrEmpty(file.PortableCommandAlias))
                 return file.PortableCommandAlias;
+            else if (!string.IsNullOrEmpty(file.RelativeFilePath))
+                return Path.GetFileNameWithoutExtension(file.RelativeFilePath);
         }
         return installer.Commands.Count > 0 ? installer.Commands[0] : null;
     }
 
-    private static string WingetLinksDir() => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Microsoft", "WinGet", "Links");
+    private static string WingetLinksDir(PortableScope scope) => scope == PortableScope.Machine
+        ? Path.Combine(
+            PortableKnownFolder(Environment.SpecialFolder.ProgramFiles),
+            "WinGet", "Links")
+        : Path.Combine(
+            PortableKnownFolder(Environment.SpecialFolder.LocalApplicationData),
+            "Microsoft", "WinGet", "Links");
 
     /// <summary>
     /// Creates (or replaces) <c>Links\&lt;alias&gt;.exe</c> as a symlink
@@ -350,69 +635,149 @@ internal static class InstallerDispatch
     /// complete without the shim.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static string? TryCreatePortableSymlink(string target, string alias)
+    private static string? TryCreatePortableSymlink(
+        string target, string alias, PortableScope scope, ExistingPortableEntry? existingEntry, List<string> warnings)
     {
         try
         {
-            var linksDir = WingetLinksDir();
+            var linksDir = WingetLinksDir(scope);
             Directory.CreateDirectory(linksDir);
+            EnsureNotPortableReparsePoint(linksDir);
+            if (alias.Contains('\\') || alias.Contains('/') || NormalizePortableRelativePath(alias) != alias)
+                throw new InvalidOperationException($"Invalid portable command alias: {alias}");
             var linkPath = Path.Combine(linksDir, $"{alias}.exe");
 
-            // Replace any prior link/file at the path so upgrades repoint to
-            // the new binary instead of leaving a stale symlink behind.
             if (File.Exists(linkPath) || new FileInfo(linkPath).LinkTarget is not null)
             {
-                try { File.Delete(linkPath); } catch { /* ignore */ }
+                if (!string.Equals(linkPath, existingEntry?.PortableSymlinkFullPath, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException($"The portable command link already exists: {linkPath}");
+                RemoveOwnedPortableLink(linkPath, linksDir,
+                    PortableLinkTargetBoundary(existingEntry, existingEntry?.InstallLocation));
             }
 
             File.CreateSymbolicLink(linkPath, target);
             return linkPath;
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                   InvalidOperationException or NotSupportedException or System.Security.SecurityException)
         {
-            // Symlink creation requires Developer Mode or admin elevation.
-            // Treat any failure as non-fatal — the package files are already in
-            // place, just without a Links\ shim.
+            warnings.Add($"Could not create the portable command link '{alias}': {ex.Message}");
             return null;
         }
     }
 
+    internal static bool RemoveOwnedPortableLink(string linkPath, string linksRoot, string? installLocation)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(linksRoot));
+        EnsureNotPortableReparsePoint(root);
+        var link = Path.GetFullPath(linkPath);
+        var parent = Path.GetDirectoryName(link);
+        if (!string.Equals(parent, root, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Portable command link is outside the links directory: {linkPath}");
+
+        var target = new FileInfo(link).LinkTarget;
+        if (target is null)
+        {
+            if (File.Exists(link) || Directory.Exists(link))
+                throw new IOException($"Portable command link is not a symbolic link: {link}");
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(installLocation))
+            throw new InvalidOperationException($"Portable command link ownership cannot be verified: {link}");
+        var resolvedTarget = Path.GetFullPath(target, root);
+        if (!PathStartsWithCaseInsensitive(resolvedTarget, Path.GetFullPath(installLocation)))
+            throw new IOException($"Portable command link points outside the installation: {link}");
+        File.Delete(link);
+        return true;
+    }
+
+    internal static string? PortableLinkTargetBoundary(ExistingPortableEntry? entry, string? installLocation)
+    {
+        if (entry is null || string.IsNullOrWhiteSpace(installLocation) ||
+            !IsOwnedPortableDirectory(true, entry.InstallLocation, installLocation))
+            return null;
+        if (entry.InstallDirectoryCreated == 1)
+            return installLocation;
+        if (string.IsNullOrWhiteSpace(entry.PortableTargetFullPath) ||
+            !Path.IsPathFullyQualified(entry.PortableTargetFullPath))
+            return null;
+        var target = Path.TrimEndingDirectorySeparator(Path.GetFullPath(entry.PortableTargetFullPath));
+        var location = Path.TrimEndingDirectorySeparator(Path.GetFullPath(installLocation));
+        return !target.Equals(location, StringComparison.OrdinalIgnoreCase) && PathStartsWithCaseInsensitive(target, location)
+            ? target : null;
+    }
+
+    internal static string? AppendPortableLinksPath(string existing, string linksDir, Func<string, string>? expand = null)
+    {
+        expand ??= Environment.ExpandEnvironmentVariables;
+        var normalizedLinks = linksDir.TrimEnd('\\', '/');
+        var alreadyPresent = existing.Split(';').Any(component =>
+        {
+            var value = expand(component.Trim().Trim('"'));
+            return value.TrimEnd('\\', '/').Equals(normalizedLinks, StringComparison.OrdinalIgnoreCase);
+        });
+        if (alreadyPresent)
+            return null;
+        if (existing.Length == 0)
+            return linksDir;
+        return existing.EndsWith(';') ? existing + linksDir : existing + ";" + linksDir;
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal static (string Value, Microsoft.Win32.RegistryValueKind Kind)? PreparePortablePathUpdate(
+        object? raw, Microsoft.Win32.RegistryValueKind kind, string linksDir, Func<string, string>? expand = null)
+    {
+        if (raw is not null and not string)
+            throw new InvalidOperationException("The existing PATH registry value is not a string.");
+        if (raw is null)
+            kind = Microsoft.Win32.RegistryValueKind.ExpandString;
+        if (kind is not (Microsoft.Win32.RegistryValueKind.String or Microsoft.Win32.RegistryValueKind.ExpandString))
+            throw new InvalidOperationException("The existing PATH registry value has an unsupported type.");
+        if (raw is string existing && existing.Contains('\0'))
+            throw new InvalidOperationException("The existing PATH registry value contains an embedded null.");
+        var expandForComparison = kind == Microsoft.Win32.RegistryValueKind.ExpandString
+            ? expand ?? Environment.ExpandEnvironmentVariables
+            : static (string value) => value;
+        var newPath = AppendPortableLinksPath((string?)raw ?? "", linksDir, expandForComparison);
+        return newPath is null ? null : (newPath, kind);
+    }
+
     /// <summary>
-    /// Adds <c>Links\</c> to the user's <c>HKCU\Environment\Path</c> if not
-    /// already present, then broadcasts WM_SETTINGCHANGE so explorer-spawned
+    /// Adds <c>Links\</c> to the selected scope's PATH if not already present,
+    /// then broadcasts WM_SETTINGCHANGE so explorer-spawned
     /// shells pick up the new PATH without a logoff. Returns true if PATH was
     /// actually appended this call.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static bool TryAddLinksDirToUserPath()
+    private static bool TryAddLinksDirToPath(PortableScope scope, List<string> warnings)
     {
         try
         {
-            var linksDir = WingetLinksDir();
-            using var envKey = Microsoft.Win32.Registry.CurrentUser.OpenSubKey("Environment", writable: true);
-            if (envKey is null) return false;
+            var linksDir = WingetLinksDir(scope);
+            using var envKey = scope == PortableScope.Machine
+                ? Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", writable: true)
+                : Microsoft.Win32.Registry.CurrentUser.OpenSubKey("Environment", writable: true);
+            if (envKey is null)
+                throw new InvalidOperationException("The environment registry key is unavailable.");
 
-            var existing = envKey.GetValue("Path") as string ?? "";
-            var normalizedLinks = linksDir.ToLowerInvariant();
-            var alreadyPresent = existing
-                .Split(';')
-                .Any(c => c.Trim().Equals(normalizedLinks, StringComparison.OrdinalIgnoreCase));
-            if (alreadyPresent) return false;
+            var raw = envKey.GetValue("Path", null, Microsoft.Win32.RegistryValueOptions.DoNotExpandEnvironmentNames);
+            var kind = raw is null ? Microsoft.Win32.RegistryValueKind.ExpandString : envKey.GetValueKind("Path");
+            var update = PreparePortablePathUpdate(raw, kind, linksDir);
+            if (update is null)
+                return false;
 
-            string newPath;
-            if (existing.Length == 0)
-                newPath = linksDir;
-            else if (existing.EndsWith(';'))
-                newPath = existing + linksDir;
-            else
-                newPath = existing + ";" + linksDir;
-
-            envKey.SetValue("Path", newPath, Microsoft.Win32.RegistryValueKind.ExpandString);
-            BroadcastEnvironmentChange();
+            envKey.SetValue("Path", update.Value.Value, update.Value.Kind);
+            try { BroadcastEnvironmentChange(); }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                warnings.Add($"PATH was updated, but the environment-change notification failed: {ex.Message}");
+            }
             return true;
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                   InvalidOperationException or System.Security.SecurityException)
         {
+            warnings.Add($"Could not add the portable links directory to PATH: {ex.Message}");
             return false;
         }
     }
@@ -420,21 +785,18 @@ internal static class InstallerDispatch
     [SupportedOSPlatform("windows")]
     private static void BroadcastEnvironmentChange()
     {
-        try
-        {
-            const uint HWND_BROADCAST = 0xFFFF;
-            const uint WM_SETTINGCHANGE = 0x001A;
-            const uint SMTO_ABORTIFHUNG = 0x0002;
-            _ = NativeMethods.SendMessageTimeoutW(
-                new IntPtr(unchecked((int)HWND_BROADCAST)),
-                WM_SETTINGCHANGE,
-                IntPtr.Zero,
-                "Environment",
-                SMTO_ABORTIFHUNG,
-                5000,
-                out _);
-        }
-        catch { /* broadcast best-effort */ }
+        const uint HWND_BROADCAST = 0xFFFF;
+        const uint WM_SETTINGCHANGE = 0x001A;
+        const uint SMTO_ABORTIFHUNG = 0x0002;
+        if (NativeMethods.SendMessageTimeoutW(
+            new IntPtr(unchecked((int)HWND_BROADCAST)),
+            WM_SETTINGCHANGE,
+            IntPtr.Zero,
+            "Environment",
+            SMTO_ABORTIFHUNG,
+            5000,
+            out _) == IntPtr.Zero)
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
     }
 
     /// <summary>
@@ -493,12 +855,21 @@ internal static class InstallerDispatch
     internal static string PortableSubkeyName(string packageId, string sourceIdentifier) =>
         $"{packageId}_{sourceIdentifier}";
 
-    private sealed record ExistingPortableEntry(string SubkeyName, string? InstallLocation, int? InstallDirectoryCreated);
+    internal sealed record ExistingPortableEntry(
+        string SubkeyName,
+        string? InstallLocation,
+        int? InstallDirectoryCreated,
+        string? PortableTargetFullPath,
+        string? PortableSymlinkFullPath,
+        string[]? Files,
+        string[]? Directories);
 
     [SupportedOSPlatform("windows")]
-    private static ExistingPortableEntry? ReadExistingPortableEntry(string packageId)
+    private static ExistingPortableEntry? ReadExistingPortableEntry(string packageId, PortableScope scope)
     {
-        using var uninstall = Microsoft.Win32.Registry.CurrentUser
+        var baseKey = scope == PortableScope.Machine ? Microsoft.Win32.Registry.LocalMachine : Microsoft.Win32.Registry.CurrentUser;
+
+        using var uninstall = baseKey
             .OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall");
         if (uninstall is null) return null;
 
@@ -512,31 +883,34 @@ internal static class InstallerDispatch
             if (!string.Equals(subkey.GetValue("WinGetInstallerType") as string, "portable", StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            int? installDirectoryCreated = subkey.GetValue("InstallDirectoryCreated") switch
-            {
-                int i => i,
-                _ => null,
-            };
-            return new ExistingPortableEntry(
-                SubkeyName: name,
-                InstallLocation: subkey.GetValue("InstallLocation") as string,
-                InstallDirectoryCreated: installDirectoryCreated);
+            return ReadPortableEntry(subkey, name);
         }
         return null;
     }
 
-    private static string ResolvePortableInstallLocation(InstallRequest request, ExistingPortableEntry? existing, string subkeyName) =>
+    [SupportedOSPlatform("windows")]
+    private static ExistingPortableEntry ReadPortableEntry(Microsoft.Win32.RegistryKey subkey, string name) =>
+        new(
+            SubkeyName: name,
+            InstallLocation: subkey.GetValue("InstallLocation") as string,
+            InstallDirectoryCreated: subkey.GetValue("InstallDirectoryCreated") as int?,
+            PortableTargetFullPath: subkey.GetValue("PortableTargetFullPath") as string,
+            PortableSymlinkFullPath: subkey.GetValue("PortableSymlinkFullPath") as string,
+            Files: subkey.GetValue("PingetPortableFiles") as string[],
+            Directories: subkey.GetValue("PingetPortableDirectories") as string[]);
+
+    private static string ResolvePortableInstallLocation(InstallRequest request, ExistingPortableEntry? existing, string subkeyName, PortableScope scope) =>
         ResolvePortableInstallLocationPure(
             request.InstallLocation,
             existing?.InstallLocation,
             subkeyName,
-            DefaultUserPortableRoot());
+            DefaultPortableRoot(scope));
 
     /// <summary>
     /// Pure resolution rule for the portable install directory. Priority:
     /// <c>requestLocation</c> (CLI override) → <c>existingLocation</c> (so
-    /// upgrades preserve a winget-installed location) → default user portable
-    /// root joined with the package's ARP subkey name.
+    /// upgrades preserve a winget-installed location) → the scope's default
+    /// portable root joined with the package's ARP subkey name.
     /// </summary>
     internal static string ResolvePortableInstallLocationPure(
         string? requestLocation,
@@ -551,9 +925,27 @@ internal static class InstallerDispatch
         return Path.Combine(defaultUserPortableRoot, subkeyName);
     }
 
-    private static string DefaultUserPortableRoot() => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Microsoft", "WinGet", "Packages");
+    private static string DefaultPortableRoot(PortableScope scope) => scope == PortableScope.Machine
+        ? Path.Combine(
+            PortableKnownFolder(Environment.SpecialFolder.ProgramFiles),
+            "WinGet",
+            "Packages"
+        )
+        : Path.Combine(
+            PortableKnownFolder(Environment.SpecialFolder.LocalApplicationData),
+            "Microsoft",
+            "WinGet",
+            "Packages"
+        );
+
+    internal static bool IsOwnedPortableDirectory(bool previouslyCreated, string? existingLocation, string targetDir)
+    {
+        if (!previouslyCreated || string.IsNullOrWhiteSpace(existingLocation) || !Path.IsPathFullyQualified(existingLocation))
+            return false;
+        var previous = Path.TrimEndingDirectorySeparator(Path.GetFullPath(existingLocation));
+        var target = Path.TrimEndingDirectorySeparator(Path.GetFullPath(targetDir));
+        return previous.Equals(target, StringComparison.OrdinalIgnoreCase);
+    }
 
     internal static void CleanDirectoryContents(string dir)
     {
@@ -568,14 +960,18 @@ internal static class InstallerDispatch
     }
 
     /// <summary>
-    /// Writes the HKCU ARP entry winget would normally write for a portable
+    /// Writes the scoped ARP entry winget would normally write for a portable
     /// install. Only the subset that winget's portable list view and pinget's
     /// installed-package discovery actually read.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static void WritePortableArpEntry(PortableArpEntry entry)
+    private static void WritePortableArpEntry(PortableArpEntry entry, PortableScope scope)
     {
-        using var subkey = Microsoft.Win32.Registry.CurrentUser
+        var baseKey = scope == PortableScope.Machine
+            ? Microsoft.Win32.Registry.LocalMachine
+            : Microsoft.Win32.Registry.CurrentUser;
+
+        using var subkey = baseKey
             .CreateSubKey($@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{entry.SubkeyName}")
             ?? throw new InvalidOperationException("failed to create portable ARP registry subkey");
 
@@ -587,8 +983,12 @@ internal static class InstallerDispatch
         subkey.SetValue("PortableTargetFullPath", entry.PortableTargetFullPath);
         if (!string.IsNullOrEmpty(entry.PortableSymlinkFullPath))
             subkey.SetValue("PortableSymlinkFullPath", entry.PortableSymlinkFullPath);
+        else
+            subkey.DeleteValue("PortableSymlinkFullPath", throwOnMissingValue: false);
         subkey.SetValue("InstallDirectoryAddedToPath", entry.AddedToPath ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
         subkey.SetValue("InstallDirectoryCreated", entry.InstallDirectoryCreated ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+        subkey.SetValue("PingetPortableFiles", entry.Files.ToArray(), Microsoft.Win32.RegistryValueKind.MultiString);
+        subkey.SetValue("PingetPortableDirectories", entry.Directories.ToArray(), Microsoft.Win32.RegistryValueKind.MultiString);
         subkey.SetValue("DisplayName", string.IsNullOrEmpty(manifest.Name) ? manifest.Id : manifest.Name);
         subkey.SetValue("DisplayVersion", manifest.Version);
         if (!string.IsNullOrEmpty(manifest.Publisher))
@@ -1065,22 +1465,17 @@ internal static class InstallerDispatch
     }
 
     [SupportedOSPlatform("windows")]
-    private static int UninstallPortable(ListMatch installed, UninstallRequest request)
+    private static int UninstallPortable(ListMatch installed, UninstallRequest request, List<string> warnings)
     {
-        // Read PortableSymlinkFullPath from the ARP entry *before* we touch the
-        // registry, so we can clean up winget-created shims in Links\. Without
-        // this, a portable that winget originally installed (with a
-        // PortableCommandAlias set in its manifest) would leave a dangling
-        // symlink in %LOCALAPPDATA%\Microsoft\WinGet\Links\ once pinget
-        // uninstalls it.
-        var knownSymlink = ReadPortableSymlinkFullPath(installed);
+        var existingEntry = ReadPortableEntryForInstalled(installed);
+        var knownSymlink = existingEntry?.PortableSymlinkFullPath;
 
         if (string.IsNullOrWhiteSpace(installed.InstallLocation))
         {
             if (request.Force)
             {
-                TryRemovePortableSymlinks(knownSymlink, null);
-                TryRemovePortableRegistryEntry(installed);
+                TryRemovePortableSymlinks(knownSymlink, null, InstalledPortableScope(installed), warnings);
+                TryRemovePortableRegistryEntry(installed, warnings);
                 return 0;
             }
             throw new InvalidOperationException($"Portable package '{installed.Name}' does not expose an install location.");
@@ -1092,7 +1487,7 @@ internal static class InstallerDispatch
         var removed = false;
         if (Directory.Exists(installed.InstallLocation))
         {
-            Directory.Delete(installed.InstallLocation, recursive: true);
+            RemovePortableDirectory(installed.InstallLocation, existingEntry, warnings);
             removed = true;
         }
         else if (File.Exists(installed.InstallLocation))
@@ -1106,56 +1501,96 @@ internal static class InstallerDispatch
             // Once the files are gone (or the user forced past missing files),
             // drop the symlink shim and ARP entry too so the package fully
             // disappears.
-            TryRemovePortableSymlinks(knownSymlink, installed.InstallLocation);
-            TryRemovePortableRegistryEntry(installed);
+            TryRemovePortableSymlinks(knownSymlink, PortableLinkTargetBoundary(existingEntry, installed.InstallLocation),
+                InstalledPortableScope(installed), warnings);
+            TryRemovePortableRegistryEntry(installed, warnings);
             return 0;
         }
 
         throw new InvalidOperationException($"Portable package location not found: {installed.InstallLocation}");
     }
 
-    /// <summary>
-    /// Reads <c>PortableSymlinkFullPath</c> from the ARP subkey backing
-    /// <paramref name="installed"/> when present. winget writes this when it
-    /// created a <c>Links\&lt;alias&gt;.exe</c> shim for a portable; pinget's
-    /// own install_portable doesn't currently create shims, so for
-    /// pinget-installed entries this returns null.
-    /// </summary>
+    private static void RemovePortableDirectory(string location, ExistingPortableEntry? entry, List<string> warnings)
+    {
+        var matchesLocation = IsOwnedPortableDirectory(true, entry?.InstallLocation, location);
+        if (matchesLocation && entry?.InstallDirectoryCreated == 1)
+        {
+            EnsureNotPortableReparsePoint(location);
+            Directory.Delete(location, recursive: true);
+        }
+        else if (matchesLocation && entry?.Files is not null)
+        {
+            RemoveTrackedPortableFiles(location, entry.Files, entry.Directories ?? []);
+        }
+        else
+        {
+            if (matchesLocation && !string.IsNullOrWhiteSpace(entry?.PortableTargetFullPath) &&
+                Path.IsPathFullyQualified(entry.PortableTargetFullPath))
+            {
+                var target = Path.GetRelativePath(location, entry.PortableTargetFullPath);
+                if (target != ".")
+                    RemoveTrackedPortableFiles(location, [target], []);
+            }
+            warnings.Add($"The portable directory '{location}' was preserved because complete file ownership information is unavailable; remove any remaining package files manually.");
+        }
+    }
+
     [SupportedOSPlatform("windows")]
-    private static string? ReadPortableSymlinkFullPath(ListMatch installed)
+    private static ExistingPortableEntry? ReadPortableEntryForInstalled(ListMatch installed)
     {
         const string ArpPrefix = @"ARP\";
         if (!installed.LocalId.StartsWith(ArpPrefix, StringComparison.OrdinalIgnoreCase))
             return null;
         var rest = installed.LocalId[ArpPrefix.Length..];
         var parts = rest.Split('\\', 3);
-        if (parts.Length != 3 || string.IsNullOrWhiteSpace(parts[2]))
+        if (parts.Length != 3 || string.IsNullOrWhiteSpace(parts[2]) || parts[2].Contains('\\') ||
+            !(parts[0].Equals("User", StringComparison.OrdinalIgnoreCase) || parts[0].Equals("Machine", StringComparison.OrdinalIgnoreCase)))
             return null;
         var hive = parts[0].Equals("User", StringComparison.OrdinalIgnoreCase)
-            ? Microsoft.Win32.Registry.CurrentUser
-            : Microsoft.Win32.Registry.LocalMachine;
-        try
-        {
-            using var subkey = hive.OpenSubKey(
-                $@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{parts[2]}");
-            return subkey?.GetValue("PortableSymlinkFullPath") as string;
-        }
-        catch { return null; }
+            ? Microsoft.Win32.RegistryHive.CurrentUser
+            : Microsoft.Win32.RegistryHive.LocalMachine;
+        var view = parts[1].Equals("X86", StringComparison.OrdinalIgnoreCase)
+            ? Microsoft.Win32.RegistryView.Registry32
+            : Microsoft.Win32.RegistryView.Registry64;
+        using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
+        using var subkey = baseKey.OpenSubKey($@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{parts[2]}");
+        return subkey is null ? null : ReadPortableEntry(subkey, parts[2]);
     }
 
-    /// <summary>
-    /// Removes the symlink shims winget would have created for this portable.
-    /// Tries (1) the exact path from <c>PortableSymlinkFullPath</c> if known,
-    /// and (2) any symlink in <c>%LOCALAPPDATA%\Microsoft\WinGet\Links\</c>
-    /// whose stored target resolves under the install location. Best-effort:
-    /// failures are swallowed.
-    /// </summary>
-    [SupportedOSPlatform("windows")]
-    private static void TryRemovePortableSymlinks(string? knownSymlink, string? installLocation)
+    internal static PortableScope InstalledPortableScope(ListMatch installed)
     {
+        if (installed.LocalId.StartsWith(@"ARP\Machine\", StringComparison.OrdinalIgnoreCase))
+            return PortableScope.Machine;
+        if (installed.LocalId.StartsWith(@"ARP\User\", StringComparison.OrdinalIgnoreCase))
+            return PortableScope.User;
+        return ResolvePortableScope(null, installed.Scope, null);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void TryRemovePortableSymlinks(string? knownSymlink, string? installLocation, PortableScope scope, List<string> warnings)
+        => RemovePortableLinksInDirectory(knownSymlink, installLocation, WingetLinksDir(scope), warnings);
+
+    internal static void RemovePortableLinksInDirectory(string? knownSymlink, string? installLocation, string linksRoot, List<string> warnings)
+    {
+        try
+        {
+            EnsureNotPortableReparsePoint(linksRoot);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                   System.Security.SecurityException)
+        {
+            warnings.Add($"Could not scan the portable links directory: {ex.Message}");
+            return;
+        }
+
         if (!string.IsNullOrWhiteSpace(knownSymlink))
         {
-            try { File.Delete(knownSymlink!); } catch { }
+            try { RemoveOwnedPortableLink(knownSymlink, linksRoot, installLocation); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                       InvalidOperationException or System.Security.SecurityException)
+            {
+                warnings.Add($"Could not remove the portable command link: {ex.Message}");
+            }
         }
 
         if (string.IsNullOrWhiteSpace(installLocation))
@@ -1163,11 +1598,6 @@ internal static class InstallerDispatch
 
         try
         {
-            var linksRoot = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Microsoft", "WinGet", "Links");
-            if (!Directory.Exists(linksRoot))
-                return;
             foreach (var entry in Directory.EnumerateFiles(linksRoot))
             {
                 try
@@ -1175,26 +1605,27 @@ internal static class InstallerDispatch
                     var info = new FileInfo(entry);
                     var target = info.LinkTarget;
                     if (target is null) continue;
-                    if (PathStartsWithCaseInsensitive(target, installLocation))
-                    {
-                        try { File.Delete(entry); } catch { }
-                    }
+                    var resolvedTarget = Path.GetFullPath(target, linksRoot);
+                    if (PathStartsWithCaseInsensitive(resolvedTarget, Path.GetFullPath(installLocation)))
+                        RemoveOwnedPortableLink(entry, linksRoot, installLocation);
                 }
-                catch { /* skip unreadable entry */ }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                           System.Security.SecurityException)
+                {
+                    warnings.Add($"Could not inspect or remove portable command link '{entry}': {ex.Message}");
+                }
             }
         }
-        catch { /* best-effort */ }
+        catch (DirectoryNotFoundException) { }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                   System.Security.SecurityException)
+        {
+            warnings.Add($"Could not scan the portable links directory: {ex.Message}");
+        }
     }
 
-    /// <summary>
-    /// Best-effort removal of the HKCU/HKLM ARP subkey backing a portable
-    /// entry. We match on LocalId (<c>ARP\&lt;scope&gt;\&lt;arch&gt;\&lt;subkey&gt;</c>) when
-    /// present so we delete the exact key the list view surfaced; otherwise we
-    /// walk the standard Uninstall path and match on WinGetPackageIdentifier.
-    /// Failures are swallowed because the file deletion already succeeded.
-    /// </summary>
     [SupportedOSPlatform("windows")]
-    private static void TryRemovePortableRegistryEntry(ListMatch installed)
+    private static void TryRemovePortableRegistryEntry(ListMatch installed, List<string> warnings)
     {
         try
         {
@@ -1203,35 +1634,30 @@ internal static class InstallerDispatch
             {
                 var rest = installed.LocalId[ArpPrefix.Length..];
                 var parts = rest.Split('\\', 3);
-                if (parts.Length == 3 && !string.IsNullOrWhiteSpace(parts[2]))
+                if (parts.Length == 3 && !string.IsNullOrWhiteSpace(parts[2]) && !parts[2].Contains('\\') &&
+                    (parts[0].Equals("User", StringComparison.OrdinalIgnoreCase) || parts[0].Equals("Machine", StringComparison.OrdinalIgnoreCase)))
                 {
                     var hive = parts[0].Equals("User", StringComparison.OrdinalIgnoreCase)
-                        ? Microsoft.Win32.Registry.CurrentUser
-                        : Microsoft.Win32.Registry.LocalMachine;
-                    hive.DeleteSubKeyTree(
+                        ? Microsoft.Win32.RegistryHive.CurrentUser
+                        : Microsoft.Win32.RegistryHive.LocalMachine;
+                    var view = parts[1].Equals("X86", StringComparison.OrdinalIgnoreCase)
+                        ? Microsoft.Win32.RegistryView.Registry32
+                        : Microsoft.Win32.RegistryView.Registry64;
+                    using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
+                    baseKey.DeleteSubKeyTree(
                         $@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{parts[2]}",
                         throwOnMissingSubKey: false);
                     return;
                 }
             }
 
-            // Fall back: scan ARP by WinGetPackageIdentifier.
-            foreach (var hive in new[] { Microsoft.Win32.Registry.CurrentUser, Microsoft.Win32.Registry.LocalMachine })
-            {
-                using var uninstall = hive.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Uninstall", writable: true);
-                if (uninstall is null) continue;
-                foreach (var name in uninstall.GetSubKeyNames())
-                {
-                    using var subkey = uninstall.OpenSubKey(name);
-                    if (subkey is null) continue;
-                    if (string.Equals(subkey.GetValue("WinGetPackageIdentifier") as string, installed.Id, StringComparison.OrdinalIgnoreCase))
-                    {
-                        try { uninstall.DeleteSubKeyTree(name, throwOnMissingSubKey: false); } catch { }
-                    }
-                }
-            }
+            warnings.Add("Could not remove the portable registry entry because its exact registry key is unavailable.");
         }
-        catch { /* best-effort: file removal already succeeded */ }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                   System.Security.SecurityException)
+        {
+            warnings.Add($"Could not remove the portable registry entry: {ex.Message}");
+        }
     }
 
     private static string? DefaultExperienceSwitch(string installerType, InstallerMode mode) => mode switch

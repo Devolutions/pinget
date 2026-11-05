@@ -72,6 +72,19 @@ pinget install --id Devolutions.MsRdpEx --scope user --silent
 pinget uninstall --id Devolutions.MsRdpEx --silent
 ```
 
+Portable installs honor `--scope user` and `--scope machine`; upgrades retain
+the installed scope unless another scope is requested. User-scoped packages
+and command links live under `%LOCALAPPDATA%\Microsoft\WinGet`, while
+machine-scoped packages and links use `%ProgramFiles%\WinGet` and require
+appropriate administrative permissions. Creating command links may also
+require Developer Mode or elevation; Pinget reports a warning if it cannot
+create a link or update PATH.
+
+When a portable package is installed into an existing directory, Pinget tracks
+its files and preserves unrelated content on upgrade and uninstall. Older
+installs without complete file tracking may leave files behind, with a warning
+to remove them manually.
+
 ### Requirements
 
 The Windows version of Pinget not only works on the same Windows versions as [what Winget does](https://github.com/microsoft/winget-cli#installing-the-client), but since Pinget does not have a hard dependency on MSIX whereas Winget has, Pinget supports several Windows versions that Winget doesn't. However, as with Winget, Pinget has a hard dependency on the [IsWow64Process2](IsWow64Process2) function, and therefore cannot run on for instance Windows 8.1 or earlier, or on ReactOS.

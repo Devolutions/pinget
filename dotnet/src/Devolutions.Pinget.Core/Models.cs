@@ -416,6 +416,7 @@ public record InstallRequest
     public bool IgnoreSecurityHash { get; init; }
     public string? DependencySource { get; init; }
     public bool NoUpgrade { get; init; }
+    public string? Scope { get; init; }
 }
 
 public record RepairRequest

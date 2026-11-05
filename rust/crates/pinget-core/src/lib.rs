@@ -1,4 +1,8 @@
 mod name_normalization;
+#[cfg(test)]
+mod portable_payload_tests;
+#[cfg(test)]
+mod portable_regression_tests;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -39,6 +43,8 @@ use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFIL
 use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+#[cfg(windows)]
+use winreg::types::{FromRegValue, ToRegValue};
 #[cfg(windows)]
 use winreg::{RegKey, enums::*};
 use zip::ZipArchive;
@@ -2316,6 +2322,8 @@ impl Repository {
     }
 
     pub fn install_request(&mut self, request: &InstallRequest) -> Result<InstallResult> {
+        let normalized_request = apply_install_scope(request, None)?;
+        let request = &normalized_request;
         self.emit_install_progress(InstallProgress::ResolvingManifest);
         let manifest = self.resolve_manifest_for_install(request)?;
         self.emit_install_progress(InstallProgress::ResolvedManifest {
@@ -2340,6 +2348,10 @@ impl Repository {
         if let Some(no_op_result) = Self::create_install_no_op_result(request, &manifest, existing_match.as_ref()) {
             return Ok(no_op_result);
         }
+
+        let effective_request =
+            apply_install_scope(request, existing_match.as_ref().and_then(|item| item.scope.as_deref()))?;
+        let request = &effective_request;
 
         Self::ensure_package_agreements_accepted(&manifest, request)?;
         self.emit_install_progress(InstallProgress::InstallingDependencies);
@@ -2391,7 +2403,15 @@ impl Repository {
         self.emit_install_progress(InstallProgress::WaitingForInstaller {
             installer_type: installer_type.clone(),
         });
-        let exit_code = dispatch_installer(&installer_path, &installer_type, request, &manifest, &installer)?;
+        let mut warnings = Vec::new();
+        let exit_code = dispatch_installer(
+            &installer_path,
+            &installer_type,
+            request,
+            &manifest,
+            &installer,
+            &mut warnings,
+        )?;
         self.emit_install_progress(InstallProgress::InstallerFinished { exit_code });
 
         Ok(InstallResult {
@@ -2402,7 +2422,7 @@ impl Repository {
             exit_code,
             success: exit_code == 0,
             no_op: false,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
@@ -2556,9 +2576,10 @@ impl Repository {
 
         let matches = self.resolve_uninstall_matches(request)?;
         let mut exit_code = 0;
+        let mut warnings = Vec::new();
 
         for installed in &matches {
-            exit_code = uninstall_package(installed, request)?;
+            exit_code = uninstall_package(installed, request, &mut warnings)?;
             if exit_code != 0 && !request.all_versions {
                 break;
             }
@@ -2576,7 +2597,7 @@ impl Repository {
             exit_code,
             success: exit_code == 0,
             no_op: false,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
@@ -9383,6 +9404,108 @@ fn prepare_installer_for_execution(installer_path: &Path, installer_type: &str) 
     Ok(executable_path)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortableScope {
+    User,
+    Machine,
+}
+
+impl PortableScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Machine => "machine",
+        }
+    }
+}
+
+fn resolve_portable_scope(
+    requested_scope: Option<&str>,
+    installed_scope: Option<&str>,
+    manifest_scope: Option<&str>,
+) -> Result<PortableScope> {
+    let scope = [requested_scope, installed_scope, manifest_scope]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty());
+    match scope {
+        None => Ok(PortableScope::User),
+        Some(value) if value.eq_ignore_ascii_case("user") => Ok(PortableScope::User),
+        Some(value) if value.eq_ignore_ascii_case("machine") => Ok(PortableScope::Machine),
+        Some(value) => bail!("Unsupported install scope '{value}'."),
+    }
+}
+
+fn apply_install_scope(request: &InstallRequest, installed_scope: Option<&str>) -> Result<InstallRequest> {
+    let mut effective = request.clone();
+    let scope = request
+        .query
+        .install_scope
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| installed_scope.filter(|value| !value.trim().is_empty()));
+    effective.query.install_scope = match scope {
+        Some(value) => Some(resolve_portable_scope(Some(value), None, None)?.as_str().to_owned()),
+        None => None,
+    };
+    Ok(effective)
+}
+
+#[cfg(windows)]
+fn program_files_dir() -> Result<PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+
+    struct KnownFolderPath(*mut u16);
+    impl Drop for KnownFolderPath {
+        fn drop(&mut self) {
+            // SAFETY: SHGetKnownFolderPath allocates this pointer with the COM task allocator.
+            unsafe { CoTaskMemFree(self.0.cast()) };
+        }
+    }
+
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: The folder ID and output pointer are valid; no user token is required.
+    let status = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut raw) };
+    let folder = KnownFolderPath(raw);
+    if status < 0 {
+        bail!("failed to resolve the Program Files known folder (HRESULT {status:#x})");
+    }
+    if folder.0.is_null() {
+        bail!("the Program Files known folder is unavailable");
+    }
+    let mut length = 0;
+    loop {
+        // SAFETY: SHGetKnownFolderPath returns a valid NUL-terminated UTF-16 string.
+        let unit = unsafe { folder.0.wrapping_add(length).read() };
+        if unit == 0 {
+            break;
+        }
+        length += 1;
+    }
+    // SAFETY: `length` counts the initialized UTF-16 units before the terminator.
+    let wide = unsafe { std::slice::from_raw_parts(folder.0, length) };
+    let path = PathBuf::from(OsString::from_wide(wide));
+    if !path.is_absolute() {
+        bail!("Program Files is not an absolute path: {}", path.display());
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn local_app_data_dir() -> Result<PathBuf> {
+    dirs::data_local_dir().context("local application data directory is unavailable")
+}
+
+#[cfg(windows)]
+fn zip_install_root(scope: PortableScope) -> Result<PathBuf> {
+    match scope {
+        PortableScope::User => Ok(local_app_data_dir()?.join("Programs")),
+        PortableScope::Machine => Ok(program_files_dir()?.join("WinGet").join("Programs")),
+    }
+}
+
 #[cfg(windows)]
 fn dispatch_installer(
     installer_path: &Path,
@@ -9390,6 +9513,7 @@ fn dispatch_installer(
     request: &InstallRequest,
     manifest: &Manifest,
     installer: &Installer,
+    warnings: &mut Vec<String>,
 ) -> Result<i32> {
     match installer_type {
         "msi" | "wix" if should_run_msi_direct(request, installer) => run_msi_direct(
@@ -9412,6 +9536,8 @@ fn dispatch_installer(
             Ok(status.code().unwrap_or(-1))
         }
         "zip" => {
+            let scope =
+                resolve_portable_scope(request.query.install_scope.as_deref(), None, installer.scope.as_deref())?;
             // A `zip` at the top-level installer position is treated as portable when
             // `NestedInstallerType=portable` is specified — that's the shape every
             // portable in the winget catalog uses (e.g. BurntSushi.ripgrep.MSVC).
@@ -9422,18 +9548,23 @@ fn dispatch_installer(
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case("portable"))
             {
-                return install_portable(installer_path, request, manifest, installer);
+                return install_portable(installer_path, request, manifest, installer, scope, warnings);
             }
-            let target = dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("Programs");
+            let target = zip_install_root(scope)?;
             fs::create_dir_all(&target)?;
             let file = fs::File::open(installer_path)?;
             let mut archive = ZipArchive::new(file)?;
             archive.extract(&target)?;
             Ok(0)
         }
-        "portable" => install_portable(installer_path, request, manifest, installer),
+        "portable" => install_portable(
+            installer_path,
+            request,
+            manifest,
+            installer,
+            resolve_portable_scope(request.query.install_scope.as_deref(), None, installer.scope.as_deref())?,
+            warnings,
+        ),
         // exe, inno, nullsoft, burn, etc. are launched through ShellExecute so
         // Windows can honor installer manifests and legacy elevation detection.
         _ => shell_execute_installer(
@@ -9772,6 +9903,7 @@ fn dispatch_installer(
     _request: &InstallRequest,
     _manifest: &Manifest,
     _installer: &Installer,
+    _warnings: &mut Vec<String>,
 ) -> Result<i32> {
     bail!("Installing packages is only supported on Windows")
 }
@@ -10003,7 +10135,7 @@ fn split_installer_switches(value: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-fn uninstall_package(installed: &ListMatch, request: &UninstallRequest) -> Result<i32> {
+fn uninstall_package(installed: &ListMatch, request: &UninstallRequest, warnings: &mut Vec<String>) -> Result<i32> {
     if request.purge && request.preserve {
         bail!("--purge and --preserve cannot be used together.");
     }
@@ -10013,7 +10145,7 @@ fn uninstall_package(installed: &ListMatch, request: &UninstallRequest) -> Resul
         .as_deref()
         .is_some_and(|value| value.eq_ignore_ascii_case("portable"))
     {
-        return uninstall_portable(installed, request);
+        return uninstall_portable(installed, request, warnings);
     }
 
     if (request.purge || request.preserve) && !request.force {
@@ -10362,18 +10494,24 @@ fn try_run_msi_uninstall(
 }
 
 #[cfg(windows)]
-fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest) -> Result<i32> {
-    // Read PortableSymlinkFullPath from the ARP entry *before* we touch the
-    // registry, so we can remove winget-created shims in Links\ if any. Without
-    // this, a portable that winget originally installed (with a
-    // PortableCommandAlias set in its manifest) would leave a dangling symlink
-    // in %LOCALAPPDATA%\Microsoft\WinGet\Links\ once pinget uninstalls it.
-    let known_symlink = read_portable_symlink_full_path(installed);
+fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest, warnings: &mut Vec<String>) -> Result<i32> {
+    let existing_entry = read_portable_entry_for_installed(installed)?;
+    let known_symlink = existing_entry
+        .as_ref()
+        .and_then(|entry| entry.portable_symlink_full_path.as_ref())
+        .map(|path| path.to_string_lossy().to_string());
 
     let Some(location) = installed.install_location.as_deref() else {
         if request.force {
-            try_remove_portable_symlinks(installed, &known_symlink, None);
-            try_remove_portable_registry_entry(installed);
+            try_remove_portable_symlinks(
+                known_symlink.as_deref().map(Path::new),
+                None,
+                installed_portable_scope(installed)?,
+                warnings,
+            );
+            if let Err(error) = remove_portable_registry_entry(installed) {
+                warnings.push(format!("Could not remove the portable registry entry: {error:#}"));
+            }
             return Ok(0);
         }
         bail!(
@@ -10388,7 +10526,7 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest) -> Resu
 
     let path = Path::new(location);
     let removed = if path.is_dir() {
-        fs::remove_dir_all(path)?;
+        remove_portable_directory(path, existing_entry.as_ref(), warnings)?;
         true
     } else if path.is_file() {
         fs::remove_file(path)?;
@@ -10400,159 +10538,263 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest) -> Resu
     if removed || request.force {
         // Once the files are gone (or the user forced past missing files), drop
         // the symlink shim and ARP entry too so the package fully disappears.
-        try_remove_portable_symlinks(installed, &known_symlink, Some(path));
-        try_remove_portable_registry_entry(installed);
+        let boundary = portable_link_target_boundary(existing_entry.as_ref(), Some(path))?;
+        try_remove_portable_symlinks(
+            known_symlink.as_deref().map(Path::new),
+            boundary.as_deref(),
+            installed_portable_scope(installed)?,
+            warnings,
+        );
+        if let Err(error) = remove_portable_registry_entry(installed) {
+            warnings.push(format!("Could not remove the portable registry entry: {error:#}"));
+        }
         return Ok(0);
     }
 
     bail!("Portable package location not found: {location}")
 }
 
-/// Reads `PortableSymlinkFullPath` from the ARP subkey backing `installed`
-/// when present. This value is recorded for portable installs that created a
-/// `Links\<alias>.exe` symlink, including pinget-installed entries when
-/// `install_portable` created that link. Entries without a created/recorded
-/// portable symlink return `None`.
 #[cfg(windows)]
-fn read_portable_symlink_full_path(installed: &ListMatch) -> Option<String> {
-    const ARP_PREFIX: &str = r"ARP\";
-    if let Some(rest) = installed.local_id.strip_prefix(ARP_PREFIX) {
+fn remove_portable_directory(
+    path: &Path,
+    entry: Option<&ExistingPortableEntry>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let matches_location =
+        is_owned_portable_directory(true, entry.and_then(|entry| entry.install_location.as_deref()), path)?;
+    if matches_location && entry.and_then(|entry| entry.install_directory_created) == Some(1) {
+        ensure_not_portable_reparse_point(path)?;
+        fs::remove_dir_all(path)?;
+    } else if let Some(files) = entry
+        .filter(|_| matches_location)
+        .and_then(|entry| entry.files.as_deref())
+    {
+        let directories = entry.and_then(|entry| entry.directories.as_deref()).unwrap_or_default();
+        remove_tracked_portable_files(path, files, directories)?;
+    } else {
+        if matches_location
+            && let Some(target) = entry
+                .and_then(|entry| entry.portable_target_full_path.as_deref())
+                .filter(|target| target.is_absolute())
+            && let Some(relative) = portable_relative_target(path, target)?
+        {
+            remove_tracked_portable_files(path, &[relative], &[])?;
+        }
+        warnings.push(format!(
+            "The portable directory '{}' was preserved because complete file ownership information is unavailable; remove any remaining package files manually.",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_portable_entry_for_installed(installed: &ListMatch) -> Result<Option<ExistingPortableEntry>> {
+    if let Some((prefix, rest)) = installed.local_id.split_once('\\')
+        && prefix.eq_ignore_ascii_case("ARP")
+    {
         let mut parts = rest.splitn(3, '\\');
         let scope = parts.next().unwrap_or("");
-        let _arch = parts.next();
+        let arch = parts.next().unwrap_or("");
         let subkey_name = parts.next().unwrap_or("");
-        if subkey_name.is_empty() {
-            return None;
+        if subkey_name.is_empty()
+            || subkey_name.contains('\\')
+            || !(scope.eq_ignore_ascii_case("User") || scope.eq_ignore_ascii_case("Machine"))
+        {
+            return Ok(None);
         }
         let hive = if scope.eq_ignore_ascii_case("User") {
             RegKey::predef(HKEY_CURRENT_USER)
         } else {
             RegKey::predef(HKEY_LOCAL_MACHINE)
         };
-        let subkey = hive
-            .open_subkey(format!(
-                r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"
-            ))
-            .ok()?;
-        return read_reg_string(&subkey, "PortableSymlinkFullPath");
+        let view = if arch.eq_ignore_ascii_case("X86") {
+            KEY_WOW64_32KEY
+        } else {
+            KEY_WOW64_64KEY
+        };
+        let subkey = match hive.open_subkey_with_flags(
+            format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"),
+            KEY_READ | view,
+        ) {
+            Ok(subkey) => subkey,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("reading the portable registry entry"),
+        };
+        return Ok(Some(portable_entry_from_registry(&subkey, subkey_name.to_owned())));
     }
-    None
+    Ok(None)
 }
 
-/// Removes the symlink shims winget would have created for this portable.
-/// Tries (1) the exact path from `PortableSymlinkFullPath` if known, and
-/// (2) any symlink in `%LOCALAPPDATA%\Microsoft\WinGet\Links\` whose target
-/// resolves under `install_location` (defensive sweep for shims winget made
-/// but didn't surface in the registry). Best-effort: failures are swallowed.
+#[cfg(windows)]
+fn installed_portable_scope(installed: &ListMatch) -> Result<PortableScope> {
+    let mut parts = installed.local_id.split('\\');
+    let prefix = parts.next().unwrap_or("");
+    let scope = parts.next().unwrap_or("");
+    if prefix.eq_ignore_ascii_case("ARP") && scope.eq_ignore_ascii_case("Machine") {
+        return Ok(PortableScope::Machine);
+    }
+    if prefix.eq_ignore_ascii_case("ARP") && scope.eq_ignore_ascii_case("User") {
+        return Ok(PortableScope::User);
+    }
+    resolve_portable_scope(None, installed.scope.as_deref(), None)
+}
+
 #[cfg(windows)]
 fn try_remove_portable_symlinks(
-    _installed: &ListMatch,
-    known_symlink: &Option<String>,
-    install_location: Option<&Path>,
+    known_symlink: Option<&Path>,
+    target_boundary: Option<&Path>,
+    scope: PortableScope,
+    warnings: &mut Vec<String>,
 ) {
-    if let Some(path) = known_symlink.as_deref() {
-        let _ = fs::remove_file(path);
-    }
-
-    // Defensive sweep: walk Links\ and remove shims whose stored target was
-    // inside (or equal to) install_location. By this point install_location is
-    // already deleted, so we compare the symlink's stored target string (which
-    // the filesystem retains even after the target itself is gone).
-    let Some(install_dir) = install_location else { return };
-
-    let Some(local) = dirs::data_local_dir() else { return };
-    let links_root = local.join("Microsoft").join("WinGet").join("Links");
-    let Ok(entries) = fs::read_dir(&links_root) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(target) = fs::read_link(&path) else { continue };
-        if path_starts_with_case_insensitive(&target, install_dir) {
-            let _ = fs::remove_file(&path);
-        }
-    }
-}
-
-/// Case-insensitive, component-aware path-prefix check for Windows. A raw
-/// `str::starts_with` on the path strings would let `C:\Foo` falsely match
-/// `C:\Foobar`; iterating path components avoids that. Used by the Links\
-/// sweep so an uninstall of one portable can't accidentally delete shims that
-/// belong to a different portable whose install dir happens to share a
-/// string-prefix.
-#[cfg(windows)]
-fn path_starts_with_case_insensitive(child: &Path, parent: &Path) -> bool {
-    let lower_components = |p: &Path| -> Vec<String> {
-        p.components()
-            .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
-            .collect()
-    };
-    let parent_components = lower_components(parent);
-    let child_components = lower_components(child);
-    if parent_components.is_empty() || parent_components.len() > child_components.len() {
-        return false;
-    }
-    parent_components
-        .iter()
-        .zip(child_components.iter())
-        .all(|(a, b)| a == b)
-}
-
-/// Best-effort removal of the HKCU/HKLM ARP subkey backing a portable entry.
-/// We match on local_id (`ARP\<scope>\<arch>\<subkey>`) when present so we
-/// delete the exact key the list view surfaced; otherwise we walk the standard
-/// Uninstall path and match on WinGetPackageIdentifier. Failures are logged via
-/// the returned warning chain in callers — we never bubble a registry-cleanup
-/// failure as a hard error because the file deletion already succeeded.
-#[cfg(windows)]
-fn try_remove_portable_registry_entry(installed: &ListMatch) {
-    // Collect (is_hkcu, subkey_path) pairs so we can re-open hives at delete
-    // time instead of holding clones of RegKey (which doesn't implement Clone).
-    let candidates: Vec<(bool, String)> = if let Some(rest) = installed.local_id.strip_prefix(r"ARP\") {
-        // local_id format is `ARP\<scope>\<arch>\<subkey>` — pick the right hive/path.
-        let mut parts = rest.splitn(3, '\\');
-        let scope = parts.next().unwrap_or("");
-        let _arch = parts.next();
-        let subkey_name = parts.next().unwrap_or("");
-        if subkey_name.is_empty() {
+    let links_root = match winget_links_dir(scope) {
+        Ok(path) => path,
+        Err(error) => {
+            warnings.push(format!("Could not locate the portable links directory: {error:#}"));
             return;
         }
-        let is_hkcu = scope.eq_ignore_ascii_case("User");
-        vec![(
-            is_hkcu,
-            format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"),
-        )]
-    } else {
-        // Fall back to scanning by WinGetPackageIdentifier.
-        let mut found = Vec::new();
-        for (is_hkcu, hive) in [
-            (true, RegKey::predef(HKEY_CURRENT_USER)),
-            (false, RegKey::predef(HKEY_LOCAL_MACHINE)),
-        ] {
-            let Ok(uninstall) = hive.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall") else {
-                continue;
-            };
-            for name in uninstall.enum_keys().flatten() {
-                let Ok(subkey) = uninstall.open_subkey(&name) else {
-                    continue;
-                };
-                if read_reg_string(&subkey, "WinGetPackageIdentifier").as_deref() == Some(installed.id.as_str()) {
-                    found.push((
-                        is_hkcu,
-                        format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{name}"),
-                    ));
-                }
-            }
+    };
+    remove_portable_links_in_directory(known_symlink, target_boundary, &links_root, warnings);
+}
+
+#[cfg(windows)]
+fn remove_portable_links_in_directory(
+    known_symlink: Option<&Path>,
+    target_boundary: Option<&Path>,
+    links_root: &Path,
+    warnings: &mut Vec<String>,
+) {
+    if let Err(error) = ensure_not_portable_reparse_point(links_root) {
+        warnings.push(format!("Could not scan the portable links directory: {error:#}"));
+        return;
+    }
+    if let Some(link) = known_symlink
+        && let Err(error) = remove_owned_portable_link(link, links_root, target_boundary)
+    {
+        warnings.push(format!("Could not remove the portable command link: {error:#}"));
+    }
+    let Some(boundary) = target_boundary else { return };
+    let entries = match fs::read_dir(links_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warnings.push(format!("Could not scan the portable links directory: {error}"));
+            return;
         }
-        found
+    };
+    for entry in entries {
+        let result = (|| -> Result<()> {
+            let path = entry?.path();
+            if !fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                return Ok(());
+            }
+            let target = fs::read_link(&path)?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                links_root.join(target)
+            };
+            if path_starts_with_case_insensitive(
+                &normalized_absolute_path(&target)?,
+                &normalized_absolute_path(boundary)?,
+            )? {
+                remove_owned_portable_link(&path, links_root, Some(boundary))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            warnings.push(format!(
+                "Could not inspect or remove a portable command link: {error:#}"
+            ));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn portable_case_insensitive_equal(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> Result<bool> {
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    let left: Vec<u16> = left.encode_wide().collect();
+    let right: Vec<u16> = right.encode_wide().collect();
+    if left.is_empty() || right.is_empty() {
+        return Ok(left.is_empty() && right.is_empty());
+    }
+    let left_len = i32::try_from(left.len()).context("portable path is too long to compare")?;
+    let right_len = i32::try_from(right.len()).context("portable path is too long to compare")?;
+    // SAFETY: Both pointers reference initialized UTF-16 buffers of the lengths passed to Windows.
+    let comparison = unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
+    if comparison == 0 {
+        return Err(std::io::Error::last_os_error()).context("comparing portable paths");
+    }
+    Ok(comparison == CSTR_EQUAL)
+}
+
+/// Compares path components rather than string prefixes so sibling paths do not overlap.
+#[cfg(windows)]
+fn path_starts_with_case_insensitive(child: &Path, parent: &Path) -> Result<bool> {
+    let mut child_components = child.components();
+    let mut parent_components = parent.components().peekable();
+    if parent_components.peek().is_none() {
+        return Ok(false);
+    }
+    for parent_component in parent_components {
+        let Some(child_component) = child_components.next() else {
+            return Ok(false);
+        };
+        if !portable_case_insensitive_equal(child_component.as_os_str(), parent_component.as_os_str())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn remove_portable_registry_entry(installed: &ListMatch) -> Result<()> {
+    let candidates: Vec<(bool, u32, String)> = if let Some((prefix, rest)) = installed.local_id.split_once('\\')
+        && prefix.eq_ignore_ascii_case("ARP")
+    {
+        let mut parts = rest.splitn(3, '\\');
+        let scope = parts.next().unwrap_or("");
+        let arch = parts.next().unwrap_or("");
+        let subkey_name = parts.next().unwrap_or("");
+        if subkey_name.is_empty()
+            || subkey_name.contains('\\')
+            || !(scope.eq_ignore_ascii_case("User") || scope.eq_ignore_ascii_case("Machine"))
+        {
+            bail!("portable registry entry has an invalid identifier");
+        }
+        let is_hkcu = scope.eq_ignore_ascii_case("User");
+        let view = if arch.eq_ignore_ascii_case("X86") {
+            KEY_WOW64_32KEY
+        } else {
+            KEY_WOW64_64KEY
+        };
+        vec![(is_hkcu, view, subkey_name.to_owned())]
+    } else {
+        bail!("the exact portable registry key is unavailable");
     };
 
-    for (is_hkcu, path) in candidates {
+    for (is_hkcu, view, name) in candidates {
         let hive = if is_hkcu {
             RegKey::predef(HKEY_CURRENT_USER)
         } else {
             RegKey::predef(HKEY_LOCAL_MACHINE)
         };
-        let _ = hive.delete_subkey_all(&path);
+        let uninstall = match hive.open_subkey_with_flags(
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+            KEY_READ | KEY_WRITE | view,
+        ) {
+            Ok(uninstall) => uninstall,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("opening the portable uninstall registry key for removal"),
+        };
+        if let Err(error) = uninstall.delete_subkey_all(&name)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error).context("deleting the portable uninstall registry entry");
+        }
     }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -10561,7 +10803,7 @@ fn is_product_code_like(value: &str) -> bool {
 }
 
 #[cfg(not(windows))]
-fn uninstall_package(_installed: &ListMatch, _request: &UninstallRequest) -> Result<i32> {
+fn uninstall_package(_installed: &ListMatch, _request: &UninstallRequest, _warnings: &mut Vec<String>) -> Result<i32> {
     bail!("Uninstalling packages is only supported on Windows")
 }
 
@@ -10573,13 +10815,12 @@ fn uninstall_package(_installed: &ListMatch, _request: &UninstallRequest) -> Res
 /// community winget catalog uses today.
 ///
 /// Behavior matches winget's portable workflow closely enough that the resulting
-/// HKCU ARP entry is recognized by `winget list` and by pinget's own list view:
+/// scoped ARP entry is recognized by `winget list` and by pinget's own list view:
 /// - Resolves the target install directory in this priority order:
 ///   1. `request.install_location` if provided (passed for upgrades)
 ///   2. Existing `InstallLocation` from the registry ARP entry (so upgrades
 ///      with no explicit location still preserve the user's custom path)
-///   3. WinGet's default user portable root, `%LOCALAPPDATA%\Microsoft\WinGet
-///      \Packages\<PackageId>_<SourceId>`
+///   3. WinGet's default portable root for the selected scope
 /// - If an existing pinget-owned install lives in that directory
 ///   (`InstallDirectoryCreated=1`), cleans its contents before extracting the
 ///   new version so leftover files from older versions don't pile up.
@@ -10592,27 +10833,125 @@ fn install_portable(
     request: &InstallRequest,
     manifest: &Manifest,
     installer: &Installer,
+    scope: PortableScope,
+    warnings: &mut Vec<String>,
 ) -> Result<i32> {
     let source_identifier = portable_source_identifier(&request.query);
-    let existing_entry = read_existing_portable_entry(&manifest.id);
+    let existing_entry = read_existing_portable_entry(&manifest.id, scope)?;
     // Reuse the existing subkey name on upgrade so we don't orphan the prior
     // entry by writing to a different one.
     let subkey_name = existing_entry
         .as_ref()
         .map(|entry| entry.subkey_name.clone())
         .unwrap_or_else(|| portable_subkey_name(&manifest.id, &source_identifier));
+    if subkey_name.contains(['\\', '/']) || normalize_portable_relative_path(&subkey_name)? != subkey_name {
+        bail!("invalid portable package identifier: {subkey_name}");
+    }
 
-    let target_dir = resolve_portable_install_location(request, &existing_entry, &subkey_name);
+    if request
+        .install_location
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        && let Some(previous_location) = existing_entry
+            .as_ref()
+            .and_then(|entry| entry.install_location.as_deref())
+            .filter(|path| !path.as_os_str().is_empty())
+        && !previous_location.is_absolute()
+    {
+        bail!("the previous portable install location is relative; specify an absolute install location");
+    }
+    let target_dir = normalized_absolute_path(&resolve_portable_install_location(
+        request,
+        &existing_entry,
+        &subkey_name,
+        scope,
+    )?)?;
 
     // If we created this directory on a previous install, wipe it clean so the
     // new version doesn't co-exist with leftovers from the previous one. We do
     // not touch a directory we don't own (InstallDirectoryCreated != 1), to
     // avoid stomping user data.
-    let prev_dir_created = existing_entry
-        .as_ref()
-        .and_then(|entry| entry.install_directory_created)
-        == Some(1);
+    let prev_dir_created = is_owned_portable_directory(
+        existing_entry
+            .as_ref()
+            .and_then(|entry| entry.install_directory_created)
+            == Some(1),
+        existing_entry
+            .as_ref()
+            .and_then(|entry| entry.install_location.as_deref()),
+        &target_dir,
+    )?;
     let dir_existed = target_dir.is_dir();
+    let installer_type = installer.installer_type.as_deref().unwrap_or("");
+    let is_zip = installer_type.eq_ignore_ascii_case("zip");
+    let payload = read_portable_payload(installer_path, is_zip)?;
+    let nested_path = if is_zip {
+        installer
+            .nested_installer_files
+            .first()
+            .map(|file| normalize_portable_relative_path(&file.relative_file_path))
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(path) = nested_path.as_deref()
+        && !payload.files.iter().any(|file| file.eq_ignore_ascii_case(path))
+    {
+        bail!("portable target '{path}' is not present in the installer archive");
+    }
+    let same_existing_location = is_owned_portable_directory(
+        true,
+        existing_entry
+            .as_ref()
+            .and_then(|entry| entry.install_location.as_deref()),
+        &target_dir,
+    )?;
+    let mut previous_files = if same_existing_location {
+        existing_entry
+            .as_ref()
+            .and_then(|entry| entry.files.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let previous_directories = if same_existing_location {
+        existing_entry
+            .as_ref()
+            .and_then(|entry| entry.directories.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if same_existing_location && !prev_dir_created && existing_entry.as_ref().is_some_and(|entry| entry.files.is_none())
+    {
+        if let Some(target) = existing_entry
+            .as_ref()
+            .and_then(|entry| entry.portable_target_full_path.as_deref())
+            .filter(|target| target.is_absolute())
+            && let Some(relative) = portable_relative_target(&target_dir, target)?
+        {
+            previous_files.push(relative);
+        }
+        warnings.push(
+            "The previous portable install did not track all files; unrecognized files in its existing directory will be preserved."
+                .to_owned(),
+        );
+    }
+    let created_directories = plan_portable_payload(
+        &payload,
+        &target_dir,
+        prev_dir_created,
+        &previous_files,
+        &previous_directories,
+    )?;
+    if prev_dir_created
+        && path_starts_with_case_insensitive(
+            &normalized_absolute_path(installer_path)?,
+            &normalized_absolute_path(&target_dir)?,
+        )?
+    {
+        bail!("the portable installer is inside the directory that would be cleaned");
+    }
     if prev_dir_created && dir_existed {
         clean_directory_contents(&target_dir).with_context(|| {
             format!(
@@ -10629,8 +10968,7 @@ fn install_portable(
     // the dir already existed this round.
     let install_directory_created = !dir_existed || prev_dir_created;
 
-    let installer_type = installer.installer_type.as_deref().unwrap_or("");
-    let portable_target_full_path: PathBuf = if installer_type.eq_ignore_ascii_case("zip") {
+    let portable_target_full_path: PathBuf = if is_zip {
         let file = fs::File::open(installer_path)
             .with_context(|| format!("failed to open installer zip: {}", installer_path.display()))?;
         let mut archive = ZipArchive::new(file).context("failed to read installer zip")?;
@@ -10640,10 +10978,9 @@ fn install_portable(
         // For nested-portable zips the binary lives at the RelativeFilePath the
         // manifest declares. We record the first one as PortableTargetFullPath so
         // winget's portable uninstall workflow can identify which file to remove.
-        installer
-            .nested_installer_files
-            .first()
-            .map(|file| target_dir.join(&file.relative_file_path))
+        nested_path
+            .as_deref()
+            .map(|path| target_dir.join(path))
             .unwrap_or_else(|| target_dir.clone())
     } else {
         // Standalone portable: copy the downloaded file into target_dir using
@@ -10658,37 +10995,367 @@ fn install_portable(
         copied
     };
 
+    if !prev_dir_created && same_existing_location && !previous_files.is_empty() {
+        let current_files: HashSet<String> = payload.files.iter().map(|path| path.to_lowercase()).collect();
+        let obsolete: Vec<String> = previous_files
+            .into_iter()
+            .filter(|file| !current_files.contains(&file.to_lowercase()))
+            .collect();
+        remove_tracked_portable_files(&target_dir, &obsolete, &[])?;
+    }
+
     // Create the Links\<alias>.exe shim so users can invoke the portable from
     // any shell, matching winget's portable workflow. Failures are non-fatal —
     // when the user lacks SeCreateSymbolicLink (no Developer Mode, not admin)
     // we still leave the package installed at install_location.
     let alias = determine_portable_alias(installer);
     let symlink_full_path = match alias.as_deref() {
-        Some(alias) if !alias.is_empty() => try_create_portable_symlink(&portable_target_full_path, alias),
+        Some(alias) if !alias.is_empty() => {
+            match try_create_portable_symlink(&portable_target_full_path, alias, scope, existing_entry.as_ref()) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    warnings.push(format!(
+                        "Could not create the portable command link '{alias}': {error:#}"
+                    ));
+                    None
+                }
+            }
+        }
         _ => None,
     };
 
-    // Ensure %LOCALAPPDATA%\Microsoft\WinGet\Links is on user PATH so the
-    // symlink we just created is resolvable from new shells. Tracks whether we
-    // added it this round so uninstall can decide whether to take it back out.
+    if let Some(previous) = existing_entry
+        .as_ref()
+        .and_then(|entry| entry.portable_symlink_full_path.as_deref())
+    {
+        let same_link = match symlink_full_path.as_deref() {
+            Some(new) => paths_equal_case_insensitive(previous, new)?,
+            None => false,
+        };
+        if !same_link {
+            let result = winget_links_dir(scope).and_then(|links| {
+                let boundary = portable_link_target_boundary(
+                    existing_entry.as_ref(),
+                    existing_entry
+                        .as_ref()
+                        .and_then(|entry| entry.install_location.as_deref()),
+                )?;
+                remove_owned_portable_link(previous, &links, boundary.as_deref())
+            });
+            if let Err(error) = result {
+                warnings.push(format!(
+                    "Could not remove the previous portable command link: {error:#}"
+                ));
+            }
+        }
+    }
+
+    // Add the scope's links directory to PATH when a command link exists.
     let added_to_path = if symlink_full_path.is_some() {
-        try_add_links_dir_to_user_path()
+        match try_add_links_dir_to_path(scope, warnings) {
+            Ok(added) => added,
+            Err(error) => {
+                warnings.push(format!("Could not add the portable links directory to PATH: {error:#}"));
+                false
+            }
+        }
     } else {
         false
     };
 
-    write_portable_arp_entry(&PortableArpEntry {
-        subkey_name: &subkey_name,
-        install_location: &target_dir,
-        portable_target_full_path: &portable_target_full_path,
-        portable_symlink_full_path: symlink_full_path.as_deref(),
-        install_directory_created,
-        added_to_path,
-        source_identifier: &source_identifier,
-        manifest,
-    })?;
+    write_portable_arp_entry(
+        &PortableArpEntry {
+            subkey_name: &subkey_name,
+            install_location: &target_dir,
+            portable_target_full_path: &portable_target_full_path,
+            portable_symlink_full_path: symlink_full_path.as_deref(),
+            install_directory_created,
+            added_to_path,
+            files: &payload.files,
+            directories: &created_directories,
+            source_identifier: &source_identifier,
+            manifest,
+        },
+        scope,
+    )?;
 
+    cleanup_previous_portable_install(existing_entry.as_ref(), &target_dir, warnings);
     Ok(0)
+}
+
+#[cfg(windows)]
+fn cleanup_previous_portable_install(
+    previous: Option<&ExistingPortableEntry>,
+    current_location: &Path,
+    warnings: &mut Vec<String>,
+) {
+    let Some(old_location) = previous.and_then(|entry| entry.install_location.as_deref()) else {
+        return;
+    };
+    if !old_location.is_absolute() {
+        warnings.push(format!(
+            "The previous portable directory '{}' is relative and was preserved; remove any remaining package files manually.",
+            old_location.display()
+        ));
+        return;
+    }
+    let result = (|| -> Result<()> {
+        if paths_equal_case_insensitive(old_location, current_location)? || !old_location.is_dir() {
+            return Ok(());
+        }
+        let old_path = normalized_absolute_path(old_location)?;
+        let new_path = normalized_absolute_path(current_location)?;
+        if path_starts_with_case_insensitive(&old_path, &new_path)?
+            || path_starts_with_case_insensitive(&new_path, &old_path)?
+        {
+            warnings.push(format!(
+                "The previous portable directory '{}' overlaps the new location and was preserved; remove any remaining package files manually.",
+                old_location.display()
+            ));
+            return Ok(());
+        }
+        remove_portable_directory(old_location, previous, warnings)
+    })();
+    if let Err(error) = result {
+        warnings.push(format!(
+            "Could not clean the previous portable directory '{}': {error:#}",
+            old_location.display()
+        ));
+    }
+}
+
+#[cfg(any(windows, test))]
+struct PortablePayload {
+    files: Vec<String>,
+    directories: Vec<String>,
+}
+
+#[cfg(any(windows, test))]
+fn read_portable_payload(installer_path: &Path, is_zip: bool) -> Result<PortablePayload> {
+    let mut files = BTreeMap::<String, String>::new();
+    let mut directories = BTreeMap::<String, String>::new();
+    let mut add_path = |path: &str, is_directory: bool| -> Result<()> {
+        let normalized = normalize_portable_relative_path(path)?;
+        if is_directory {
+            directories.insert(normalized.to_lowercase(), normalized.clone());
+        } else if files.insert(normalized.to_lowercase(), normalized.clone()).is_some() {
+            bail!("the portable installer contains duplicate files: {normalized}");
+        }
+        let mut parent = normalized.as_str();
+        while let Some((prefix, _)) = parent.rsplit_once('\\') {
+            directories.insert(prefix.to_lowercase(), prefix.to_owned());
+            parent = prefix;
+        }
+        Ok(())
+    };
+
+    if is_zip {
+        let file = fs::File::open(installer_path)
+            .with_context(|| format!("opening installer zip {}", installer_path.display()))?;
+        let mut archive = ZipArchive::new(file).context("reading installer zip")?;
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index)?;
+            if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
+                bail!("portable installer contains a symbolic link: {}", entry.name());
+            }
+            let name = entry.name();
+            let is_directory = name.ends_with(['/', '\\']);
+            let name = name.trim_end_matches(['/', '\\']);
+            if is_directory && name == "." {
+                continue;
+            }
+            add_path(name, is_directory)?;
+        }
+    } else {
+        let name = installer_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("portable installer has no valid filename"))?;
+        add_path(name, false)?;
+    }
+
+    if files.is_empty() {
+        bail!("the portable installer contains no files");
+    }
+    if files.keys().any(|path| directories.contains_key(path)) {
+        bail!("the portable installer contains conflicting file and directory paths");
+    }
+    Ok(PortablePayload {
+        files: files.into_values().collect(),
+        directories: directories.into_values().collect(),
+    })
+}
+
+#[cfg(any(windows, test))]
+fn plan_portable_payload(
+    payload: &PortablePayload,
+    target_dir: &Path,
+    directory_owned: bool,
+    previous_files: &[String],
+    previous_directories: &[String],
+) -> Result<Vec<String>> {
+    let previous_file_set: HashSet<String> = previous_files
+        .iter()
+        .map(|path| normalize_portable_relative_path(path).map(|path| path.to_lowercase()))
+        .collect::<Result<_>>()?;
+    for relative_path in &payload.files {
+        let destination = safe_portable_path(target_dir, relative_path)?;
+        if !directory_owned && destination.is_dir() {
+            bail!(
+                "portable file conflicts with an existing directory: {}",
+                destination.display()
+            );
+        }
+        if !directory_owned && destination.exists() && !previous_file_set.contains(&relative_path.to_lowercase()) {
+            bail!(
+                "portable file conflicts with an existing file: {}",
+                destination.display()
+            );
+        }
+    }
+    let mut created_directories: BTreeMap<String, String> = previous_directories
+        .iter()
+        .map(|path| normalize_portable_relative_path(path).map(|path| (path.to_lowercase(), path)))
+        .collect::<Result<_>>()?;
+    for relative_path in &payload.directories {
+        let directory = safe_portable_path(target_dir, relative_path)?;
+        if !directory_owned && directory.is_file() {
+            bail!(
+                "portable directory conflicts with an existing file: {}",
+                directory.display()
+            );
+        }
+        if !directory.is_dir() {
+            created_directories.insert(relative_path.to_lowercase(), relative_path.clone());
+        }
+    }
+    Ok(created_directories.into_values().collect())
+}
+
+#[cfg(any(windows, test))]
+fn normalize_portable_relative_path(path: &str) -> Result<String> {
+    if path.trim().is_empty() || path.starts_with(['/', '\\']) || path.contains(':') {
+        bail!("invalid portable relative path: {path}");
+    }
+    let normalized = path.replace('/', "\\");
+    let parts: Vec<&str> = normalized
+        .split('\\')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts.is_empty()
+        || parts.iter().any(|part| {
+            *part == ".."
+                || part.ends_with([' ', '.'])
+                || part
+                    .chars()
+                    .any(|ch| ch <= '\u{1f}' || matches!(ch, '<' | '>' | '"' | '|' | '?' | '*'))
+                || is_reserved_portable_name(part)
+        })
+    {
+        bail!("invalid portable relative path: {path}");
+    }
+    Ok(parts.join("\\"))
+}
+
+#[cfg(any(windows, test))]
+fn is_reserved_portable_name(part: &str) -> bool {
+    let name = part.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    matches!(name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (name.len() == 4
+            && (name.starts_with("COM") || name.starts_with("LPT"))
+            && name.as_bytes()[3].is_ascii_digit()
+            && name.as_bytes()[3] != b'0')
+}
+
+#[cfg(windows)]
+fn portable_relative_target(root: &Path, target: &Path) -> Result<Option<String>> {
+    let root = normalized_absolute_path(root)?;
+    let target = normalized_absolute_path(target)?;
+    if !path_starts_with_case_insensitive(&target, &root)? {
+        bail!(
+            "portable target is outside the installation directory: {}",
+            target.display()
+        );
+    }
+    let relative: PathBuf = target.components().skip(root.components().count()).collect();
+    if relative.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    normalize_portable_relative_path(&relative.to_string_lossy()).map(Some)
+}
+
+#[cfg(any(windows, test))]
+fn safe_portable_path(root: &Path, relative_path: &str) -> Result<PathBuf> {
+    let normalized = normalize_portable_relative_path(relative_path)?;
+    let mut current = root.to_path_buf();
+    for component in std::iter::once("").chain(normalized.split('\\')) {
+        if !component.is_empty() {
+            current.push(component);
+        }
+        ensure_not_portable_reparse_point(&current)?;
+    }
+    Ok(current)
+}
+
+#[cfg(any(windows, test))]
+fn ensure_not_portable_reparse_point(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            #[cfg(windows)]
+            let is_reparse = {
+                use std::os::windows::fs::MetadataExt;
+                metadata.file_attributes() & 0x400 != 0
+            };
+            #[cfg(not(windows))]
+            let is_reparse = metadata.file_type().is_symlink();
+            if is_reparse {
+                bail!(
+                    "portable path contains a symbolic link or reparse point: {}",
+                    path.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("examining {}", path.display())),
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn remove_tracked_portable_files(root: &Path, files: &[String], directories: &[String]) -> Result<()> {
+    let file_paths = files
+        .iter()
+        .map(|path| safe_portable_path(root, path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut directory_paths = directories
+        .iter()
+        .map(|path| safe_portable_path(root, path))
+        .collect::<Result<Vec<_>>>()?;
+    directory_paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in &file_paths {
+        if path.is_dir() {
+            bail!("tracked portable file is now a directory: {}", path.display());
+        }
+    }
+    for path in &file_paths {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+    for path in &directory_paths {
+        match fs::read_dir(path) {
+            Ok(mut entries) => {
+                if entries.next().transpose()?.is_none() {
+                    fs::remove_dir(path).with_context(|| format!("removing {}", path.display()))?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -10699,6 +11366,8 @@ struct PortableArpEntry<'a> {
     portable_symlink_full_path: Option<&'a Path>,
     install_directory_created: bool,
     added_to_path: bool,
+    files: &'a [String],
+    directories: &'a [String],
     source_identifier: &'a str,
     manifest: &'a Manifest,
 }
@@ -10713,86 +11382,280 @@ fn determine_portable_alias(installer: &Installer) -> Option<String> {
     installer
         .nested_installer_files
         .iter()
-        .find_map(|file| file.portable_command_alias.clone())
+        .find_map(|file| {
+            file.portable_command_alias
+                .as_deref()
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    Path::new(&file.relative_file_path)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(str::to_owned)
+                })
+        })
         .or_else(|| installer.commands.first().cloned())
 }
 
 #[cfg(windows)]
-fn winget_links_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Microsoft")
-        .join("WinGet")
-        .join("Links")
+fn winget_links_dir(scope: PortableScope) -> Result<PathBuf> {
+    match scope {
+        PortableScope::User => Ok(local_app_data_dir()?.join("Microsoft").join("WinGet").join("Links")),
+        PortableScope::Machine => Ok(program_files_dir()?.join("WinGet").join("Links")),
+    }
 }
 
-/// Creates (or replaces) `Links\<alias>.exe` as a file symlink pointing at the
-/// portable's binary. Returns the link path on success. Returns None and logs
-/// a warning if the user can't create symlinks (no Developer Mode, not admin)
-/// so the install can still complete without the shim.
 #[cfg(windows)]
-fn try_create_portable_symlink(target: &Path, alias: &str) -> Option<PathBuf> {
+fn try_create_portable_symlink(
+    target: &Path,
+    alias: &str,
+    scope: PortableScope,
+    existing_entry: Option<&ExistingPortableEntry>,
+) -> Result<PathBuf> {
     use std::os::windows::fs::symlink_file;
-    let links_dir = winget_links_dir();
-    if fs::create_dir_all(&links_dir).is_err() {
-        return None;
+    let links_dir = winget_links_dir(scope)?;
+    fs::create_dir_all(&links_dir).with_context(|| format!("creating {}", links_dir.display()))?;
+    ensure_not_portable_reparse_point(&links_dir)?;
+    if alias.contains(['\\', '/']) || normalize_portable_relative_path(alias)? != alias {
+        bail!("invalid portable command alias: {alias}");
     }
     let link_path = links_dir.join(format!("{alias}.exe"));
 
-    // Replace any prior link/file at the path so upgrades repoint to the new
-    // binary instead of leaving a stale symlink behind.
     if link_path.symlink_metadata().is_ok() {
-        let _ = fs::remove_file(&link_path);
+        let Some(previous) = existing_entry.and_then(|entry| entry.portable_symlink_full_path.as_deref()) else {
+            bail!("the portable command link already exists: {}", link_path.display());
+        };
+        if !paths_equal_case_insensitive(&link_path, previous)? {
+            bail!("the portable command link already exists: {}", link_path.display());
+        }
+        let boundary = portable_link_target_boundary(
+            existing_entry,
+            existing_entry.and_then(|entry| entry.install_location.as_deref()),
+        )?;
+        remove_owned_portable_link(&link_path, &links_dir, boundary.as_deref())?;
     }
 
-    // Symlink creation fails with ERROR_PRIVILEGE_NOT_HELD (1314) when the
-    // process lacks SeCreateSymbolicLink (no Developer Mode, not admin). Treat
-    // that — and any other I/O failure — as non-fatal: the package files are
-    // already in place, just without a Links\ shim.
-    symlink_file(target, &link_path).ok().map(|()| link_path)
+    symlink_file(target, &link_path).with_context(|| format!("linking {}", link_path.display()))?;
+    Ok(link_path)
 }
 
-/// Adds `Links\` to the user's HKCU\Environment\Path if not already present,
-/// then broadcasts WM_SETTINGCHANGE so explorer-spawned shells pick up the
-/// new PATH without a logoff. Returns true if we actually appended PATH this
-/// call — callers should write `InstallDirectoryAddedToPath` accordingly so a
-/// follow-up uninstall doesn't take PATH back out for other portables.
 #[cfg(windows)]
-fn try_add_links_dir_to_user_path() -> bool {
-    let links_dir = winget_links_dir();
-    let links_str = links_dir.to_string_lossy().to_string();
-    let normalized_links = links_str.to_ascii_lowercase();
-
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(env_key) = hkcu.open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE) else {
-        return false;
-    };
-    let existing: String = env_key.get_value("Path").unwrap_or_default();
-    let already_present = existing
-        .split(';')
-        .any(|component| component.trim().to_ascii_lowercase() == normalized_links);
-    if already_present {
-        return false;
+fn normalized_absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("path escapes its root: {}", path.display());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
     }
+    Ok(normalized)
+}
 
-    let new_path = if existing.is_empty() {
-        links_str
-    } else if existing.ends_with(';') {
-        format!("{existing}{links_str}")
+#[cfg(windows)]
+fn paths_equal_case_insensitive(left: &Path, right: &Path) -> Result<bool> {
+    let left = normalized_absolute_path(left)?;
+    let right = normalized_absolute_path(right)?;
+    portable_case_insensitive_equal(left.as_os_str(), right.as_os_str())
+}
+
+#[cfg(windows)]
+fn remove_owned_portable_link(link: &Path, links_root: &Path, install_location: Option<&Path>) -> Result<bool> {
+    let root = normalized_absolute_path(links_root)?;
+    ensure_not_portable_reparse_point(&root)?;
+    let link = normalized_absolute_path(link)?;
+    let parent = link
+        .parent()
+        .ok_or_else(|| anyhow!("portable command link has no parent"))?;
+    if !paths_equal_case_insensitive(parent, &root)? {
+        bail!(
+            "portable command link is outside the links directory: {}",
+            link.display()
+        );
+    }
+    match fs::symlink_metadata(&link) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => {
+            bail!("portable command link is not a symbolic link: {}", link.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("examining {}", link.display())),
+    }
+    let target = fs::read_link(&link).with_context(|| format!("reading {}", link.display()))?;
+    let target = if target.is_absolute() {
+        target
     } else {
-        format!("{existing};{links_str}")
+        root.join(target)
     };
-
-    if env_key.set_value("Path", &new_path).is_err() {
-        return false;
+    let target = normalized_absolute_path(&target)?;
+    let Some(install_location) = install_location else {
+        bail!("portable command link ownership cannot be verified: {}", link.display());
+    };
+    let install_location = normalized_absolute_path(install_location)?;
+    if !path_starts_with_case_insensitive(&target, &install_location)? {
+        bail!(
+            "portable command link points outside the installation: {}",
+            link.display()
+        );
     }
-
-    broadcast_environment_change();
-    true
+    fs::remove_file(&link).with_context(|| format!("removing {}", link.display()))?;
+    Ok(true)
 }
 
 #[cfg(windows)]
-fn broadcast_environment_change() {
+fn portable_link_target_boundary(
+    entry: Option<&ExistingPortableEntry>,
+    location: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let (Some(entry), Some(location)) = (entry, location) else {
+        return Ok(None);
+    };
+    if !is_owned_portable_directory(true, entry.install_location.as_deref(), location)? {
+        return Ok(None);
+    }
+    if entry.install_directory_created == Some(1) {
+        return Ok(Some(location.to_path_buf()));
+    }
+    let Some(target) = entry.portable_target_full_path.as_deref() else {
+        return Ok(None);
+    };
+    if !target.is_absolute() {
+        return Ok(None);
+    }
+    let target = normalized_absolute_path(target)?;
+    let location = normalized_absolute_path(location)?;
+    if !paths_equal_case_insensitive(&target, &location)? && path_starts_with_case_insensitive(&target, &location)? {
+        Ok(Some(target))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(windows)]
+fn append_portable_links_path(existing: &str, links_dir: &str, expand: impl Fn(&str) -> String) -> Option<String> {
+    let normalize = |value: &str| value.trim_end_matches(['\\', '/']).to_lowercase();
+    let normalized_links = normalize(links_dir);
+    if existing.split(';').any(|component| {
+        let expanded = expand(component.trim().trim_matches('"'));
+        normalize(&expanded) == normalized_links
+    }) {
+        return None;
+    }
+    if existing.is_empty() {
+        Some(links_dir.to_owned())
+    } else if existing.ends_with(';') {
+        Some(format!("{existing}{links_dir}"))
+    } else {
+        Some(format!("{existing};{links_dir}"))
+    }
+}
+
+#[cfg(windows)]
+fn expand_environment_path(value: &str) -> String {
+    let mut expanded = String::new();
+    let mut remaining = value;
+    while let Some((before, after_start)) = remaining.split_once('%') {
+        expanded.push_str(before);
+        let Some((name, after_end)) = after_start.split_once('%') else {
+            expanded.push('%');
+            expanded.push_str(after_start);
+            return expanded;
+        };
+        match std::env::var(name) {
+            Ok(value) => expanded.push_str(&value),
+            Err(_) => {
+                expanded.push('%');
+                expanded.push_str(name);
+                expanded.push('%');
+            }
+        }
+        remaining = after_end;
+    }
+    expanded.push_str(remaining);
+    expanded
+}
+
+#[cfg(windows)]
+fn try_add_links_dir_to_path(scope: PortableScope, warnings: &mut Vec<String>) -> Result<bool> {
+    let links_dir = winget_links_dir(scope)?;
+    let links_str = links_dir.to_string_lossy().to_string();
+
+    let (hive, key_path) = match scope {
+        PortableScope::User => (RegKey::predef(HKEY_CURRENT_USER), r"Environment"),
+        PortableScope::Machine => (
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    };
+    let env_key = hive
+        .open_subkey_with_flags(key_path, KEY_READ | KEY_WRITE)
+        .with_context(|| format!("opening the {scope:?} environment registry key"))?;
+    let existing = match env_key.get_raw_value("Path") {
+        Ok(raw) => Some(raw),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("reading the PATH registry value"),
+    };
+    let Some(update) = prepare_portable_path_update(existing, &links_str, expand_environment_path)? else {
+        return Ok(false);
+    };
+    env_key
+        .set_raw_value("Path", &update)
+        .context("writing the PATH registry value")?;
+    if let Err(error) = broadcast_environment_change() {
+        warnings.push(format!(
+            "PATH was updated, but the environment-change notification failed: {error:#}"
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn prepare_portable_path_update(
+    existing: Option<winreg::reg_value::RegValue>,
+    links_dir: &str,
+    expand: impl Fn(&str) -> String,
+) -> Result<Option<winreg::reg_value::RegValue>> {
+    let (existing_path, value_type) = match existing {
+        Some(raw) => {
+            if raw.vtype != REG_SZ && raw.vtype != REG_EXPAND_SZ {
+                bail!("the existing PATH registry value has an unsupported type");
+            }
+            if raw.bytes.len() % 2 != 0 {
+                bail!("the existing PATH registry value has invalid UTF-16 data");
+            }
+            let value = OsString::from_reg_value(&raw)
+                .context("decoding the PATH registry value")?
+                .into_string()
+                .map_err(|_| anyhow!("the existing PATH registry value has invalid UTF-16 data"))?;
+            if value.contains('\0') {
+                bail!("the existing PATH registry value contains an embedded null");
+            }
+            (value, raw.vtype)
+        }
+        None => (String::new(), REG_EXPAND_SZ),
+    };
+    let expandable = value_type == REG_EXPAND_SZ;
+    let Some(new_path) = append_portable_links_path(&existing_path, links_dir, |component| {
+        if expandable {
+            expand(component)
+        } else {
+            component.to_owned()
+        }
+    }) else {
+        return Ok(None);
+    };
+    let mut raw = new_path.to_reg_value();
+    raw.vtype = value_type;
+    Ok(Some(raw))
+}
+
+#[cfg(windows)]
+fn broadcast_environment_change() -> Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
@@ -10807,7 +11670,7 @@ fn broadcast_environment_change() {
     // SAFETY: SendMessageTimeoutW only reads `param` for the duration of the
     // call (it copies the string before returning), and `result` is a stack
     // local we provide. No aliasing or lifetime issues.
-    unsafe {
+    let sent = unsafe {
         let mut result: usize = 0;
         SendMessageTimeoutW(
             HWND_BROADCAST,
@@ -10817,8 +11680,12 @@ fn broadcast_environment_change() {
             SMTO_ABORTIFHUNG,
             5000,
             &mut result,
-        );
+        )
+    };
+    if sent == 0 {
+        return Err(std::io::Error::last_os_error()).context("broadcasting the environment change");
     }
+    Ok(())
 }
 
 /// Source identifier embedded in the ARP subkey name. We mirror winget for
@@ -10843,20 +11710,35 @@ fn portable_subkey_name(package_id: &str, source_identifier: &str) -> String {
 struct ExistingPortableEntry {
     install_location: Option<PathBuf>,
     install_directory_created: Option<u32>,
+    portable_target_full_path: Option<PathBuf>,
+    portable_symlink_full_path: Option<PathBuf>,
+    files: Option<Vec<String>>,
+    directories: Option<Vec<String>>,
     subkey_name: String,
 }
 
 #[cfg(windows)]
-fn read_existing_portable_entry(package_id: &str) -> Option<ExistingPortableEntry> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let uninstall = hkcu
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
-        .ok()?;
-    for name in uninstall.enum_keys().flatten() {
-        let Ok(subkey) = uninstall.open_subkey(&name) else {
-            continue;
+fn read_existing_portable_entry(package_id: &str, scope: PortableScope) -> Result<Option<ExistingPortableEntry>> {
+    let hive = match scope {
+        PortableScope::User => RegKey::predef(HKEY_CURRENT_USER),
+        PortableScope::Machine => RegKey::predef(HKEY_LOCAL_MACHINE),
+    };
+    let uninstall = match hive.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall") {
+        Ok(uninstall) => uninstall,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("opening portable uninstall registry entries"),
+    };
+    for name in uninstall.enum_keys() {
+        let name = name.context("enumerating portable uninstall registry entries")?;
+        let subkey = match uninstall.open_subkey(&name) {
+            Ok(subkey) => subkey,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("reading portable registry entry {name}")),
         };
-        if read_reg_string(&subkey, "WinGetPackageIdentifier").as_deref() != Some(package_id) {
+        if !read_reg_string(&subkey, "WinGetPackageIdentifier")
+            .as_deref()
+            .is_some_and(|id| id.eq_ignore_ascii_case(package_id))
+        {
             continue;
         }
         if !read_reg_string(&subkey, "WinGetInstallerType")
@@ -10865,13 +11747,28 @@ fn read_existing_portable_entry(package_id: &str) -> Option<ExistingPortableEntr
         {
             continue;
         }
-        return Some(ExistingPortableEntry {
-            install_location: read_reg_string(&subkey, "InstallLocation").map(PathBuf::from),
-            install_directory_created: read_reg_dword(&subkey, "InstallDirectoryCreated"),
-            subkey_name: name,
-        });
+        return Ok(Some(portable_entry_from_registry(&subkey, name)));
     }
-    None
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn portable_entry_from_registry(subkey: &RegKey, subkey_name: String) -> ExistingPortableEntry {
+    let read_paths = |name| -> Option<Vec<String>> {
+        subkey
+            .get_value::<Vec<String>, _>(name)
+            .ok()
+            .map(|paths| paths.into_iter().filter(|path| !path.is_empty()).collect())
+    };
+    ExistingPortableEntry {
+        install_location: read_reg_string(subkey, "InstallLocation").map(PathBuf::from),
+        install_directory_created: read_reg_dword(subkey, "InstallDirectoryCreated"),
+        portable_target_full_path: read_reg_string(subkey, "PortableTargetFullPath").map(PathBuf::from),
+        portable_symlink_full_path: read_reg_string(subkey, "PortableSymlinkFullPath").map(PathBuf::from),
+        files: read_paths("PingetPortableFiles"),
+        directories: read_paths("PingetPortableDirectories"),
+        subkey_name,
+    }
 }
 
 #[cfg(windows)]
@@ -10879,16 +11776,17 @@ fn resolve_portable_install_location(
     request: &InstallRequest,
     existing: &Option<ExistingPortableEntry>,
     subkey_name: &str,
-) -> PathBuf {
-    resolve_portable_install_location_pure(
+    scope: PortableScope,
+) -> Result<PathBuf> {
+    Ok(resolve_portable_install_location_pure(
         request.install_location.as_deref(),
         existing
             .as_ref()
             .and_then(|e| e.install_location.as_deref())
             .and_then(Path::to_str),
         subkey_name,
-        &default_user_portable_root(),
-    )
+        &default_portable_root(scope)?,
+    ))
 }
 
 /// Pure resolution rule for the portable install directory. Priority:
@@ -10903,12 +11801,12 @@ fn resolve_portable_install_location_pure(
     default_user_portable_root: &Path,
 ) -> PathBuf {
     if let Some(custom) = request_location
-        && !custom.is_empty()
+        && !custom.trim().is_empty()
     {
         return PathBuf::from(custom);
     }
     if let Some(loc) = existing_location
-        && !loc.is_empty()
+        && !loc.trim().is_empty()
     {
         return PathBuf::from(loc);
     }
@@ -10916,12 +11814,23 @@ fn resolve_portable_install_location_pure(
 }
 
 #[cfg(windows)]
-fn default_user_portable_root() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Microsoft")
-        .join("WinGet")
-        .join("Packages")
+fn default_portable_root(scope: PortableScope) -> Result<PathBuf> {
+    match scope {
+        PortableScope::User => Ok(local_app_data_dir()?.join("Microsoft").join("WinGet").join("Packages")),
+        PortableScope::Machine => Ok(program_files_dir()?.join("WinGet").join("Packages")),
+    }
+}
+
+#[cfg(windows)]
+fn is_owned_portable_directory(
+    previously_created: bool,
+    existing_location: Option<&Path>,
+    target_dir: &Path,
+) -> Result<bool> {
+    let Some(existing_location) = existing_location.filter(|path| previously_created && path.is_absolute()) else {
+        return Ok(false);
+    };
+    paths_equal_case_insensitive(existing_location, target_dir)
 }
 
 #[cfg(windows)]
@@ -10945,13 +11854,16 @@ fn clean_directory_contents(dir: &Path) -> Result<()> {
 /// install. Only the subset that winget's portable list view and pinget's
 /// `collect_uninstall_view` actually read.
 #[cfg(windows)]
-fn write_portable_arp_entry(entry: &PortableArpEntry<'_>) -> Result<()> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+fn write_portable_arp_entry(entry: &PortableArpEntry<'_>, scope: PortableScope) -> Result<()> {
+    let hive = match scope {
+        PortableScope::User => RegKey::predef(HKEY_CURRENT_USER),
+        PortableScope::Machine => RegKey::predef(HKEY_LOCAL_MACHINE),
+    };
     let uninstall_path = format!(
         r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{}",
         entry.subkey_name
     );
-    let (subkey, _) = hkcu
+    let (subkey, _) = hive
         .create_subkey(&uninstall_path)
         .context("failed to create portable ARP registry subkey")?;
 
@@ -10967,6 +11879,10 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>) -> Result<()> {
     )?;
     if let Some(symlink_path) = entry.portable_symlink_full_path {
         subkey.set_value("PortableSymlinkFullPath", &symlink_path.to_string_lossy().to_string())?;
+    } else if let Err(error) = subkey.delete_value("PortableSymlinkFullPath")
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error).context("removing the previous portable symlink registry value");
     }
     subkey.set_value(
         "InstallDirectoryAddedToPath",
@@ -10976,6 +11892,8 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>) -> Result<()> {
         "InstallDirectoryCreated",
         &(if entry.install_directory_created { 1u32 } else { 0u32 }),
     )?;
+    subkey.set_value("PingetPortableFiles", &entry.files.to_vec())?;
+    subkey.set_value("PingetPortableDirectories", &entry.directories.to_vec())?;
     subkey.set_value(
         "DisplayName",
         &if manifest.name.is_empty() {
@@ -11168,29 +12086,29 @@ mod tests {
         // Regression: a naive str::starts_with would falsely consider
         // C:\Foobar a child of C:\Foo and let the Links\ sweep delete unrelated
         // symlinks. The component-aware check must reject these.
-        assert!(!path_starts_with_case_insensitive(
-            Path::new(r"C:\Foobar\bin.exe"),
-            Path::new(r"C:\Foo"),
-        ));
-        assert!(!path_starts_with_case_insensitive(
-            Path::new(r"C:\Foo\bin.exe.bak"),
-            Path::new(r"C:\Foo\bin.exe"),
-        ));
+        assert!(
+            !path_starts_with_case_insensitive(Path::new(r"C:\Foobar\bin.exe"), Path::new(r"C:\Foo"),)
+                .expect("compare sibling paths")
+        );
+        assert!(
+            !path_starts_with_case_insensitive(Path::new(r"C:\Foo\bin.exe.bak"), Path::new(r"C:\Foo\bin.exe"),)
+                .expect("compare sibling files")
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn path_prefix_check_accepts_real_children_and_self() {
         // Dir install: the symlink target lives inside the install dir.
-        assert!(path_starts_with_case_insensitive(
-            Path::new(r"C:\Foo\sub\bin.exe"),
-            Path::new(r"C:\Foo"),
-        ));
+        assert!(
+            path_starts_with_case_insensitive(Path::new(r"C:\Foo\sub\bin.exe"), Path::new(r"C:\Foo"),)
+                .expect("compare child path")
+        );
         // File install: the symlink points at the same file we removed.
-        assert!(path_starts_with_case_insensitive(
-            Path::new(r"C:\Foo\bin.exe"),
-            Path::new(r"C:\Foo\bin.exe"),
-        ));
+        assert!(
+            path_starts_with_case_insensitive(Path::new(r"C:\Foo\bin.exe"), Path::new(r"C:\Foo\bin.exe"),)
+                .expect("compare identical paths")
+        );
     }
 
     #[cfg(windows)]
@@ -11198,10 +12116,13 @@ mod tests {
     fn path_prefix_check_is_case_insensitive() {
         // Windows paths are case-insensitive — winget and pinget may write
         // them with different casing.
-        assert!(path_starts_with_case_insensitive(
-            Path::new(r"c:\users\test\appdata\local\microsoft\winget\packages\foo\bin.exe"),
-            Path::new(r"C:\Users\test\AppData\Local\Microsoft\WinGet\Packages\Foo"),
-        ));
+        assert!(
+            path_starts_with_case_insensitive(
+                Path::new(r"c:\users\test\appdata\local\microsoft\winget\packages\foo\bin.exe"),
+                Path::new(r"C:\Users\test\AppData\Local\Microsoft\WinGet\Packages\Foo"),
+            )
+            .expect("compare paths with different case")
+        );
     }
 
     #[cfg(windows)]
@@ -11393,10 +12314,10 @@ mod tests {
     fn path_prefix_check_handles_mixed_separators() {
         // NestedInstallerFiles RelativeFilePath uses '/' in manifests, so the
         // path we joined can end up mixed-separator on Windows.
-        assert!(path_starts_with_case_insensitive(
-            Path::new(r"C:\Foo\sub/bin.exe"),
-            Path::new(r"C:\Foo"),
-        ));
+        assert!(
+            path_starts_with_case_insensitive(Path::new(r"C:\Foo\sub/bin.exe"), Path::new(r"C:\Foo"),)
+                .expect("compare paths with mixed separators")
+        );
     }
 
     #[test]
