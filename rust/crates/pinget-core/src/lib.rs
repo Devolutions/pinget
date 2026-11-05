@@ -11536,7 +11536,7 @@ fn portable_link_target_boundary(
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn append_portable_links_path(existing: &str, links_dir: &str, expand: impl Fn(&str) -> String) -> Option<String> {
     let normalize = |value: &str| value.trim_end_matches(['\\', '/']).to_lowercase();
     let normalized_links = normalize(links_dir);
