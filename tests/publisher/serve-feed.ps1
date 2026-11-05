@@ -122,6 +122,9 @@ try {
             }
             $tls.Flush()
         }
+        catch {
+            Write-Output "Ignored transient client connection error: $($_.Exception.Message)"
+        }
         finally {
             if ($null -ne $tls) {
                 $tls.Dispose()

@@ -210,6 +210,7 @@ pub struct RepositoryOptions {
     pub source_mode: SourceMode,
     pub pre_indexed_source_auto_update_interval: Option<Duration>,
     pub install_progress: Option<fn(&InstallProgress)>,
+    pub package_agreements_prompt: Option<fn(&Manifest) -> Result<bool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +259,7 @@ impl RepositoryOptions {
             source_mode: SourceMode::Private,
             pre_indexed_source_auto_update_interval: Some(Duration::minutes(DEFAULT_PREINDEXED_AUTO_UPDATE_MINUTES)),
             install_progress: None,
+            package_agreements_prompt: None,
         }
     }
 
@@ -293,6 +295,14 @@ impl RepositoryOptions {
     #[must_use]
     pub fn with_install_progress(mut self, progress: fn(&InstallProgress)) -> Self {
         self.install_progress = Some(progress);
+        self
+    }
+
+    /// Prompts the user to accept package agreements when `--accept-package-agreements`
+    /// was not supplied. Intended for interactive CLI sessions.
+    #[must_use]
+    pub fn with_package_agreements_prompt(mut self, prompt: fn(&Manifest) -> Result<bool>) -> Self {
+        self.package_agreements_prompt = Some(prompt);
         self
     }
 }
@@ -535,6 +545,8 @@ pub struct Installer {
     pub url: Option<String>,
     pub sha256: Option<String>,
     pub product_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msstore_product_identifier: Option<String>,
     pub locale: Option<String>,
     pub scope: Option<String>,
     pub release_date: Option<String>,
@@ -949,6 +961,9 @@ enum MatchLocator {
     Rest {
         package_id: String,
         versions: Vec<VersionKey>,
+        package_family_names: Vec<String>,
+        product_codes: Vec<String>,
+        upgrade_codes: Vec<String>,
     },
 }
 
@@ -1011,6 +1026,7 @@ pub struct Repository {
     store: SourceStore,
     source_mode: EffectiveSourceMode,
     install_progress: Option<fn(&InstallProgress)>,
+    package_agreements_prompt: Option<fn(&Manifest) -> Result<bool>>,
     pre_indexed_source_auto_update_interval: Option<Duration>,
     preindexed_refresh_attempts: HashMap<String, PreindexedRefreshAttempt>,
 }
@@ -1086,6 +1102,7 @@ impl Repository {
             store,
             source_mode,
             install_progress: options.install_progress,
+            package_agreements_prompt: options.package_agreements_prompt,
             pre_indexed_source_auto_update_interval: options.pre_indexed_source_auto_update_interval,
             preindexed_refresh_attempts: HashMap::new(),
         })
@@ -1447,9 +1464,16 @@ impl Repository {
             let available_query = package_query_from_list_query(query);
             let located = self.search_located(&available_query, SearchSemantics::Many)?;
             warnings.extend(located.warnings);
-            let candidates: Vec<SearchMatch> = located.matches.into_iter().map(|c| c.display).collect();
+            let candidates: Vec<SearchMatch> = located.matches.iter().map(|c| c.display.clone()).collect();
             for package in &mut installed {
                 if package.correlated.is_some() {
+                    continue;
+                }
+                if let Some(matched) = correlate_installed_package_from_located(package, &located.matches) {
+                    if package.name.starts_with("ms-resource:") && !matched.name.trim().is_empty() {
+                        package.name = matched.name.clone();
+                    }
+                    package.correlated = Some(matched);
                     continue;
                 }
                 package.correlated =
@@ -2267,6 +2291,14 @@ impl Repository {
         let (manifest, manifest_documents) = self.resolve_manifest_and_documents_for_install(request)?;
         let installer = select_installer(&manifest.installers, &request.query)
             .ok_or_else(|| anyhow!("No applicable installer found for the current system"))?;
+        if installer
+            .installer_type
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("msstore"))
+            && installer.url.is_none()
+        {
+            bail!("Downloading Microsoft Store (msstore) installers is not supported; use 'install' instead.");
+        }
         let url = installer
             .url
             .as_deref()
@@ -2353,7 +2385,7 @@ impl Repository {
             apply_install_scope(request, existing_match.as_ref().and_then(|item| item.scope.as_deref()))?;
         let request = &effective_request;
 
-        Self::ensure_package_agreements_accepted(&manifest, request)?;
+        self.ensure_package_agreements_accepted(&manifest, request)?;
         self.emit_install_progress(InstallProgress::InstallingDependencies);
         self.install_dependencies(&manifest, request, &mut HashSet::new())?;
 
@@ -2390,15 +2422,24 @@ impl Repository {
             let _ = self.uninstall_request(&uninstall_request);
         }
 
-        let temp_dir = std::env::temp_dir().join("pinget-install");
-        let installer_path = self.fetch_installer_for_request(request, &temp_dir)?.installer_path;
-
         let installer_type = installer.installer_type.as_deref().unwrap_or("exe").to_lowercase();
-        let installer_path = prepare_installer_for_execution(&installer_path, &installer_type)?;
+        let (installer_path, progress_path) = if installer_type == "msstore" {
+            let store_target = installer
+                .msstore_product_identifier
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(&manifest.id);
+            (PathBuf::new(), PathBuf::from(store_target))
+        } else {
+            let temp_dir = std::env::temp_dir().join("pinget-install");
+            let fetched_path = self.fetch_installer_for_request(request, &temp_dir)?.installer_path;
+            let prepared_path = prepare_installer_for_execution(&fetched_path, &installer_type)?;
+            (prepared_path.clone(), prepared_path)
+        };
 
         self.emit_install_progress(InstallProgress::StartingInstaller {
             installer_type: installer_type.clone(),
-            path: installer_path.clone(),
+            path: progress_path,
         });
         self.emit_install_progress(InstallProgress::WaitingForInstaller {
             installer_type: installer_type.clone(),
@@ -2449,9 +2490,29 @@ impl Repository {
             include_pinned: false,
         })?;
 
-        Ok(installed_matches.matches.into_iter().find(|candidate| {
-            candidate.id.eq_ignore_ascii_case(&manifest.id) || candidate.local_id.eq_ignore_ascii_case(&manifest.id)
-        }))
+        if let Some(found) = installed_matches.matches.into_iter().find(|candidate| {
+            candidate.id.eq_ignore_ascii_case(&manifest.id)
+                || candidate.local_id.eq_ignore_ascii_case(&manifest.id)
+                || manifest_matches_installed_package_family_name(manifest, &candidate.package_family_names)
+        }) {
+            return Ok(Some(found));
+        }
+
+        if manifest.installers.iter().any(|installer| {
+            installer
+                .package_family_name
+                .as_deref()
+                .is_some_and(|pfn| !pfn.trim().is_empty())
+        }) {
+            let all_installed = collect_installed_packages(request.query.install_scope.as_deref())?;
+            if let Some(found) = all_installed.into_iter().find(|candidate| {
+                manifest_matches_installed_package_family_name(manifest, &candidate.package_family_names)
+            }) {
+                return Ok(Some(list_match_from_installed(found, &self.store.sources)));
+            }
+        }
+
+        Ok(None)
     }
 
     fn create_install_no_op_result(
@@ -2476,6 +2537,8 @@ impl Repository {
 
         if !request.force
             && !existing_match.installed_version.trim().is_empty()
+            && !is_unknown_version(&existing_match.installed_version)
+            && !is_unknown_version(&manifest.version)
             && compare_version(&existing_match.installed_version, &manifest.version) != Ordering::Less
         {
             return Some(InstallResult {
@@ -2619,11 +2682,17 @@ impl Repository {
         Ok((manifest, documents))
     }
 
-    fn ensure_package_agreements_accepted(manifest: &Manifest, request: &InstallRequest) -> Result<()> {
-        if !request.accept_package_agreements && !manifest.agreements.is_empty() {
-            bail!("Package agreements are present; rerun with --accept-package-agreements to continue.");
+    fn ensure_package_agreements_accepted(&self, manifest: &Manifest, request: &InstallRequest) -> Result<()> {
+        if request.accept_package_agreements || manifest.agreements.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        if let Some(prompt) = self.package_agreements_prompt {
+            if prompt(manifest)? {
+                return Ok(());
+            }
+            bail!("Package agreements were not agreed to.");
+        }
+        bail!("Package agreements are present; rerun with --accept-package-agreements to continue.");
     }
 
     fn install_dependencies(
@@ -2724,11 +2793,15 @@ impl Repository {
             .clone()
             .or_else(|| installed_match.and_then(|item| item.source_name.clone()));
         query.exact = true;
-        query.version = request
-            .query
-            .version
-            .clone()
-            .or_else(|| installed_match.map(|item| item.installed_version.clone()));
+        query.version = request.query.version.clone().or_else(|| {
+            installed_match.and_then(|item| {
+                let is_msstore = item
+                    .source_name
+                    .as_deref()
+                    .is_some_and(|source| source.eq_ignore_ascii_case("msstore"));
+                (!is_msstore && !is_unknown_version(&item.installed_version)).then(|| item.installed_version.clone())
+            })
+        });
 
         InstallRequest {
             query,
@@ -3064,7 +3137,9 @@ impl Repository {
                     vec![version_data_file, manifest_bytes.path],
                 ))
             }
-            MatchLocator::Rest { package_id, versions } => {
+            MatchLocator::Rest {
+                package_id, versions, ..
+            } => {
                 let source = self.source_clone(located.source_index);
                 let selected = select_rest_version(
                     versions,
@@ -3227,6 +3302,7 @@ impl Repository {
             let package_name =
                 json_string(&item, "PackageName").ok_or_else(|| anyhow!("REST search result missing PackageName"))?;
             let mut versions = parse_rest_versions(&item)?;
+            let (package_family_names, product_codes, upgrade_codes) = parse_rest_version_identities(&item);
             sort_versions_desc(&mut versions);
             let latest = versions
                 .first()
@@ -3249,7 +3325,13 @@ impl Repository {
                     match_criteria: rest_match_criteria(&item, query, semantics),
                 },
                 source_index,
-                locator: MatchLocator::Rest { package_id, versions },
+                locator: MatchLocator::Rest {
+                    package_id,
+                    versions,
+                    package_family_names,
+                    product_codes,
+                    upgrade_codes,
+                },
             });
         }
 
@@ -3653,18 +3735,7 @@ impl Repository {
         let contract = choose_contract(&info.server_supported_versions)
             .ok_or_else(|| anyhow!("no compatible REST contract for {}", source.name))?;
         let url = format!("{}/packageManifests/{}", source.arg.trim_end_matches('/'), package_id);
-
-        let mut params = vec![("Version", version.to_owned())];
-        if !channel.is_empty() {
-            params.push(("Channel", channel.to_owned()));
-        }
-        if info
-            .required_query_parameters
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case("Market"))
-        {
-            params.push(("Market", default_market()));
-        }
+        let params = build_rest_manifest_query_params(version, channel, &info);
 
         let response = self
             .client
@@ -3887,7 +3958,7 @@ fn allow_loose_list_correlation(query: &ListQuery) -> bool {
 }
 
 fn installed_package_has_upgrade(package: &InstalledPackage) -> bool {
-    if is_greater_than_version_marker(&package.installed_version) {
+    if is_greater_than_version_marker(&package.installed_version) || installed_package_has_unknown_version(package) {
         return false;
     }
     package
@@ -4241,6 +4312,61 @@ fn list_package_matches(package: &InstalledPackage, query: &ListQuery) -> bool {
     }
 
     true
+}
+
+fn manifest_matches_installed_package_family_name(manifest: &Manifest, installed_pfns: &[String]) -> bool {
+    if installed_pfns.is_empty() {
+        return false;
+    }
+    manifest.installers.iter().any(|installer| {
+        installer.package_family_name.as_deref().is_some_and(|pfn| {
+            installed_pfns
+                .iter()
+                .any(|installed| installed.eq_ignore_ascii_case(pfn))
+        })
+    })
+}
+
+fn correlate_installed_package_from_located(
+    package: &InstalledPackage,
+    located_matches: &[LocatedMatch],
+) -> Option<SearchMatch> {
+    for located in located_matches {
+        let MatchLocator::Rest {
+            package_family_names,
+            product_codes,
+            upgrade_codes,
+            ..
+        } = &located.locator
+        else {
+            continue;
+        };
+
+        let pfn_match = !package.package_family_names.is_empty()
+            && package.package_family_names.iter().any(|installed_pfn| {
+                package_family_names
+                    .iter()
+                    .any(|candidate_pfn| candidate_pfn.eq_ignore_ascii_case(installed_pfn))
+            });
+        let product_code_match = !package.product_codes.is_empty()
+            && package.product_codes.iter().any(|installed_code| {
+                product_codes
+                    .iter()
+                    .any(|candidate_code| candidate_code.eq_ignore_ascii_case(installed_code))
+            });
+        let upgrade_code_match = !package.upgrade_codes.is_empty()
+            && package.upgrade_codes.iter().any(|installed_code| {
+                upgrade_codes
+                    .iter()
+                    .any(|candidate_code| candidate_code.eq_ignore_ascii_case(installed_code))
+            });
+
+        if pfn_match || product_code_match || upgrade_code_match {
+            return Some(located.display.clone());
+        }
+    }
+
+    None
 }
 
 fn correlate_installed_package(
@@ -6976,6 +7102,43 @@ fn append_required_rest_filters(filters: &mut Vec<JsonValue>, info: &RestInforma
     }
 }
 
+fn build_rest_manifest_query_params(
+    version: &str,
+    channel: &str,
+    info: &RestInformation,
+) -> Vec<(&'static str, String)> {
+    let mut params = Vec::new();
+    if !version.trim().is_empty()
+        && !is_unknown_version(version)
+        && !info
+            .unsupported_query_parameters
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("Version"))
+    {
+        params.push(("Version", version.to_owned()));
+    }
+    if !channel.trim().is_empty()
+        && !info
+            .unsupported_query_parameters
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("Channel"))
+    {
+        params.push(("Channel", channel.to_owned()));
+    }
+    if info
+        .required_query_parameters
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case("Market"))
+        && !info
+            .unsupported_query_parameters
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("Market"))
+    {
+        params.push(("Market", default_market()));
+    }
+    params
+}
+
 fn rest_filter(field: &str, value: &str, exact: bool) -> JsonValue {
     serde_json::json!({
         "PackageMatchField": field,
@@ -7302,6 +7465,12 @@ fn build_download_manifest_yaml(manifest: &Manifest, documents: &JsonValue, inst
     if let Some(product_code) = installer.product_code.as_ref() {
         single_installer.insert("ProductCode".to_owned(), JsonValue::String(product_code.clone()));
     }
+    if let Some(store_product_id) = installer.msstore_product_identifier.as_ref() {
+        single_installer.insert(
+            "MSStoreProductIdentifier".to_owned(),
+            JsonValue::String(store_product_id.clone()),
+        );
+    }
     if let Some(release_date) = installer.release_date.as_ref() {
         single_installer.insert("ReleaseDate".to_owned(), JsonValue::String(release_date.clone()));
     }
@@ -7477,6 +7646,43 @@ fn parse_rest_versions(item: &JsonValue) -> Result<Vec<VersionKey>> {
     Ok(result)
 }
 
+fn parse_rest_version_identities(item: &JsonValue) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut package_family_names = Vec::new();
+    let mut product_codes = Vec::new();
+    let mut upgrade_codes = Vec::new();
+
+    if let Some(versions) = item.get("Versions").and_then(JsonValue::as_array) {
+        for version in versions {
+            for pfn in json_string_list(version, "PackageFamilyNames") {
+                if !package_family_names
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(&pfn))
+                {
+                    package_family_names.push(pfn);
+                }
+            }
+            for code in json_string_list(version, "ProductCodes") {
+                if !product_codes
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(&code))
+                {
+                    product_codes.push(code);
+                }
+            }
+            for code in json_string_list(version, "UpgradeCodes") {
+                if !upgrade_codes
+                    .iter()
+                    .any(|existing: &String| existing.eq_ignore_ascii_case(&code))
+                {
+                    upgrade_codes.push(code);
+                }
+            }
+        }
+    }
+
+    (package_family_names, product_codes, upgrade_codes)
+}
+
 fn parse_yaml_manifest_bundle(bytes: &[u8]) -> Result<(Manifest, JsonValue)> {
     let mut merged = YamlMapping::new();
     let mut documents = Vec::new();
@@ -7547,11 +7753,38 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
     let selected = versions
         .iter()
         .find(|item| {
-            json_string(item, "PackageVersion").as_deref() == Some(version)
-                && json_string(item, "Channel").unwrap_or_default() == channel
+            json_string(item, "PackageVersion")
+                .as_deref()
+                .is_some_and(|pv| pv.eq_ignore_ascii_case(version))
+                && json_string(item, "Channel")
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case(channel)
         })
-        .or_else(|| versions.first())
-        .ok_or_else(|| anyhow!("REST manifest response did not contain a version payload"))?;
+        .or_else(|| {
+            if !version.trim().is_empty() && !is_unknown_version(version) {
+                return None;
+            }
+            versions
+                .iter()
+                .filter(|item| {
+                    channel.is_empty()
+                        || json_string(item, "Channel")
+                            .unwrap_or_default()
+                            .eq_ignore_ascii_case(channel)
+                })
+                .max_by(|left, right| {
+                    let left_version = json_string(left, "PackageVersion").unwrap_or_default();
+                    let left_channel = json_string(left, "Channel").unwrap_or_default();
+                    let right_version = json_string(right, "PackageVersion").unwrap_or_default();
+                    let right_channel = json_string(right, "Channel").unwrap_or_default();
+                    compare_version_and_channel(&left_version, &left_channel, &right_version, &right_channel)
+                })
+        })
+        .ok_or_else(|| anyhow!("REST manifest response did not contain a version payload for version '{version}'"))?;
+    let resolved_version = json_string(selected, "PackageVersion")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| version.to_owned());
+    let resolved_channel = json_string(selected, "Channel").unwrap_or_else(|| channel.to_owned());
 
     let default_locale = selected
         .get("DefaultLocale")
@@ -7565,6 +7798,7 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
     let top_installer_type = json_string(selected, "InstallerType");
     let top_nested_installer_type = json_string(selected, "NestedInstallerType");
     let top_nested_installer_files = json_nested_installer_files(selected);
+    let top_msstore_product_identifier = json_string(selected, "MSStoreProductIdentifier");
 
     let installers = selected
         .get("Installers")
@@ -7598,6 +7832,8 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
                     url: json_string(item, "InstallerUrl"),
                     sha256: json_string(item, "InstallerSha256"),
                     product_code: json_string(item, "ProductCode"),
+                    msstore_product_identifier: json_string(item, "MSStoreProductIdentifier")
+                        .or_else(|| top_msstore_product_identifier.clone()),
                     locale: json_string(item, "InstallerLocale"),
                     scope: json_string(item, "Scope"),
                     release_date: json_string(item, "ReleaseDate"),
@@ -7621,8 +7857,8 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
     let manifest = Manifest {
         id: package_id.to_owned(),
         name,
-        version: version.to_owned(),
-        channel: channel.to_owned(),
+        version: resolved_version.clone(),
+        channel: resolved_channel.clone(),
         publisher: json_string(default_locale, "Publisher"),
         description: json_string(default_locale, "Description")
             .or_else(|| json_string(default_locale, "ShortDescription")),
@@ -7649,7 +7885,14 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
 
     Ok((
         manifest,
-        build_rest_manifest_documents(data, selected, default_locale, package_id, version, channel),
+        build_rest_manifest_documents(
+            data,
+            selected,
+            default_locale,
+            package_id,
+            &resolved_version,
+            &resolved_channel,
+        ),
     ))
 }
 
@@ -7838,6 +8081,7 @@ fn split_merged_manifest_document(merged: &JsonValue) -> Vec<JsonValue> {
             "Dependencies",
             "PackageFamilyName",
             "ProductCode",
+            "MSStoreProductIdentifier",
             "Capabilities",
             "RestrictedCapabilities",
             "Markets",
@@ -8012,6 +8256,7 @@ fn installer_defaults(root: &YamlMapping) -> YamlMapping {
         "InstallerUrl",
         "InstallerSha256",
         "ProductCode",
+        "MSStoreProductIdentifier",
         "InstallerLocale",
         "Platform",
         "MinimumOSVersion",
@@ -8039,6 +8284,7 @@ fn installer_from_yaml(root: &YamlMapping, switches: InstallerSwitches) -> Insta
         url: yaml_string(root, "InstallerUrl"),
         sha256: yaml_string(root, "InstallerSha256"),
         product_code: yaml_string(root, "ProductCode"),
+        msstore_product_identifier: yaml_string(root, "MSStoreProductIdentifier"),
         locale: yaml_string(root, "InstallerLocale"),
         scope: yaml_string(root, "Scope"),
         release_date: yaml_string(root, "ReleaseDate"),
@@ -8514,7 +8760,30 @@ fn major_minor(version: &str) -> (String, String) {
 }
 
 fn default_market() -> String {
-    std::env::var("WINGET_RS_MARKET").unwrap_or_else(|_| DEFAULT_MARKET.to_owned())
+    for var_name in ["PINGET_MARKET", "WINGET_RS_MARKET", "WINGET_DOTNET_MARKET"] {
+        if let Ok(value) = std::env::var(var_name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+    }
+    os_geographic_region().unwrap_or_else(|| DEFAULT_MARKET.to_owned())
+}
+
+#[cfg(windows)]
+fn os_geographic_region() -> Option<String> {
+    let geo = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Control Panel\International\Geo")
+        .ok()?;
+    let name = read_reg_string(&geo, "Name")?;
+    let trimmed = name.trim();
+    (trimmed.len() == 2 && trimmed.chars().all(|ch| ch.is_ascii_alphabetic())).then(|| trimmed.to_ascii_uppercase())
+}
+
+#[cfg(not(windows))]
+fn os_geographic_region() -> Option<String> {
+    None
 }
 
 fn select_installer(installers: &[Installer], query: &PackageQuery) -> Option<Installer> {
@@ -8939,7 +9208,18 @@ fn compare_version_and_channel(
     })
 }
 
+fn is_unknown_version(version: &str) -> bool {
+    version.trim().eq_ignore_ascii_case("Unknown")
+}
+
 fn compare_version(left: &str, right: &str) -> Ordering {
+    match (is_unknown_version(left), is_unknown_version(right)) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
+
     let left_less_than = left.trim().strip_prefix('<').map(str::trim);
     let right_less_than = right.trim().strip_prefix('<').map(str::trim);
     match (left_less_than, right_less_than) {
@@ -9535,6 +9815,7 @@ fn dispatch_installer(
             let status = cmd.status().context("failed to run Add-AppxPackage")?;
             Ok(status.code().unwrap_or(-1))
         }
+        "msstore" => run_msstore_installer(request, manifest, installer),
         "zip" => {
             let scope =
                 resolve_portable_scope(request.query.install_scope.as_deref(), None, installer.scope.as_deref())?;
@@ -9578,6 +9859,194 @@ fn dispatch_installer(
 #[cfg(windows)]
 fn should_run_msi_direct(request: &InstallRequest, installer: &Installer) -> bool {
     request.mode == InstallerMode::Silent && !should_elevate_msi_shell_execute(installer)
+}
+
+#[cfg(windows)]
+fn run_msstore_installer(request: &InstallRequest, manifest: &Manifest, installer: &Installer) -> Result<i32> {
+    use std::process::Command;
+
+    let product_id = installer
+        .msstore_product_identifier
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&manifest.id);
+    let is_machine = request
+        .query
+        .install_scope
+        .as_deref()
+        .or(installer.scope.as_deref())
+        .is_some_and(|scope| scope.eq_ignore_ascii_case("machine"));
+    let is_silent = request.mode == InstallerMode::Silent;
+    let script = build_msstore_install_script(product_id, is_machine, is_silent, request.force);
+    let args = vec![
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-Command".to_owned(),
+        script,
+    ];
+
+    if is_machine {
+        return shell_execute_installer(Path::new("powershell.exe"), &args, true);
+    }
+
+    let mut cmd = Command::new("powershell");
+    cmd.args(&args);
+    let status = cmd.status().context("failed to run MSStore installer via PowerShell")?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+#[cfg(any(windows, test))]
+fn build_msstore_install_script(product_id: &str, is_machine: bool, is_silent: bool, force: bool) -> String {
+    let escaped_product_id = product_id.replace('\'', "''");
+    let machine_literal = if is_machine { "$true" } else { "$false" };
+    let silent_literal = if is_silent { "$true" } else { "$false" };
+    let force_literal = if force { "$true" } else { "$false" };
+
+    format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $productId = '{escaped_product_id}'\n\
+         $isMachine = {machine_literal}\n\
+         $isSilent = {silent_literal}\n\
+         $force = {force_literal}\n\
+         Add-Type -AssemblyName System.Runtime.WindowsRuntime\n\
+         $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{\n\
+             $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'\n\
+         }})[0]\n\
+         $asTaskProgressGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{\n\
+             $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperationWithProgress`2'\n\
+         }})[0]\n\
+         function Await-WinRt($op, [Type]$resultType) {{\n\
+             $asTask = $asTaskGeneric.MakeGenericMethod($resultType)\n\
+             $task = $asTask.Invoke($null, @($op))\n\
+             $task.GetAwaiter().GetResult()\n\
+         }}\n\
+         function Await-WinRtWithProgress($op, [Type]$resultType, [Type]$progressType) {{\n\
+             $asTask = $asTaskProgressGeneric.MakeGenericMethod($resultType, $progressType)\n\
+             $task = $asTask.Invoke($null, @($op))\n\
+             $task.GetAwaiter().GetResult()\n\
+         }}\n\
+         $mgr = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager, Windows.ApplicationModel, ContentType=WindowsRuntime]::new()\n\
+         [void][Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementResult, Windows.ApplicationModel, ContentType=WindowsRuntime]\n\
+         [void][Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementStatus, Windows.ApplicationModel, ContentType=WindowsRuntime]\n\
+         [void][Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem, Windows.ApplicationModel, ContentType=WindowsRuntime]\n\
+         [void][Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState, Windows.ApplicationModel, ContentType=WindowsRuntime]\n\
+         [void][Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode, Windows.ApplicationModel, ContentType=WindowsRuntime]\n\
+         if (Await-WinRt ($mgr.IsStoreBlockedByPolicyAsync('Microsoft.WindowsStore', 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US')) ([bool])) {{\n\
+             [Console]::Error.WriteLine('The Microsoft Store client is blocked by policy.')\n\
+             exit -1978335205\n\
+         }}\n\
+         if (-not (Await-WinRt ($mgr.GetIsAppAllowedToInstallAsync($productId)) ([bool]))) {{\n\
+             [Console]::Error.WriteLine('The Microsoft Store app is blocked by policy.')\n\
+             exit -1978335204\n\
+         }}\n\
+         try {{\n\
+             if ($isMachine) {{\n\
+                 [void](Await-WinRt ($mgr.GetFreeDeviceEntitlementAsync($productId, '', '')) ([Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementResult]))\n\
+             }} else {{\n\
+                 $entitlement = Await-WinRt ($mgr.GetFreeUserEntitlementAsync($productId, '', '')) ([Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementResult])\n\
+                 if ($null -eq $entitlement -or $entitlement.Status -eq [Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementStatus]::NoStoreAccount) {{\n\
+                     [void](Await-WinRt ($mgr.GetFreeDeviceEntitlementAsync($productId, '', '')) ([Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementResult]))\n\
+                 }}\n\
+             }}\n\
+         }} catch {{}}\n\
+         $options = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallOptions, Windows.ApplicationModel, ContentType=WindowsRuntime]::new()\n\
+         $options.AllowForcedAppRestart = $force\n\
+         if ($isSilent) {{\n\
+             $noToast = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode]::NoToast\n\
+             $options.InstallInProgressToastNotificationMode = $noToast\n\
+             $options.CompletedInstallToastNotificationMode = $noToast\n\
+         }}\n\
+         if ($isMachine) {{\n\
+             $options.InstallForAllUsers = $true\n\
+         }}\n\
+         $itemsType = [System.Collections.Generic.IReadOnlyList[Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem]]\n\
+         $items = Await-WinRt ($mgr.StartProductInstallAsync($productId, '', 'WinGetCli', '', $options)) $itemsType\n\
+         $action = 'None'\n\
+         foreach ($item in $items) {{\n\
+             $state = $item.GetCurrentStatus().InstallState\n\
+             if ($state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Canceled -or\n\
+                 $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Error) {{\n\
+                 $action = 'Cancel'\n\
+                 break\n\
+             }}\n\
+             if ($state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Paused -or\n\
+                 $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::PausedLowBattery -or\n\
+                 $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::PausedWiFiRecommended -or\n\
+                 $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::PausedWiFiRequired -or\n\
+                 $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::ReadyToDownload) {{\n\
+                 $action = 'Restart'\n\
+             }}\n\
+         }}\n\
+         if ($action -eq 'Cancel') {{\n\
+             $mgr.Cancel($productId)\n\
+             for ($i = 0; $i -lt 50; $i++) {{\n\
+                 Start-Sleep -Milliseconds 200\n\
+                 $stillPresent = $false\n\
+                 foreach ($active in $mgr.AppInstallItems) {{\n\
+                     if ($active.ProductId -ieq $productId) {{ $stillPresent = $true; break }}\n\
+                 }}\n\
+                 if (-not $stillPresent) {{ break }}\n\
+             }}\n\
+             $items = Await-WinRt ($mgr.StartProductInstallAsync($productId, '', 'WinGetCli', '', $options)) $itemsType\n\
+         }} elseif ($action -eq 'Restart') {{\n\
+             $mgr.Restart($productId)\n\
+             $items = Await-WinRt ($mgr.StartProductInstallAsync($productId, '', 'WinGetCli', '', $options)) $itemsType\n\
+         }}\n\
+         if ($isSilent) {{\n\
+             $noToast = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode]::NoToast\n\
+             foreach ($item in $items) {{\n\
+                 $item.InstallInProgressToastNotificationMode = $noToast\n\
+                 $item.CompletedInstallToastNotificationMode = $noToast\n\
+             }}\n\
+         }}\n\
+         $maxProgress = 100 * $items.Count\n\
+         $currentProgress = 0\n\
+         while ($currentProgress -lt $maxProgress) {{\n\
+             $currentProgress = 0\n\
+             $allCompleted = $true\n\
+             foreach ($item in $items) {{\n\
+                 $status = $item.GetCurrentStatus()\n\
+                 $currentProgress += [int]$status.PercentComplete\n\
+                 if ($status.InstallState -ne [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Completed) {{\n\
+                     $allCompleted = $false\n\
+                 }}\n\
+                 $err = $status.ErrorCode\n\
+                 if ($null -ne $err -and $err.HResult -lt 0) {{\n\
+                     try {{ $mgr.Cancel($productId) }} catch {{}}\n\
+                     exit $err.HResult\n\
+                 }}\n\
+                 if ($status.InstallState -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Canceled -or\n\
+                     $status.InstallState -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Error) {{\n\
+                     try {{ $mgr.Cancel($productId) }} catch {{}}\n\
+                     exit 1\n\
+                 }}\n\
+             }}\n\
+             if ($allCompleted -or $currentProgress -ge $maxProgress) {{ break }}\n\
+             Start-Sleep -Milliseconds 100\n\
+         }}\n\
+         if ($isMachine) {{\n\
+             $pkgMgr = [Windows.Management.Deployment.PackageManager, Windows.Management.Deployment, ContentType=WindowsRuntime]::new()\n\
+             [void][Windows.Management.Deployment.DeploymentResult, Windows.Management.Deployment, ContentType=WindowsRuntime]\n\
+             [void][Windows.Management.Deployment.DeploymentProgress, Windows.Management.Deployment, ContentType=WindowsRuntime]\n\
+             $provisioned = $pkgMgr.FindProvisionedPackages()\n\
+             foreach ($item in $items) {{\n\
+                 $familyName = $item.PackageFamilyName\n\
+                 if ([string]::IsNullOrWhiteSpace($familyName)) {{ continue }}\n\
+                 $already = $false\n\
+                 foreach ($p in $provisioned) {{\n\
+                     if ($p.Id.FamilyName -eq $familyName) {{ $already = $true; break }}\n\
+                 }}\n\
+                 if (-not $already) {{\n\
+                     $provResult = Await-WinRtWithProgress ($pkgMgr.ProvisionPackageForAllUsersAsync($familyName)) ([Windows.Management.Deployment.DeploymentResult]) ([Windows.Management.Deployment.DeploymentProgress])\n\
+                     $provErr = $provResult.ExtendedErrorCode\n\
+                     if ($null -ne $provErr -and $provErr.HResult -lt 0) {{\n\
+                         exit $provErr.HResult\n\
+                     }}\n\
+                 }}\n\
+             }}\n\
+         }}\n\
+         exit 0"
+    )
 }
 
 #[cfg(windows)]
@@ -13242,6 +13711,7 @@ mod tests {
                     url: Some("https://example.test/Test.Package.msix".to_owned()),
                     sha256: Some("ABC123".to_owned()),
                     product_code: None,
+                    msstore_product_identifier: None,
                     locale: Some("en-US".to_owned()),
                     scope: Some("machine".to_owned()),
                     release_date: None,
@@ -13267,6 +13737,7 @@ mod tests {
                 url: Some("https://example.test/Test.Package.msix".to_owned()),
                 sha256: Some("ABC123".to_owned()),
                 product_code: None,
+                msstore_product_identifier: None,
                 locale: Some("en-US".to_owned()),
                 scope: Some("machine".to_owned()),
                 release_date: None,
@@ -13684,23 +14155,7 @@ Installers:
             .iter()
             .map(|a| Installer {
                 architecture: Some((*a).to_owned()),
-                installer_type: None,
-                url: None,
-                sha256: None,
-                product_code: None,
-                locale: None,
-                scope: None,
-                release_date: None,
-                package_family_name: None,
-                upgrade_code: None,
-                platforms: Vec::new(),
-                minimum_os_version: None,
-                switches: InstallerSwitches::default(),
-                commands: Vec::new(),
-                package_dependencies: Vec::new(),
-                require_explicit_upgrade: false,
-                nested_installer_type: None,
-                nested_installer_files: Vec::new(),
+                ..Installer::default()
             })
             .collect();
         Manifest {
@@ -14220,29 +14675,14 @@ Installers:
     #[test]
     fn installer_switch_arguments_prefer_manifest_switches() {
         let installer = Installer {
-            architecture: None,
             installer_type: Some("inno".to_owned()),
-            url: None,
-            sha256: None,
-            product_code: None,
-            locale: None,
-            scope: None,
-            release_date: None,
-            package_family_name: None,
-            upgrade_code: None,
-            platforms: Vec::new(),
-            minimum_os_version: None,
             switches: InstallerSwitches {
                 silent: Some("/mysilent".to_owned()),
                 silent_with_progress: Some("/mysilentwithprogress".to_owned()),
                 interactive: Some("/myinteractive".to_owned()),
                 ..InstallerSwitches::default()
             },
-            commands: Vec::new(),
-            package_dependencies: Vec::new(),
-            require_explicit_upgrade: false,
-            nested_installer_type: None,
-            nested_installer_files: Vec::new(),
+            ..Installer::default()
         };
         let manifest = Manifest {
             id: "Test.Package".to_owned(),
@@ -14313,24 +14753,8 @@ Installers:
     #[test]
     fn installer_switch_arguments_use_inno_defaults_without_manifest_switches() {
         let installer = Installer {
-            architecture: None,
             installer_type: Some("inno".to_owned()),
-            url: None,
-            sha256: None,
-            product_code: None,
-            locale: None,
-            scope: None,
-            release_date: None,
-            package_family_name: None,
-            upgrade_code: None,
-            platforms: Vec::new(),
-            minimum_os_version: None,
-            switches: InstallerSwitches::default(),
-            commands: Vec::new(),
-            package_dependencies: Vec::new(),
-            require_explicit_upgrade: false,
-            nested_installer_type: None,
-            nested_installer_files: Vec::new(),
+            ..Installer::default()
         };
         let manifest = Manifest {
             id: "Test.Package".to_owned(),
@@ -14484,29 +14908,14 @@ Installers:
     #[test]
     fn installer_command_arguments_append_manifest_and_cli_switches() {
         let installer = Installer {
-            architecture: None,
             installer_type: Some("msi".to_owned()),
-            url: None,
-            sha256: None,
-            product_code: None,
-            locale: None,
-            scope: None,
-            release_date: None,
-            package_family_name: None,
-            upgrade_code: None,
-            platforms: Vec::new(),
-            minimum_os_version: None,
             switches: InstallerSwitches {
                 custom: Some("ADDLOCAL=Core".to_owned()),
                 log: Some("/log \"<LOGPATH>\"".to_owned()),
                 install_location: Some("TARGETDIR=\"<INSTALLPATH>\"".to_owned()),
                 ..InstallerSwitches::default()
             },
-            commands: Vec::new(),
-            package_dependencies: Vec::new(),
-            require_explicit_upgrade: false,
-            nested_installer_type: None,
-            nested_installer_files: Vec::new(),
+            ..Installer::default()
         };
         let manifest = Manifest {
             id: "ShareX.ShareX".to_owned(),
@@ -14560,28 +14969,13 @@ Installers:
     #[test]
     fn msi_shell_execute_arguments_include_msiexec_target() {
         let installer = Installer {
-            architecture: None,
             installer_type: Some("wix".to_owned()),
-            url: None,
-            sha256: None,
-            product_code: None,
-            locale: None,
-            scope: None,
-            release_date: None,
-            package_family_name: None,
-            upgrade_code: None,
-            platforms: Vec::new(),
-            minimum_os_version: None,
             switches: InstallerSwitches {
                 log: Some("/log \"<LOGPATH>\"".to_owned()),
                 install_location: Some("INSTALLDIR=\"<INSTALLPATH>\"".to_owned()),
                 ..InstallerSwitches::default()
             },
-            commands: Vec::new(),
-            package_dependencies: Vec::new(),
-            require_explicit_upgrade: false,
-            nested_installer_type: None,
-            nested_installer_files: Vec::new(),
+            ..Installer::default()
         };
         let mut request = InstallRequest::new(PackageQuery::default());
         request.mode = InstallerMode::Silent;
@@ -15243,42 +15637,17 @@ Installers:
             Installer {
                 architecture: Some("x86".to_owned()),
                 installer_type: Some("zip".to_owned()),
-                url: None,
-                sha256: None,
-                product_code: None,
                 locale: Some("en-US".to_owned()),
                 scope: Some("user".to_owned()),
-                release_date: None,
-                package_family_name: None,
-                upgrade_code: None,
-                platforms: Vec::new(),
-                minimum_os_version: None,
-                switches: InstallerSwitches::default(),
-                commands: Vec::new(),
-                package_dependencies: Vec::new(),
-                require_explicit_upgrade: false,
-                nested_installer_type: None,
-                nested_installer_files: Vec::new(),
+                ..Installer::default()
             },
             Installer {
                 architecture: Some("x64".to_owned()),
                 installer_type: Some("msix".to_owned()),
-                url: None,
-                sha256: None,
-                product_code: None,
                 locale: Some("en-US".to_owned()),
                 scope: Some("user".to_owned()),
-                release_date: None,
-                package_family_name: None,
-                upgrade_code: None,
-                platforms: Vec::new(),
-                minimum_os_version: None,
-                switches: InstallerSwitches::default(),
                 commands: vec!["demo".to_owned()],
-                package_dependencies: Vec::new(),
-                require_explicit_upgrade: false,
-                nested_installer_type: None,
-                nested_installer_files: Vec::new(),
+                ..Installer::default()
             },
         ];
         let query = PackageQuery {
@@ -15300,42 +15669,16 @@ Installers:
             Installer {
                 architecture: Some("x64".to_owned()),
                 installer_type: Some("exe".to_owned()),
-                url: None,
-                sha256: None,
-                product_code: None,
                 locale: Some("en-US".to_owned()),
                 scope: Some("machine".to_owned()),
-                release_date: None,
-                package_family_name: None,
-                upgrade_code: None,
-                platforms: Vec::new(),
-                minimum_os_version: None,
-                switches: InstallerSwitches::default(),
-                commands: Vec::new(),
-                package_dependencies: Vec::new(),
-                require_explicit_upgrade: false,
-                nested_installer_type: None,
-                nested_installer_files: Vec::new(),
+                ..Installer::default()
             },
             Installer {
                 architecture: Some("x64".to_owned()),
                 installer_type: Some("exe".to_owned()),
-                url: None,
-                sha256: None,
-                product_code: None,
                 locale: Some("en-US".to_owned()),
                 scope: Some("user".to_owned()),
-                release_date: None,
-                package_family_name: None,
-                upgrade_code: None,
-                platforms: Vec::new(),
-                minimum_os_version: None,
-                switches: InstallerSwitches::default(),
-                commands: Vec::new(),
-                package_dependencies: Vec::new(),
-                require_explicit_upgrade: false,
-                nested_installer_type: None,
-                nested_installer_files: Vec::new(),
+                ..Installer::default()
             },
         ];
 
@@ -15349,42 +15692,18 @@ Installers:
             Installer {
                 architecture: Some("x64".to_owned()),
                 installer_type: Some("exe".to_owned()),
-                url: None,
-                sha256: None,
-                product_code: None,
                 locale: Some("en-US".to_owned()),
                 scope: Some("user".to_owned()),
-                release_date: None,
-                package_family_name: None,
-                upgrade_code: None,
                 platforms: vec!["Windows.Universal".to_owned()],
-                minimum_os_version: None,
-                switches: InstallerSwitches::default(),
-                commands: Vec::new(),
-                package_dependencies: Vec::new(),
-                require_explicit_upgrade: false,
-                nested_installer_type: None,
-                nested_installer_files: Vec::new(),
+                ..Installer::default()
             },
             Installer {
                 architecture: Some("x64".to_owned()),
                 installer_type: Some("exe".to_owned()),
-                url: None,
-                sha256: None,
-                product_code: None,
                 locale: Some("en-US".to_owned()),
                 scope: Some("user".to_owned()),
-                release_date: None,
-                package_family_name: None,
-                upgrade_code: None,
                 platforms: vec!["Windows.Desktop".to_owned()],
-                minimum_os_version: None,
-                switches: InstallerSwitches::default(),
-                commands: Vec::new(),
-                package_dependencies: Vec::new(),
-                require_explicit_upgrade: false,
-                nested_installer_type: None,
-                nested_installer_files: Vec::new(),
+                ..Installer::default()
             },
         ];
         let query = PackageQuery {
@@ -15403,42 +15722,18 @@ Installers:
             Installer {
                 architecture: Some("x64".to_owned()),
                 installer_type: Some("exe".to_owned()),
-                url: None,
-                sha256: None,
-                product_code: None,
                 locale: Some("en-US".to_owned()),
                 scope: Some("user".to_owned()),
-                release_date: None,
-                package_family_name: None,
-                upgrade_code: None,
-                platforms: Vec::new(),
                 minimum_os_version: Some("10.0.22621.0".to_owned()),
-                switches: InstallerSwitches::default(),
-                commands: Vec::new(),
-                package_dependencies: Vec::new(),
-                require_explicit_upgrade: false,
-                nested_installer_type: None,
-                nested_installer_files: Vec::new(),
+                ..Installer::default()
             },
             Installer {
                 architecture: Some("x64".to_owned()),
                 installer_type: Some("exe".to_owned()),
-                url: None,
-                sha256: None,
-                product_code: None,
                 locale: Some("en-US".to_owned()),
                 scope: Some("user".to_owned()),
-                release_date: None,
-                package_family_name: None,
-                upgrade_code: None,
-                platforms: Vec::new(),
                 minimum_os_version: Some("10.0.19041.0".to_owned()),
-                switches: InstallerSwitches::default(),
-                commands: Vec::new(),
-                package_dependencies: Vec::new(),
-                require_explicit_upgrade: false,
-                nested_installer_type: None,
-                nested_installer_files: Vec::new(),
+                ..Installer::default()
             },
         ];
         let query = PackageQuery {
@@ -17959,5 +18254,209 @@ Installers:
         };
         let result = dedupe_correlated_for_upgrade(vec![uncorrelated]);
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn rest_manifest_query_params_omit_unknown_version_and_append_market() {
+        let info = RestInformation {
+            source_identifier: "StoreEdgeFD".to_owned(),
+            server_supported_versions: vec!["1.6.0".to_owned()],
+            required_package_match_fields: vec!["market".to_owned()],
+            unsupported_package_match_fields: Vec::new(),
+            required_query_parameters: vec!["market".to_owned()],
+            unsupported_query_parameters: vec!["Channel".to_owned()],
+        };
+
+        let unknown_params = build_rest_manifest_query_params("Unknown", "preview", &info);
+        assert_eq!(unknown_params, vec![("Market", default_market())]);
+
+        let known_params = build_rest_manifest_query_params("1.2.3", "preview", &info);
+        assert_eq!(
+            known_params,
+            vec![("Version", "1.2.3".to_owned()), ("Market", default_market())]
+        );
+    }
+
+    #[test]
+    fn parse_rest_manifest_handles_msstore_unknown_version_and_product_identifier() {
+        let payload = br#"{
+          "Data": {
+            "PackageIdentifier": "9WZDNCRFJB3H",
+            "Versions": [
+              {
+                "PackageVersion": "Unknown",
+                "DefaultLocale": {
+                  "PackageLocale": "en-us",
+                  "Publisher": "Katans",
+                  "PackageName": "Todo",
+                  "Agreements": [
+                    {
+                      "AgreementLabel": "Terms of Transaction",
+                      "AgreementUrl": "https://aka.ms/microsoft-store-terms-of-transaction"
+                    }
+                  ]
+                },
+                "Installers": [
+                  {
+                    "MSStoreProductIdentifier": "9WZDNCRFJB3H",
+                    "Architecture": "x64",
+                    "InstallerType": "msstore",
+                    "PackageFamilyName": "21767Katans.Todo_ey1k83fg9dn8w",
+                    "Scope": "user"
+                  }
+                ]
+              }
+            ]
+          }
+        }"#;
+
+        let (manifest, document) = parse_rest_manifest(payload, "9WZDNCRFJB3H", "Unknown", "").expect("parse");
+        assert_eq!(manifest.id, "9WZDNCRFJB3H");
+        assert_eq!(manifest.name, "Todo");
+        assert_eq!(manifest.version, "Unknown");
+        assert_eq!(manifest.agreements.len(), 1);
+        assert_eq!(manifest.installers.len(), 1);
+        assert_eq!(manifest.installers[0].installer_type.as_deref(), Some("msstore"));
+        assert_eq!(
+            manifest.installers[0].msstore_product_identifier.as_deref(),
+            Some("9WZDNCRFJB3H")
+        );
+        assert_eq!(
+            manifest.installers[0].package_family_name.as_deref(),
+            Some("21767Katans.Todo_ey1k83fg9dn8w")
+        );
+        assert_eq!(document["PackageVersion"], "Unknown");
+    }
+
+    #[test]
+    fn parse_rest_manifest_resolves_concrete_version_when_search_version_was_unknown() {
+        let payload = br#"{
+          "Data": {
+            "PackageIdentifier": "XP9KHM4BK9FZ7Q",
+            "Versions": [
+              {
+                "PackageVersion": "1.113.0",
+                "DefaultLocale": {
+                  "PackageLocale": "en-us",
+                  "Publisher": "Microsoft Corporation",
+                  "PackageName": "Visual Studio Code"
+                },
+                "Installers": [
+                  {
+                    "Architecture": "x64",
+                    "InstallerType": "exe",
+                    "InstallerUrl": "https://example.test/vscode.exe",
+                    "InstallerSha256": "9490453f2d73eb32f365c631bbad3b9d4837af27ce31ad6cb3dad56c50b0a5fa"
+                  }
+                ]
+              }
+            ]
+          }
+        }"#;
+
+        let (manifest, document) = parse_rest_manifest(payload, "XP9KHM4BK9FZ7Q", "Unknown", "").expect("parse");
+        assert_eq!(manifest.version, "1.113.0");
+        assert_eq!(manifest.name, "Visual Studio Code");
+        assert_eq!(document["PackageVersion"], "1.113.0");
+
+        let missing = parse_rest_manifest(payload, "XP9KHM4BK9FZ7Q", "1.2.3", "");
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn create_install_no_op_result_does_not_skip_when_version_is_unknown() {
+        let request = InstallRequest::new(PackageQuery::default());
+        let unknown_manifest = sample_manifest("9WZDNCRFJB3H", "Unknown", "Todo");
+        let installed_real = ListMatch {
+            name: "Todo".to_owned(),
+            id: "9WZDNCRFJB3H".to_owned(),
+            local_id: r"MSIX\21767Katans.Todo_1.3.1.64_x64__ey1k83fg9dn8w".to_owned(),
+            installed_version: "1.3.1.64".to_owned(),
+            available_version: Some("Unknown".to_owned()),
+            source_name: Some("msstore".to_owned()),
+            publisher: None,
+            scope: Some("User".to_owned()),
+            installer_category: Some("msix".to_owned()),
+            install_location: None,
+            package_family_names: vec!["21767Katans.Todo_ey1k83fg9dn8w".to_owned()],
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+        };
+        assert!(Repository::create_install_no_op_result(&request, &unknown_manifest, Some(&installed_real)).is_none());
+
+        let known_manifest = sample_manifest("Test.Package", "1.0.0", "Test");
+        let mut installed_unknown = installed_real;
+        installed_unknown.installed_version = "Unknown".to_owned();
+        assert!(Repository::create_install_no_op_result(&request, &known_manifest, Some(&installed_unknown)).is_none());
+    }
+
+    #[test]
+    fn compare_version_treats_unknown_as_lowest() {
+        assert_eq!(compare_version("Unknown", "Unknown"), Ordering::Equal);
+        assert_eq!(compare_version("Unknown", "1.0.0"), Ordering::Less);
+        assert_eq!(compare_version("1.0.0", "Unknown"), Ordering::Greater);
+    }
+
+    #[test]
+    fn build_msstore_install_script_embeds_parameters_and_entitlement_flow() {
+        let script = build_msstore_install_script("9WZDNCRFJB3H", false, true, false);
+        assert!(script.contains("$productId = '9WZDNCRFJB3H'"));
+        assert!(script.contains("$isMachine = $false"));
+        assert!(script.contains("$isSilent = $true"));
+        assert!(script.contains("StartProductInstallAsync"));
+        assert!(script.contains("GetFreeUserEntitlementAsync"));
+        assert!(script.contains("GetFreeDeviceEntitlementAsync"));
+        assert!(script.contains("exit -1978335205"));
+        assert!(script.contains("exit -1978335204"));
+        assert!(script.contains("$err.HResult"));
+    }
+
+    #[test]
+    fn correlate_installed_package_from_located_matches_rest_package_family_name() {
+        let installed = InstalledPackage {
+            name: "21767Katans.Todo".to_owned(),
+            local_id: r"MSIX\21767Katans.Todo_1.3.1.64_x64__ey1k83fg9dn8w".to_owned(),
+            installed_version: "1.3.1.64".to_owned(),
+            publisher: None,
+            scope: Some("User".to_owned()),
+            installer_category: Some("msix".to_owned()),
+            install_location: None,
+            package_family_names: vec!["21767Katans.Todo_ey1k83fg9dn8w".to_owned()],
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+            correlated: None,
+            winget_package_identifier: None,
+            winget_source_identifier: None,
+            installed_version_canonical: false,
+            correlated_requires_explicit_upgrade: false,
+            correlated_lacks_compatible_installer: false,
+        };
+        let located = vec![LocatedMatch {
+            display: SearchMatch {
+                source_name: "msstore".to_owned(),
+                source_kind: SourceKind::Rest,
+                id: "9WZDNCRFJB3H".to_owned(),
+                name: "Todo".to_owned(),
+                moniker: None,
+                version: Some("Unknown".to_owned()),
+                channel: None,
+                match_criteria: None,
+            },
+            source_index: 0,
+            locator: MatchLocator::Rest {
+                package_id: "9WZDNCRFJB3H".to_owned(),
+                versions: vec![VersionKey {
+                    version: "Unknown".to_owned(),
+                    channel: String::new(),
+                }],
+                package_family_names: vec!["21767Katans.Todo_ey1k83fg9dn8w".to_owned()],
+                product_codes: Vec::new(),
+                upgrade_codes: Vec::new(),
+            },
+        }];
+
+        let correlated = correlate_installed_package_from_located(&installed, &located).expect("correlated");
+        assert_eq!(correlated.id, "9WZDNCRFJB3H");
+        assert_eq!(correlated.source_name, "msstore");
     }
 }

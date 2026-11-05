@@ -3504,6 +3504,209 @@ Installers:
         Assert.Equal(InstallerMode.Interactive, installRequest.Mode);
         Assert.Equal(@"C:\temp\repair.log", installRequest.LogPath);
     }
+
+    [Fact]
+    public void BuildManifestRequestUrl_OmitsUnknownVersionAndIncludesRequiredMarket()
+    {
+        var source = new SourceRecord
+        {
+            Name = "msstore",
+            Kind = SourceKind.Rest,
+            Arg = "https://storeedgefd.dsx.mp.microsoft.com/v9.0",
+            Identifier = "StoreEdgeFD",
+        };
+        var info = new RestSource.RestInformation
+        {
+            SourceIdentifier = "StoreEdgeFD",
+            ServerSupportedVersions = ["1.6.0"],
+            RequiredQueryParameters = ["market"],
+            UnsupportedQueryParameters = ["Channel"],
+        };
+
+        var unknownUrl = RestSource.BuildManifestRequestUrl(source, info, "9WZDNCRFJB3H", "Unknown", "preview");
+        Assert.Equal(
+            $"https://storeedgefd.dsx.mp.microsoft.com/v9.0/packageManifests/9WZDNCRFJB3H?Market={RestSource.DefaultMarket()}",
+            unknownUrl);
+
+        var knownUrl = RestSource.BuildManifestRequestUrl(source, info, "Contoso.App", "1.2.3", "preview");
+        Assert.Equal(
+            $"https://storeedgefd.dsx.mp.microsoft.com/v9.0/packageManifests/Contoso.App?Version=1.2.3&Market={RestSource.DefaultMarket()}",
+            knownUrl);
+    }
+
+    [Fact]
+    public void ParseRestManifest_ResolvesMsStoreUnknownAndConcreteVersions()
+    {
+        using var storeDoc = JsonDocument.Parse("""
+            {
+              "Data": {
+                "PackageIdentifier": "9WZDNCRFJB3H",
+                "Versions": [
+                  {
+                    "PackageVersion": "Unknown",
+                    "DefaultLocale": {
+                      "PackageLocale": "en-us",
+                      "Publisher": "Katans",
+                      "PackageName": "Todo",
+                      "Agreements": [
+                        {
+                          "AgreementLabel": "Terms of Transaction",
+                          "AgreementUrl": "https://aka.ms/microsoft-store-terms-of-transaction"
+                        }
+                      ]
+                    },
+                    "Installers": [
+                      {
+                        "MSStoreProductIdentifier": "9WZDNCRFJB3H",
+                        "Architecture": "x64",
+                        "InstallerType": "msstore",
+                        "PackageFamilyName": "21767Katans.Todo_ey1k83fg9dn8w",
+                        "Scope": "user"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            """);
+
+        var (storeManifest, _) = RestSource.ParseRestManifest(storeDoc.RootElement, "9WZDNCRFJB3H", "Unknown", "");
+        Assert.Equal("9WZDNCRFJB3H", storeManifest.Id);
+        Assert.Equal("Todo", storeManifest.Name);
+        Assert.Equal("Unknown", storeManifest.Version);
+        Assert.Single(storeManifest.Agreements);
+        Assert.Single(storeManifest.Installers);
+        Assert.Equal("msstore", storeManifest.Installers[0].InstallerType);
+        Assert.Equal("9WZDNCRFJB3H", storeManifest.Installers[0].MSStoreProductIdentifier);
+        Assert.Equal("21767Katans.Todo_ey1k83fg9dn8w", storeManifest.Installers[0].PackageFamilyName);
+
+        using var sparkDoc = JsonDocument.Parse("""
+            {
+              "Data": {
+                "PackageIdentifier": "XP9KHM4BK9FZ7Q",
+                "Versions": [
+                  {
+                    "PackageVersion": "1.113.0",
+                    "DefaultLocale": {
+                      "PackageLocale": "en-us",
+                      "Publisher": "Microsoft Corporation",
+                      "PackageName": "Visual Studio Code"
+                    },
+                    "Installers": [
+                      {
+                        "Architecture": "x64",
+                        "InstallerType": "exe",
+                        "InstallerUrl": "https://example.test/vscode.exe"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            """);
+
+        var (sparkManifest, _) = RestSource.ParseRestManifest(sparkDoc.RootElement, "XP9KHM4BK9FZ7Q", "Unknown", "");
+        Assert.Equal("1.113.0", sparkManifest.Version);
+        Assert.Equal("Visual Studio Code", sparkManifest.Name);
+        Assert.Equal("Microsoft Corporation", sparkManifest.Publisher);
+        Assert.Single(sparkManifest.Installers);
+
+        Assert.Throws<InvalidOperationException>(() =>
+            RestSource.ParseRestManifest(sparkDoc.RootElement, "XP9KHM4BK9FZ7Q", "1.2.3", ""));
+    }
+
+    [Fact]
+    public void CreateInstallNoOpResult_DoesNotSkipWhenVersionIsUnknown()
+    {
+        var request = new InstallRequest { Query = new PackageQuery() };
+        var unknownManifest = new Manifest
+        {
+            Id = "9WZDNCRFJB3H",
+            Name = "Todo",
+            Version = "Unknown",
+        };
+        var installedReal = new ListMatch
+        {
+            Name = "Todo",
+            Id = "9WZDNCRFJB3H",
+            LocalId = @"MSIX\21767Katans.Todo_1.3.1.64_x64__ey1k83fg9dn8w",
+            InstalledVersion = "1.3.1.64",
+            AvailableVersion = "Unknown",
+            SourceName = "msstore",
+            PackageFamilyNames = ["21767Katans.Todo_ey1k83fg9dn8w"],
+        };
+        Assert.Null(Repository.CreateInstallNoOpResult(request, unknownManifest, installedReal));
+
+        var knownManifest = new Manifest
+        {
+            Id = "Test.Package",
+            Name = "Test",
+            Version = "1.0.0",
+        };
+        var installedUnknown = installedReal with { InstalledVersion = "Unknown" };
+        Assert.Null(Repository.CreateInstallNoOpResult(request, knownManifest, installedUnknown));
+    }
+
+    [Fact]
+    public void CompareVersionStrings_TreatsUnknownAsLowest()
+    {
+        Assert.Equal(0, RestSource.CompareVersionStrings("Unknown", "Unknown"));
+        Assert.True(RestSource.CompareVersionStrings("Unknown", "1.0.0") < 0);
+        Assert.True(RestSource.CompareVersionStrings("1.0.0", "Unknown") > 0);
+    }
+
+    [Fact]
+    public void BuildMsStoreInstallScript_IncludesEntitlementAndInstallFlow()
+    {
+        var script = InstallerDispatch.BuildMsStoreInstallScript("9WZDNCRFJB3H", isMachine: false, isSilent: true, force: false);
+        Assert.Contains("$productId = '9WZDNCRFJB3H'", script);
+        Assert.Contains("$isMachine = $false", script);
+        Assert.Contains("$isSilent = $true", script);
+        Assert.Contains("StartProductInstallAsync", script);
+        Assert.Contains("GetFreeUserEntitlementAsync", script);
+        Assert.Contains("GetFreeDeviceEntitlementAsync", script);
+        Assert.Contains("exit -1978335205", script);
+        Assert.Contains("exit -1978335204", script);
+        Assert.Contains("$err.HResult", script);
+    }
+
+    [Fact]
+    public void CorrelateInstalledPackageFromLocated_MatchesRestPackageFamilyName()
+    {
+        var installed = new InstalledPackage
+        {
+            Name = "21767Katans.Todo",
+            LocalId = @"MSIX\21767Katans.Todo_1.3.1.64_x64__ey1k83fg9dn8w",
+            InstalledVersion = "1.3.1.64",
+            Scope = "User",
+            InstallerCategory = "msix",
+            PackageFamilyNames = ["21767Katans.Todo_ey1k83fg9dn8w"],
+        };
+        var located = new List<LocatedMatch>
+        {
+            new()
+            {
+                Display = new SearchMatch
+                {
+                    SourceName = "msstore",
+                    SourceKind = SourceKind.Rest,
+                    Id = "9WZDNCRFJB3H",
+                    Name = "Todo",
+                    Version = "Unknown",
+                },
+                SourceIndex = 0,
+                Locator = new RestLocator(
+                    "9WZDNCRFJB3H",
+                    [new VersionKey { Version = "Unknown", Channel = "" }],
+                    ["21767Katans.Todo_ey1k83fg9dn8w"]),
+            }
+        };
+
+        var correlated = Repository.CorrelateInstalledPackageFromLocated(installed, located);
+        Assert.NotNull(correlated);
+        Assert.Equal("9WZDNCRFJB3H", correlated!.Id);
+        Assert.Equal("msstore", correlated.SourceName);
+    }
 }
 
 [Collection(RepositoryStateCollection.Name)]

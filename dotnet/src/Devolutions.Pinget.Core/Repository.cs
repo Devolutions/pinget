@@ -31,6 +31,7 @@ public class Repository : IDisposable
     private readonly string _appRoot;
     private readonly HttpClient _client;
     private readonly Action<RepositoryWarning>? _diagnostics;
+    private readonly Func<Manifest, bool>? _packageAgreementsPrompt;
     private readonly TimeSpan? _preIndexedSourceAutoUpdateInterval;
     private SourceStore _store;
     private readonly EffectiveSourceMode _sourceMode;
@@ -47,6 +48,7 @@ public class Repository : IDisposable
         SourceStore store,
         EffectiveSourceMode sourceMode,
         Action<RepositoryWarning>? diagnostics,
+        Func<Manifest, bool>? packageAgreementsPrompt,
         TimeSpan? preIndexedSourceAutoUpdateInterval)
     {
         _appRoot = appRoot;
@@ -54,6 +56,7 @@ public class Repository : IDisposable
         _store = store;
         _sourceMode = sourceMode;
         _diagnostics = diagnostics;
+        _packageAgreementsPrompt = packageAgreementsPrompt;
         _preIndexedSourceAutoUpdateInterval = preIndexedSourceAutoUpdateInterval;
     }
 
@@ -76,7 +79,7 @@ public class Repository : IDisposable
         });
         client.Timeout = Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
-        return new Repository(appRoot, client, store, sourceMode, options.Diagnostics, options.PreIndexedSourceAutoUpdateInterval);
+        return new Repository(appRoot, client, store, sourceMode, options.Diagnostics, options.PackageAgreementsPrompt, options.PreIndexedSourceAutoUpdateInterval);
     }
 
     internal static SourceMode ResolveRequestedSourceMode(SourceMode? configuredSourceMode, string? requestedAppRoot) =>
@@ -599,6 +602,16 @@ public class Repository : IDisposable
                 foreach (var pkg in installed)
                 {
                     if (pkg.Correlated is not null) continue;
+                    if (CorrelateInstalledPackageFromLocated(pkg, matches) is { } locatedMatch)
+                    {
+                        if (pkg.Name.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase) &&
+                            !string.IsNullOrWhiteSpace(locatedMatch.Name))
+                        {
+                            pkg.Name = locatedMatch.Name;
+                        }
+                        pkg.Correlated = locatedMatch;
+                        continue;
+                    }
                     pkg.Correlated = CorrelateInstalledPackage(pkg, candidates, AllowLooseListCorrelation(query));
                 }
             }
@@ -703,6 +716,11 @@ public class Repository : IDisposable
         var (manifest, manifestDocuments) = ResolveManifestAndDocumentsForInstall(request);
         var installer = SelectInstaller(manifest.Installers, request.Query)
             ?? throw new InvalidOperationException("No applicable installer found for the current system");
+        if (string.Equals(installer.InstallerType, "msstore", StringComparison.OrdinalIgnoreCase) &&
+            installer.Url is null)
+        {
+            throw new InvalidOperationException("Downloading Microsoft Store (msstore) installers is not supported; use 'install' instead.");
+        }
         var url = installer.Url ?? throw new InvalidOperationException("Installer has no URL");
 
         Directory.CreateDirectory(downloadDir);
@@ -1007,11 +1025,18 @@ public class Repository : IDisposable
             }
         }
 
-        var tempDir = Path.Combine(Path.GetTempPath(), "pinget-install");
-        var installerPath = FetchInstaller(request, tempDir).InstallerPath;
-
         var installerType = (selectedInstaller.InstallerType ?? "exe").ToLowerInvariant();
-        installerPath = PrepareInstallerForExecution(installerPath, installerType);
+        string installerPath;
+        if (installerType == "msstore")
+        {
+            installerPath = "";
+        }
+        else
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), "pinget-install");
+            installerPath = FetchInstaller(request, tempDir).InstallerPath;
+            installerPath = PrepareInstallerForExecution(installerPath, installerType);
+        }
         var warnings = new List<string>();
         var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
 
@@ -1169,15 +1194,49 @@ public class Repository : IDisposable
             Count = 100,
         }).Matches;
 
-        return installedMatches.FirstOrDefault(match =>
+        var found = installedMatches.FirstOrDefault(match =>
             match.Id.Equals(manifest.Id, StringComparison.OrdinalIgnoreCase) ||
-            match.LocalId.Equals(manifest.Id, StringComparison.OrdinalIgnoreCase));
+            match.LocalId.Equals(manifest.Id, StringComparison.OrdinalIgnoreCase) ||
+            ManifestMatchesInstalledPackageFamilyName(manifest, match.PackageFamilyNames));
+        if (found is not null)
+            return found;
+
+        if (manifest.Installers.Any(i => !string.IsNullOrWhiteSpace(i.PackageFamilyName)))
+        {
+            var allInstalled = InstalledPackages.Collect(request.Query.InstallScope);
+            var pfnMatch = allInstalled.FirstOrDefault(candidate =>
+                ManifestMatchesInstalledPackageFamilyName(manifest, candidate.PackageFamilyNames));
+            if (pfnMatch is not null)
+                return ListMatchFromInstalled(pfnMatch, _store.Sources);
+        }
+
+        return null;
     }
 
-    private static void EnsurePackageAgreementsAccepted(Manifest manifest, InstallRequest request)
+    private static bool ManifestMatchesInstalledPackageFamilyName(Manifest manifest, IReadOnlyList<string> installedPfns)
     {
-        if (!request.AcceptPackageAgreements && manifest.Agreements.Count > 0)
-            throw new InvalidOperationException("Package agreements are present; rerun with --accept-package-agreements to continue.");
+        if (installedPfns.Count == 0)
+            return false;
+
+        return manifest.Installers.Any(installer =>
+            !string.IsNullOrWhiteSpace(installer.PackageFamilyName) &&
+            installedPfns.Any(installed => installed.Equals(installer.PackageFamilyName, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private void EnsurePackageAgreementsAccepted(Manifest manifest, InstallRequest request)
+    {
+        if (request.AcceptPackageAgreements || manifest.Agreements.Count == 0)
+            return;
+
+        if (_packageAgreementsPrompt is not null)
+        {
+            if (_packageAgreementsPrompt(manifest))
+                return;
+
+            throw new InvalidOperationException("Package agreements were not agreed to.");
+        }
+
+        throw new InvalidOperationException("Package agreements are present; rerun with --accept-package-agreements to continue.");
     }
 
     private void InstallDependencies(Manifest manifest, InstallRequest request)
@@ -1238,7 +1297,11 @@ public class Repository : IDisposable
             Moniker = installedMatch is null ? request.Query.Moniker : null,
             Source = request.Query.Source ?? installedMatch?.SourceName,
             Exact = true,
-            Version = request.Query.Version ?? installedMatch?.InstalledVersion,
+            Version = request.Query.Version ?? (installedMatch is not null &&
+                !string.Equals(installedMatch.SourceName, "msstore", StringComparison.OrdinalIgnoreCase) &&
+                !RestSource.IsUnknownVersion(installedMatch.InstalledVersion)
+                ? installedMatch.InstalledVersion
+                : null),
         },
         ManifestPath = request.ManifestPath,
         Mode = request.Mode,
@@ -1285,6 +1348,8 @@ public class Repository : IDisposable
 
         if (!request.Force &&
             !string.IsNullOrWhiteSpace(existingMatch.InstalledVersion) &&
+            !RestSource.IsUnknownVersion(existingMatch.InstalledVersion) &&
+            !RestSource.IsUnknownVersion(manifest.Version) &&
             RestSource.CompareVersionStrings(existingMatch.InstalledVersion, manifest.Version) >= 0)
         {
             return new InstallResult
@@ -1405,6 +1470,7 @@ public class Repository : IDisposable
         if (!string.IsNullOrEmpty(installer.Scope)) singleInstaller["Scope"] = installer.Scope;
         if (!string.IsNullOrEmpty(installer.Locale)) singleInstaller["InstallerLocale"] = installer.Locale;
         if (!string.IsNullOrEmpty(installer.ProductCode)) singleInstaller["ProductCode"] = installer.ProductCode;
+        if (!string.IsNullOrEmpty(installer.MSStoreProductIdentifier)) singleInstaller["MSStoreProductIdentifier"] = installer.MSStoreProductIdentifier;
         if (!string.IsNullOrEmpty(installer.ReleaseDate)) singleInstaller["ReleaseDate"] = installer.ReleaseDate;
 
         document["Installers"] = new List<object?> { singleInstaller };
@@ -1645,7 +1711,7 @@ public class Repository : IDisposable
                 MatchCriteria = r.MatchCriteria,
             },
             SourceIndex = sourceIndex,
-            Locator = new RestLocator(r.PackageId, r.Versions),
+            Locator = new RestLocator(r.PackageId, r.Versions, r.PackageFamilyNames, r.ProductCodes, r.UpgradeCodes),
         }).ToList(), truncated);
     }
 
@@ -2342,6 +2408,7 @@ public class Repository : IDisposable
             : [];
         string? topScope = GetOptStr("Scope");
         string? topProductCode = GetOptStr("ProductCode");
+        string? topMsStoreProductIdentifier = GetOptStr("MSStoreProductIdentifier");
         string? topLocale = GetOptStr("InstallerLocale");
         string? topReleaseDate = GetOptStr("ReleaseDate");
         string? topPackageFamilyName = GetOptStr("PackageFamilyName");
@@ -2384,6 +2451,7 @@ public class Repository : IDisposable
                         Url = InstStr("InstallerUrl"),
                         Sha256 = InstStr("InstallerSha256"),
                         ProductCode = InstStr("ProductCode") ?? topProductCode,
+                        MSStoreProductIdentifier = InstStr("MSStoreProductIdentifier") ?? topMsStoreProductIdentifier,
                         Locale = InstStr("InstallerLocale") ?? topLocale,
                         Scope = InstStr("Scope") ?? topScope,
                         ReleaseDate = InstStr("ReleaseDate") ?? topReleaseDate,
@@ -2629,6 +2697,7 @@ public class Repository : IDisposable
             "Dependencies",
             "PackageFamilyName",
             "ProductCode",
+            "MSStoreProductIdentifier",
             "Capabilities",
             "RestrictedCapabilities",
             "Markets",
@@ -2764,6 +2833,33 @@ public class Repository : IDisposable
             pkg.Correlated = CorrelateInstalledPackage(pkg, candidates, true);
         }
         return warnings;
+    }
+
+    internal static SearchMatch? CorrelateInstalledPackageFromLocated(InstalledPackage pkg, IReadOnlyList<LocatedMatch> locatedMatches)
+    {
+        foreach (var located in locatedMatches)
+        {
+            if (located.Locator is not RestLocator rest)
+                continue;
+
+            bool pfnMatch = pkg.PackageFamilyNames.Count > 0 &&
+                            rest.PackageFamilyNames is { Count: > 0 } &&
+                            pkg.PackageFamilyNames.Any(installedPfn =>
+                                rest.PackageFamilyNames.Any(candidatePfn => candidatePfn.Equals(installedPfn, StringComparison.OrdinalIgnoreCase)));
+            bool productCodeMatch = pkg.ProductCodes.Count > 0 &&
+                                    rest.ProductCodes is { Count: > 0 } &&
+                                    pkg.ProductCodes.Any(installedCode =>
+                                        rest.ProductCodes.Any(candidateCode => candidateCode.Equals(installedCode, StringComparison.OrdinalIgnoreCase)));
+            bool upgradeCodeMatch = pkg.UpgradeCodes.Count > 0 &&
+                                    rest.UpgradeCodes is { Count: > 0 } &&
+                                    pkg.UpgradeCodes.Any(installedCode =>
+                                        rest.UpgradeCodes.Any(candidateCode => candidateCode.Equals(installedCode, StringComparison.OrdinalIgnoreCase)));
+
+            if (pfnMatch || productCodeMatch || upgradeCodeMatch)
+                return located.Display;
+        }
+
+        return null;
     }
 
     internal static SearchMatch? CorrelateInstalledPackage(InstalledPackage pkg, List<SearchMatch> candidates, bool loose)
@@ -3945,6 +4041,7 @@ public class Repository : IDisposable
 
     private static bool InstalledPackageHasUpgrade(InstalledPackage pkg) =>
         !IsGreaterThanVersionMarker(pkg.InstalledVersion) &&
+        !InstalledPackageHasUnknownVersion(pkg) &&
         pkg.Correlated?.Version is string availableVersion &&
         RestSource.CompareVersionStrings(availableVersion, pkg.InstalledVersion) > 0;
 

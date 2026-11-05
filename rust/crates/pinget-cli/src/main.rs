@@ -1,16 +1,16 @@
 #![allow(clippy::print_stdout)]
 
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use pinget_core::{
     CacheWarmResult, Documentation, InstallProgress, InstallRequest, InstallResult, InstallerMode, ListMatch,
-    ListQuery, ListResponse, PackageQuery, PinRecord, PinType, RepairRequest, Repository, RepositoryOptions,
-    SearchMatch, SearchResponse, ShowResult, SourceKind, SourceRecord, SourceUpdateResult, UninstallRequest,
-    VersionsResult,
+    ListQuery, ListResponse, Manifest, PackageAgreement, PackageQuery, PinRecord, PinType, RepairRequest, Repository,
+    RepositoryOptions, SearchMatch, SearchResponse, ShowResult, SourceKind, SourceRecord, SourceUpdateResult,
+    UninstallRequest, VersionsResult,
 };
 use pinget_publisher::{BuildOptions as PublisherBuildOptions, PublishOptions as PublisherPublishOptions, Signing};
 
@@ -253,6 +253,8 @@ struct UpgradeArgs {
     ignore_security_hash: bool,
     #[arg(long = "dependency-source")]
     dependency_source: Option<String>,
+    #[arg(long = "accept-package-agreements")]
+    accept_package_agreements: bool,
     #[arg(long)]
     all: bool,
     #[arg(long)]
@@ -761,7 +763,7 @@ fn run() -> Result<()> {
                             install_location: None,
                             skip_dependencies: false,
                             dependencies_only: false,
-                            accept_package_agreements: false,
+                            accept_package_agreements: args.accept_package_agreements,
                             force: false,
                             rename: None,
                             uninstall_previous: false,
@@ -769,11 +771,17 @@ fn run() -> Result<()> {
                             dependency_source: args.dependency_source.clone(),
                             no_upgrade: false,
                         }) {
+                            Ok(r) if r.no_op => {
+                                print_warnings(&r.warnings);
+                                println!("  No changes were made for {}", m.id);
+                            }
                             Ok(r) if r.success => {
+                                print_warnings(&r.warnings);
                                 println!("  Successfully upgraded {}", m.id);
                                 success_count += 1;
                             }
                             Ok(r) => {
+                                print_warnings(&r.warnings);
                                 write_stderr_line(format_args!(
                                     "  Failed to upgrade {} (exit code: {})",
                                     m.id, r.exit_code
@@ -1111,7 +1119,7 @@ fn run() -> Result<()> {
             print_package_action_result(&result, "repaired", "repair");
         }
         Commands::Import(args) => {
-            let mut repository = Repository::open()?;
+            let mut repository = open_repository_with_install_progress()?;
             do_import(
                 &mut repository,
                 &args.import_file,
@@ -1592,48 +1600,32 @@ fn print_show(result: ShowResult) {
     if !result.manifest.channel.is_empty() {
         print_field("Channel", &result.manifest.channel);
     }
-    if let Some(value) = &result.manifest.publisher {
-        print_field("Publisher", value);
-    }
-    if let Some(value) = &result.manifest.publisher_url {
-        print_field("Publisher Url", value);
-    }
-    if let Some(value) = &result.manifest.publisher_support_url {
-        print_field("Publisher Support Url", value);
-    }
-    if let Some(value) = &result.manifest.author {
-        print_field("Author", value);
-    }
-    if let Some(value) = &result.manifest.moniker {
-        print_field("Moniker", value);
-    }
-    if let Some(value) = &result.manifest.description {
+    print_optional_field("Publisher", result.manifest.publisher.as_deref());
+    print_optional_field("Publisher Url", result.manifest.publisher_url.as_deref());
+    print_optional_field(
+        "Publisher Support Url",
+        result.manifest.publisher_support_url.as_deref(),
+    );
+    print_optional_field("Author", result.manifest.author.as_deref());
+    print_optional_field("Moniker", result.manifest.moniker.as_deref());
+    if let Some(value) = result.manifest.description.as_deref().filter(|value| !value.is_empty()) {
         print_multiline_with_colon("Description", value);
     }
-    if let Some(value) = &result.manifest.package_url {
-        print_field("Homepage", value);
-    }
-    if let Some(value) = &result.manifest.license {
-        print_field("License", value);
-    }
-    if let Some(value) = &result.manifest.license_url {
-        print_field("License Url", value);
-    }
-    if let Some(value) = &result.manifest.privacy_url {
-        print_field("Privacy Url", value);
-    }
-    if let Some(value) = &result.manifest.copyright {
-        print_field("Copyright", value);
-    }
-    if let Some(value) = &result.manifest.copyright_url {
-        print_field("Copyright Url", value);
-    }
-    if let Some(value) = &result.manifest.release_notes {
+    print_optional_field("Homepage", result.manifest.package_url.as_deref());
+    print_optional_field("License", result.manifest.license.as_deref());
+    print_optional_field("License Url", result.manifest.license_url.as_deref());
+    print_optional_field("Privacy Url", result.manifest.privacy_url.as_deref());
+    print_optional_field("Copyright", result.manifest.copyright.as_deref());
+    print_optional_field("Copyright Url", result.manifest.copyright_url.as_deref());
+    if let Some(value) = result
+        .manifest
+        .release_notes
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         print_multiline_with_colon("Release Notes", value);
     }
-    if let Some(value) = &result.manifest.release_notes_url {
-        print_field("Release Notes Url", value);
-    }
+    print_optional_field("Release Notes Url", result.manifest.release_notes_url.as_deref());
     if !result.manifest.package_dependencies.is_empty() {
         print_field("Dependencies", &result.manifest.package_dependencies.join(", "));
     }
@@ -1641,6 +1633,7 @@ fn print_show(result: ShowResult) {
     if !result.manifest.tags.is_empty() {
         print_list("Tags", &result.manifest.tags);
     }
+    print_agreements(&result.manifest.agreements);
 
     println!("Installer:");
     if let Some(installer) = result.selected_installer.as_ref() {
@@ -1670,6 +1663,9 @@ fn print_show(result: ShowResult) {
         }
         if let Some(value) = &installer.product_code {
             print_indented_field("ProductCode", value);
+        }
+        if let Some(value) = &installer.msstore_product_identifier {
+            print_indented_field("Store Product Id", value);
         }
         if let Some(value) = &installer.package_family_name {
             print_indented_field("PackageFamilyName", value);
@@ -1710,7 +1706,39 @@ fn print_warnings(warnings: &[String]) {
 }
 
 fn open_repository_with_install_progress() -> Result<Repository> {
-    Repository::open_with_options(RepositoryOptions::for_current_user()?.with_install_progress(print_install_progress))
+    let mut options = RepositoryOptions::for_current_user()?.with_install_progress(print_install_progress);
+    if io::stdin().is_terminal() && io::stderr().is_terminal() {
+        options = options.with_package_agreements_prompt(prompt_package_agreements);
+    }
+    Repository::open_with_options(options)
+}
+
+fn prompt_package_agreements(manifest: &Manifest) -> Result<bool> {
+    println!(
+        "Agreements for {} [{}] Version {}",
+        manifest.name, manifest.id, manifest.version
+    );
+    print_field("Version", &manifest.version);
+    print_optional_field("Publisher", manifest.publisher.as_deref());
+    print_optional_field("Publisher Url", manifest.publisher_url.as_deref());
+    print_optional_field("Publisher Support Url", manifest.publisher_support_url.as_deref());
+    print_optional_field("Author", manifest.author.as_deref());
+    print_optional_field("Homepage", manifest.package_url.as_deref());
+    print_optional_field("License", manifest.license.as_deref());
+    print_optional_field("License Url", manifest.license_url.as_deref());
+    print_optional_field("Privacy Url", manifest.privacy_url.as_deref());
+    print_optional_field("Copyright", manifest.copyright.as_deref());
+    print_optional_field("Copyright Url", manifest.copyright_url.as_deref());
+    print_agreements(&manifest.agreements);
+    println!();
+    println!("Do you agree to all the application agreements terms?");
+    print!("[Y] Yes  [N] No: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let answer = input.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
 fn print_install_progress(progress: &InstallProgress) {
@@ -1757,6 +1785,12 @@ fn print_field(label: &str, value: &str) {
     println!("{label}: {value}");
 }
 
+fn print_optional_field(label: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        print_field(label, value);
+    }
+}
+
 fn print_indented_field(label: &str, value: &str) {
     println!("  {label}: {value}");
 }
@@ -1785,6 +1819,35 @@ fn print_documentation(entries: &[Documentation]) {
         match entry.label.as_deref() {
             Some(label) if !label.is_empty() => println!("  {label}: {}", entry.url),
             _ => println!("  {}", entry.url),
+        }
+    }
+}
+
+fn print_agreements(agreements: &[PackageAgreement]) {
+    if agreements.is_empty() {
+        return;
+    }
+
+    println!("Agreements:");
+    for agreement in agreements {
+        let label = agreement.label.as_deref().filter(|value| !value.is_empty());
+        let text = agreement.text.as_deref().filter(|value| !value.is_empty());
+        let url = agreement.url.as_deref().filter(|value| !value.is_empty());
+        match (label, text, url) {
+            (Some(label), Some(text), Some(url)) => {
+                println!("  {label}: {text}");
+                println!("  {label} Url: {url}");
+            }
+            (Some(label), Some(text), None) => println!("  {label}: {text}"),
+            (Some(label), None, Some(url)) => println!("  {label}: {url}"),
+            (None, Some(text), Some(url)) => {
+                println!("  {text}");
+                println!("  {url}");
+            }
+            (None, Some(text), None) => println!("  {text}"),
+            (None, None, Some(url)) => println!("  {url}"),
+            (Some(label), None, None) => println!("  {label}"),
+            (None, None, None) => {}
         }
     }
 }

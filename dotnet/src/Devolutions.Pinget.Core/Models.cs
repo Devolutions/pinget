@@ -55,6 +55,7 @@ public record RepositoryOptions
     public SourceMode? SourceMode { get; init; }
     public string UserAgent { get; init; } = "pinget-dotnet/0.1";
     public Action<RepositoryWarning>? Diagnostics { get; init; }
+    public Func<Manifest, bool>? PackageAgreementsPrompt { get; init; }
 
     /// <summary>
     /// Maximum age for an existing pre-indexed source index before Pinget attempts a background refresh.
@@ -252,6 +253,7 @@ public record Installer
     public string? Url { get; init; }
     public string? Sha256 { get; init; }
     public string? ProductCode { get; init; }
+    public string? MSStoreProductIdentifier { get; init; }
     public string? Locale { get; init; }
     public string? Scope { get; init; }
     public string? ReleaseDate { get; init; }
@@ -549,6 +551,8 @@ public record SerializableInstaller
     public string? InstallerUrl { get; init; }
     public string? InstallerSha256 { get; init; }
     public string? ProductCode { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? MSStoreProductIdentifier { get; init; }
     public string? InstallerLocale { get; init; }
     public string? Scope { get; init; }
     public string? ReleaseDate { get; init; }
@@ -569,6 +573,7 @@ public record SerializableInstaller
         InstallerUrl = installer.Url,
         InstallerSha256 = installer.Sha256,
         ProductCode = installer.ProductCode,
+        MSStoreProductIdentifier = installer.MSStoreProductIdentifier,
         InstallerLocale = installer.Locale,
         Scope = installer.Scope,
         ReleaseDate = installer.ReleaseDate,
@@ -702,7 +707,12 @@ internal abstract record MatchLocator;
 
 internal record PreIndexedV1Locator(long PackageRowId) : MatchLocator;
 internal record PreIndexedV2Locator(long PackageRowId, string PackageHash) : MatchLocator;
-internal record RestLocator(string PackageId, List<VersionKey> Versions) : MatchLocator;
+internal record RestLocator(
+    string PackageId,
+    List<VersionKey> Versions,
+    List<string>? PackageFamilyNames = null,
+    List<string>? ProductCodes = null,
+    List<string>? UpgradeCodes = null) : MatchLocator;
 
 internal static class StructuredOutput
 {
@@ -842,6 +852,7 @@ internal static class StructuredOutput
         AddString(document, "InstallerUrl", installer.Url);
         AddString(document, "InstallerSha256", installer.Sha256);
         AddString(document, "ProductCode", installer.ProductCode);
+        AddString(document, "MSStoreProductIdentifier", installer.MSStoreProductIdentifier);
         AddString(document, "InstallerLocale", installer.Locale);
         AddString(document, "Scope", installer.Scope);
         AddString(document, "ReleaseDate", installer.ReleaseDate);

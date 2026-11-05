@@ -15,6 +15,8 @@ internal static class RestSource
         public List<string> ServerSupportedVersions { get; init; } = [];
         public List<string> RequiredPackageMatchFields { get; init; } = [];
         public List<string> UnsupportedPackageMatchFields { get; init; } = [];
+        public List<string> RequiredQueryParameters { get; init; } = [];
+        public List<string> UnsupportedQueryParameters { get; init; } = [];
     }
 
     internal record RestInfoCache
@@ -64,6 +66,12 @@ internal static class RestSource
             UnsupportedPackageMatchFields = data.TryGetProperty("UnsupportedPackageMatchFields", out var upmf)
                 ? upmf.EnumerateArray().Select(v => v.GetString() ?? "").ToList()
                 : [],
+            RequiredQueryParameters = data.TryGetProperty("RequiredQueryParameters", out var rqp)
+                ? rqp.EnumerateArray().Select(v => v.GetString() ?? "").ToList()
+                : [],
+            UnsupportedQueryParameters = data.TryGetProperty("UnsupportedQueryParameters", out var uqp)
+                ? uqp.EnumerateArray().Select(v => v.GetString() ?? "").ToList()
+                : [],
         };
 
         // Cache for 1 hour
@@ -112,6 +120,7 @@ internal static class RestSource
             var packageId = item.GetProperty("PackageIdentifier").GetString() ?? "";
             var packageName = item.TryGetProperty("PackageName", out var pn) ? pn.GetString() ?? "" : packageId;
             var versions = ParseVersions(item);
+            var (packageFamilyNames, productCodes, upgradeCodes) = ParseVersionIdentities(item);
             SortVersionsDesc(versions);
             var latest = versions.FirstOrDefault() ?? new VersionKey { Version = "?", Channel = "" };
 
@@ -122,6 +131,9 @@ internal static class RestSource
                 Moniker = item.TryGetProperty("Moniker", out var mk) ? mk.GetString() : null,
                 LatestVersion = latest,
                 Versions = versions,
+                PackageFamilyNames = packageFamilyNames,
+                ProductCodes = productCodes,
+                UpgradeCodes = upgradeCodes,
                 MatchCriteria = DetermineRestMatchCriteria(item, query, semantics)
             });
         }
@@ -133,7 +145,7 @@ internal static class RestSource
         RestInformation info, string packageId, string version, string channel)
     {
         var contract = ChooseContract(info.ServerSupportedVersions) ?? "1.0.0";
-        var url = $"{source.Arg.TrimEnd('/')}/packageManifests/{Uri.EscapeDataString(packageId)}";
+        var url = BuildManifestRequestUrl(source, info, packageId, version, channel);
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Add("Version", contract);
@@ -209,7 +221,7 @@ internal static class RestSource
     {
         if (info.RequiredPackageMatchFields.Any(f => f.Equals("market", StringComparison.OrdinalIgnoreCase)))
         {
-            var market = Environment.GetEnvironmentVariable("WINGET_DOTNET_MARKET") ?? "US";
+            var market = DefaultMarket();
             filters.Add((JsonNode?)new JsonObject
             {
                 ["PackageMatchField"] = "Market",
@@ -220,6 +232,73 @@ internal static class RestSource
                 }
             });
         }
+    }
+
+    internal static string DefaultMarket()
+    {
+        foreach (var varName in new[] { "PINGET_MARKET", "WINGET_RS_MARKET", "WINGET_DOTNET_MARKET" })
+        {
+            var value = Environment.GetEnvironmentVariable(varName)?.Trim();
+            if (!string.IsNullOrEmpty(value))
+                return value;
+        }
+
+        return OsGeographicRegion() ?? "US";
+    }
+
+    private static string? OsGeographicRegion()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                using var geo = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Control Panel\International\Geo");
+                var name = (geo?.GetValue("Name") as string)?.Trim();
+                if (name is { Length: 2 } && char.IsAsciiLetter(name[0]) && char.IsAsciiLetter(name[1]))
+                    return name.ToUpperInvariant();
+            }
+            catch
+            {
+            }
+        }
+
+        return null;
+    }
+
+    internal static List<(string Key, string Value)> BuildManifestQueryParameters(string version, string channel, RestInformation info)
+    {
+        var parameters = new List<(string Key, string Value)>();
+        if (!string.IsNullOrWhiteSpace(version) &&
+            !IsUnknownVersion(version) &&
+            !info.UnsupportedQueryParameters.Any(p => p.Equals("Version", StringComparison.OrdinalIgnoreCase)))
+        {
+            parameters.Add(("Version", version));
+        }
+
+        if (!string.IsNullOrWhiteSpace(channel) &&
+            !info.UnsupportedQueryParameters.Any(p => p.Equals("Channel", StringComparison.OrdinalIgnoreCase)))
+        {
+            parameters.Add(("Channel", channel));
+        }
+
+        if (info.RequiredQueryParameters.Any(p => p.Equals("Market", StringComparison.OrdinalIgnoreCase)) &&
+            !info.UnsupportedQueryParameters.Any(p => p.Equals("Market", StringComparison.OrdinalIgnoreCase)))
+        {
+            parameters.Add(("Market", DefaultMarket()));
+        }
+
+        return parameters;
+    }
+
+    internal static string BuildManifestRequestUrl(SourceRecord source, RestInformation info, string packageId, string version, string channel)
+    {
+        var baseUrl = $"{source.Arg.TrimEnd('/')}/packageManifests/{Uri.EscapeDataString(packageId)}";
+        var queryParams = BuildManifestQueryParameters(version, channel, info);
+        if (queryParams.Count == 0)
+            return baseUrl;
+
+        var queryString = string.Join("&", queryParams.Select(p => $"{Uri.EscapeDataString(p.Key)}={Uri.EscapeDataString(p.Value)}"));
+        return $"{baseUrl}?{queryString}";
     }
 
     private static int SourceFetchResults(PackageQuery query, SearchSemantics semantics)
@@ -244,7 +323,41 @@ internal static class RestSource
             .ToList();
     }
 
-    private static (Manifest Manifest, object StructuredDocuments) ParseRestManifest(JsonElement json, string packageId, string version, string channel)
+    private static (List<string> PackageFamilyNames, List<string> ProductCodes, List<string> UpgradeCodes) ParseVersionIdentities(JsonElement item)
+    {
+        var packageFamilyNames = new List<string>();
+        var productCodes = new List<string>();
+        var upgradeCodes = new List<string>();
+
+        if (!item.TryGetProperty("Versions", out var versionsArr) || versionsArr.ValueKind != JsonValueKind.Array)
+            return (packageFamilyNames, productCodes, upgradeCodes);
+
+        static void AddDistinctStrings(JsonElement parent, string prop, List<string> target)
+        {
+            if (!parent.TryGetProperty(prop, out var arr) || arr.ValueKind != JsonValueKind.Array)
+                return;
+
+            foreach (var elem in arr.EnumerateArray())
+            {
+                if (elem.ValueKind != JsonValueKind.String) continue;
+                var val = elem.GetString();
+                if (string.IsNullOrWhiteSpace(val)) continue;
+                if (!target.Any(existing => existing.Equals(val, StringComparison.OrdinalIgnoreCase)))
+                    target.Add(val);
+            }
+        }
+
+        foreach (var v in versionsArr.EnumerateArray())
+        {
+            AddDistinctStrings(v, "PackageFamilyNames", packageFamilyNames);
+            AddDistinctStrings(v, "ProductCodes", productCodes);
+            AddDistinctStrings(v, "UpgradeCodes", upgradeCodes);
+        }
+
+        return (packageFamilyNames, productCodes, upgradeCodes);
+    }
+
+    internal static (Manifest Manifest, object StructuredDocuments) ParseRestManifest(JsonElement json, string packageId, string version, string channel)
     {
         var data = json.TryGetProperty("Data", out var d) ? d : json;
 
@@ -252,22 +365,63 @@ internal static class RestSource
         var defaultLocale = data.TryGetProperty("DefaultLocale", out var dl) ? dl : data;
         var versionsArr = data.TryGetProperty("Versions", out var va) ? va : default;
 
-        // Try to find the matching version data
+        // Try to find the matching version data, or fall back to the highest version in the payload
         JsonElement? versionData = null;
         if (versionsArr.ValueKind == JsonValueKind.Array)
         {
             foreach (var v in versionsArr.EnumerateArray())
             {
                 var pv = v.TryGetProperty("PackageVersion", out var pvVal) ? pvVal.GetString() : null;
-                if (pv == version)
+                var ch = v.TryGetProperty("Channel", out var chVal) ? chVal.GetString() ?? "" : "";
+                if (string.Equals(pv, version, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(ch, channel, StringComparison.OrdinalIgnoreCase))
                 {
                     versionData = v;
-                    if (v.TryGetProperty("DefaultLocale", out var vdl))
-                        defaultLocale = vdl;
                     break;
                 }
             }
+
+            if (versionData is null)
+            {
+                if (!string.IsNullOrWhiteSpace(version) && !IsUnknownVersion(version))
+                    throw new InvalidOperationException($"REST manifest response did not contain a version payload for version '{version}'.");
+
+                foreach (var v in versionsArr.EnumerateArray())
+                {
+                    var ch = v.TryGetProperty("Channel", out var chVal) ? chVal.GetString() ?? "" : "";
+                    if (!string.IsNullOrEmpty(channel) && !string.Equals(ch, channel, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (versionData is null)
+                    {
+                        versionData = v;
+                        continue;
+                    }
+
+                    var candidateVer = v.TryGetProperty("PackageVersion", out var cv) ? cv.GetString() ?? "" : "";
+                    var currentVer = versionData.Value.TryGetProperty("PackageVersion", out var curV) ? curV.GetString() ?? "" : "";
+                    if (CompareVersionStrings(candidateVer, currentVer) > 0)
+                        versionData = v;
+                }
+
+                if (versionData is null)
+                    throw new InvalidOperationException("REST manifest response did not contain a version payload.");
+            }
+
+            if (versionData is { } selectedVersion && selectedVersion.TryGetProperty("DefaultLocale", out var vdl))
+                defaultLocale = vdl;
         }
+
+        var resolvedVersion = versionData is { } svVer &&
+                              svVer.TryGetProperty("PackageVersion", out var resolvedPv) &&
+                              resolvedPv.GetString() is { Length: > 0 } actualVersion
+            ? actualVersion
+            : version;
+        var resolvedChannel = versionData is { } svCh &&
+                              svCh.TryGetProperty("Channel", out var resolvedCh) &&
+                              resolvedCh.ValueKind == JsonValueKind.String
+            ? resolvedCh.GetString() ?? channel
+            : channel;
 
         string GetStr(JsonElement el, string prop) =>
             el.TryGetProperty(prop, out var v) ? v.GetString() ?? "" : "";
@@ -351,25 +505,41 @@ internal static class RestSource
             };
         }
 
+        bool GetBool(JsonElement el, string prop) =>
+            el.TryGetProperty(prop, out var v) &&
+            (v.ValueKind == JsonValueKind.True ||
+             (v.ValueKind == JsonValueKind.String && string.Equals(v.GetString(), "true", StringComparison.OrdinalIgnoreCase)));
+
         var installers = new List<Installer>();
         var installersSource = versionData ?? data;
         var defaultSwitches = GetSwitches(installersSource);
+        var topPlatforms = GetStrArray(installersSource, "Platform");
+        var topMinimumOsVersion = GetOptStr(installersSource, "MinimumOSVersion");
+        var topInstallerType = GetOptStr(installersSource, "InstallerType");
+        var topNestedInstallerType = GetOptStr(installersSource, "NestedInstallerType") ?? GetOptStr(data, "NestedInstallerType");
+        var topMsStoreProductIdentifier = GetOptStr(installersSource, "MSStoreProductIdentifier");
         if (installersSource.TryGetProperty("Installers", out var instArr) && instArr.ValueKind == JsonValueKind.Array)
         {
             foreach (var inst in instArr.EnumerateArray())
             {
                 var nestedFiles = ReadNestedInstallerFilesJson(inst);
                 if (nestedFiles.Count == 0)
+                    nestedFiles = ReadNestedInstallerFilesJson(installersSource);
+                if (nestedFiles.Count == 0)
                     nestedFiles = ReadNestedInstallerFilesJson(data);
+                var platforms = GetStrArray(inst, "Platform");
                 installers.Add(new Installer
                 {
+                    Platforms = platforms.Count > 0 ? platforms : [.. topPlatforms],
+                    MinimumOsVersion = GetOptStr(inst, "MinimumOSVersion") ?? topMinimumOsVersion,
                     Architecture = GetOptStr(inst, "Architecture"),
-                    InstallerType = GetOptStr(inst, "InstallerType"),
-                    NestedInstallerType = GetOptStr(inst, "NestedInstallerType") ?? GetOptStr(data, "NestedInstallerType"),
+                    InstallerType = GetOptStr(inst, "InstallerType") ?? topInstallerType,
+                    NestedInstallerType = GetOptStr(inst, "NestedInstallerType") ?? topNestedInstallerType,
                     NestedInstallerFiles = nestedFiles,
                     Url = GetOptStr(inst, "InstallerUrl"),
                     Sha256 = GetOptStr(inst, "InstallerSha256"),
                     ProductCode = GetOptStr(inst, "ProductCode"),
+                    MSStoreProductIdentifier = GetOptStr(inst, "MSStoreProductIdentifier") ?? topMsStoreProductIdentifier,
                     Locale = GetOptStr(inst, "InstallerLocale"),
                     Scope = GetOptStr(inst, "Scope"),
                     ReleaseDate = GetOptStr(inst, "ReleaseDate"),
@@ -378,6 +548,7 @@ internal static class RestSource
                     Switches = GetSwitches(inst).MergeWith(defaultSwitches),
                     Commands = GetStrArray(inst, "Commands"),
                     PackageDependencies = GetPackageDependencies(inst),
+                    RequireExplicitUpgrade = GetBool(inst, "RequireExplicitUpgrade"),
                 });
             }
         }
@@ -443,16 +614,19 @@ internal static class RestSource
         if (icons.Count == 0 && data.TryGetProperty("DefaultLocale", out var packageDefaultLocale))
             icons = GetIcons(packageDefaultLocale);
 
+        var topLevelRequireExplicit = GetBool(installersSource, "RequireExplicitUpgrade");
+        var anyInstallerRequireExplicit = installers.Any(i => i.RequireExplicitUpgrade);
+
         var manifest = new Manifest
         {
             Id = GetStr(data, "PackageIdentifier").Length > 0 ? GetStr(data, "PackageIdentifier") : packageId,
             Name = GetOptStr(defaultLocale, "PackageName") ?? GetStr(data, "PackageName"),
-            Version = version,
-            Channel = channel,
+            Version = resolvedVersion,
+            Channel = resolvedChannel,
             Publisher = GetOptStr(defaultLocale, "Publisher"),
             Description = GetOptStr(defaultLocale, "Description") ?? GetOptStr(defaultLocale, "ShortDescription"),
             ShortDescription = GetOptStr(defaultLocale, "ShortDescription"),
-            Moniker = GetOptStr(data, "Moniker"),
+            Moniker = GetOptStr(defaultLocale, "Moniker") ?? GetOptStr(data, "Moniker"),
             PackageUrl = GetOptStr(defaultLocale, "PackageUrl"),
             PublisherUrl = GetOptStr(defaultLocale, "PublisherUrl"),
             PublisherSupportUrl = GetOptStr(defaultLocale, "PublisherSupportUrl"),
@@ -470,9 +644,10 @@ internal static class RestSource
             Documentation = docs,
             Icons = icons,
             Installers = installers,
+            RequireExplicitUpgrade = topLevelRequireExplicit || anyInstallerRequireExplicit,
         };
 
-        return (manifest, BuildStructuredDocuments(data, installersSource, defaultLocale, packageId, version, channel));
+        return (manifest, BuildStructuredDocuments(data, installersSource, defaultLocale, packageId, resolvedVersion, resolvedChannel));
     }
 
     private static object BuildStructuredDocuments(JsonElement data, JsonElement installerSource, JsonElement defaultLocale, string packageId, string version, string channel)
@@ -576,8 +751,18 @@ internal static class RestSource
         versions.Sort((a, b) => -CompareVersionStrings(a.Version, b.Version));
     }
 
+    internal static bool IsUnknownVersion(string? version) =>
+        version is not null && version.Trim().Equals("Unknown", StringComparison.OrdinalIgnoreCase);
+
     internal static int CompareVersionStrings(string a, string b)
     {
+        bool aUnknown = IsUnknownVersion(a);
+        bool bUnknown = IsUnknownVersion(b);
+        if (aUnknown != bUnknown)
+            return aUnknown ? -1 : 1;
+        if (aUnknown)
+            return 0;
+
         var aLessThan = StripLessThanPrefix(a);
         var bLessThan = StripLessThanPrefix(b);
         if (aLessThan is not null && bLessThan is not null)
@@ -620,6 +805,9 @@ internal static class RestSource
         public string? Moniker { get; init; }
         public required VersionKey LatestVersion { get; init; }
         public required List<VersionKey> Versions { get; init; }
+        public List<string> PackageFamilyNames { get; init; } = [];
+        public List<string> ProductCodes { get; init; } = [];
+        public List<string> UpgradeCodes { get; init; } = [];
         public string? MatchCriteria { get; init; }
     }
 }

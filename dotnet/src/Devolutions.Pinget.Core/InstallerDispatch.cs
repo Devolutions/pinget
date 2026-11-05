@@ -34,6 +34,7 @@ internal static class InstallerDispatch
         {
             "msi" or "wix" => RunMsi(installerPath, request, manifest, installer),
             "msix" or "appx" => RunMsix(installerPath),
+            "msstore" => RunMsStore(request, manifest, installer),
             "zip" when IsPortableZipInstaller(installer) => InstallPortable(installerPath, request, manifest, installer,
                 ResolvePortableScope(request.Query.InstallScope ?? request.Scope, null, installer.Scope), warnings),
             "portable" => InstallPortable(installerPath, request, manifest, installer,
@@ -215,6 +216,186 @@ internal static class InstallerDispatch
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to run Add-AppxPackage");
         proc.WaitForExit();
         return proc.ExitCode;
+    }
+
+    private static int RunMsStore(InstallRequest request, Manifest manifest, Installer installer)
+    {
+        var productId = !string.IsNullOrWhiteSpace(installer.MSStoreProductIdentifier)
+            ? installer.MSStoreProductIdentifier!
+            : manifest.Id;
+        var effectiveScope = request.Query.InstallScope ?? request.Scope ?? installer.Scope;
+        var isMachine = string.Equals(effectiveScope, "machine", StringComparison.OrdinalIgnoreCase);
+        var isSilent = request.Mode == InstallerMode.Silent;
+        var script = BuildMsStoreInstallScript(productId, isMachine, isSilent, request.Force);
+        string[] args = ["-NoProfile", "-NonInteractive", "-Command", script];
+
+        if (isMachine)
+            return RunShellExecute("powershell.exe", args, runAs: true);
+
+        var psi = new ProcessStartInfo("powershell")
+        {
+            UseShellExecute = false,
+        };
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to run MSStore installer via PowerShell");
+        proc.WaitForExit();
+        return proc.ExitCode;
+    }
+
+    internal static string BuildMsStoreInstallScript(string productId, bool isMachine, bool isSilent, bool force)
+    {
+        var escapedProductId = productId.Replace("'", "''");
+        var machineLiteral = isMachine ? "$true" : "$false";
+        var silentLiteral = isSilent ? "$true" : "$false";
+        var forceLiteral = force ? "$true" : "$false";
+
+        return $$"""
+            $ErrorActionPreference = 'Stop'
+            $productId = '{{escapedProductId}}'
+            $isMachine = {{machineLiteral}}
+            $isSilent = {{silentLiteral}}
+            $force = {{forceLiteral}}
+            Add-Type -AssemblyName System.Runtime.WindowsRuntime
+            $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+            })[0]
+            $asTaskProgressGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperationWithProgress`2'
+            })[0]
+            function Await-WinRt($op, [Type]$resultType) {
+                $asTask = $asTaskGeneric.MakeGenericMethod($resultType)
+                $task = $asTask.Invoke($null, @($op))
+                $task.GetAwaiter().GetResult()
+            }
+            function Await-WinRtWithProgress($op, [Type]$resultType, [Type]$progressType) {
+                $asTask = $asTaskProgressGeneric.MakeGenericMethod($resultType, $progressType)
+                $task = $asTask.Invoke($null, @($op))
+                $task.GetAwaiter().GetResult()
+            }
+            $mgr = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager, Windows.ApplicationModel, ContentType=WindowsRuntime]::new()
+            [void][Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementResult, Windows.ApplicationModel, ContentType=WindowsRuntime]
+            [void][Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementStatus, Windows.ApplicationModel, ContentType=WindowsRuntime]
+            [void][Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem, Windows.ApplicationModel, ContentType=WindowsRuntime]
+            [void][Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState, Windows.ApplicationModel, ContentType=WindowsRuntime]
+            [void][Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode, Windows.ApplicationModel, ContentType=WindowsRuntime]
+            if (Await-WinRt ($mgr.IsStoreBlockedByPolicyAsync('Microsoft.WindowsStore', 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US')) ([bool])) {
+                [Console]::Error.WriteLine('The Microsoft Store client is blocked by policy.')
+                exit -1978335205
+            }
+            if (-not (Await-WinRt ($mgr.GetIsAppAllowedToInstallAsync($productId)) ([bool]))) {
+                [Console]::Error.WriteLine('The Microsoft Store app is blocked by policy.')
+                exit -1978335204
+            }
+            try {
+                if ($isMachine) {
+                    [void](Await-WinRt ($mgr.GetFreeDeviceEntitlementAsync($productId, '', '')) ([Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementResult]))
+                } else {
+                    $entitlement = Await-WinRt ($mgr.GetFreeUserEntitlementAsync($productId, '', '')) ([Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementResult])
+                    if ($null -eq $entitlement -or $entitlement.Status -eq [Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementStatus]::NoStoreAccount) {
+                        [void](Await-WinRt ($mgr.GetFreeDeviceEntitlementAsync($productId, '', '')) ([Windows.ApplicationModel.Store.Preview.InstallControl.GetEntitlementResult]))
+                    }
+                }
+            } catch {}
+            $options = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallOptions, Windows.ApplicationModel, ContentType=WindowsRuntime]::new()
+            $options.AllowForcedAppRestart = $force
+            if ($isSilent) {
+                $noToast = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode]::NoToast
+                $options.InstallInProgressToastNotificationMode = $noToast
+                $options.CompletedInstallToastNotificationMode = $noToast
+            }
+            if ($isMachine) {
+                $options.InstallForAllUsers = $true
+            }
+            $itemsType = [System.Collections.Generic.IReadOnlyList[Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallItem]]
+            $items = Await-WinRt ($mgr.StartProductInstallAsync($productId, '', 'WinGetCli', '', $options)) $itemsType
+            $action = 'None'
+            foreach ($item in $items) {
+                $state = $item.GetCurrentStatus().InstallState
+                if ($state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Canceled -or
+                    $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Error) {
+                    $action = 'Cancel'
+                    break
+                }
+                if ($state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Paused -or
+                    $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::PausedLowBattery -or
+                    $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::PausedWiFiRecommended -or
+                    $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::PausedWiFiRequired -or
+                    $state -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::ReadyToDownload) {
+                    $action = 'Restart'
+                }
+            }
+            if ($action -eq 'Cancel') {
+                $mgr.Cancel($productId)
+                for ($i = 0; $i -lt 50; $i++) {
+                    Start-Sleep -Milliseconds 200
+                    $stillPresent = $false
+                    foreach ($active in $mgr.AppInstallItems) {
+                        if ($active.ProductId -ieq $productId) { $stillPresent = $true; break }
+                    }
+                    if (-not $stillPresent) { break }
+                }
+                $items = Await-WinRt ($mgr.StartProductInstallAsync($productId, '', 'WinGetCli', '', $options)) $itemsType
+            } elseif ($action -eq 'Restart') {
+                $mgr.Restart($productId)
+                $items = Await-WinRt ($mgr.StartProductInstallAsync($productId, '', 'WinGetCli', '', $options)) $itemsType
+            }
+            if ($isSilent) {
+                $noToast = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode]::NoToast
+                foreach ($item in $items) {
+                    $item.InstallInProgressToastNotificationMode = $noToast
+                    $item.CompletedInstallToastNotificationMode = $noToast
+                }
+            }
+            $maxProgress = 100 * $items.Count
+            $currentProgress = 0
+            while ($currentProgress -lt $maxProgress) {
+                $currentProgress = 0
+                $allCompleted = $true
+                foreach ($item in $items) {
+                    $status = $item.GetCurrentStatus()
+                    $currentProgress += [int]$status.PercentComplete
+                    if ($status.InstallState -ne [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Completed) {
+                        $allCompleted = $false
+                    }
+                    $err = $status.ErrorCode
+                    if ($null -ne $err -and $err.HResult -lt 0) {
+                        try { $mgr.Cancel($productId) } catch {}
+                        exit $err.HResult
+                    }
+                    if ($status.InstallState -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Canceled -or
+                        $status.InstallState -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Error) {
+                        try { $mgr.Cancel($productId) } catch {}
+                        exit 1
+                    }
+                }
+                if ($allCompleted -or $currentProgress -ge $maxProgress) { break }
+                Start-Sleep -Milliseconds 100
+            }
+            if ($isMachine) {
+                $pkgMgr = [Windows.Management.Deployment.PackageManager, Windows.Management.Deployment, ContentType=WindowsRuntime]::new()
+                [void][Windows.Management.Deployment.DeploymentResult, Windows.Management.Deployment, ContentType=WindowsRuntime]
+                [void][Windows.Management.Deployment.DeploymentProgress, Windows.Management.Deployment, ContentType=WindowsRuntime]
+                $provisioned = $pkgMgr.FindProvisionedPackages()
+                foreach ($item in $items) {
+                    $familyName = $item.PackageFamilyName
+                    if ([string]::IsNullOrWhiteSpace($familyName)) { continue }
+                    $already = $false
+                    foreach ($p in $provisioned) {
+                        if ($p.Id.FamilyName -eq $familyName) { $already = $true; break }
+                    }
+                    if (-not $already) {
+                        $provResult = Await-WinRtWithProgress ($pkgMgr.ProvisionPackageForAllUsersAsync($familyName)) ([Windows.Management.Deployment.DeploymentResult]) ([Windows.Management.Deployment.DeploymentProgress])
+                        $provErr = $provResult.ExtendedErrorCode
+                        if ($null -ne $provErr -and $provErr.HResult -lt 0) {
+                            exit $provErr.HResult
+                        }
+                    }
+                }
+            }
+            exit 0
+            """;
     }
 
     private static int ExtractZip(string path, PortableScope scope)
