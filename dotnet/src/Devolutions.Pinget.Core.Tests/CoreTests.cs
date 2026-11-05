@@ -3610,6 +3610,41 @@ Installers:
         Assert.Equal("Visual Studio Code", sparkManifest.Name);
         Assert.Equal("Microsoft Corporation", sparkManifest.Publisher);
         Assert.Single(sparkManifest.Installers);
+
+        Assert.Throws<InvalidOperationException>(() =>
+            RestSource.ParseRestManifest(sparkDoc.RootElement, "XP9KHM4BK9FZ7Q", "1.2.3", ""));
+    }
+
+    [Fact]
+    public void CreateInstallNoOpResult_DoesNotSkipWhenVersionIsUnknown()
+    {
+        var request = new InstallRequest { Query = new PackageQuery() };
+        var unknownManifest = new Manifest
+        {
+            Id = "9WZDNCRFJB3H",
+            Name = "Todo",
+            Version = "Unknown",
+        };
+        var installedReal = new ListMatch
+        {
+            Name = "Todo",
+            Id = "9WZDNCRFJB3H",
+            LocalId = @"MSIX\21767Katans.Todo_1.3.1.64_x64__ey1k83fg9dn8w",
+            InstalledVersion = "1.3.1.64",
+            AvailableVersion = "Unknown",
+            SourceName = "msstore",
+            PackageFamilyNames = ["21767Katans.Todo_ey1k83fg9dn8w"],
+        };
+        Assert.Null(Repository.CreateInstallNoOpResult(request, unknownManifest, installedReal));
+
+        var knownManifest = new Manifest
+        {
+            Id = "Test.Package",
+            Name = "Test",
+            Version = "1.0.0",
+        };
+        var installedUnknown = installedReal with { InstalledVersion = "Unknown" };
+        Assert.Null(Repository.CreateInstallNoOpResult(request, knownManifest, installedUnknown));
     }
 
     [Fact]
@@ -3630,6 +3665,9 @@ Installers:
         Assert.Contains("StartProductInstallAsync", script);
         Assert.Contains("GetFreeUserEntitlementAsync", script);
         Assert.Contains("GetFreeDeviceEntitlementAsync", script);
+        Assert.Contains("exit -1978335205", script);
+        Assert.Contains("exit -1978335204", script);
+        Assert.Contains("$err.HResult", script);
     }
 
     [Fact]

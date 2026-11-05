@@ -1348,6 +1348,8 @@ public class Repository : IDisposable
 
         if (!request.Force &&
             !string.IsNullOrWhiteSpace(existingMatch.InstalledVersion) &&
+            !RestSource.IsUnknownVersion(existingMatch.InstalledVersion) &&
+            !RestSource.IsUnknownVersion(manifest.Version) &&
             RestSource.CompareVersionStrings(existingMatch.InstalledVersion, manifest.Version) >= 0)
         {
             return new InstallResult

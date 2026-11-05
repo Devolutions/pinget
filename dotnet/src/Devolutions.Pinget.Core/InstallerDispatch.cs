@@ -223,19 +223,21 @@ internal static class InstallerDispatch
         var productId = !string.IsNullOrWhiteSpace(installer.MSStoreProductIdentifier)
             ? installer.MSStoreProductIdentifier!
             : manifest.Id;
-        var effectiveScope = request.Query.InstallScope ?? installer.Scope;
+        var effectiveScope = request.Query.InstallScope ?? request.Scope ?? installer.Scope;
         var isMachine = string.Equals(effectiveScope, "machine", StringComparison.OrdinalIgnoreCase);
         var isSilent = request.Mode == InstallerMode.Silent;
         var script = BuildMsStoreInstallScript(productId, isMachine, isSilent, request.Force);
+        string[] args = ["-NoProfile", "-NonInteractive", "-Command", script];
+
+        if (isMachine)
+            return RunShellExecute("powershell.exe", args, runAs: true);
 
         var psi = new ProcessStartInfo("powershell")
         {
             UseShellExecute = false,
         };
-        psi.ArgumentList.Add("-NoProfile");
-        psi.ArgumentList.Add("-NonInteractive");
-        psi.ArgumentList.Add("-Command");
-        psi.ArgumentList.Add(script);
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
 
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to run MSStore installer via PowerShell");
         proc.WaitForExit();
@@ -259,8 +261,16 @@ internal static class InstallerDispatch
             $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
                 $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
             })[0]
+            $asTaskProgressGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperationWithProgress`2'
+            })[0]
             function Await-WinRt($op, [Type]$resultType) {
                 $asTask = $asTaskGeneric.MakeGenericMethod($resultType)
+                $task = $asTask.Invoke($null, @($op))
+                $task.GetAwaiter().GetResult()
+            }
+            function Await-WinRtWithProgress($op, [Type]$resultType, [Type]$progressType) {
+                $asTask = $asTaskProgressGeneric.MakeGenericMethod($resultType, $progressType)
                 $task = $asTask.Invoke($null, @($op))
                 $task.GetAwaiter().GetResult()
             }
@@ -272,11 +282,11 @@ internal static class InstallerDispatch
             [void][Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode, Windows.ApplicationModel, ContentType=WindowsRuntime]
             if (Await-WinRt ($mgr.IsStoreBlockedByPolicyAsync('Microsoft.WindowsStore', 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US')) ([bool])) {
                 [Console]::Error.WriteLine('The Microsoft Store client is blocked by policy.')
-                exit -1978334975
+                exit -1978335205
             }
             if (-not (Await-WinRt ($mgr.GetIsAppAllowedToInstallAsync($productId)) ([bool]))) {
                 [Console]::Error.WriteLine('The Microsoft Store app is blocked by policy.')
-                exit -1978334974
+                exit -1978335204
             }
             try {
                 if ($isMachine) {
@@ -350,9 +360,9 @@ internal static class InstallerDispatch
                         $allCompleted = $false
                     }
                     $err = $status.ErrorCode
-                    if ($null -ne $err -and $err.Value -lt 0) {
+                    if ($null -ne $err -and $err.HResult -lt 0) {
                         try { $mgr.Cancel($productId) } catch {}
-                        exit $err.Value
+                        exit $err.HResult
                     }
                     if ($status.InstallState -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Canceled -or
                         $status.InstallState -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Error) {
@@ -364,24 +374,25 @@ internal static class InstallerDispatch
                 Start-Sleep -Milliseconds 100
             }
             if ($isMachine) {
-                try {
-                    $pkgMgr = [Windows.Management.Deployment.PackageManager, Windows.Management.Deployment, ContentType=WindowsRuntime]::new()
-                    $provisioned = $pkgMgr.FindProvisionedPackages()
-                    foreach ($item in $items) {
-                        $familyName = $item.PackageFamilyName
-                        if ([string]::IsNullOrWhiteSpace($familyName)) { continue }
-                        $already = $false
-                        foreach ($p in $provisioned) {
-                            if ($p.Id.FamilyName -eq $familyName) { $already = $true; break }
-                        }
-                        if (-not $already) {
-                            $provOp = $pkgMgr.ProvisionPackageForAllUsersAsync($familyName)
-                            while ($provOp.Status -eq [Windows.Foundation.AsyncStatus, Windows.Foundation, ContentType=WindowsRuntime]::Started) {
-                                Start-Sleep -Milliseconds 100
-                            }
+                $pkgMgr = [Windows.Management.Deployment.PackageManager, Windows.Management.Deployment, ContentType=WindowsRuntime]::new()
+                [void][Windows.Management.Deployment.DeploymentResult, Windows.Management.Deployment, ContentType=WindowsRuntime]
+                [void][Windows.Management.Deployment.DeploymentProgress, Windows.Management.Deployment, ContentType=WindowsRuntime]
+                $provisioned = $pkgMgr.FindProvisionedPackages()
+                foreach ($item in $items) {
+                    $familyName = $item.PackageFamilyName
+                    if ([string]::IsNullOrWhiteSpace($familyName)) { continue }
+                    $already = $false
+                    foreach ($p in $provisioned) {
+                        if ($p.Id.FamilyName -eq $familyName) { $already = $true; break }
+                    }
+                    if (-not $already) {
+                        $provResult = Await-WinRtWithProgress ($pkgMgr.ProvisionPackageForAllUsersAsync($familyName)) ([Windows.Management.Deployment.DeploymentResult]) ([Windows.Management.Deployment.DeploymentProgress])
+                        $provErr = $provResult.ExtendedErrorCode
+                        if ($null -ne $provErr -and $provErr.HResult -lt 0) {
+                            exit $provErr.HResult
                         }
                     }
-                } catch {}
+                }
             }
             exit 0
             """;

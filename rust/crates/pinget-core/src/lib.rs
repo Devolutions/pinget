@@ -2537,6 +2537,8 @@ impl Repository {
 
         if !request.force
             && !existing_match.installed_version.trim().is_empty()
+            && !is_unknown_version(&existing_match.installed_version)
+            && !is_unknown_version(&manifest.version)
             && compare_version(&existing_match.installed_version, &manifest.version) != Ordering::Less
         {
             return Some(InstallResult {
@@ -7759,15 +7761,26 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
                     .eq_ignore_ascii_case(channel)
         })
         .or_else(|| {
-            versions.iter().max_by(|left, right| {
-                let left_version = json_string(left, "PackageVersion").unwrap_or_default();
-                let left_channel = json_string(left, "Channel").unwrap_or_default();
-                let right_version = json_string(right, "PackageVersion").unwrap_or_default();
-                let right_channel = json_string(right, "Channel").unwrap_or_default();
-                compare_version_and_channel(&left_version, &left_channel, &right_version, &right_channel)
-            })
+            if !version.trim().is_empty() && !is_unknown_version(version) {
+                return None;
+            }
+            versions
+                .iter()
+                .filter(|item| {
+                    channel.is_empty()
+                        || json_string(item, "Channel")
+                            .unwrap_or_default()
+                            .eq_ignore_ascii_case(channel)
+                })
+                .max_by(|left, right| {
+                    let left_version = json_string(left, "PackageVersion").unwrap_or_default();
+                    let left_channel = json_string(left, "Channel").unwrap_or_default();
+                    let right_version = json_string(right, "PackageVersion").unwrap_or_default();
+                    let right_channel = json_string(right, "Channel").unwrap_or_default();
+                    compare_version_and_channel(&left_version, &left_channel, &right_version, &right_channel)
+                })
         })
-        .ok_or_else(|| anyhow!("REST manifest response did not contain a version payload"))?;
+        .ok_or_else(|| anyhow!("REST manifest response did not contain a version payload for version '{version}'"))?;
     let resolved_version = json_string(selected, "PackageVersion")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| version.to_owned());
@@ -8747,7 +8760,30 @@ fn major_minor(version: &str) -> (String, String) {
 }
 
 fn default_market() -> String {
-    std::env::var("WINGET_RS_MARKET").unwrap_or_else(|_| DEFAULT_MARKET.to_owned())
+    for var_name in ["PINGET_MARKET", "WINGET_RS_MARKET", "WINGET_DOTNET_MARKET"] {
+        if let Ok(value) = std::env::var(var_name) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+    }
+    os_geographic_region().unwrap_or_else(|| DEFAULT_MARKET.to_owned())
+}
+
+#[cfg(windows)]
+fn os_geographic_region() -> Option<String> {
+    let geo = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Control Panel\International\Geo")
+        .ok()?;
+    let name = read_reg_string(&geo, "Name")?;
+    let trimmed = name.trim();
+    (trimmed.len() == 2 && trimmed.chars().all(|ch| ch.is_ascii_alphabetic())).then(|| trimmed.to_ascii_uppercase())
+}
+
+#[cfg(not(windows))]
+fn os_geographic_region() -> Option<String> {
+    None
 }
 
 fn select_installer(installers: &[Installer], query: &PackageQuery) -> Option<Installer> {
@@ -9842,9 +9878,19 @@ fn run_msstore_installer(request: &InstallRequest, manifest: &Manifest, installe
         .is_some_and(|scope| scope.eq_ignore_ascii_case("machine"));
     let is_silent = request.mode == InstallerMode::Silent;
     let script = build_msstore_install_script(product_id, is_machine, is_silent, request.force);
+    let args = vec![
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-Command".to_owned(),
+        script,
+    ];
+
+    if is_machine {
+        return shell_execute_installer(Path::new("powershell.exe"), &args, true);
+    }
 
     let mut cmd = Command::new("powershell");
-    cmd.arg("-NoProfile").arg("-NonInteractive").arg("-Command").arg(script);
+    cmd.args(&args);
     let status = cmd.status().context("failed to run MSStore installer via PowerShell")?;
     Ok(status.code().unwrap_or(-1))
 }
@@ -9866,8 +9912,16 @@ fn build_msstore_install_script(product_id: &str, is_machine: bool, is_silent: b
          $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{\n\
              $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'\n\
          }})[0]\n\
+         $asTaskProgressGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{\n\
+             $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperationWithProgress`2'\n\
+         }})[0]\n\
          function Await-WinRt($op, [Type]$resultType) {{\n\
              $asTask = $asTaskGeneric.MakeGenericMethod($resultType)\n\
+             $task = $asTask.Invoke($null, @($op))\n\
+             $task.GetAwaiter().GetResult()\n\
+         }}\n\
+         function Await-WinRtWithProgress($op, [Type]$resultType, [Type]$progressType) {{\n\
+             $asTask = $asTaskProgressGeneric.MakeGenericMethod($resultType, $progressType)\n\
              $task = $asTask.Invoke($null, @($op))\n\
              $task.GetAwaiter().GetResult()\n\
          }}\n\
@@ -9879,11 +9933,11 @@ fn build_msstore_install_script(product_id: &str, is_machine: bool, is_silent: b
          [void][Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallationToastNotificationMode, Windows.ApplicationModel, ContentType=WindowsRuntime]\n\
          if (Await-WinRt ($mgr.IsStoreBlockedByPolicyAsync('Microsoft.WindowsStore', 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US')) ([bool])) {{\n\
              [Console]::Error.WriteLine('The Microsoft Store client is blocked by policy.')\n\
-             exit -1978334975\n\
+             exit -1978335205\n\
          }}\n\
          if (-not (Await-WinRt ($mgr.GetIsAppAllowedToInstallAsync($productId)) ([bool]))) {{\n\
              [Console]::Error.WriteLine('The Microsoft Store app is blocked by policy.')\n\
-             exit -1978334974\n\
+             exit -1978335204\n\
          }}\n\
          try {{\n\
              if ($isMachine) {{\n\
@@ -9957,9 +10011,9 @@ fn build_msstore_install_script(product_id: &str, is_machine: bool, is_silent: b
                      $allCompleted = $false\n\
                  }}\n\
                  $err = $status.ErrorCode\n\
-                 if ($null -ne $err -and $err.Value -lt 0) {{\n\
+                 if ($null -ne $err -and $err.HResult -lt 0) {{\n\
                      try {{ $mgr.Cancel($productId) }} catch {{}}\n\
-                     exit $err.Value\n\
+                     exit $err.HResult\n\
                  }}\n\
                  if ($status.InstallState -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Canceled -or\n\
                      $status.InstallState -eq [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallState]::Error) {{\n\
@@ -9971,24 +10025,25 @@ fn build_msstore_install_script(product_id: &str, is_machine: bool, is_silent: b
              Start-Sleep -Milliseconds 100\n\
          }}\n\
          if ($isMachine) {{\n\
-             try {{\n\
-                 $pkgMgr = [Windows.Management.Deployment.PackageManager, Windows.Management.Deployment, ContentType=WindowsRuntime]::new()\n\
-                 $provisioned = $pkgMgr.FindProvisionedPackages()\n\
-                 foreach ($item in $items) {{\n\
-                     $familyName = $item.PackageFamilyName\n\
-                     if ([string]::IsNullOrWhiteSpace($familyName)) {{ continue }}\n\
-                     $already = $false\n\
-                     foreach ($p in $provisioned) {{\n\
-                         if ($p.Id.FamilyName -eq $familyName) {{ $already = $true; break }}\n\
-                     }}\n\
-                     if (-not $already) {{\n\
-                         $provOp = $pkgMgr.ProvisionPackageForAllUsersAsync($familyName)\n\
-                         while ($provOp.Status -eq [Windows.Foundation.AsyncStatus, Windows.Foundation, ContentType=WindowsRuntime]::Started) {{\n\
-                             Start-Sleep -Milliseconds 100\n\
-                         }}\n\
+             $pkgMgr = [Windows.Management.Deployment.PackageManager, Windows.Management.Deployment, ContentType=WindowsRuntime]::new()\n\
+             [void][Windows.Management.Deployment.DeploymentResult, Windows.Management.Deployment, ContentType=WindowsRuntime]\n\
+             [void][Windows.Management.Deployment.DeploymentProgress, Windows.Management.Deployment, ContentType=WindowsRuntime]\n\
+             $provisioned = $pkgMgr.FindProvisionedPackages()\n\
+             foreach ($item in $items) {{\n\
+                 $familyName = $item.PackageFamilyName\n\
+                 if ([string]::IsNullOrWhiteSpace($familyName)) {{ continue }}\n\
+                 $already = $false\n\
+                 foreach ($p in $provisioned) {{\n\
+                     if ($p.Id.FamilyName -eq $familyName) {{ $already = $true; break }}\n\
+                 }}\n\
+                 if (-not $already) {{\n\
+                     $provResult = Await-WinRtWithProgress ($pkgMgr.ProvisionPackageForAllUsersAsync($familyName)) ([Windows.Management.Deployment.DeploymentResult]) ([Windows.Management.Deployment.DeploymentProgress])\n\
+                     $provErr = $provResult.ExtendedErrorCode\n\
+                     if ($null -ne $provErr -and $provErr.HResult -lt 0) {{\n\
+                         exit $provErr.HResult\n\
                      }}\n\
                  }}\n\
-             }} catch {{}}\n\
+             }}\n\
          }}\n\
          exit 0"
     )
@@ -18303,6 +18358,36 @@ Installers:
         assert_eq!(manifest.version, "1.113.0");
         assert_eq!(manifest.name, "Visual Studio Code");
         assert_eq!(document["PackageVersion"], "1.113.0");
+
+        let missing = parse_rest_manifest(payload, "XP9KHM4BK9FZ7Q", "1.2.3", "");
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn create_install_no_op_result_does_not_skip_when_version_is_unknown() {
+        let request = InstallRequest::new(PackageQuery::default());
+        let unknown_manifest = sample_manifest("9WZDNCRFJB3H", "Unknown", "Todo");
+        let installed_real = ListMatch {
+            name: "Todo".to_owned(),
+            id: "9WZDNCRFJB3H".to_owned(),
+            local_id: r"MSIX\21767Katans.Todo_1.3.1.64_x64__ey1k83fg9dn8w".to_owned(),
+            installed_version: "1.3.1.64".to_owned(),
+            available_version: Some("Unknown".to_owned()),
+            source_name: Some("msstore".to_owned()),
+            publisher: None,
+            scope: Some("User".to_owned()),
+            installer_category: Some("msix".to_owned()),
+            install_location: None,
+            package_family_names: vec!["21767Katans.Todo_ey1k83fg9dn8w".to_owned()],
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+        };
+        assert!(Repository::create_install_no_op_result(&request, &unknown_manifest, Some(&installed_real)).is_none());
+
+        let known_manifest = sample_manifest("Test.Package", "1.0.0", "Test");
+        let mut installed_unknown = installed_real;
+        installed_unknown.installed_version = "Unknown".to_owned();
+        assert!(Repository::create_install_no_op_result(&request, &known_manifest, Some(&installed_unknown)).is_none());
     }
 
     #[test]
@@ -18321,6 +18406,9 @@ Installers:
         assert!(script.contains("StartProductInstallAsync"));
         assert!(script.contains("GetFreeUserEntitlementAsync"));
         assert!(script.contains("GetFreeDeviceEntitlementAsync"));
+        assert!(script.contains("exit -1978335205"));
+        assert!(script.contains("exit -1978335204"));
+        assert!(script.contains("$err.HResult"));
     }
 
     #[test]

@@ -771,11 +771,17 @@ fn run() -> Result<()> {
                             dependency_source: args.dependency_source.clone(),
                             no_upgrade: false,
                         }) {
+                            Ok(r) if r.no_op => {
+                                print_warnings(&r.warnings);
+                                println!("  No changes were made for {}", m.id);
+                            }
                             Ok(r) if r.success => {
+                                print_warnings(&r.warnings);
                                 println!("  Successfully upgraded {}", m.id);
                                 success_count += 1;
                             }
                             Ok(r) => {
+                                print_warnings(&r.warnings);
                                 write_stderr_line(format_args!(
                                     "  Failed to upgrade {} (exit code: {})",
                                     m.id, r.exit_code

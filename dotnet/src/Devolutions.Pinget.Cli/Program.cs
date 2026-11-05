@@ -1541,6 +1541,8 @@ static (string Symbol, string Description)? LookupHresult(long code)
             0x0012 => ("APPINSTALLER_CLI_ERROR_NO_SOURCES_DEFINED", "No sources are configured."),
             0x0013 => ("APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND", "Multiple packages matched the query."),
             0x0016 => ("APPINSTALLER_CLI_ERROR_NO_APPLICABLE_UPGRADE", "No applicable upgrade found."),
+            0x001B => ("APPINSTALLER_CLI_ERROR_MSSTORE_BLOCKED_BY_POLICY", "This feature is blocked by Group Policy."),
+            0x001C => ("APPINSTALLER_CLI_ERROR_MSSTORE_APP_BLOCKED_BY_POLICY", "This Microsoft Store app is blocked by Group Policy."),
             _ => null,
         },
         _ => code switch

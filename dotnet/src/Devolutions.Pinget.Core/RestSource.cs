@@ -234,10 +234,36 @@ internal static class RestSource
         }
     }
 
-    internal static string DefaultMarket() =>
-        Environment.GetEnvironmentVariable("WINGET_DOTNET_MARKET")
-        ?? Environment.GetEnvironmentVariable("WINGET_RS_MARKET")
-        ?? "US";
+    internal static string DefaultMarket()
+    {
+        foreach (var varName in new[] { "PINGET_MARKET", "WINGET_RS_MARKET", "WINGET_DOTNET_MARKET" })
+        {
+            var value = Environment.GetEnvironmentVariable(varName)?.Trim();
+            if (!string.IsNullOrEmpty(value))
+                return value;
+        }
+
+        return OsGeographicRegion() ?? "US";
+    }
+
+    private static string? OsGeographicRegion()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                using var geo = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Control Panel\International\Geo");
+                var name = (geo?.GetValue("Name") as string)?.Trim();
+                if (name is { Length: 2 } && char.IsAsciiLetter(name[0]) && char.IsAsciiLetter(name[1]))
+                    return name.ToUpperInvariant();
+            }
+            catch
+            {
+            }
+        }
+
+        return null;
+    }
 
     internal static List<(string Key, string Value)> BuildManifestQueryParameters(string version, string channel, RestInformation info)
     {
@@ -357,8 +383,15 @@ internal static class RestSource
 
             if (versionData is null)
             {
+                if (!string.IsNullOrWhiteSpace(version) && !IsUnknownVersion(version))
+                    throw new InvalidOperationException($"REST manifest response did not contain a version payload for version '{version}'.");
+
                 foreach (var v in versionsArr.EnumerateArray())
                 {
+                    var ch = v.TryGetProperty("Channel", out var chVal) ? chVal.GetString() ?? "" : "";
+                    if (!string.IsNullOrEmpty(channel) && !string.Equals(ch, channel, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
                     if (versionData is null)
                     {
                         versionData = v;
@@ -370,6 +403,9 @@ internal static class RestSource
                     if (CompareVersionStrings(candidateVer, currentVer) > 0)
                         versionData = v;
                 }
+
+                if (versionData is null)
+                    throw new InvalidOperationException("REST manifest response did not contain a version payload.");
             }
 
             if (versionData is { } selectedVersion && selectedVersion.TryGetProperty("DefaultLocale", out var vdl))
