@@ -16,7 +16,7 @@ chrono = { version = "0.4.44", features = ["serde"] }
 flate2 = "1.1.9"
 fs2 = "0.4"
 quick-xml = "0.38"
-pinget-core = { version = "0.14.1", path = "../pinget-core" }
+pinget-core = { version = "0.14.2", path = "../pinget-core" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/Devolutions/pinget/releases/tag/pinget-publisher-v0.14.1) - 2026-11-06
+
+### Other
+
+- *(release)* prepare Pinget 0.14.1 ([#65](https://github.com/Devolutions/pinget/pull/65))
+- *(release)* prepare for publishing ([#63](https://github.com/Devolutions/pinget/pull/63))
+- Replace makeappx and signtool with in-process MSIX writing and psign-tool ([#60](https://github.com/Devolutions/pinget/pull/60))
+- Add native WinGet preindexed repository publishers in Rust and C# ([#59](https://github.com/Devolutions/pinget/pull/59))
+
 ## [0.14.0](https://github.com/Devolutions/pinget/releases/tag/pinget-publisher-v0.14.0) - 2026-11-05
 
 ### Other
