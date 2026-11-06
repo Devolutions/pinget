@@ -391,6 +391,12 @@ public class Repository : IDisposable
         }
     }
 
+    private void EnsureHashOverrideAllowed(bool ignoreSecurityHash)
+    {
+        if (ignoreSecurityHash)
+            EnsureAdminSettingEnabled("InstallerHashOverride", "--ignore-security-hash");
+    }
+
     public void SetAdminSetting(string name, bool enabled)
     {
         var normalized = SettingsStoreManager.NormalizeAdminSettingName(name);
@@ -726,8 +732,7 @@ public class Repository : IDisposable
     /// </summary>
     private FetchedInstaller FetchInstaller(InstallRequest request, string downloadDir)
     {
-        if (request.IgnoreSecurityHash)
-            EnsureAdminSettingEnabled("InstallerHashOverride", "--ignore-security-hash");
+        EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
         var (manifest, manifestDocuments) = ResolveManifestAndDocumentsForInstall(request);
         var installer = SelectInstaller(manifest.Installers, request.Query)
             ?? throw new InvalidOperationException("No applicable installer found for the current system");
@@ -982,6 +987,9 @@ public class Repository : IDisposable
 
     public InstallResult Install(InstallRequest request)
     {
+        // Refuse a disabled override before any side effect (agreement prompt, dependency
+        // installs) and on paths that never fetch an installer (no-op, msstore, dependencies-only).
+        EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
         request = ApplyInstallScope(request);
         var manifest = ResolveManifestForInstall(request);
         if (!OperatingSystem.IsWindows())
@@ -1110,6 +1118,7 @@ public class Repository : IDisposable
 
     public InstallResult Repair(RepairRequest request)
     {
+        EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
         if (string.IsNullOrWhiteSpace(request.ManifestPath) && !OperatingSystem.IsWindows())
         {
             var packageId = request.Query.Id ??
@@ -1188,10 +1197,7 @@ public class Repository : IDisposable
     private (Manifest Manifest, object Documents) ResolveManifestAndDocumentsForInstall(InstallRequest request)
     {
         if (!string.IsNullOrWhiteSpace(request.ManifestPath))
-        {
-            EnsureAdminSettingEnabled("LocalManifestFiles", "--manifest");
             return LoadManifestFromPathWithDocuments(request.ManifestPath!);
-        }
 
         var (located, _, _) = FindSingleMatch(request.Query);
         var (manifest, documents, _) = ManifestForMatch(located, request.Query);
@@ -1400,7 +1406,7 @@ public class Repository : IDisposable
         return null;
     }
 
-    private static (string PackageId, string Version) DescribeUninstallTarget(UninstallRequest request)
+    private (string PackageId, string Version) DescribeUninstallTarget(UninstallRequest request)
     {
         if (!string.IsNullOrWhiteSpace(request.ManifestPath))
         {
@@ -1463,11 +1469,16 @@ public class Repository : IDisposable
         return request.AllVersions ? matches : [matches[0]];
     }
 
-    private static Manifest LoadManifestFromPath(string manifestPath)
+    private Manifest LoadManifestFromPath(string manifestPath)
         => LoadManifestFromPathWithDocuments(manifestPath).Manifest;
 
-    private static (Manifest Manifest, object Documents) LoadManifestFromPathWithDocuments(string manifestPath)
+    /// <summary>
+    /// Loads a user-supplied <c>--manifest</c>. Every local-manifest load goes through here, so the
+    /// <c>LocalManifestFiles</c> admin setting gates install, repair, download, and uninstall alike.
+    /// </summary>
+    private (Manifest Manifest, object Documents) LoadManifestFromPathWithDocuments(string manifestPath)
     {
+        EnsureAdminSettingEnabled("LocalManifestFiles", "--manifest");
         var resolved = ResolveManifestPath(manifestPath);
         var bytes = File.ReadAllBytes(resolved);
         return (ParseYamlManifest(bytes), ParseYamlManifestDocuments(bytes));

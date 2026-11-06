@@ -18,13 +18,17 @@ internal sealed record PackageExportEntry(
     string PackageIdentifier,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Version);
 
-internal sealed record PackageExportSourceDetails(string Name, string Argument, string Type);
+internal sealed record PackageExportSourceDetails(string Name, string Argument, string Type, string Identifier = "");
 
 internal sealed record PackageExportSource(
     PackageExportSourceDetails SourceDetails,
     List<PackageExportEntry> Packages);
 
-internal sealed record PackagesExportPayload(string Schema, List<PackageExportSource> Sources);
+internal sealed record PackagesExportPayload(
+    [property: JsonPropertyName("$schema")] string Schema,
+    List<PackageExportSource> Sources,
+    string CreationDate = "",
+    string WinGetVersion = "");
 
 [JsonSerializable(typeof(SourceExportPayload))]
 [JsonSerializable(typeof(PackagesExportPayload))]

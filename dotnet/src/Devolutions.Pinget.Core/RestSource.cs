@@ -772,42 +772,94 @@ internal static class RestSource
         if (bLessThan is not null && CompareVersionStrings(a, bLessThan) == 0)
             return 1;
 
-        var partsA = a.Split('.', '-');
-        var partsB = b.Split('.', '-');
-        int maxLen = Math.Max(partsA.Length, partsB.Length);
+        var partsA = TokenizeVersion(a);
+        var partsB = TokenizeVersion(b);
+        int maxLen = Math.Max(partsA.Count, partsB.Count);
         for (int i = 0; i < maxLen; i++)
         {
-            var pa = i < partsA.Length ? partsA[i] : "0";
-            var pb = i < partsB.Length ? partsB[i] : "0";
-            int cmp = CompareVersionPart(pa, pb);
+            var pa = i < partsA.Count ? partsA[i] : "0";
+            var pb = i < partsB.Count ? partsB[i] : "0";
+            int cmp = CompareVersionToken(pa, pb);
             if (cmp != 0) return cmp;
         }
         return 0;
     }
 
-    // Like WinGet: each part is a leading integer plus an optional text suffix. Integers
-    // compare numerically; with equal integers, a part without a suffix ranks above one with
-    // a suffix, so "1.0.0" > "1.0.0-rc1" and "3" > "3a".
-    private static int CompareVersionPart(string a, string b)
+    // Same rules as the Rust compare_version: numbers compare numerically; a text token against a
+    // number (or a missing part, padded as "0") is a pre-release style suffix ranked below it, so
+    // "1.0.0" > "1.0.0-rc1" and "1.0.1" > "1.0b"; text tokens compare ASCII case-insensitively.
+    private static int CompareVersionToken(string a, string b)
     {
-        var (numberA, suffixA) = SplitVersionPart(a);
-        var (numberB, suffixB) = SplitVersionPart(b);
-        if (numberA != numberB) return numberA.CompareTo(numberB);
-        if (suffixA.Length == 0) return suffixB.Length == 0 ? 0 : 1;
-        if (suffixB.Length == 0) return -1;
-        return string.Compare(suffixA, suffixB, StringComparison.OrdinalIgnoreCase);
+        bool numberA = IsNumericToken(a);
+        bool numberB = IsNumericToken(b);
+        if (numberA && numberB) return CompareNumericTokens(a, b);
+        if (numberA) return 1;
+        if (numberB) return -1;
+        return string.CompareOrdinal(ToAsciiLower(a), ToAsciiLower(b));
     }
 
-    private static (ulong Number, string Suffix) SplitVersionPart(string part)
+    private static bool IsNumericToken(string token)
     {
-        int digits = 0;
-        while (digits < part.Length && char.IsAsciiDigit(part[digits]))
-            digits++;
-        if (digits == 0)
-            return (0, part);
-        // Saturate absurdly long digit runs instead of throwing.
-        var number = ulong.TryParse(part.AsSpan(0, digits), out var parsed) ? parsed : ulong.MaxValue;
-        return (number, part[digits..]);
+        foreach (var ch in token)
+        {
+            if (!char.IsAsciiDigit(ch))
+                return false;
+        }
+        return token.Length > 0;
+    }
+
+    // Digit runs of any length: ignore leading zeros, then the longer run is larger.
+    private static int CompareNumericTokens(string a, string b)
+    {
+        var trimmedA = a.TrimStart('0');
+        var trimmedB = b.TrimStart('0');
+        if (trimmedA.Length != trimmedB.Length)
+            return trimmedA.Length.CompareTo(trimmedB.Length);
+        return string.CompareOrdinal(trimmedA, trimmedB);
+    }
+
+    private static string ToAsciiLower(string value)
+        => string.Create(value.Length, value, static (span, source) =>
+        {
+            for (int i = 0; i < source.Length; i++)
+                span[i] = char.IsAsciiLetterUpper(source[i]) ? (char)(source[i] | 0x20) : source[i];
+        });
+
+    /// <summary>
+    /// Splits a version on '.', '-', '_' and '+', and between digit and non-digit runs, so
+    /// "1.0.0-rc10" becomes ["1", "0", "0", "rc", "10"]. Mirrors the Rust tokenize_version.
+    /// </summary>
+    internal static List<string> TokenizeVersion(string value)
+    {
+        var parts = new List<string>();
+        var current = new System.Text.StringBuilder();
+        bool? currentIsDigit = null;
+        foreach (var ch in value)
+        {
+            if (ch is '.' or '-' or '_' or '+')
+            {
+                if (current.Length > 0)
+                {
+                    parts.Add(current.ToString());
+                    current.Clear();
+                }
+                currentIsDigit = null;
+                continue;
+            }
+
+            bool isDigit = char.IsAsciiDigit(ch);
+            if (currentIsDigit is bool previous && previous != isDigit)
+            {
+                parts.Add(current.ToString());
+                current.Clear();
+            }
+            current.Append(ch);
+            currentIsDigit = isDigit;
+        }
+
+        if (current.Length > 0)
+            parts.Add(current.ToString());
+        return parts;
     }
 
     private static string? StripLessThanPrefix(string value)

@@ -232,12 +232,10 @@ upgradeCommand.SetHandler((ctx) =>
     if (silent && interactive)
         throw new InvalidOperationException("--silent and --interactive cannot be used together.");
 
+    var upgradeAll = ctx.ParseResult.GetValueForOption(uAllOpt);
     var doInstall = !string.IsNullOrWhiteSpace(manifestPath)
-        || ctx.ParseResult.GetValueForOption(uAllOpt)
-        || ctx.ParseResult.GetValueForArgument(uArg) is not null
-        || ctx.ParseResult.GetValueForOption(uqOpt) is not null
-        || ctx.ParseResult.GetValueForOption(uidOpt) is not null
-        || ctx.ParseResult.GetValueForOption(unOpt) is not null;
+        || upgradeAll
+        || hasExplicitUpgradeSelector;
 
     var query = new ListQuery
     {
@@ -313,7 +311,13 @@ upgradeCommand.SetHandler((ctx) =>
     }
     else
     {
-        var upgradeable = result.Matches.Where(m => m.AvailableVersion is not null).ToList();
+        var upgradeable = UpgradeTargetSelector.Select(
+            result.Matches,
+            upgradeAll,
+            query.Query,
+            query.Id,
+            query.Name,
+            query.Moniker);
         var pins = repo.ListPins();
         var upgradedCount = 0;
         var failureCount = 0;
@@ -573,7 +577,7 @@ exportCommand.SetHandler((output, source, includeVersions) =>
     // List everything (plain `list` already correlates installed packages to their source),
     // then filter by source here: `list --source` needs a text query, and any query filters.
     var listResult = repo.List(new ListQuery());
-    var export = ExportPayloadBuilder.Build(listResult.Matches, repo.ListSources(), source, includeVersions);
+    var export = ExportPayloadBuilder.Build(listResult.Matches, repo.ListSources(), source, includeVersions, Version);
     File.WriteAllText(output, StructuredOutputSerializer.SerializeJson(export, CliJsonContext.Default.PackagesExportPayload));
     Console.WriteLine($"Exported {export.Sources.Sum(s => s.Packages.Count)} packages to {output}");
 }, exOutputOpt, exSourceOpt, exVersionsOpt);
