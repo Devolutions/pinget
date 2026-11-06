@@ -122,3 +122,49 @@ fn invalid_and_duplicate_archive_paths_are_rejected() {
         );
     }
 }
+
+/// Writes a one-entry archive whose central-directory Unix mode is `mode`. The zip writer masks
+/// modes to `0o777`, so the external attributes are patched after the fact.
+fn create_archive_with_unix_mode(path: &Path, name: &str, body: &[u8], mode: u32) {
+    let mut bytes = Vec::new();
+    {
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        archive
+            .start_file(name, zip::write::SimpleFileOptions::default().unix_permissions(0o644))
+            .expect("create fixture entry");
+        archive.write_all(body).expect("write fixture entry");
+        archive.finish().expect("finish fixture archive");
+    }
+    let header = bytes
+        .windows(4)
+        .position(|window| window == [0x50, 0x4b, 0x01, 0x02])
+        .expect("central directory header");
+    bytes[header + 5] = 3; // version made by: Unix, so the reader honors the mode
+    bytes[header + 38..header + 42].copy_from_slice(&(mode << 16).to_le_bytes());
+    std::fs::write(path, bytes).expect("write fixture archive");
+}
+
+#[test]
+fn rejects_entries_the_extractor_would_create_as_symlinks() {
+    let fixture = Fixture::new();
+    for mode in [0o120777, 0o160777] {
+        let archive_path = fixture.0.join(format!("link-{mode:o}.zip"));
+        create_archive_with_unix_mode(&archive_path, "bin/helper", br"C:\Windows\System32\cmd.exe", mode);
+        assert!(
+            zip::ZipArchive::new(std::fs::File::open(&archive_path).expect("open fixture"))
+                .expect("read fixture")
+                .by_index(0)
+                .expect("entry")
+                .is_symlink(),
+            "fixture mode {mode:o} must be a symlink to the zip crate"
+        );
+        let Err(error) = read_portable_payload(&archive_path, true) else {
+            panic!("symlink entry with mode {mode:o} must be rejected");
+        };
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+    }
+
+    let regular = fixture.0.join("regular.zip");
+    create_archive_with_unix_mode(&regular, "bin/tool.exe", b"package", 0o100644);
+    read_portable_payload(&regular, true).expect("regular file is accepted");
+}

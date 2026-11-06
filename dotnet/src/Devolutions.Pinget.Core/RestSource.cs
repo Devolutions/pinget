@@ -779,17 +779,35 @@ internal static class RestSource
         {
             var pa = i < partsA.Length ? partsA[i] : "0";
             var pb = i < partsB.Length ? partsB[i] : "0";
-            if (long.TryParse(pa, out var na) && long.TryParse(pb, out var nb))
-            {
-                if (na != nb) return na.CompareTo(nb);
-            }
-            else
-            {
-                int cmp = string.Compare(pa, pb, StringComparison.OrdinalIgnoreCase);
-                if (cmp != 0) return cmp;
-            }
+            int cmp = CompareVersionPart(pa, pb);
+            if (cmp != 0) return cmp;
         }
         return 0;
+    }
+
+    // Like WinGet: each part is a leading integer plus an optional text suffix. Integers
+    // compare numerically; with equal integers, a part without a suffix ranks above one with
+    // a suffix, so "1.0.0" > "1.0.0-rc1" and "3" > "3a".
+    private static int CompareVersionPart(string a, string b)
+    {
+        var (numberA, suffixA) = SplitVersionPart(a);
+        var (numberB, suffixB) = SplitVersionPart(b);
+        if (numberA != numberB) return numberA.CompareTo(numberB);
+        if (suffixA.Length == 0) return suffixB.Length == 0 ? 0 : 1;
+        if (suffixB.Length == 0) return -1;
+        return string.Compare(suffixA, suffixB, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static (ulong Number, string Suffix) SplitVersionPart(string part)
+    {
+        int digits = 0;
+        while (digits < part.Length && char.IsAsciiDigit(part[digits]))
+            digits++;
+        if (digits == 0)
+            return (0, part);
+        // Saturate absurdly long digit runs instead of throwing.
+        var number = ulong.TryParse(part.AsSpan(0, digits), out var parsed) ? parsed : ulong.MaxValue;
+        return (number, part[digits..]);
     }
 
     private static string? StripLessThanPrefix(string value)

@@ -207,12 +207,23 @@ internal static class InstallerDispatch
         return unchecked((int)MsiInstallProduct(path, string.IsNullOrEmpty(parsed.Properties) ? null : parsed.Properties));
     }
 
+    internal const string MsixInstallPathVariable = "PINGET_MSIX_INSTALLER_PATH";
+    internal const string MsixInstallScript = "Add-AppxPackage -Path $env:PINGET_MSIX_INSTALLER_PATH";
+
     private static int RunMsix(string path)
     {
-        var psi = new ProcessStartInfo("powershell", $"-NoProfile -Command \"Add-AppxPackage -Path '{path}'\"")
+        // Pass the path through the environment rather than interpolating it into the script:
+        // the file name comes from the manifest URL, and PowerShell treats both ASCII and
+        // typographic quotes as string delimiters.
+        var psi = new ProcessStartInfo("powershell")
         {
             UseShellExecute = false
         };
+        psi.ArgumentList.Add("-NoProfile");
+        psi.ArgumentList.Add("-NonInteractive");
+        psi.ArgumentList.Add("-Command");
+        psi.ArgumentList.Add(MsixInstallScript);
+        psi.Environment[MsixInstallPathVariable] = path;
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to run Add-AppxPackage");
         proc.WaitForExit();
         return proc.ExitCode;
@@ -1194,16 +1205,21 @@ internal static class InstallerDispatch
 
     internal static List<string> BuildArguments(string installerType, InstallRequest request, Manifest manifest, Installer installer, string? installerPath = null, bool includeMsiInstallTarget = true)
     {
-        if (!string.IsNullOrWhiteSpace(request.Override))
-            return SplitArguments(request.Override!);
-
         var normalizedType = installerType.ToLowerInvariant();
         var args = new List<string>();
 
+        // --override replaces the installer switches, never the msiexec target: without
+        // `/i <package>`, msiexec has nothing to install (WinGet always keeps it).
         if (includeMsiInstallTarget && normalizedType is ("msi" or "wix"))
         {
             args.Add("/i");
             args.Add(installerPath ?? throw new InvalidOperationException("Installer path is required for MSI arguments."));
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.Override))
+        {
+            args.AddRange(SplitArguments(request.Override!));
+            return args;
         }
 
         var experienceSwitch = request.Mode switch

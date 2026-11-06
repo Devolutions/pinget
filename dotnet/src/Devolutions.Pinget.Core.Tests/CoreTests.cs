@@ -32,6 +32,12 @@ public class VersionCompareTests
     [InlineData("1.3.18-stable", "1.3.17-stable", 1)]
     [InlineData("25.4.1", "< 25.4.1", 1)]
     [InlineData("< 25.4.1", "25.4.1", -1)]
+    [InlineData("1.0.0", "1.0.0-rc1", 1)]
+    [InlineData("2.0.0-beta.1", "2.0.0", -1)]
+    [InlineData("1.0.0-preview2", "1.0.0-preview1", 1)]
+    [InlineData("1.2.3a", "1.2.10", -1)]
+    [InlineData("1.2.3a", "1.2.3", -1)]
+    [InlineData("1.2.10a", "1.2.3", 1)]
     public void CompareVersionStrings_ReturnsCorrectOrdering(string a, string b, int expected)
     {
         var result = RestSource.CompareVersionStrings(a, b);
@@ -1705,6 +1711,8 @@ public class RepositoryParityTests
                 """);
 
             using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            repo.SetAdminSetting("LocalManifestFiles", true);
+            repo.SetAdminSetting("InstallerHashOverride", true);
             var request = new InstallRequest
             {
                 Query = new PackageQuery(),
@@ -1741,6 +1749,8 @@ public class RepositoryParityTests
                 """);
 
             using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            repo.SetAdminSetting("LocalManifestFiles", true);
+            repo.SetAdminSetting("InstallerHashOverride", true);
             var request = new InstallRequest
             {
                 Query = new PackageQuery(),
@@ -1783,6 +1793,8 @@ public class RepositoryParityTests
                 """);
 
             using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            repo.SetAdminSetting("LocalManifestFiles", true);
+            repo.SetAdminSetting("InstallerHashOverride", true);
             repo.SetRequestHeader("Authorization", "Bearer test-token");
 
             var request = new InstallRequest
@@ -1825,6 +1837,8 @@ public class RepositoryParityTests
                 """);
 
             using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            repo.SetAdminSetting("LocalManifestFiles", true);
+            repo.SetAdminSetting("InstallerHashOverride", true);
             var request = new InstallRequest
             {
                 Query = new PackageQuery(),
@@ -2066,6 +2080,19 @@ public class RepositoryParityTests
             @"C:\temp\ShareX.msi");
 
         Assert.Equal(["/i", @"C:\temp\ShareX.msi", "/quiet", "/norestart", "/log", @"C:\temp\winget.log", "ADDLOCAL=Core", "REBOOT=ReallySuppress", @"TARGETDIR=C:\Apps\ShareX"], args);
+    }
+
+    [Fact]
+    public void BuildArguments_OverrideKeepsMsiexecTarget()
+    {
+        var request = new InstallRequest { Query = new PackageQuery(), Override = "/passive ALLUSERS=1" };
+        var manifest = new Manifest { Id = "Test.Package", Name = "Test", Version = "1.0" };
+        var installer = new Installer { InstallerType = "msi" };
+
+        Assert.Equal(["/i", @"C:\temp\app.msi", "/passive", "ALLUSERS=1"],
+            InstallerDispatch.BuildArguments("msi", request, manifest, installer, @"C:\temp\app.msi"));
+        Assert.Equal(["/passive", "ALLUSERS=1"],
+            InstallerDispatch.BuildArguments("msi", request, manifest, installer, @"C:\temp\app.msi", includeMsiInstallTarget: false));
     }
 
     [Fact]
@@ -2736,6 +2763,112 @@ Installers:
 
         var rowid = Repository.LookupUniqueNormalizedIdentityForTesting(connection, "foo", "bar");
         Assert.Null(rowid);
+    }
+
+    [Fact]
+    public void ManifestAndHashOverride_RequireAdminSettings()
+    {
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            var manifestPath = TestPaths.WriteManifest(appRoot, """
+                PackageIdentifier: Test.Package
+                PackageVersion: 1.0.0
+                PackageName: Test Package
+                ManifestType: merged
+                ManifestVersion: 1.10.0
+                Installers:
+                  - InstallerType: exe
+                    InstallerUrl: https://example.invalid/installer.exe
+                    InstallerSha256: 00
+                """);
+            using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+            var request = new InstallRequest { Query = new PackageQuery(), ManifestPath = manifestPath };
+
+            var ex = Assert.Throws<InvalidOperationException>(() => repo.DownloadInstaller(request, Path.Combine(appRoot, "downloads")));
+            Assert.Contains("LocalManifestFiles", ex.Message);
+
+            repo.SetAdminSetting("LocalManifestFiles", true);
+            ex = Assert.Throws<InvalidOperationException>(() => repo.DownloadInstaller(
+                request with { IgnoreSecurityHash = true }, Path.Combine(appRoot, "downloads")));
+            Assert.Contains("InstallerHashOverride", ex.Message);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void EnsureDependencyInstalled_ThrowsOnFailedInstaller()
+    {
+        static InstallResult Result(bool success, bool noOp, int exitCode) => new()
+        {
+            PackageId = "Microsoft.VCRedist.2015+.x64",
+            Version = "14.0",
+            InstallerPath = "",
+            InstallerType = "exe",
+            ExitCode = exitCode,
+            Success = success,
+            NoOp = noOp,
+        };
+
+        Repository.EnsureDependencyInstalled("Dep", Result(true, false, 0));
+        Repository.EnsureDependencyInstalled("Dep", Result(true, true, 0));
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => Repository.EnsureDependencyInstalled("Dep", Result(false, false, 1603)));
+        Assert.Contains("1603", ex.Message);
+    }
+
+    [Fact]
+    public void QueryV1Versions_OrdersByVersionSemanticsNotText()
+    {
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE versions (rowid INTEGER PRIMARY KEY, version TEXT NOT NULL);
+                CREATE TABLE channels (rowid INTEGER PRIMARY KEY, channel TEXT NOT NULL);
+                CREATE TABLE pathparts (rowid INTEGER PRIMARY KEY, parent INT64, pathpart TEXT NOT NULL);
+                CREATE TABLE manifest (rowid INTEGER PRIMARY KEY, id INT64 NOT NULL, version INT64 NOT NULL,
+                    channel INT64, pathpart INT64, hash BLOB);
+                INSERT INTO versions VALUES (1, '9.0.0'), (2, '10.0.0'), (3, '10.0.0-rc1');
+                INSERT INTO pathparts VALUES (1, NULL, 'manifests'), (2, 1, 'c'), (3, 2, 'Contoso.App.yaml');
+                INSERT INTO manifest (rowid, id, version) VALUES (1, 7, 1), (3, 7, 3);
+                INSERT INTO manifest (rowid, id, version, pathpart, hash) VALUES (2, 7, 2, 3, X'00ABFF');";
+            cmd.ExecuteNonQuery();
+        }
+
+        var versions = PreIndexedSource.QueryV1Versions(connection, 7);
+
+        Assert.Equal(["10.0.0", "10.0.0-rc1", "9.0.0"], versions.Select(v => v.Version).ToArray());
+        var latest = versions[0];
+        Assert.Equal(3, latest.PathPart);
+        Assert.Equal("00abff", latest.ManifestHash);
+        Assert.Equal("manifests/c/Contoso.App.yaml", PreIndexedSource.ResolveV1RelativePath(connection, latest.PathPart));
+        Assert.Null(versions[2].ManifestHash);
+    }
+
+    [Fact]
+    public void QueryV1Versions_SupportsIndexWithoutHashColumn()
+    {
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+                CREATE TABLE versions (rowid INTEGER PRIMARY KEY, version TEXT NOT NULL);
+                CREATE TABLE channels (rowid INTEGER PRIMARY KEY, channel TEXT NOT NULL);
+                CREATE TABLE manifest (rowid INTEGER PRIMARY KEY, id INT64 NOT NULL, version INT64 NOT NULL,
+                    channel INT64, pathpart INT64);
+                INSERT INTO versions VALUES (1, '1.0.0');
+                INSERT INTO manifest (rowid, id, version) VALUES (1, 7, 1);";
+            cmd.ExecuteNonQuery();
+        }
+
+        var row = Assert.Single(PreIndexedSource.QueryV1Versions(connection, 7));
+        Assert.Null(row.ManifestHash);
     }
 
     [Fact]

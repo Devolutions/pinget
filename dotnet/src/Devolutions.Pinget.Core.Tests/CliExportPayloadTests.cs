@@ -115,4 +115,47 @@ public class CliExportPayloadTests
         Assert.DoesNotContain("AnonymousType", json);
         Assert.DoesNotContain("k__BackingField", json);
     }
+
+    private static ListMatch Installed(string id, string? source) => new()
+    {
+        Name = id.Split('.')[^1],
+        Id = id,
+        LocalId = id,
+        InstalledVersion = "1.0",
+        SourceName = source,
+    };
+
+    private static readonly SourceRecord[] Sources =
+    [
+        new() { Name = "winget", Kind = SourceKind.PreIndexed, Arg = "https://cdn.winget.microsoft.com/cache", Identifier = "Microsoft.Winget.Source_8wekyb3d8bbwe" },
+        new() { Name = "contoso", Kind = SourceKind.Rest, Arg = "https://contoso.test/api", Identifier = "contoso" },
+    ];
+
+    [Fact]
+    public void ExportPayloadBuilder_SourceFilterKeepsPackagesWithoutSpaces()
+    {
+        var payload = ExportPayloadBuilder.Build(
+            [Installed("Git.Git", "winget"), Installed("Contoso.Tool", "contoso")], Sources, "winget", includeVersions: false);
+
+        var source = Assert.Single(payload.Sources);
+        Assert.Equal("winget", source.SourceDetails.Name);
+        Assert.Equal("Git.Git", Assert.Single(source.Packages).PackageIdentifier);
+    }
+
+    [Fact]
+    public void ExportPayloadBuilder_GroupsBySourceAndSkipsUnsourcedPackages()
+    {
+        var payload = ExportPayloadBuilder.Build(
+            [Installed("Git.Git", "winget"), Installed("Contoso.Tool", "contoso"), Installed("Local.Only", null)],
+            Sources,
+            sourceFilter: null,
+            includeVersions: true);
+
+        Assert.Equal(["winget", "contoso"], payload.Sources.Select(s => s.SourceDetails.Name).ToArray());
+        var contoso = payload.Sources[1];
+        Assert.Equal("Microsoft.Rest", contoso.SourceDetails.Type);
+        Assert.Equal("https://contoso.test/api", contoso.SourceDetails.Argument);
+        Assert.Equal("1.0", Assert.Single(contoso.Packages).Version);
+        Assert.DoesNotContain(payload.Sources.SelectMany(s => s.Packages), p => p.PackageIdentifier == "Local.Only");
+    }
 }
