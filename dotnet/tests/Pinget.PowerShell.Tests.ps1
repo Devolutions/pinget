@@ -202,6 +202,10 @@ Describe 'Pinget format data and result objects' {
             return
         }
 
+        # -AllowHashMismatch is gated by the InstallerHashOverride admin setting (as in WinGet);
+        # the test app root is isolated, so enabling it here does not touch the machine.
+        Enable-PingetSetting -Name InstallerHashOverride
+
         $warnings = @()
         $result = Export-PingetPackage `
             -Id 'WinMerge.WinMerge' `

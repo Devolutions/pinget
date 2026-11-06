@@ -9784,6 +9784,7 @@ fn resolve_portable_scope(
 /// `ZipArchive::extract` uses to decide whether to create a symlink. A stricter file-type test
 /// (`mode & S_IFMT == S_IFLNK`) lets modes like `0o160777` through and still get extracted as
 /// links pointing outside the install directory.
+#[cfg(any(windows, test))]
 fn zip_entry_is_symlink<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> bool {
     entry.is_symlink()
 }
