@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2](https://github.com/Devolutions/pinget/compare/pinget-core-v0.14.1...pinget-core-v0.14.2) - 2026-11-06
+
+### Other
+
+- Fix PR #66 review follow-ups: export --source, admin gates, upgrade selection, version compare ([#67](https://github.com/Devolutions/pinget/pull/67))
+- Fix 18 correctness and security defects in Rust and C# ([#66](https://github.com/Devolutions/pinget/pull/66))
+
 ## [0.14.1](https://github.com/Devolutions/pinget/compare/pinget-core-v0.14.0...pinget-core-v0.14.1) - 2026-11-05
 
 ### Other
