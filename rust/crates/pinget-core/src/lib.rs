@@ -1337,6 +1337,13 @@ impl Repository {
         Ok(())
     }
 
+    fn ensure_hash_override_allowed(&self, ignore_security_hash: bool) -> Result<()> {
+        if ignore_security_hash {
+            self.ensure_admin_setting_enabled("InstallerHashOverride", "--ignore-security-hash")?;
+        }
+        Ok(())
+    }
+
     pub fn set_admin_setting(&self, name: &str, enabled: bool) -> Result<()> {
         let normalized = normalize_admin_setting_name(name)?;
         let mut settings = match self.get_admin_settings()? {
@@ -2304,9 +2311,7 @@ impl Repository {
         request: &InstallRequest,
         download_dir: &Path,
     ) -> Result<FetchedInstaller> {
-        if request.ignore_security_hash {
-            self.ensure_admin_setting_enabled("InstallerHashOverride", "--ignore-security-hash")?;
-        }
+        self.ensure_hash_override_allowed(request.ignore_security_hash)?;
         let (manifest, manifest_documents) = self.resolve_manifest_and_documents_for_install(request)?;
         let installer = select_installer(&manifest.installers, &request.query)
             .ok_or_else(|| anyhow!("No applicable installer found for the current system"))?;
@@ -2373,6 +2378,9 @@ impl Repository {
     }
 
     pub fn install_request(&mut self, request: &InstallRequest) -> Result<InstallResult> {
+        // Refuse a disabled override before any side effect (agreement prompt, dependency
+        // installs) and on paths that never fetch an installer (no-op, msstore, dependencies-only).
+        self.ensure_hash_override_allowed(request.ignore_security_hash)?;
         let normalized_request = apply_install_scope(request, None)?;
         let request = &normalized_request;
         self.emit_install_progress(InstallProgress::ResolvingManifest);
@@ -2578,6 +2586,7 @@ impl Repository {
     }
 
     pub fn repair(&mut self, request: &RepairRequest) -> Result<InstallResult> {
+        self.ensure_hash_override_allowed(request.ignore_security_hash)?;
         if request.manifest_path.is_none() && !package_actions_supported() {
             let package_id = request
                 .query
@@ -2631,7 +2640,7 @@ impl Repository {
     pub fn uninstall_request(&mut self, request: &UninstallRequest) -> Result<InstallResult> {
         if !package_actions_supported() {
             let (package_id, version) = if let Some(path) = &request.manifest_path {
-                let manifest = Self::load_manifest_from_path(path)?;
+                let manifest = self.load_manifest_from_path(path)?;
                 (manifest.id, request.query.version.clone().unwrap_or(manifest.version))
             } else {
                 (
@@ -2693,8 +2702,7 @@ impl Repository {
         request: &InstallRequest,
     ) -> Result<(Manifest, JsonValue)> {
         if let Some(path) = &request.manifest_path {
-            self.ensure_admin_setting_enabled("LocalManifestFiles", "--manifest")?;
-            return Self::load_manifest_from_path_with_documents(path);
+            return self.load_manifest_from_path_with_documents(path);
         }
 
         let (located, _warnings) = self.find_single_match(&request.query)?;
@@ -2849,7 +2857,7 @@ impl Repository {
         let mut effective_product_code = request.product_code.clone();
 
         if let Some(path) = &request.manifest_path {
-            let manifest = Self::load_manifest_from_path(path)?;
+            let manifest = self.load_manifest_from_path(path)?;
             effective_query = PackageQuery {
                 query: Some(manifest.id.clone()),
                 id: Some(manifest.id.clone()),
@@ -2899,11 +2907,15 @@ impl Repository {
         })
     }
 
-    fn load_manifest_from_path(manifest_path: &Path) -> Result<Manifest> {
-        Self::load_manifest_from_path_with_documents(manifest_path).map(|(manifest, _)| manifest)
+    fn load_manifest_from_path(&self, manifest_path: &Path) -> Result<Manifest> {
+        self.load_manifest_from_path_with_documents(manifest_path)
+            .map(|(manifest, _)| manifest)
     }
 
-    fn load_manifest_from_path_with_documents(manifest_path: &Path) -> Result<(Manifest, JsonValue)> {
+    /// Loads a user-supplied `--manifest`. Every local-manifest load goes through here, so the
+    /// `LocalManifestFiles` admin setting gates install, repair, download, and uninstall alike.
+    fn load_manifest_from_path_with_documents(&self, manifest_path: &Path) -> Result<(Manifest, JsonValue)> {
+        self.ensure_admin_setting_enabled("LocalManifestFiles", "--manifest")?;
         let resolved = resolve_manifest_path(manifest_path)?;
         let bytes =
             fs::read(&resolved).with_context(|| format!("failed to read manifest from {}", resolved.display()))?;
@@ -9300,11 +9312,11 @@ fn compare_version(left: &str, right: &str) -> Ordering {
         let right_part = right_parts.get(index).map(String::as_str).unwrap_or("0");
         // A text token against a number (or a missing part) is a pre-release style suffix,
         // which WinGet ranks below the plain release: "1.0.0" > "1.0.0-rc1", "1.0.1" > "1.0b".
-        let ordering = match (left_part.parse::<u64>().ok(), right_part.parse::<u64>().ok()) {
-            (Some(left_number), Some(right_number)) => left_number.cmp(&right_number),
-            (Some(_), None) => Ordering::Greater,
-            (None, Some(_)) => Ordering::Less,
-            (None, None) => left_part.to_ascii_lowercase().cmp(&right_part.to_ascii_lowercase()),
+        let ordering = match (is_numeric_token(left_part), is_numeric_token(right_part)) {
+            (true, true) => compare_numeric_tokens(left_part, right_part),
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => left_part.to_ascii_lowercase().cmp(&right_part.to_ascii_lowercase()),
         };
 
         if ordering != Ordering::Equal {
@@ -9313,6 +9325,18 @@ fn compare_version(left: &str, right: &str) -> Ordering {
     }
 
     Ordering::Equal
+}
+
+fn is_numeric_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Compares digit runs of any length (no u64 overflow): ignore leading zeros, then the longer
+/// run is larger.
+fn compare_numeric_tokens(left: &str, right: &str) -> Ordering {
+    let left = left.trim_start_matches('0');
+    let right = right.trim_start_matches('0');
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
 }
 
 fn tokenize_version(value: &str) -> Vec<String> {
@@ -15320,6 +15344,97 @@ Installers:
         assert!(error.to_string().contains("InstallerHashOverride"), "{error}");
     }
 
+    static GATED_AGREEMENT_PROMPTED: AtomicBool = AtomicBool::new(false);
+
+    fn record_gated_agreement_prompt(_manifest: &Manifest) -> Result<bool> {
+        GATED_AGREEMENT_PROMPTED.store(true, AtomicOrdering::SeqCst);
+        Ok(true)
+    }
+
+    #[test]
+    fn hash_override_is_refused_before_install_side_effects() {
+        let root = temp_app_root("hash_override_install_gate");
+        fs::create_dir_all(&root).expect("create app root");
+        // An msstore installer never reaches the installer fetch, and the agreement would be
+        // prompted for first: the gate must fire before either.
+        let manifest = root.join("msstore.yaml");
+        fs::write(
+            &manifest,
+            "PackageIdentifier: Test.Store
+PackageVersion: 1.0.0
+PackageName: Test Store
+ManifestType: singleton
+ManifestVersion: 1.10.0
+Agreements:
+  - AgreementLabel: EULA
+    Agreement: Terms
+Installers:
+  - InstallerType: msstore
+    PackageIdentifier: 9NBLGGH4NNS1
+",
+        )
+        .expect("write manifest");
+        let options =
+            RepositoryOptions::new(root.clone()).with_package_agreements_prompt(record_gated_agreement_prompt);
+        let mut repository = Repository::open_with_options(options).expect("open repository");
+        repository
+            .set_admin_setting("LocalManifestFiles", true)
+            .expect("enable manifests");
+
+        let mut request = InstallRequest::new(PackageQuery::default());
+        request.manifest_path = Some(manifest.clone());
+        request.ignore_security_hash = true;
+        for dependencies_only in [false, true] {
+            request.dependencies_only = dependencies_only;
+            let error = repository
+                .install_request(&request)
+                .expect_err("--ignore-security-hash must be refused without InstallerHashOverride");
+            assert!(error.to_string().contains("InstallerHashOverride"), "{error}");
+        }
+        assert!(!GATED_AGREEMENT_PROMPTED.load(AtomicOrdering::SeqCst));
+
+        let mut repair = RepairRequest::new(PackageQuery {
+            id: Some("Test.Store".to_owned()),
+            ..PackageQuery::default()
+        });
+        repair.ignore_security_hash = true;
+        let error = repository
+            .repair(&repair)
+            .expect_err("repair --ignore-security-hash must be refused without InstallerHashOverride");
+        assert!(error.to_string().contains("InstallerHashOverride"), "{error}");
+
+        repair.manifest_path = Some(manifest);
+        let error = repository
+            .repair(&repair)
+            .expect_err("repair --manifest --ignore-security-hash must be refused");
+        assert!(error.to_string().contains("InstallerHashOverride"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_manifest_requires_local_manifest_files() {
+        let root = temp_app_root("uninstall_manifest_gate");
+        fs::create_dir_all(&root).expect("create app root");
+        let manifest = write_installer_download_manifest(&root, "https://example.invalid/installer.exe", "00");
+        let mut repository =
+            Repository::open_with_options(RepositoryOptions::new(root.clone())).expect("open repository");
+
+        let mut request = UninstallRequest::new(PackageQuery::default());
+        request.manifest_path = Some(manifest.clone());
+        let error = repository
+            .uninstall_request(&request)
+            .expect_err("uninstall --manifest must be refused without LocalManifestFiles");
+        assert!(error.to_string().contains("LocalManifestFiles"), "{error}");
+
+        let mut repair = RepairRequest::new(PackageQuery::default());
+        repair.manifest_path = Some(manifest);
+        let error = repository
+            .repair(&repair)
+            .expect_err("repair --manifest must be refused without LocalManifestFiles");
+        assert!(error.to_string().contains("LocalManifestFiles"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn download_installer_follows_redirect_and_verifies_final_bytes() {
         let server = TestHttpServer::start();
@@ -15727,6 +15842,17 @@ Installers:
         assert_eq!(compare_version("1.0b", "1.0.1"), Ordering::Less);
         assert_eq!(compare_version("25.4.1", "< 25.4.1"), Ordering::Greater);
         assert_eq!(compare_version("< 25.4.1", "25.4.1"), Ordering::Less);
+        assert_eq!(compare_version("1.0.0-rc10", "1.0.0-rc2"), Ordering::Greater);
+        assert_eq!(compare_version("1.0.0-rc2", "1.0.0-rc10"), Ordering::Less);
+        assert_eq!(compare_version("1.0.0-preview10", "1.0.0-preview2"), Ordering::Greater);
+        assert_eq!(compare_version("1.0.0-RC2", "1.0.0-rc2"), Ordering::Equal);
+        assert_eq!(compare_version("1.0.0-alpha", "1.0.0.0alpha"), Ordering::Less);
+        assert_eq!(compare_version("1.0.0_1", "1.0.0+1"), Ordering::Equal);
+        assert_eq!(compare_version("1.0.007", "1.0.7"), Ordering::Equal);
+        assert_eq!(
+            compare_version("1.99999999999999999999", "1.18446744073709551615"),
+            Ordering::Greater
+        );
     }
 
     #[test]

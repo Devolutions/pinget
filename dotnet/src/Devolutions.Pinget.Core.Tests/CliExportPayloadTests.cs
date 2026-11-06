@@ -80,12 +80,15 @@ public class CliExportPayloadTests
         using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(payload, CliJsonContext.Default.PackagesExportPayload));
         var root = document.RootElement;
 
-        Assert.Equal("https://aka.ms/winget-packages.schema.2.0.json", root.GetProperty("Schema").GetString());
+        Assert.Equal("https://aka.ms/winget-packages.schema.2.0.json", root.GetProperty("$schema").GetString());
+        Assert.False(root.TryGetProperty("Schema", out _));
+        Assert.True(root.TryGetProperty("CreationDate", out _));
         var source = root.GetProperty("Sources")[0];
         var details = source.GetProperty("SourceDetails");
         Assert.Equal("winget", details.GetProperty("Name").GetString());
         Assert.Equal("https://cdn.winget.microsoft.com/cache", details.GetProperty("Argument").GetString());
         Assert.Equal("Microsoft.PreIndexed", details.GetProperty("Type").GetString());
+        Assert.True(details.TryGetProperty("Identifier", out _));
         Assert.False(details.TryGetProperty("Arg", out _));
         Assert.True(source.GetProperty("Packages").ValueKind == JsonValueKind.Array);
     }
@@ -157,5 +160,26 @@ public class CliExportPayloadTests
         Assert.Equal("https://contoso.test/api", contoso.SourceDetails.Argument);
         Assert.Equal("1.0", Assert.Single(contoso.Packages).Version);
         Assert.DoesNotContain(payload.Sources.SelectMany(s => s.Packages), p => p.PackageIdentifier == "Local.Only");
+    }
+
+    [Fact]
+    public void ExportPayloadBuilder_EmitsWingetHeaderAndSourceIdentifier()
+    {
+        var payload = ExportPayloadBuilder.Build(
+            [Installed("Git.Git", "winget"), Installed("Contoso.Tool", "contoso")],
+            Sources,
+            sourceFilter: null,
+            includeVersions: false,
+            wingetVersion: "9.9.9",
+            creationDate: new DateTimeOffset(2026, 11, 6, 12, 34, 56, 789, TimeSpan.Zero));
+
+        using var document = JsonDocument.Parse(StructuredOutputSerializer.SerializeJson(payload, CliJsonContext.Default.PackagesExportPayload));
+        var root = document.RootElement;
+        Assert.Equal(ExportPayloadBuilder.Schema, root.GetProperty("$schema").GetString());
+        Assert.Equal("2026-11-06T12:34:56.789", root.GetProperty("CreationDate").GetString());
+        Assert.Equal("9.9.9", root.GetProperty("WinGetVersion").GetString());
+        var sources = root.GetProperty("Sources");
+        Assert.Equal("Microsoft.Winget.Source_8wekyb3d8bbwe", sources[0].GetProperty("SourceDetails").GetProperty("Identifier").GetString());
+        Assert.Equal("contoso", sources[1].GetProperty("SourceDetails").GetProperty("Identifier").GetString());
     }
 }

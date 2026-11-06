@@ -229,6 +229,9 @@ struct UpgradeArgs {
     moniker: Option<String>,
     #[arg(long, short = 's')]
     source: Option<String>,
+    /// Version to upgrade to. Applies to the install, not to the installed-package filter.
+    #[arg(long, short = 'v')]
+    version: Option<String>,
     #[arg(long)]
     locale: Option<String>,
     #[arg(long = "installer-type")]
@@ -691,11 +694,7 @@ fn run() -> Result<()> {
             }
         }
         Commands::Upgrade(args) => {
-            let do_install = args.all
-                || args.query.is_some()
-                || args.query_option.is_some()
-                || args.id.is_some()
-                || args.name.is_some();
+            let do_install = args.all || has_explicit_upgrade_selector(&args);
             let mut repository = if do_install {
                 open_repository_with_install_progress()?
             } else {
@@ -751,6 +750,7 @@ fn run() -> Result<()> {
                             id: Some(m.id.clone()),
                             source: m.source_name.clone(),
                             exact: true,
+                            version: args.version.clone(),
                             locale: args.locale.clone(),
                             installer_type: args.installer_type.clone(),
                             installer_architecture: args.installer_architecture.clone(),
@@ -1398,6 +1398,8 @@ impl From<UpgradeArgs> for ListQuery {
             tag: None,
             command: None,
             product_code: None,
+            // `--version` is the upgrade target; ListQuery.version filters on the *installed*
+            // version, so it must not be set here. The target goes on the install query.
             version: None,
             source: value.source,
             count: value.count,
@@ -1948,66 +1950,95 @@ fn print_hash(file_path: &str, _msix: bool) -> Result<()> {
 }
 
 fn do_export(repository: &mut Repository, args: &ExportArgs) -> Result<()> {
-    let list_query = ListQuery {
-        query: None,
-        id: None,
-        name: None,
-        moniker: None,
-        tag: None,
-        command: None,
-        product_code: None,
-        version: None,
-        source: args.source.clone(),
-        count: None,
-        exact: false,
-        install_scope: None,
-        upgrade_only: false,
-        include_unknown: false,
-        include_pinned: false,
-    };
-    let result = repository.list(&list_query)?;
-
-    let packages: Vec<serde_json::Value> = result
-        .matches
-        .iter()
-        .filter(|m| m.source_name.is_some())
-        .map(|m| {
-            let mut obj = serde_json::json!({
-                "PackageIdentifier": m.id,
-            });
-            if args.include_versions {
-                obj["Version"] = serde_json::Value::String(m.installed_version.clone());
-            }
-            if let Some(source) = &m.source_name {
-                obj["SourceDetails"] = serde_json::json!({
-                    "Name": source,
-                    "Type": "Microsoft.PreIndexed.Package",
-                    "Argument": ""
-                });
-            }
-            obj
-        })
-        .collect();
-
-    let export = serde_json::json!({
-        "$schema": "https://aka.ms/winget-packages.schema.2.0.json",
-        "CreationDate": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
-        "Sources": [{
-            "SourceDetails": {
-                "Name": "winget",
-                "Type": "Microsoft.PreIndexed.Package",
-                "Argument": "https://cdn.winget.microsoft.com/cache"
-            },
-            "Packages": packages
-        }],
-        "WinGetVersion": VERSION,
-    });
+    // List everything (plain `list` already correlates installed packages to their source),
+    // then filter by source here: `list --source` needs a text query, and any query filters.
+    let result = repository.list(&ListQuery::default())?;
+    let creation_date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+    let (export, package_count) = build_export_payload(
+        &result.matches,
+        &repository.list_sources(),
+        args.source.as_deref(),
+        args.include_versions,
+        &creation_date,
+    );
 
     let json = serde_json::to_string_pretty(&export)?;
     std::fs::write(&args.output, &json)
         .map_err(|e| anyhow::anyhow!("failed to write export file '{}': {}", args.output, e))?;
-    println!("Exported {} packages to {}", packages.len(), args.output);
+    println!("Exported {package_count} packages to {}", args.output);
     Ok(())
+}
+
+const PACKAGES_EXPORT_SCHEMA: &str = "https://aka.ms/winget-packages.schema.2.0.json";
+
+/// Groups installed packages by the source they correlate to, in the WinGet packages export
+/// format. Packages with no source cannot be re-imported and are skipped; `source_filter`
+/// keeps one source. Returns the payload and the number of exported packages.
+fn build_export_payload(
+    matches: &[ListMatch],
+    sources: &[SourceRecord],
+    source_filter: Option<&str>,
+    include_versions: bool,
+    creation_date: &str,
+) -> (serde_json::Value, usize) {
+    let mut groups: Vec<(&str, Vec<&ListMatch>)> = Vec::new();
+    for m in matches {
+        let Some(source_name) = m.source_name.as_deref().filter(|name| !name.trim().is_empty()) else {
+            continue;
+        };
+        if source_filter.is_some_and(|filter| !source_name.eq_ignore_ascii_case(filter)) {
+            continue;
+        }
+        match groups
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(source_name))
+        {
+            Some((_, rows)) => rows.push(m),
+            None => groups.push((source_name, vec![m])),
+        }
+    }
+
+    let mut package_count = 0usize;
+    let export_sources: Vec<serde_json::Value> = groups
+        .into_iter()
+        .map(|(source_name, rows)| {
+            let record = sources
+                .iter()
+                .find(|source| source.name.eq_ignore_ascii_case(source_name));
+            let source_type = match record.map(|source| &source.kind) {
+                Some(SourceKind::Rest) => "Microsoft.Rest",
+                _ => "Microsoft.PreIndexed.Package",
+            };
+            let packages: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|m| {
+                    let mut obj = serde_json::json!({ "PackageIdentifier": m.id });
+                    if include_versions {
+                        obj["Version"] = serde_json::Value::String(m.installed_version.clone());
+                    }
+                    obj
+                })
+                .collect();
+            package_count += packages.len();
+            serde_json::json!({
+                "SourceDetails": {
+                    "Name": record.map_or(source_name, |source| source.name.as_str()),
+                    "Argument": record.map_or("", |source| source.arg.as_str()),
+                    "Identifier": record.map_or("", |source| source.identifier.as_str()),
+                    "Type": source_type,
+                },
+                "Packages": packages,
+            })
+        })
+        .collect();
+
+    let export = serde_json::json!({
+        "$schema": PACKAGES_EXPORT_SCHEMA,
+        "CreationDate": creation_date,
+        "Sources": export_sources,
+        "WinGetVersion": VERSION,
+    });
+    (export, package_count)
 }
 
 fn print_error_lookup(input: &str) {
@@ -2774,9 +2805,11 @@ fn find_matching_pin<'a>(item: &ListMatch, pins: &'a [PinRecord]) -> Option<&'a 
 }
 
 /// Picks the rows `upgrade` will install. `--all` takes every upgradeable row. A named upgrade
-/// (query, `--id`, `--name`) targets one package, as in WinGet: the list filter is a substring
-/// match, so an exact id/name match wins, and any remaining ambiguity is an error instead of
-/// upgrading every package that happens to contain the text.
+/// (query, `--id`, `--name`, `--moniker`) targets one package, as in WinGet: the list filter is a
+/// substring match, so an exact match wins, and any remaining ambiguity is an error instead of
+/// upgrading every package that happens to contain the text. `--id` is compared only to the id,
+/// `--name` only to the name, and the query to either. `ListMatch` carries no moniker, so a
+/// moniker selector narrows only through the list query itself.
 fn select_upgrade_targets<'a>(matches: &'a [ListMatch], args: &UpgradeArgs) -> Result<Vec<&'a ListMatch>> {
     let upgradeable: Vec<&ListMatch> = matches.iter().filter(|m| m.available_version.is_some()).collect();
     if args.all || !has_explicit_upgrade_selector(args) {
@@ -2793,24 +2826,16 @@ fn select_upgrade_targets<'a>(matches: &'a [ListMatch], args: &UpgradeArgs) -> R
         return Ok(upgradeable);
     }
 
-    let selectors: Vec<&str> = [
-        args.id.as_deref(),
-        args.name.as_deref(),
-        args.query.as_deref(),
-        args.query_option.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    let exact: Vec<&ListMatch> = upgradeable
-        .iter()
-        .copied()
-        .filter(|m| {
-            selectors
-                .iter()
-                .any(|value| m.id.eq_ignore_ascii_case(value) || m.name.eq_ignore_ascii_case(value))
-        })
-        .collect();
+    let query = args.query.as_deref().or(args.query_option.as_deref());
+    let is_exact = |m: &ListMatch| {
+        args.id.as_deref().is_some_and(|id| m.id.eq_ignore_ascii_case(id))
+            || args
+                .name
+                .as_deref()
+                .is_some_and(|name| m.name.eq_ignore_ascii_case(name))
+            || query.is_some_and(|value| m.id.eq_ignore_ascii_case(value) || m.name.eq_ignore_ascii_case(value))
+    };
+    let exact: Vec<&ListMatch> = upgradeable.iter().copied().filter(|m| is_exact(m)).collect();
     if !exact.is_empty() && distinct_ids(&exact) == 1 {
         return Ok(exact);
     }
@@ -3157,6 +3182,182 @@ mod tests {
         assert_eq!(all.len(), 3);
     }
 
+    fn installed_row(id: &str, source: Option<&str>) -> ListMatch {
+        ListMatch {
+            available_version: None,
+            source_name: source.map(str::to_owned),
+            ..upgradeable_row(id, id)
+        }
+    }
+
+    fn source_record(name: &str, kind: SourceKind, arg: &str, identifier: &str) -> SourceRecord {
+        SourceRecord {
+            name: name.to_owned(),
+            kind,
+            arg: arg.to_owned(),
+            identifier: identifier.to_owned(),
+            trust_level: "Trusted".to_owned(),
+            explicit: false,
+            priority: 0,
+            last_update: None,
+            source_version: None,
+            etag: None,
+            last_modified: None,
+        }
+    }
+
+    fn export_sources() -> Vec<SourceRecord> {
+        vec![
+            source_record(
+                "winget",
+                SourceKind::PreIndexed,
+                "https://cdn.winget.microsoft.com/cache",
+                "Microsoft.Winget.Source_8wekyb3d8bbwe",
+            ),
+            source_record("contoso", SourceKind::Rest, "https://contoso.test/api", "contoso-id"),
+        ]
+    }
+
+    #[test]
+    fn export_groups_by_source_and_skips_unsourced_packages() {
+        let rows = vec![
+            installed_row("Git.Git", Some("winget")),
+            installed_row("Contoso.Tool", Some("contoso")),
+            installed_row("Local.Only", None),
+            installed_row("Microsoft.Edge", Some("WinGet")),
+        ];
+
+        let (payload, count) = build_export_payload(&rows, &export_sources(), None, true, "2026-11-06T00:00:00.000");
+
+        assert_eq!(count, 3);
+        assert_eq!(payload["$schema"], PACKAGES_EXPORT_SCHEMA);
+        assert_eq!(payload["CreationDate"], "2026-11-06T00:00:00.000");
+        let sources = payload["Sources"].as_array().expect("sources");
+        assert_eq!(sources.len(), 2);
+
+        let winget = &sources[0];
+        assert_eq!(winget["SourceDetails"]["Name"], "winget");
+        assert_eq!(winget["SourceDetails"]["Type"], "Microsoft.PreIndexed.Package");
+        assert_eq!(
+            winget["SourceDetails"]["Argument"],
+            "https://cdn.winget.microsoft.com/cache"
+        );
+        assert_eq!(
+            winget["SourceDetails"]["Identifier"],
+            "Microsoft.Winget.Source_8wekyb3d8bbwe"
+        );
+        let winget_ids: Vec<&str> = winget["Packages"]
+            .as_array()
+            .expect("packages")
+            .iter()
+            .map(|p| p["PackageIdentifier"].as_str().expect("id"))
+            .collect();
+        assert_eq!(winget_ids, ["Git.Git", "Microsoft.Edge"]);
+
+        let contoso = &sources[1];
+        assert_eq!(contoso["SourceDetails"]["Name"], "contoso");
+        assert_eq!(contoso["SourceDetails"]["Type"], "Microsoft.Rest");
+        assert_eq!(contoso["SourceDetails"]["Argument"], "https://contoso.test/api");
+        assert_eq!(contoso["SourceDetails"]["Identifier"], "contoso-id");
+        assert_eq!(contoso["Packages"][0]["Version"], "1.0");
+        assert!(!payload.to_string().contains("Local.Only"));
+    }
+
+    #[test]
+    fn export_source_filter_keeps_one_source_without_versions() {
+        let rows = vec![
+            installed_row("Git.Git", Some("winget")),
+            installed_row("Contoso.Tool", Some("contoso")),
+        ];
+
+        let (payload, count) = build_export_payload(
+            &rows,
+            &export_sources(),
+            Some("CONTOSO"),
+            false,
+            "2026-11-06T00:00:00.000",
+        );
+
+        assert_eq!(count, 1);
+        let sources = payload["Sources"].as_array().expect("sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["SourceDetails"]["Name"], "contoso");
+        let package = &sources[0]["Packages"][0];
+        assert_eq!(package["PackageIdentifier"], "Contoso.Tool");
+        assert!(package.get("Version").is_none());
+    }
+
+    #[test]
+    fn exported_payload_round_trips_through_import() {
+        let rows = vec![
+            installed_row("Git.Git", Some("winget")),
+            installed_row("Contoso.Tool", Some("contoso")),
+        ];
+        let (payload, _) = build_export_payload(&rows, &export_sources(), None, false, "2026-11-06T00:00:00.000");
+        let mut repository = FakeImportRepository::default();
+
+        do_import_from_content(&mut repository, &payload.to_string(), true, false, false, false, false)
+            .expect("import exported payload");
+
+        assert_eq!(repository.searched, ["Git.Git", "Contoso.Tool"]);
+        assert_eq!(
+            repository.searched_sources,
+            [Some("winget".to_owned()), Some("contoso".to_owned())]
+        );
+    }
+
+    #[test]
+    fn upgrade_selectors_match_only_their_own_field() {
+        let rows = vec![
+            upgradeable_row("Git.Git", "Git"),
+            upgradeable_row("GitHub.GitLFS", "Git LFS"),
+        ];
+
+        // `--id Git` must not pick Git.Git just because its *name* is "Git".
+        let error = select_upgrade_targets(&rows, &upgrade_args(&["--id", "Git"])).expect_err("--id Git");
+        assert!(error.to_string().contains("Multiple installed packages"), "{error}");
+
+        let by_name = select_upgrade_targets(&rows, &upgrade_args(&["--name", "Git"])).expect("--name Git");
+        assert_eq!(by_name.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["Git.Git"]);
+
+        // `--name Git.Git` must not pick Git.Git through its id.
+        let error = select_upgrade_targets(&rows, &upgrade_args(&["--name", "Git.Git"])).expect_err("--name id");
+        assert!(error.to_string().contains("Multiple installed packages"), "{error}");
+
+        // The positional query and `--query` match either field.
+        for args in [&["Git"][..], &["--query", "GitHub.GitLFS"][..]] {
+            let selected = select_upgrade_targets(&rows, &upgrade_args(args)).expect("query");
+            assert_eq!(selected.len(), 1);
+        }
+    }
+
+    #[test]
+    fn upgrade_moniker_selects_single_listed_package() {
+        let args = upgrade_args(&["--moniker", "git"]);
+        assert!(has_explicit_upgrade_selector(&args));
+
+        let rows = vec![upgradeable_row("Git.Git", "Git")];
+        let selected = select_upgrade_targets(&rows, &args).expect("single moniker match");
+        assert_eq!(selected.len(), 1);
+
+        let rows = vec![
+            upgradeable_row("Git.Git", "Git"),
+            upgradeable_row("GitHub.GitLFS", "Git LFS"),
+        ];
+        let error = select_upgrade_targets(&rows, &args).expect_err("ambiguous moniker");
+        assert!(error.to_string().contains("Multiple installed packages"), "{error}");
+    }
+
+    #[test]
+    fn upgrade_version_targets_install_not_installed_filter() {
+        for flag in ["--version", "-v"] {
+            let args = upgrade_args(&["--id", "Git.Git", flag, "2.45.0"]);
+            assert_eq!(args.version.as_deref(), Some("2.45.0"));
+            let list_query = ListQuery::from(args);
+            assert_eq!(list_query.version, None);
+        }
+    }
+
     #[test]
     fn global_output_format_still_applies_to_other_commands() {
         let cli = Cli::try_parse_from(["pinget", "list", "--output", "json"]).expect("parse list");
@@ -3167,6 +3368,7 @@ mod tests {
     #[derive(Default)]
     struct FakeImportRepository {
         searched: Vec<String>,
+        searched_sources: Vec<Option<String>>,
         installed: Vec<String>,
         failed_package: Option<String>,
         thrown_package: Option<String>,
@@ -3180,6 +3382,7 @@ mod tests {
         fn search(&mut self, query: &PackageQuery) -> Result<SearchResponse> {
             let id = query.id.clone().unwrap_or_default();
             self.searched.push(id.clone());
+            self.searched_sources.push(query.source.clone());
             if self.search_error_package.as_deref() == Some(id.as_str()) {
                 return Err(anyhow::anyhow!("source configuration is invalid"));
             }

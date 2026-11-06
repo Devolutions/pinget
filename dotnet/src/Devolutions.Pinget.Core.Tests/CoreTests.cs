@@ -38,10 +38,29 @@ public class VersionCompareTests
     [InlineData("1.2.3a", "1.2.10", -1)]
     [InlineData("1.2.3a", "1.2.3", -1)]
     [InlineData("1.2.10a", "1.2.3", 1)]
+    [InlineData("1.0b", "1.0.1", -1)]
+    [InlineData("1.0", "1.0.0-beta", 1)]
+    [InlineData("1.0.0-rc10", "1.0.0-rc2", 1)]
+    [InlineData("1.0.0-rc2", "1.0.0-rc10", -1)]
+    [InlineData("1.0.0-preview10", "1.0.0-preview2", 1)]
+    [InlineData("1.0.0-RC2", "1.0.0-rc2", 0)]
+    [InlineData("1.0.0-alpha", "1.0.0.0alpha", -1)]
+    [InlineData("1.0.0_1", "1.0.0+1", 0)]
+    [InlineData("1.0.007", "1.0.7", 0)]
+    [InlineData("1.99999999999999999999", "1.18446744073709551615", 1)]
+    [InlineData("Unknown", "1.0.0", -1)]
     public void CompareVersionStrings_ReturnsCorrectOrdering(string a, string b, int expected)
     {
         var result = RestSource.CompareVersionStrings(a, b);
         Assert.Equal(expected, Math.Sign(result));
+    }
+
+    [Fact]
+    public void TokenizeVersion_SplitsSeparatorsAndDigitTransitions()
+    {
+        Assert.Equal(["1", "0", "0", "rc", "10"], RestSource.TokenizeVersion("1.0.0-rc10"));
+        Assert.Equal(["2", "0", "beta", "1", "build", "7"], RestSource.TokenizeVersion("2.0_beta1+build7"));
+        Assert.Empty(RestSource.TokenizeVersion("..-"));
     }
 
     public class VersionSelectionTests
@@ -1688,6 +1707,94 @@ public class RepositoryParityTests
             });
 
         Assert.Null(result);
+    }
+
+    [Fact]
+    public void Install_RefusesHashOverrideBeforeSideEffects()
+    {
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            // An msstore installer never reaches the installer fetch, and the agreement would be
+            // prompted for first: the gate must fire before either.
+            var manifestPath = TestPaths.WriteManifest(appRoot, """
+                PackageIdentifier: Test.Store
+                PackageVersion: 1.0.0
+                PackageName: Test Store
+                ManifestType: merged
+                ManifestVersion: 1.10.0
+                Agreements:
+                  - AgreementLabel: EULA
+                    Agreement: Terms
+                Installers:
+                  - InstallerType: msstore
+                    PackageIdentifier: 9NBLGGH4NNS1
+                """);
+
+            var prompted = false;
+            using var repo = Repository.Open(new RepositoryOptions
+            {
+                AppRoot = appRoot,
+                PackageAgreementsPrompt = _ => prompted = true,
+            });
+            repo.SetAdminSetting("LocalManifestFiles", true);
+
+            foreach (var dependenciesOnly in new[] { false, true })
+            {
+                var request = new InstallRequest
+                {
+                    Query = new PackageQuery(),
+                    ManifestPath = manifestPath,
+                    IgnoreSecurityHash = true,
+                    DependenciesOnly = dependenciesOnly,
+                };
+                var ex = Assert.Throws<InvalidOperationException>(() => repo.Install(request));
+                Assert.Contains("InstallerHashOverride", ex.Message);
+            }
+            Assert.False(prompted);
+
+            var repairById = new RepairRequest { Query = new PackageQuery { Id = "Test.Store" }, IgnoreSecurityHash = true };
+            Assert.Contains("InstallerHashOverride", Assert.Throws<InvalidOperationException>(() => repo.Repair(repairById)).Message);
+
+            var repairByManifest = repairById with { ManifestPath = manifestPath };
+            Assert.Contains("InstallerHashOverride", Assert.Throws<InvalidOperationException>(() => repo.Repair(repairByManifest)).Message);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
+    }
+
+    [Fact]
+    public void UninstallAndRepair_RefuseManifestWithoutLocalManifestFiles()
+    {
+        var appRoot = TestPaths.CreateTempAppRoot();
+        try
+        {
+            var manifestPath = TestPaths.WriteManifest(appRoot, """
+                PackageIdentifier: Test.Package
+                PackageVersion: 1.0.0
+                PackageName: Test Package
+                ManifestType: merged
+                ManifestVersion: 1.10.0
+                Installers:
+                  - InstallerType: exe
+                    InstallerUrl: https://example.invalid/installer.exe
+                    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+                """);
+
+            using var repo = Repository.Open(new RepositoryOptions { AppRoot = appRoot });
+
+            var uninstall = new UninstallRequest { Query = new PackageQuery(), ManifestPath = manifestPath };
+            Assert.Contains("LocalManifestFiles", Assert.Throws<InvalidOperationException>(() => repo.Uninstall(uninstall)).Message);
+
+            var repair = new RepairRequest { Query = new PackageQuery(), ManifestPath = manifestPath };
+            Assert.Contains("LocalManifestFiles", Assert.Throws<InvalidOperationException>(() => repo.Repair(repair)).Message);
+        }
+        finally
+        {
+            TestPaths.DeleteAppRoot(appRoot);
+        }
     }
 
     [Fact]

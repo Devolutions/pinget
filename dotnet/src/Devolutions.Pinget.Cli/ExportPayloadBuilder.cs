@@ -14,7 +14,9 @@ internal static class ExportPayloadBuilder
         IEnumerable<ListMatch> matches,
         IReadOnlyList<SourceRecord> sources,
         string? sourceFilter,
-        bool includeVersions)
+        bool includeVersions,
+        string wingetVersion = "",
+        DateTimeOffset? creationDate = null)
     {
         var groups = matches
             .Where(match => !string.IsNullOrWhiteSpace(match.SourceName))
@@ -33,7 +35,8 @@ internal static class ExportPayloadBuilder
                 {
                     SourceKind.Rest => "Microsoft.Rest",
                     _ => "Microsoft.PreIndexed.Package",
-                });
+                },
+                Identifier: record?.Identifier ?? "");
             var packages = group
                 .Select(match => new PackageExportEntry(
                     PackageIdentifier: match.Id,
@@ -42,6 +45,11 @@ internal static class ExportPayloadBuilder
             exportSources.Add(new PackageExportSource(details, packages));
         }
 
-        return new PackagesExportPayload(Schema, exportSources);
+        var created = (creationDate ?? DateTimeOffset.UtcNow).UtcDateTime;
+        return new PackagesExportPayload(
+            Schema,
+            exportSources,
+            CreationDate: created.ToString("yyyy-MM-dd'T'HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture),
+            WinGetVersion: wingetVersion);
     }
 }
