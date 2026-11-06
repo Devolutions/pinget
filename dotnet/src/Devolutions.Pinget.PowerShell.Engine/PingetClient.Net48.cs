@@ -87,18 +87,18 @@ public sealed class PingetClient : IDisposable
         PSPackageFieldMatchOption matchOption)
     {
         var response = RequiredObject(_packageManager.SearchJson(ToJsonString(BuildPackageQuery(id, name, moniker, source, query, tag, command, count, matchOption))));
-        var items = RequiredArray(response, "matches")
+        var items = RequiredArray(response, "Matches")
             .OfType<JsonObject>()
             .Select(match => new PSFoundCatalogPackage(
-                RequiredString(match, "id"),
-                RequiredString(match, "name"),
-                RequiredString(match, "source_name"),
-                OptionalString(match, "moniker"),
-                OptionalString(match, "version"),
-                OptionalString(match, "match_criteria")))
+                RequiredString(match, "Id"),
+                RequiredString(match, "Name"),
+                RequiredString(match, "SourceName"),
+                OptionalString(match, "Moniker"),
+                OptionalString(match, "Version"),
+                OptionalString(match, "MatchCriteria")))
             .ToList();
 
-        return new CollectionResult<PSFoundCatalogPackage>(items, WarningsFrom(response), Bool(response, "truncated"));
+        return new CollectionResult<PSFoundCatalogPackage>(items, WarningsFrom(response), Bool(response, "Truncated"));
     }
 
     public CollectionResult<PSInstalledCatalogPackage> GetInstalledPackages(
@@ -113,22 +113,22 @@ public sealed class PingetClient : IDisposable
         PSPackageFieldMatchOption matchOption)
     {
         var response = RequiredObject(_packageManager.ListJson(ToJsonString(BuildListQuery(id, name, moniker, source, query, tag, command, count, matchOption))));
-        var items = RequiredArray(response, "matches")
+        var items = RequiredArray(response, "Matches")
             .OfType<JsonObject>()
             .Select(match => new PSInstalledCatalogPackage(
-                RequiredString(match, "id"),
-                RequiredString(match, "name"),
-                OptionalString(match, "source_name") ?? string.Empty,
+                RequiredString(match, "Id"),
+                RequiredString(match, "Name"),
+                OptionalString(match, "SourceName") ?? string.Empty,
                 null,
-                RequiredString(match, "installed_version"),
-                OptionalString(match, "available_version") is { } availableVersion ? new[] { availableVersion } : Array.Empty<string>(),
-                OptionalString(match, "publisher"),
-                OptionalString(match, "scope"),
-                StringArray(match, "package_family_names"),
-                StringArray(match, "product_codes")))
+                RequiredString(match, "InstalledVersion"),
+                OptionalString(match, "AvailableVersion") is { } availableVersion ? new[] { availableVersion } : Array.Empty<string>(),
+                OptionalString(match, "Publisher"),
+                OptionalString(match, "Scope"),
+                StringArray(match, "PackageFamilyNames"),
+                StringArray(match, "ProductCodes")))
             .ToList();
 
-        return new CollectionResult<PSInstalledCatalogPackage>(items, WarningsFrom(response), Bool(response, "truncated"));
+        return new CollectionResult<PSInstalledCatalogPackage>(items, WarningsFrom(response), Bool(response, "Truncated"));
     }
 
     public CommandResult<PSDownloadResult> DownloadPackage(
@@ -323,7 +323,7 @@ public sealed class PingetClient : IDisposable
             ["mode"] = ToInstallerMode(mode),
         };
         SetIfNotNull(request, "log_path", Normalize(log));
-        SetIfNotNull((JsonObject)request["query"]!, "version", version ?? GetCatalogVersion(inputObject));
+        SetIfNotNull((JsonObject)request["query"]!, "version", version ?? GetInstalledVersion(inputObject));
 
         var result = RequiredObject(_packageManager.UninstallJson(ToJsonString(request)));
         return new CommandResult<PSUninstallResult>(ToPsUninstallResult(result, request, inputObject), WarningsFrom(result));
@@ -360,7 +360,7 @@ public sealed class PingetClient : IDisposable
             ["moniker"] = Normalize(moniker ?? inputObject?.Moniker),
             ["source"] = Normalize(source ?? inputObject?.Source),
             ["query"] = JoinQuery(query),
-            ["version"] = Normalize(version),
+            // -Version is the upgrade target; a list "version" would filter on the installed version.
             ["upgrade_only"] = true,
             ["include_unknown"] = includeUnknown,
             ["exact"] = true,
@@ -369,13 +369,13 @@ public sealed class PingetClient : IDisposable
         var matches = RequiredObject(_packageManager.ListJson(ToJsonString(listQuery)));
         warnings.AddRange(WarningsFrom(matches));
         var results = new List<PSInstallResult>();
-        foreach (var match in RequiredArray(matches, "matches").OfType<JsonObject>())
+        foreach (var match in RequiredArray(matches, "Matches").OfType<JsonObject>())
         {
-            var matchSource = OptionalString(match, "source_name");
+            var matchSource = OptionalString(match, "SourceName");
             var request = BuildInstallRequest(
                 null,
-                Normalize(version) ?? OptionalString(match, "available_version"),
-                RequiredString(match, "id"),
+                Normalize(version) ?? OptionalString(match, "AvailableVersion"),
+                RequiredString(match, "Id"),
                 null,
                 null,
                 matchSource,
@@ -395,17 +395,17 @@ public sealed class PingetClient : IDisposable
             var result = RequiredObject(_packageManager.InstallJson(ToJsonString(request)));
             warnings.AddRange(WarningsFrom(result));
             results.Add(ToPsInstallResult(result, request, new PSInstalledCatalogPackage(
-                RequiredString(match, "id"),
-                RequiredString(match, "name"),
+                RequiredString(match, "Id"),
+                RequiredString(match, "Name"),
                 matchSource ?? string.Empty,
                 null,
-                RequiredString(match, "installed_version"),
-                OptionalString(match, "available_version") is { } availableVersion ? new[] { availableVersion } : Array.Empty<string>(),
-                OptionalString(match, "publisher"),
-                OptionalString(match, "scope"))));
+                RequiredString(match, "InstalledVersion"),
+                OptionalString(match, "AvailableVersion") is { } availableVersion ? new[] { availableVersion } : Array.Empty<string>(),
+                OptionalString(match, "Publisher"),
+                OptionalString(match, "Scope"))));
         }
 
-        return new CollectionResult<PSInstallResult>(results, warnings, Bool(matches, "truncated"));
+        return new CollectionResult<PSInstallResult>(results, warnings, Bool(matches, "Truncated"));
     }
 
     public CommandResult<PSRepairResult> RepairPackage(
@@ -438,10 +438,10 @@ public sealed class PingetClient : IDisposable
             ["mode"] = ToInstallerMode(mode),
         };
         SetIfNotNull(request, "log_path", Normalize(log));
-        SetIfNotNull((JsonObject)request["query"]!, "version", version ?? GetCatalogVersion(inputObject));
+        SetIfNotNull((JsonObject)request["query"]!, "version", version ?? GetInstalledVersion(inputObject));
 
         var result = RequiredObject(_packageManager.RepairJson(ToJsonString(request)));
-        var repairedVersion = Normalize(version) ?? GetCatalogVersion(inputObject) ?? RequiredString(result, "version");
+        var repairedVersion = Normalize(version) ?? GetInstalledVersion(inputObject) ?? RequiredString(result, "version");
         return new CommandResult<PSRepairResult>(ToPsRepairResult(result, request, new PSInstalledCatalogPackage(
             RequiredString(result, "package_id"),
             inputObject?.Name ?? RequiredString(result, "package_id"),
@@ -690,6 +690,15 @@ public sealed class PingetClient : IDisposable
         }
     }
 
+    // Uninstall and repair act on what is installed: their query version is matched against the
+    // installed version, so a piped installed package must not contribute its available version.
+    private static string? GetInstalledVersion(PSCatalogPackage? inputObject)
+    {
+        if (inputObject is PSInstalledCatalogPackage installed)
+            return installed.InstalledVersion;
+        return GetCatalogVersion(inputObject);
+    }
+
     private static string? GetCatalogVersion(PSCatalogPackage? inputObject)
     {
         if (inputObject is PSFoundCatalogPackage found)
@@ -741,7 +750,10 @@ public sealed class PingetClient : IDisposable
             ?? throw new InvalidOperationException($"The native Pinget COM bridge returned an object without '{name}'.");
     }
 
-    private static List<string> WarningsFrom(JsonObject source) => StringArray(source, "warnings").ToList();
+    // Search/list responses (SearchResponse, ListResponse) are serialized in PascalCase by the
+    // Rust core; install/uninstall/repair results use snake_case. Accept both spellings.
+    private static List<string> WarningsFrom(JsonObject source) =>
+        StringArray(source, "Warnings").Concat(StringArray(source, "warnings")).ToList();
 
     private static string[] StringArray(JsonObject source, string name)
     {

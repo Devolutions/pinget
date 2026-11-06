@@ -351,7 +351,7 @@ public sealed class PingetClient : IDisposable
                 0,
                 PSPackageFieldMatchOption.EqualsCaseInsensitive) with
             {
-                Version = version ?? GetCatalogVersion(inputObject),
+                Version = version ?? GetInstalledVersion(inputObject),
             },
             Force = force,
             LogPath = Normalize(log),
@@ -395,7 +395,7 @@ public sealed class PingetClient : IDisposable
             Moniker = Normalize(moniker ?? inputObject?.Moniker),
             Source = Normalize(source ?? inputObject?.Source),
             Query = JoinQuery(query),
-            Version = Normalize(version),
+            // -Version is the upgrade target; ListQuery.Version would filter on the installed version.
             UpgradeOnly = true,
             IncludeUnknown = includeUnknown,
             Exact = true,
@@ -469,7 +469,7 @@ public sealed class PingetClient : IDisposable
                 Moniker = Normalize(moniker ?? inputObject?.Moniker),
                 Source = Normalize(source ?? inputObject?.Source),
                 Query = JoinQuery(query),
-                Version = Normalize(version) ?? GetCatalogVersion(inputObject),
+                Version = Normalize(version) ?? GetInstalledVersion(inputObject),
                 Exact = true,
             },
             IgnoreSecurityHash = allowHashMismatch,
@@ -479,7 +479,7 @@ public sealed class PingetClient : IDisposable
         };
 
         var result = _repository.Repair(request);
-        var repairedVersion = Normalize(version) ?? GetCatalogVersion(inputObject) ?? result.Version;
+        var repairedVersion = Normalize(version) ?? GetInstalledVersion(inputObject) ?? result.Version;
         warnings.AddRange(result.Warnings);
         return new CommandResult<PSRepairResult>(ToPsRepairResult(result, request, new PSInstalledCatalogPackage(
             result.PackageId,
@@ -586,6 +586,14 @@ public sealed class PingetClient : IDisposable
         PSInstalledCatalogPackage installed when installed.AvailableVersions.Count > 0 => installed.AvailableVersions[0],
         PSInstalledCatalogPackage installed => installed.InstalledVersion,
         _ => null,
+    };
+
+    // Uninstall and repair act on what is installed: their query version is matched against the
+    // installed version, so a piped installed package must not contribute its available version.
+    private static string? GetInstalledVersion(PSCatalogPackage? inputObject) => inputObject switch
+    {
+        PSInstalledCatalogPackage installed => installed.InstalledVersion,
+        _ => GetCatalogVersion(inputObject),
     };
 
     private static InstallerMode ToInstallerMode(PSPackageInstallMode mode) => mode switch

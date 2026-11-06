@@ -378,6 +378,19 @@ public class Repository : IDisposable
         return settings;
     }
 
+    /// <summary>
+    /// Admin settings gate security-sensitive arguments, as in WinGet: without them,
+    /// <c>--ignore-security-hash</c> and <c>--manifest</c> are refused rather than silently honored.
+    /// </summary>
+    internal void EnsureAdminSettingEnabled(string name, string argument)
+    {
+        if (GetAdminSettings()[name]?.GetValue<bool>() != true)
+        {
+            throw new InvalidOperationException(
+                $"{argument} is disabled by policy; an administrator must enable it with 'pinget settings --enable {name}'.");
+        }
+    }
+
     public void SetAdminSetting(string name, bool enabled)
     {
         var normalized = SettingsStoreManager.NormalizeAdminSettingName(name);
@@ -713,6 +726,8 @@ public class Repository : IDisposable
     /// </summary>
     private FetchedInstaller FetchInstaller(InstallRequest request, string downloadDir)
     {
+        if (request.IgnoreSecurityHash)
+            EnsureAdminSettingEnabled("InstallerHashOverride", "--ignore-security-hash");
         var (manifest, manifestDocuments) = ResolveManifestAndDocumentsForInstall(request);
         var installer = SelectInstaller(manifest.Installers, request.Query)
             ?? throw new InvalidOperationException("No applicable installer found for the current system");
@@ -1173,7 +1188,10 @@ public class Repository : IDisposable
     private (Manifest Manifest, object Documents) ResolveManifestAndDocumentsForInstall(InstallRequest request)
     {
         if (!string.IsNullOrWhiteSpace(request.ManifestPath))
+        {
+            EnsureAdminSettingEnabled("LocalManifestFiles", "--manifest");
             return LoadManifestFromPathWithDocuments(request.ManifestPath!);
+        }
 
         var (located, _, _) = FindSingleMatch(request.Query);
         var (manifest, documents, _) = ManifestForMatch(located, request.Query);
@@ -1252,8 +1270,22 @@ public class Repository : IDisposable
 
         foreach (var dependencyId in dependencies)
         {
-            Install(CreateDependencyInstallRequest(dependencyId, request));
+            var result = Install(CreateDependencyInstallRequest(dependencyId, request));
+            EnsureDependencyInstalled(dependencyId, result);
         }
+    }
+
+    /// <summary>
+    /// A failed dependency must stop the dependent install, as in WinGet. Installer failures are
+    /// reported through <see cref="InstallResult.Success"/>, not exceptions, so check explicitly.
+    /// </summary>
+    internal static void EnsureDependencyInstalled(string dependencyId, InstallResult result)
+    {
+        if (result.Success || result.NoOp)
+            return;
+
+        throw new InvalidOperationException(
+            $"Dependency {dependencyId} failed to install (exit code: {result.ExitCode}).");
     }
 
     internal static InstallRequest CreateDependencyInstallRequest(string dependencyId, InstallRequest request) => new()

@@ -1321,6 +1321,22 @@ impl Repository {
         Ok(JsonValue::Object(settings))
     }
 
+    /// Admin settings gate security-sensitive arguments, as in WinGet: without them,
+    /// `--ignore-security-hash` and `--manifest` are refused rather than silently honored.
+    fn ensure_admin_setting_enabled(&self, name: &str, argument: &str) -> Result<()> {
+        let enabled = self
+            .get_admin_settings()?
+            .get(name)
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        if !enabled {
+            bail!(
+                "{argument} is disabled by policy; an administrator must enable it with 'pinget settings --enable {name}'."
+            );
+        }
+        Ok(())
+    }
+
     pub fn set_admin_setting(&self, name: &str, enabled: bool) -> Result<()> {
         let normalized = normalize_admin_setting_name(name)?;
         let mut settings = match self.get_admin_settings()? {
@@ -2288,6 +2304,9 @@ impl Repository {
         request: &InstallRequest,
         download_dir: &Path,
     ) -> Result<FetchedInstaller> {
+        if request.ignore_security_hash {
+            self.ensure_admin_setting_enabled("InstallerHashOverride", "--ignore-security-hash")?;
+        }
         let (manifest, manifest_documents) = self.resolve_manifest_and_documents_for_install(request)?;
         let installer = select_installer(&manifest.installers, &request.query)
             .ok_or_else(|| anyhow!("No applicable installer found for the current system"))?;
@@ -2674,6 +2693,7 @@ impl Repository {
         request: &InstallRequest,
     ) -> Result<(Manifest, JsonValue)> {
         if let Some(path) = &request.manifest_path {
+            self.ensure_admin_setting_enabled("LocalManifestFiles", "--manifest")?;
             return Self::load_manifest_from_path_with_documents(path);
         }
 
@@ -2723,8 +2743,9 @@ impl Repository {
                 continue;
             }
 
-            let dependency_request = Self::create_dependency_install_request(dependency_id, request);
-            self.install_request(&dependency_request)?;
+            let dependency_request = Self::create_dependency_install_request(dependency_id.clone(), request);
+            let result = self.install_request(&dependency_request)?;
+            ensure_dependency_installed(&dependency_id, &result)?;
         }
 
         Ok(())
@@ -4227,7 +4248,12 @@ fn winget_package_identity_from_local_id(local_id: &str, sources: &[SourceRecord
         let Some(source_identifier_start_index) = local_id.len().checked_sub(source_suffix.len()) else {
             continue;
         };
-        if !local_id[source_identifier_start_index..].eq_ignore_ascii_case(&source_suffix) {
+        // `get` rather than indexing: the offset is computed in bytes and may fall inside a
+        // multi-byte character of a non-ASCII registry key name (e.g. "Äpfel Editor").
+        if !local_id
+            .get(source_identifier_start_index..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(&source_suffix))
+        {
             continue;
         }
         if source_identifier_start_index <= package_id_start_index {
@@ -7686,8 +7712,17 @@ fn parse_rest_version_identities(item: &JsonValue) -> (Vec<String>, Vec<String>,
 fn parse_yaml_manifest_bundle(bytes: &[u8]) -> Result<(Manifest, JsonValue)> {
     let mut merged = YamlMapping::new();
     let mut documents = Vec::new();
-    for document in serde_yaml::Deserializer::from_slice(bytes) {
-        let value = YamlValue::deserialize(document).context("failed to deserialize YAML document")?;
+    let raw_versions = raw_package_versions(bytes);
+    for (index, document) in serde_yaml::Deserializer::from_slice(bytes).enumerate() {
+        let mut value = YamlValue::deserialize(document).context("failed to deserialize YAML document")?;
+        // `YamlValue` resolves plain scalars by YAML type, so `PackageVersion: 1.10` would
+        // become the float 1.1. WinGet treats manifest scalars as strings; restore the text.
+        if let (Some(Some(raw_version)), Some(mapping)) = (raw_versions.get(index), value.as_mapping_mut()) {
+            let key = YamlValue::from("PackageVersion");
+            if mapping.contains_key(&key) {
+                mapping.insert(key, YamlValue::String(raw_version.clone()));
+            }
+        }
         documents.push(serde_json::to_value(&value).context("failed to convert YAML manifest document")?);
         if let Some(mapping) = value.as_mapping() {
             merge_yaml_mapping(&mut merged, mapping);
@@ -8594,6 +8629,24 @@ fn json_installer_switches(value: &JsonValue) -> InstallerSwitches {
     }
 }
 
+/// Reads each document's `PackageVersion` as its original scalar text. Deserializing into a
+/// `String` makes serde_yaml keep the source representation (`1.10`, not `1.1`).
+fn raw_package_versions(bytes: &[u8]) -> Vec<Option<String>> {
+    #[derive(Deserialize)]
+    struct RawPackageVersion {
+        #[serde(rename = "PackageVersion", default)]
+        package_version: Option<String>,
+    }
+
+    serde_yaml::Deserializer::from_slice(bytes)
+        .map(|document| {
+            RawPackageVersion::deserialize(document)
+                .ok()
+                .and_then(|raw| raw.package_version)
+        })
+        .collect()
+}
+
 fn merge_yaml_mapping(target: &mut YamlMapping, source: &YamlMapping) {
     for (key, value) in source {
         target.insert(key.clone(), value.clone());
@@ -8832,9 +8885,18 @@ fn installer_matches_requested(
     current_os_version: Option<&str>,
 ) -> bool {
     matches_optional_ci(installer.installer_type.as_deref(), requested_type)
-        && matches_optional_ci(installer.scope.as_deref(), requested_scope)
+        && installer_matches_scope(installer.scope.as_deref(), requested_scope)
         && installer_matches_platform(installer, requested_platform, system_platform)
         && installer_matches_os_version(installer, requested_os_version, current_os_version)
+}
+
+/// An installer that does not declare a scope can install into either scope, so it stays
+/// applicable when a scope is requested (or inherited from the installed package).
+fn installer_matches_scope(installer_scope: Option<&str>, requested_scope: Option<&str>) -> bool {
+    match (installer_scope, requested_scope) {
+        (Some(scope), Some(requested)) => scope.eq_ignore_ascii_case(requested),
+        _ => true,
+    }
 }
 
 fn installer_matches_platform(
@@ -9236,12 +9298,13 @@ fn compare_version(left: &str, right: &str) -> Ordering {
     for index in 0..max_len {
         let left_part = left_parts.get(index).map(String::as_str).unwrap_or("0");
         let right_part = right_parts.get(index).map(String::as_str).unwrap_or("0");
-        let numeric = left_part.parse::<u64>().ok().zip(right_part.parse::<u64>().ok());
-
-        let ordering = if let Some((left_number, right_number)) = numeric {
-            left_number.cmp(&right_number)
-        } else {
-            left_part.to_ascii_lowercase().cmp(&right_part.to_ascii_lowercase())
+        // A text token against a number (or a missing part) is a pre-release style suffix,
+        // which WinGet ranks below the plain release: "1.0.0" > "1.0.0-rc1", "1.0.1" > "1.0b".
+        let ordering = match (left_part.parse::<u64>().ok(), right_part.parse::<u64>().ok()) {
+            (Some(left_number), Some(right_number)) => left_number.cmp(&right_number),
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (None, None) => left_part.to_ascii_lowercase().cmp(&right_part.to_ascii_lowercase()),
         };
 
         if ordering != Ordering::Equal {
@@ -9717,6 +9780,26 @@ fn resolve_portable_scope(
     }
 }
 
+/// Uses the zip crate's own predicate (`mode & S_IFLNK == S_IFLNK`), which is what
+/// `ZipArchive::extract` uses to decide whether to create a symlink. A stricter file-type test
+/// (`mode & S_IFMT == S_IFLNK`) lets modes like `0o160777` through and still get extracted as
+/// links pointing outside the install directory.
+fn zip_entry_is_symlink<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> bool {
+    entry.is_symlink()
+}
+
+/// A failed dependency must stop the dependent install (as WinGet does). Installer failures come
+/// back as `success == false` rather than as errors, so they have to be checked explicitly.
+fn ensure_dependency_installed(dependency_id: &str, result: &InstallResult) -> Result<()> {
+    if result.success || result.no_op {
+        return Ok(());
+    }
+    bail!(
+        "dependency {dependency_id} failed to install (exit code: {})",
+        result.exit_code
+    )
+}
+
 fn apply_install_scope(request: &InstallRequest, installed_scope: Option<&str>) -> Result<InstallRequest> {
     let mut effective = request.clone();
     let scope = request
@@ -9808,10 +9891,15 @@ fn dispatch_installer(
         "msix" | "appx" => {
             use std::process::Command;
 
+            // Pass the path through the environment rather than interpolating it into the
+            // script: the file name comes from the manifest URL, and PowerShell treats both
+            // ASCII and typographic quotes as string delimiters.
             let mut cmd = Command::new("powershell");
             cmd.arg("-NoProfile")
+                .arg("-NonInteractive")
                 .arg("-Command")
-                .arg(format!("Add-AppxPackage -Path '{}'", installer_path.display()));
+                .arg(MSIX_INSTALL_SCRIPT)
+                .env(MSIX_INSTALL_PATH_ENV, installer_path);
             let status = cmd.status().context("failed to run Add-AppxPackage")?;
             Ok(status.code().unwrap_or(-1))
         }
@@ -9835,6 +9923,12 @@ fn dispatch_installer(
             fs::create_dir_all(&target)?;
             let file = fs::File::open(installer_path)?;
             let mut archive = ZipArchive::new(file)?;
+            for index in 0..archive.len() {
+                let entry = archive.by_index(index)?;
+                if zip_entry_is_symlink(&entry) {
+                    bail!("installer archive contains a symbolic link: {}", entry.name());
+                }
+            }
             archive.extract(&target)?;
             Ok(0)
         }
@@ -9894,6 +9988,11 @@ fn run_msstore_installer(request: &InstallRequest, manifest: &Manifest, installe
     let status = cmd.status().context("failed to run MSStore installer via PowerShell")?;
     Ok(status.code().unwrap_or(-1))
 }
+
+#[cfg(windows)]
+const MSIX_INSTALL_PATH_ENV: &str = "PINGET_MSIX_INSTALLER_PATH";
+#[cfg(windows)]
+const MSIX_INSTALL_SCRIPT: &str = "Add-AppxPackage -Path $env:PINGET_MSIX_INSTALLER_PATH";
 
 #[cfg(any(windows, test))]
 fn build_msstore_install_script(product_id: &str, is_machine: bool, is_silent: bool, force: bool) -> String {
@@ -10418,18 +10517,21 @@ fn installer_command_arguments_with_options(
     installer: &Installer,
     include_msi_install_target: bool,
 ) -> Vec<String> {
-    if let Some(override_args) = request.override_args.as_deref() {
-        return split_installer_switches(override_args);
+    let mut args = Vec::new();
+    // `--override` replaces the installer switches, never the msiexec target: without
+    // `/i <package>`, msiexec has nothing to install (WinGet always keeps it).
+    if include_msi_install_target && matches!(installer_type, "msi" | "wix") {
+        args.push("/i".to_owned());
+        args.push(installer_path.display().to_string());
     }
 
-    let mut args = Vec::new();
-    match installer_type {
-        "msi" | "wix" if include_msi_install_target => {
-            args.push("/i".to_owned());
-            args.push(installer_path.display().to_string());
-        }
-        "msix" | "appx" | "zip" => return Vec::new(),
-        _ => {}
+    if let Some(override_args) = request.override_args.as_deref() {
+        args.extend(split_installer_switches(override_args));
+        return args;
+    }
+
+    if matches!(installer_type, "msix" | "appx" | "zip") {
+        return Vec::new();
     }
 
     let configured = match request.mode {
@@ -11624,7 +11726,7 @@ fn read_portable_payload(installer_path: &Path, is_zip: bool) -> Result<Portable
         let mut archive = ZipArchive::new(file).context("reading installer zip")?;
         for index in 0..archive.len() {
             let entry = archive.by_index(index)?;
-            if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
+            if zip_entry_is_symlink(&entry) {
                 bail!("portable installer contains a symbolic link: {}", entry.name());
             }
             let name = entry.name();
@@ -14345,6 +14447,39 @@ Installers:
     }
 
     #[test]
+    fn parse_yaml_manifest_bundle_keeps_numeric_looking_version_text() {
+        let yaml = r#"
+PackageIdentifier: Test.Package
+PackageVersion: 1.10
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.10.0
+---
+PackageIdentifier: Test.Package
+PackageVersion: 1.10
+PackageLocale: en-US
+PackageName: Test Package
+Publisher: Example
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0
+---
+PackageIdentifier: Test.Package
+PackageVersion: 1.10
+ManifestType: installer
+ManifestVersion: 1.10.0
+Installers:
+  - Architecture: x64
+    InstallerType: exe
+    InstallerUrl: https://example.test/Test.Package.exe
+    InstallerSha256: ABC123
+"#;
+
+        let (manifest, documents) = parse_yaml_manifest_bundle(yaml.as_bytes()).expect("bundle");
+        assert_eq!(manifest.version, "1.10");
+        assert_eq!(documents["PackageVersion"].as_str(), Some("1.10"));
+    }
+
+    #[test]
     fn parse_yaml_manifest_bundle_returns_singleton_document() {
         let yaml = r#"
 PackageIdentifier: Test.Package
@@ -14967,6 +15102,37 @@ Installers:
     }
 
     #[test]
+    fn msi_override_keeps_msiexec_target() {
+        let installer = Installer {
+            installer_type: Some("msi".to_owned()),
+            ..Installer::default()
+        };
+        let mut request = InstallRequest::new(PackageQuery::default());
+        request.override_args = Some("/passive ALLUSERS=1".to_owned());
+        let path = Path::new(r"C:\temp\app.msi");
+
+        assert_eq!(
+            installer_command_arguments_with_options("msi", &request, path, &installer, true),
+            vec![
+                "/i".to_owned(),
+                path.display().to_string(),
+                "/passive".to_owned(),
+                "ALLUSERS=1".to_owned()
+            ]
+        );
+        // The direct MsiInstallProduct path takes the package separately: override only.
+        assert_eq!(
+            installer_command_arguments_with_options("msi", &request, path, &installer, false),
+            vec!["/passive".to_owned(), "ALLUSERS=1".to_owned()]
+        );
+        // Non-MSI installers keep plain override semantics.
+        assert_eq!(
+            installer_command_arguments_with_options("exe", &request, path, &installer, true),
+            vec!["/passive".to_owned(), "ALLUSERS=1".to_owned()]
+        );
+    }
+
+    #[test]
     fn msi_shell_execute_arguments_include_msiexec_target() {
         let installer = Installer {
             installer_type: Some("wix".to_owned()),
@@ -15122,9 +15288,35 @@ Installers:
 
     fn download_test_installer(app_root: &Path, manifest_path: &Path) -> Result<DownloadOutput> {
         let mut repository = Repository::open_with_options(RepositoryOptions::new(app_root.to_path_buf()))?;
+        repository.set_admin_setting("LocalManifestFiles", true)?;
         let mut request = InstallRequest::new(PackageQuery::default());
         request.manifest_path = Some(manifest_path.to_path_buf());
         repository.download_installer_for_request(&request, &app_root.join("downloads"))
+    }
+
+    #[test]
+    fn manifest_and_hash_override_require_admin_settings() {
+        let root = temp_app_root("admin_setting_gates");
+        fs::create_dir_all(&root).expect("create app root");
+        let manifest = write_installer_download_manifest(&root, "https://example.invalid/installer.exe", "00");
+        let mut repository =
+            Repository::open_with_options(RepositoryOptions::new(root.clone())).expect("open repository");
+
+        let mut request = InstallRequest::new(PackageQuery::default());
+        request.manifest_path = Some(manifest);
+        let error = repository
+            .download_installer_for_request(&request, &root.join("downloads"))
+            .expect_err("--manifest must be refused without LocalManifestFiles");
+        assert!(error.to_string().contains("LocalManifestFiles"), "{error}");
+
+        repository
+            .set_admin_setting("LocalManifestFiles", true)
+            .expect("enable");
+        request.ignore_security_hash = true;
+        let error = repository
+            .download_installer_for_request(&request, &root.join("downloads"))
+            .expect_err("--ignore-security-hash must be refused without InstallerHashOverride");
+        assert!(error.to_string().contains("InstallerHashOverride"), "{error}");
     }
 
     #[test]
@@ -15526,6 +15718,12 @@ Installers:
         assert_eq!(compare_version("1.10.0", "1.9.9"), Ordering::Greater);
         assert_eq!(compare_version("2.0", "10.0"), Ordering::Less);
         assert_eq!(compare_version("1.0.0-preview2", "1.0.0-preview1"), Ordering::Greater);
+        assert_eq!(compare_version("1.0.0", "1.0.0-rc1"), Ordering::Greater);
+        assert_eq!(compare_version("2.0.0-beta.1", "2.0.0"), Ordering::Less);
+        assert_eq!(compare_version("1.0", "1.0.0-beta"), Ordering::Greater);
+        assert_eq!(compare_version("1.2.3a", "1.2.10"), Ordering::Less);
+        assert_eq!(compare_version("1.2.3a", "1.2.3"), Ordering::Less);
+        assert_eq!(compare_version("1.0b", "1.0.1"), Ordering::Less);
         assert_eq!(compare_version("25.4.1", "< 25.4.1"), Ordering::Greater);
         assert_eq!(compare_version("< 25.4.1", "25.4.1"), Ordering::Less);
     }
@@ -15661,6 +15859,68 @@ Installers:
         let selected = select_installer(&installers, &query).expect("selected installer");
         assert_eq!(selected.installer_type.as_deref(), Some("msix"));
         assert_eq!(selected.architecture.as_deref(), Some("x64"));
+    }
+
+    #[test]
+    fn local_id_identity_handles_non_ascii_registry_key_names() {
+        let sources = SourceStore::default().sources;
+        // 29 bytes; the msstore suffix offset (17) lands inside the two-byte 'Ä'.
+        assert_eq!(
+            winget_package_identity_from_local_id(r"ARP\Machine\X64\Äpfel Editor", &sources),
+            None
+        );
+        let winget = sources
+            .iter()
+            .find(|source| source.name == "winget")
+            .expect("default winget source");
+        let local_id = format!(r"ARP\User\X64\Größe.Tool_{}", winget.identifier);
+        assert_eq!(
+            winget_package_identity_from_local_id(&local_id, &sources),
+            Some(("Größe.Tool".to_owned(), "winget".to_owned()))
+        );
+    }
+
+    #[test]
+    fn failed_dependency_install_is_an_error() {
+        let result = |success: bool, no_op: bool, exit_code: i32| InstallResult {
+            package_id: "Microsoft.VCRedist.2015+.x64".to_owned(),
+            version: "14.0".to_owned(),
+            installer_path: PathBuf::new(),
+            installer_type: "exe".to_owned(),
+            exit_code,
+            success,
+            no_op,
+            warnings: Vec::new(),
+        };
+
+        assert!(ensure_dependency_installed("Dep", &result(true, false, 0)).is_ok());
+        assert!(ensure_dependency_installed("Dep", &result(true, true, 0)).is_ok());
+        let error = ensure_dependency_installed("Dep", &result(false, false, 1603)).expect_err("must fail");
+        assert!(error.to_string().contains("1603"));
+    }
+
+    #[test]
+    fn requested_scope_accepts_installer_without_declared_scope() {
+        let installers = vec![
+            Installer {
+                architecture: Some("x64".to_owned()),
+                installer_type: Some("machine-only".to_owned()),
+                scope: Some("machine".to_owned()),
+                ..Installer::default()
+            },
+            Installer {
+                architecture: Some("x64".to_owned()),
+                installer_type: Some("exe".to_owned()),
+                ..Installer::default()
+            },
+        ];
+        let query = PackageQuery {
+            install_scope: Some("user".to_owned()),
+            ..PackageQuery::default()
+        };
+
+        let selected = select_installer(&installers, &query).expect("unscoped installer should be applicable");
+        assert_eq!(selected.installer_type.as_deref(), Some("exe"));
     }
 
     #[test]

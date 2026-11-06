@@ -315,7 +315,7 @@ internal static class PreIndexedSource
         foreach (var row in rawRows)
         {
             if (!grouped.TryGetValue(row.PackageRowId, out var existing) ||
-                string.Compare(row.Version, existing.Version, StringComparison.OrdinalIgnoreCase) > 0)
+                RestSource.CompareVersionStrings(row.Version, existing.Version) > 0)
             {
                 grouped[row.PackageRowId] = row;
             }
@@ -329,16 +329,17 @@ internal static class PreIndexedSource
 
     public static List<V1VersionRow> QueryV1Versions(SqliteConnection conn, long packageRowid)
     {
+        // `manifest.pathpart` is the rowid of the leaf path part (resolved by ResolveV1RelativePath),
+        // and `manifest.hash` is a SHA-256 BLOB that only exists in V1.1+ indexes.
+        var hashSql = ColumnExists(conn, "manifest", "hash") ? "m.hash" : "NULL";
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"
+        cmd.CommandText = $@"
             SELECT m.rowid, v.version, COALESCE(ch.channel, '') AS channel,
-                   pp.pathpart, COALESCE(m.hash, '') AS hash
+                   m.pathpart, {hashSql} AS hash
             FROM manifest m
             JOIN versions v ON v.rowid = m.version
             LEFT JOIN channels ch ON ch.rowid = m.channel
-            LEFT JOIN pathparts pp ON pp.rowid = m.pathpart
-            WHERE m.id = @id
-            ORDER BY v.version DESC";
+            WHERE m.id = @id";
         cmd.Parameters.AddWithValue("@id", packageRowid);
 
         var rows = new List<V1VersionRow>();
@@ -351,10 +352,14 @@ internal static class PreIndexedSource
                 Version = reader.GetString(1),
                 Channel = reader.GetString(2),
                 PathPart = reader.IsDBNull(3) ? null : reader.GetInt64(3),
-                ManifestHash = reader.IsDBNull(4) ? null : reader.GetString(4)
+                ManifestHash = reader.IsDBNull(4) ? null : HexString(reader, 4)
             });
         }
-        return rows;
+        // `versions.version` is TEXT, so the SQL ORDER BY is lexical ("9.0.0" > "10.0.0").
+        // Callers take the first row as the latest, so re-sort with version semantics.
+        return rows
+            .OrderByDescending(row => row.Version, Comparer<string>.Create(RestSource.CompareVersionStrings))
+            .ToList();
     }
 
     public static string ResolveV1RelativePath(SqliteConnection conn, long? pathPartId)
@@ -785,6 +790,15 @@ internal static class PreIndexedSource
 
     private static string MatchParameter(string value, bool exact)
         => exact ? value : $"%{value}%";
+
+    private static bool ColumnExists(SqliteConnection conn, string table, string column)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM pragma_table_info(@table) WHERE name = @column LIMIT 1";
+        cmd.Parameters.AddWithValue("@table", table);
+        cmd.Parameters.AddWithValue("@column", column);
+        return cmd.ExecuteScalar() is not null;
+    }
 
     private static string HexString(SqliteDataReader reader, int ordinal)
     {

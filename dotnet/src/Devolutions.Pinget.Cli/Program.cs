@@ -248,7 +248,8 @@ upgradeCommand.SetHandler((ctx) =>
         Source = ctx.ParseResult.GetValueForOption(usOpt),
         Count = ctx.ParseResult.GetValueForOption(ucOpt),
         Exact = ctx.ParseResult.GetValueForOption(ueOpt),
-        Version = ctx.ParseResult.GetValueForOption(uvOpt),
+        // --version is the upgrade target. ListQuery.Version filters on the *installed*
+        // version, so it must not be set here; the target goes on the install query below.
         InstallScope = ctx.ParseResult.GetValueForOption(uScopeOpt),
         UpgradeOnly = true,
         IncludeUnknown = ctx.ParseResult.GetValueForOption(uUnknownOpt),
@@ -263,7 +264,7 @@ upgradeCommand.SetHandler((ctx) =>
         Moniker = query.Moniker,
         Source = query.Source,
         Exact = query.Exact,
-        Version = query.Version,
+        Version = ctx.ParseResult.GetValueForOption(uvOpt),
         Locale = ctx.ParseResult.GetValueForOption(uLocaleOpt),
         InstallerType = ctx.ParseResult.GetValueForOption(uTypeOpt),
         InstallerArchitecture = ctx.ParseResult.GetValueForOption(uArchOpt),
@@ -308,7 +309,7 @@ upgradeCommand.SetHandler((ctx) =>
     else if (!string.IsNullOrWhiteSpace(manifestPath))
     {
         var installResult = repo.Install(baseInstallRequest);
-        PrintPackageActionResult(installResult, "upgrade", "upgraded");
+        ctx.ExitCode = PrintPackageActionResult(installResult, "upgrade", "upgraded");
     }
     else
     {
@@ -569,24 +570,12 @@ exportCommand.AddOption(exOutputOpt); exportCommand.AddOption(exSourceOpt); expo
 exportCommand.SetHandler((output, source, includeVersions) =>
 {
     using var repo = Repository.Open();
-    var listResult = repo.List(new ListQuery { Source = source is not null ? source : null, Query = source is not null ? " " : null });
-    var packages = listResult.Matches.Select(m => new PackageExportEntry(
-        PackageIdentifier: m.Id,
-        Version: includeVersions ? m.InstalledVersion : null)).ToList();
-
-    var export = new PackagesExportPayload(
-        Schema: "https://aka.ms/winget-packages.schema.2.0.json",
-        Sources:
-        [
-            new PackageExportSource(
-                SourceDetails: new PackageExportSourceDetails(
-                    Name: source ?? "winget",
-                    Argument: "https://cdn.winget.microsoft.com/cache",
-                    Type: "Microsoft.PreIndexed"),
-                Packages: packages)
-        ]);
+    // List everything (plain `list` already correlates installed packages to their source),
+    // then filter by source here: `list --source` needs a text query, and any query filters.
+    var listResult = repo.List(new ListQuery());
+    var export = ExportPayloadBuilder.Build(listResult.Matches, repo.ListSources(), source, includeVersions);
     File.WriteAllText(output, StructuredOutputSerializer.SerializeJson(export, CliJsonContext.Default.PackagesExportPayload));
-    Console.WriteLine($"Exported {packages.Count} packages to {output}");
+    Console.WriteLine($"Exported {export.Sources.Sum(s => s.Packages.Count)} packages to {output}");
 }, exOutputOpt, exSourceOpt, exVersionsOpt);
 
 // ── Error ──
@@ -1004,7 +993,7 @@ installCommand.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(iignoreSecurityHashOpt),
         ctx.ParseResult.GetValueForOption(idependencySourceOpt),
         ctx.ParseResult.GetValueForOption(inoUpgradeOpt)));
-    PrintPackageActionResult(result, "install", "installed");
+    ctx.ExitCode = PrintPackageActionResult(result, "install", "installed");
 });
 
 // ── Uninstall ──
@@ -1057,7 +1046,7 @@ uninstallCommand.SetHandler((ctx) =>
         Preserve = ctx.ParseResult.GetValueForOption(uiPreserveOpt),
         LogPath = ctx.ParseResult.GetValueForOption(uiLogOpt),
     });
-    PrintPackageActionResult(result, "uninstall", "uninstalled");
+    ctx.ExitCode = PrintPackageActionResult(result, "uninstall", "uninstalled");
 });
 
 // ── Repair ──
@@ -1110,7 +1099,7 @@ repairCommand.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(racceptPkgAgreementsOpt),
         ctx.ParseResult.GetValueForOption(rforceOpt),
         ctx.ParseResult.GetValueForOption(rignoreSecurityHashOpt)));
-    PrintPackageActionResult(result, "repair", "repaired");
+    ctx.ExitCode = PrintPackageActionResult(result, "repair", "repaired");
 });
 
 // ── Import ──
@@ -1485,18 +1474,28 @@ static void PrintSources(List<SourceRecord> sources)
         Console.WriteLine($"{s.Name,-12} {s.TrustLevel,-8} {s.Explicit.ToString().ToLowerInvariant(),-8} {s.Arg}");
 }
 
-static void PrintPackageActionResult(InstallResult result, string action, string actionPastTense)
+/// Prints the outcome and returns the process exit code: 0 on success or no-op, otherwise the
+/// installer's exit code (or 1 if it reported 0 despite failing), matching the Rust CLI.
+static int PrintPackageActionResult(InstallResult result, string action, string actionPastTense)
 {
     PrintWarnings(result.Warnings);
     var target = string.IsNullOrWhiteSpace(result.Version)
         ? result.PackageId
         : $"{result.PackageId} v{result.Version}";
     if (result.NoOp)
+    {
         Console.WriteLine($"No changes were made for {target}.");
-    else if (result.Success)
+        return 0;
+    }
+
+    if (result.Success)
+    {
         Console.WriteLine($"Successfully {actionPastTense} {target}");
-    else
-        Console.Error.WriteLine($"Failed to {action} {target} (exit code: {result.ExitCode})");
+        return 0;
+    }
+
+    Console.Error.WriteLine($"Failed to {action} {target} (exit code: {result.ExitCode})");
+    return result.ExitCode != 0 ? result.ExitCode : 1;
 }
 
 static void PrintErrorLookup(string input)

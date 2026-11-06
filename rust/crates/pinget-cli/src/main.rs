@@ -608,9 +608,19 @@ fn main() {
     }
 }
 
+fn resolve_output_format(cli: &Cli) -> Result<OutputFormat> {
+    // `export` defines its own `--output`/`-o` (the destination file, as in WinGet). Clap
+    // shares the arg id with the global output-format flag, so the file path also lands in
+    // `cli.output`; it is not an output format there.
+    if matches!(cli.command, Some(Commands::Export(_))) {
+        return Ok(OutputFormat::Text);
+    }
+    OutputFormat::from_option(cli.output.as_deref())
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let output = OutputFormat::from_option(cli.output.as_deref())?;
+    let output = resolve_output_format(&cli)?;
 
     if cli.info {
         print_info();
@@ -713,11 +723,7 @@ fn run() -> Result<()> {
                     print_serialized(&result, output)?;
                 }
             } else {
-                let upgradeable: Vec<_> = result
-                    .matches
-                    .iter()
-                    .filter(|m| m.available_version.is_some())
-                    .collect();
+                let upgradeable = select_upgrade_targets(&result.matches, &args)?;
                 if upgradeable.is_empty() {
                     println!("No applicable upgrade found.");
                 } else {
@@ -2767,6 +2773,56 @@ fn find_matching_pin<'a>(item: &ListMatch, pins: &'a [PinRecord]) -> Option<&'a 
     source_specific.or(source_agnostic)
 }
 
+/// Picks the rows `upgrade` will install. `--all` takes every upgradeable row. A named upgrade
+/// (query, `--id`, `--name`) targets one package, as in WinGet: the list filter is a substring
+/// match, so an exact id/name match wins, and any remaining ambiguity is an error instead of
+/// upgrading every package that happens to contain the text.
+fn select_upgrade_targets<'a>(matches: &'a [ListMatch], args: &UpgradeArgs) -> Result<Vec<&'a ListMatch>> {
+    let upgradeable: Vec<&ListMatch> = matches.iter().filter(|m| m.available_version.is_some()).collect();
+    if args.all || !has_explicit_upgrade_selector(args) {
+        return Ok(upgradeable);
+    }
+
+    let distinct_ids = |rows: &[&ListMatch]| {
+        let mut ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        ids.sort_by_key(|id| id.to_ascii_lowercase());
+        ids.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        ids.len()
+    };
+    if distinct_ids(&upgradeable) <= 1 {
+        return Ok(upgradeable);
+    }
+
+    let selectors: Vec<&str> = [
+        args.id.as_deref(),
+        args.name.as_deref(),
+        args.query.as_deref(),
+        args.query_option.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let exact: Vec<&ListMatch> = upgradeable
+        .iter()
+        .copied()
+        .filter(|m| {
+            selectors
+                .iter()
+                .any(|value| m.id.eq_ignore_ascii_case(value) || m.name.eq_ignore_ascii_case(value))
+        })
+        .collect();
+    if !exact.is_empty() && distinct_ids(&exact) == 1 {
+        return Ok(exact);
+    }
+
+    let candidates = upgradeable
+        .iter()
+        .map(|m| format!("  {} ({})", m.name, m.id))
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!("Multiple installed packages found matching input criteria. Please refine the input.\n{candidates}")
+}
+
 fn has_explicit_upgrade_selector(args: &UpgradeArgs) -> bool {
     args.query.is_some()
         || args.query_option.is_some()
@@ -3037,6 +3093,76 @@ mod tests {
     use pinget_core::VersionKey;
 
     use super::*;
+
+    #[test]
+    fn export_output_file_is_not_treated_as_output_format() {
+        for flag in ["-o", "--output"] {
+            let cli = Cli::try_parse_from(["pinget", "export", flag, r"C:\tmp\packages.json"]).expect("parse export");
+            assert_eq!(resolve_output_format(&cli).expect("format"), OutputFormat::Text);
+            match cli.command {
+                Some(Commands::Export(args)) => assert_eq!(args.output, r"C:\tmp\packages.json"),
+                _ => panic!("expected export command"),
+            }
+        }
+    }
+
+    fn upgradeable_row(id: &str, name: &str) -> ListMatch {
+        ListMatch {
+            name: name.to_owned(),
+            id: id.to_owned(),
+            local_id: format!(r"ARP\Machine\X64\{name}"),
+            installed_version: "1.0".to_owned(),
+            available_version: Some("2.0".to_owned()),
+            source_name: Some("winget".to_owned()),
+            publisher: None,
+            scope: None,
+            installer_category: None,
+            install_location: None,
+            package_family_names: Vec::new(),
+            product_codes: Vec::new(),
+            upgrade_codes: Vec::new(),
+        }
+    }
+
+    fn upgrade_args(command_line: &[&str]) -> UpgradeArgs {
+        let mut full = vec!["pinget", "upgrade"];
+        full.extend_from_slice(command_line);
+        match Cli::try_parse_from(full).expect("parse upgrade").command {
+            Some(Commands::Upgrade(parsed)) => parsed,
+            _ => panic!("expected upgrade command"),
+        }
+    }
+
+    #[test]
+    fn named_upgrade_targets_one_package() {
+        let rows = vec![
+            upgradeable_row("Microsoft.Edge", "Microsoft Edge"),
+            upgradeable_row("Microsoft.EdgeWebView2Runtime", "Microsoft Edge WebView2 Runtime"),
+            upgradeable_row("Git.Git", "Git"),
+        ];
+
+        let exact = select_upgrade_targets(&rows, &upgrade_args(&["--id", "Microsoft.Edge"])).expect("exact id");
+        assert_eq!(
+            exact.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["Microsoft.Edge"]
+        );
+
+        let error = select_upgrade_targets(&rows[..2], &upgrade_args(&["edge"])).expect_err("ambiguous query");
+        assert!(error.to_string().contains("Multiple installed packages"), "{error}");
+
+        let single = select_upgrade_targets(&rows[2..], &upgrade_args(&["git"])).expect("single substring match");
+        assert_eq!(single.len(), 1);
+
+        let all = select_upgrade_targets(&rows, &upgrade_args(&["--all"])).expect("upgrade --all");
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn global_output_format_still_applies_to_other_commands() {
+        let cli = Cli::try_parse_from(["pinget", "list", "--output", "json"]).expect("parse list");
+        assert_eq!(resolve_output_format(&cli).expect("format"), OutputFormat::Json);
+        assert!(Cli::try_parse_from(["pinget", "list", "--output", "bogus"]).is_err());
+    }
 
     #[derive(Default)]
     struct FakeImportRepository {
