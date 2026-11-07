@@ -13205,6 +13205,7 @@ fn msi_repair_product_code(installed: &ListMatch) -> Option<String> {
 
 /// `msiexec` arguments for repairing an installed product, matching WinGet's
 /// GetMsiExecRepairArgs (`/f` defaults to `omus`) plus pinget's `--log` support.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn build_msi_repair_arguments(product_code: &str, mode: InstallerMode, log_path: Option<&Path>) -> Vec<String> {
     let mut args = vec!["/f".to_owned(), product_code.to_owned()];
     match mode {
@@ -14322,6 +14323,7 @@ fn portable_link_alias(alias: &str) -> String {
 
 /// The primary (first) command alias of a portable installer.
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn determine_portable_alias(installer: &Installer) -> Option<String> {
     determine_portable_links(installer, !installer.nested_installer_files.is_empty(), None, None)
         .ok()?

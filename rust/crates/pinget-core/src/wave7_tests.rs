@@ -1,5 +1,6 @@
 //! Regression tests for the portable / archive / repair / process-launch defect fixes (wave 7).
 
+#[cfg_attr(not(windows), allow(unused_imports))]
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 

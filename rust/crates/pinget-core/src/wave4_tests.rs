@@ -205,6 +205,7 @@ Installers:
     );
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const DEPENDENCY_MANIFEST_HEADER: &str = "PackageIdentifier: Test.DepRoot
 PackageVersion: 1.0.0
 PackageName: Test Dep Root
