@@ -30,7 +30,18 @@ internal sealed record PackagesExportPayload(
     string CreationDate = "",
     string WinGetVersion = "");
 
+/// <summary>
+/// <c>pin list --output json|yaml</c> row. Same shape as the Rust CLI's serialized <c>PinRecord</c>
+/// (PascalCase keys, pin type as its name).
+/// </summary>
+internal sealed record PinListEntry(string PackageId, string Version, string SourceId, string PinType)
+{
+    internal static List<PinListEntry> FromPins(IEnumerable<Devolutions.Pinget.Core.PinRecord> pins) =>
+        pins.Select(pin => new PinListEntry(pin.PackageId, pin.Version, pin.SourceId, pin.PinType.ToString())).ToList();
+}
+
 [JsonSerializable(typeof(SourceExportPayload))]
 [JsonSerializable(typeof(PackagesExportPayload))]
+[JsonSerializable(typeof(List<PinListEntry>))]
 [JsonSourceGenerationOptions(WriteIndented = true)]
 internal partial class CliJsonContext : JsonSerializerContext;

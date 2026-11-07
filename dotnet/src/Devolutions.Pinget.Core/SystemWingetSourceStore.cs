@@ -316,7 +316,8 @@ internal static class SystemWingetSourceStore
         if (name.Length is 0 || version.Length is 0 || publisherId.Length is 0)
             return null;
 
-        var familyName = resourceId.Length is 0 ? $"{name}_{publisherId}" : $"{name}_{resourceId}_{publisherId}";
+        // The package family name is always Name_PublisherId; the resource id only appears in the full name.
+        var familyName = $"{name}_{publisherId}";
         return (version, familyName, resourceId);
     }
 

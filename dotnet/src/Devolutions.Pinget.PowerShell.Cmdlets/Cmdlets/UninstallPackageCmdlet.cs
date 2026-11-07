@@ -25,7 +25,7 @@ public sealed class UninstallPackageCmdlet : PackageCmdlet
             return;
 
         using var client = PingetClient.Open();
-        var result = client.UninstallPackage(PSCatalogPackage, Version, Id, Name, Moniker, Source, Query, Force, Log, Mode);
+        var result = client.UninstallPackage(PSCatalogPackage, Version, Id, Name, Moniker, Source, Query, Force, Log, Mode, MatchOption);
         foreach (var warning in result.Warnings)
             WriteWarning(warning);
         WriteObject(result.Value);

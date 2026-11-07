@@ -2,7 +2,6 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Encodings.Web;
 using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 using YamlDotNet.RepresentationModel;
@@ -512,18 +511,10 @@ public sealed partial class PublisherWorkspace
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
     }
 
-    private static string WriteInventory(IReadOnlyDictionary<string, string> inventory)
-    {
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
-        {
-            writer.WriteStartObject();
-            foreach (var entry in inventory.OrderBy(x => x.Key, StringComparer.Ordinal))
-                writer.WriteString(entry.Key, entry.Value);
-            writer.WriteEndObject();
-        }
-        return Encoding.UTF8.GetString(stream.ToArray());
-    }
+    // Same bytes as the Rust publisher's serde_json inventory, so equivalent trees share a build ID.
+    private static string WriteInventory(IReadOnlyDictionary<string, string> inventory) =>
+        "{" + string.Join(",", inventory.OrderBy(x => x.Key, StringComparer.Ordinal)
+            .Select(entry => ManifestScanner.JsonQuote(entry.Key) + ":" + ManifestScanner.JsonQuote(entry.Value))) + "}";
 
     private static bool HasTable(SqliteConnection connection, string name)
     {
@@ -536,7 +527,7 @@ public sealed partial class PublisherWorkspace
     internal static string ResolveContained(string root, string relative)
     {
         if (Path.IsPathRooted(relative) || relative.Split('/').Any(part => part is "" or "." or ".."
-            || part.Any(c => c < ' ' || "\\:*?\"<>|".Contains(c))))
+            || part.Any(c => c < ' ' || "\\:*?\"<>|".Contains(c)) || !ManifestScanner.IsWindowsSafeName(part)))
             throw new PublisherException($"Unsafe publisher relative path: '{relative}'.");
         var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var fullPath = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)));

@@ -25,7 +25,7 @@ internal static class PinStore
         }
         else
         {
-            cmd.CommandText = $"SELECT package_id, version, source_id, {pinTypeColumn} FROM pin WHERE source_id = @src";
+            cmd.CommandText = $"SELECT package_id, version, source_id, {pinTypeColumn} FROM pin WHERE source_id = @src COLLATE NOCASE";
             cmd.Parameters.AddWithValue("@src", sourceId);
         }
 
@@ -51,16 +51,7 @@ internal static class PinStore
         using var conn = new SqliteConnection($"Data Source={dbPath}");
         conn.Open();
 
-        using var createCmd = conn.CreateCommand();
-        createCmd.CommandText = @"
-            CREATE TABLE IF NOT EXISTS pin (
-                package_id TEXT NOT NULL,
-                version TEXT NOT NULL DEFAULT '*',
-                source_id TEXT NOT NULL DEFAULT '',
-                type INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (package_id, source_id)
-            )";
-        createCmd.ExecuteNonQuery();
+        EnsureSchema(conn);
 
         var pinTypeColumn = ResolvePinTypeColumn(conn) ?? CurrentPinTypeColumn;
 
@@ -91,11 +82,11 @@ internal static class PinStore
         using var cmd = conn.CreateCommand();
         if (string.IsNullOrWhiteSpace(sourceId))
         {
-            cmd.CommandText = "DELETE FROM pin WHERE package_id = @id";
+            cmd.CommandText = "DELETE FROM pin WHERE package_id = @id COLLATE NOCASE";
         }
         else
         {
-            cmd.CommandText = "DELETE FROM pin WHERE package_id = @id AND source_id = @src";
+            cmd.CommandText = "DELETE FROM pin WHERE package_id = @id COLLATE NOCASE AND source_id = @src COLLATE NOCASE";
             cmd.Parameters.AddWithValue("@src", sourceId);
         }
         cmd.Parameters.AddWithValue("@id", packageId);
@@ -118,11 +109,30 @@ internal static class PinStore
                 conn.Open();
 
                 using var cmd = conn.CreateCommand();
-                cmd.CommandText = "DELETE FROM pin WHERE source_id = @src";
+                cmd.CommandText = "DELETE FROM pin WHERE source_id = @src COLLATE NOCASE";
                 cmd.Parameters.AddWithValue("@src", sourceId);
                 cmd.ExecuteNonQuery();
             }
         }
+    }
+
+    /// <summary>
+    /// Creates WinGet's pinning database schema (PinningIndex 1.0) when it is missing. WinGet opens
+    /// pinning.db through SQLiteStorageBase, which reads metadata.majorVersion/minorVersion; a file
+    /// without them is treated as corrupt and deleted, losing every pin. The pin table and its unique
+    /// index match Pinning_1_0/PinTable.cpp.
+    /// </summary>
+    internal static void EnsureSchema(SqliteConnection conn)
+    {
+        using var createCmd = conn.CreateCommand();
+        createCmd.CommandText = """
+            CREATE TABLE IF NOT EXISTS [metadata]([name] TEXT PRIMARY KEY NOT NULL,[value] TEXT NOT NULL) WITHOUT ROWID;
+            INSERT OR IGNORE INTO [metadata] ([name], [value]) VALUES ('majorVersion', '1');
+            INSERT OR IGNORE INTO [metadata] ([name], [value]) VALUES ('minorVersion', '0');
+            CREATE TABLE IF NOT EXISTS pin (package_id TEXT NOT NULL, source_id TEXT NOT NULL, type INT64 NOT NULL, version TEXT NOT NULL);
+            CREATE UNIQUE INDEX IF NOT EXISTS pin_index ON pin (package_id, source_id);
+            """;
+        createCmd.ExecuteNonQuery();
     }
 
     private static string? ResolvePinTypeColumn(SqliteConnection conn)

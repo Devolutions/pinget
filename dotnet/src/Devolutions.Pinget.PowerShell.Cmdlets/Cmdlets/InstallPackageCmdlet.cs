@@ -36,7 +36,8 @@ public sealed class InstallPackageCmdlet : InstallCmdlet
             Scope,
             Architecture,
             Mode,
-            InstallerType);
+            InstallerType,
+            MatchOption);
 
         foreach (var warning in result.Warnings)
             WriteWarning(warning);

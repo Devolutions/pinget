@@ -102,12 +102,14 @@ fn build_multifile_manifest_set_emits_complete_v2_index_and_feed() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("index should contain ARP version bounds");
-    assert_eq!(arp_bounds, ("1.9.0".to_owned(), "1.10.0".to_owned()));
+    // WinGet stores the latest version's ARP range on the package row.
+    assert_eq!(arp_bounds, ("1.10.0".to_owned(), "1.10.0".to_owned()));
 
     for (table, column, expected) in [
-        ("pfns2", "pfn", "Pinget.Matrix_1234567890abc"),
-        ("productcodes2", "productcode", "{00112233-4455-6677-8899-AABBCCDDEEFF}"),
-        ("upgradecodes2", "upgradecode", "{11223344-5566-7788-99AA-BBCCDDEEFF00}"),
+        // Stored case-folded, as WinGet does, so lowercase exact lookups match.
+        ("pfns2", "pfn", "pinget.matrix_1234567890abc"),
+        ("productcodes2", "productcode", "{00112233-4455-6677-8899-aabbccddeeff}"),
+        ("upgradecodes2", "upgradecode", "{11223344-5566-7788-99aa-bbccddeeff00}"),
     ] {
         assert_eq!(
             read_correlations(&database, table, column),

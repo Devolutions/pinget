@@ -15,7 +15,8 @@ public sealed class PublisherPackagingTests
     private const string Publisher = "CN=Pinget Publisher Conformance Test";
 
     [Theory]
-    [InlineData("bad-name", Publisher, "1.0.0.0", "Package identity")]
+    // Hyphens are valid in AppX package names; underscores are not.
+    [InlineData("bad_name", Publisher, "1.0.0.0", "Package identity")]
     [InlineData(PackageName, Publisher, "1.2.3", "four numeric components")]
     [InlineData(PackageName, Publisher, "1.2.3.65536", "four numeric components")]
     public void Publish_InvalidIdentityOrPackageVersion_IsRejected(

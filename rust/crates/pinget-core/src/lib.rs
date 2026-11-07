@@ -3,6 +3,24 @@ mod name_normalization;
 mod portable_payload_tests;
 #[cfg(test)]
 mod portable_regression_tests;
+#[cfg(test)]
+mod wave10_tests;
+#[cfg(test)]
+mod wave11_tests;
+#[cfg(test)]
+mod wave1_tests;
+#[cfg(test)]
+mod wave2_tests;
+#[cfg(test)]
+mod wave3_tests;
+#[cfg(test)]
+mod wave4_tests;
+#[cfg(test)]
+mod wave7_tests;
+#[cfg(test)]
+mod wave8_tests;
+#[cfg(test)]
+mod wave9_tests;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -119,6 +137,10 @@ const SUPPORTED_ADMIN_SETTINGS: &[&str] = &[
     "LocalArchiveMalwareScanOverride",
     "ProxyCommandLineOptions",
 ];
+/// Cache lifetime for a REST `/information` response without a usable Cache-Control max-age.
+const REST_INFORMATION_DEFAULT_MAX_AGE_SECONDS: u64 = 60;
+/// Upper bound on the server-supplied Cache-Control max-age for REST `/information` (one day).
+const REST_INFORMATION_MAX_AGE_SECONDS: u64 = 86_400;
 const REST_SUPPORTED_CONTRACTS: &[&str] = &[
     "1.12.0", "1.10.0", "1.9.0", "1.7.0", "1.6.0", "1.5.0", "1.4.0", "1.1.0", "1.0.0",
 ];
@@ -140,25 +162,29 @@ impl Display for SourceKind {
     }
 }
 
+/// A configured source. Serialized with the same camelCase keys the C# implementation
+/// writes to `sources.json`, so both can share one store; the snake_case aliases keep
+/// stores written by earlier Rust builds readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceRecord {
     pub name: String,
     pub kind: SourceKind,
     pub arg: String,
     pub identifier: String,
-    #[serde(default = "default_source_trust_level")]
+    #[serde(default = "default_source_trust_level", alias = "trust_level")]
     pub trust_level: String,
     #[serde(default)]
     pub explicit: bool,
     #[serde(default)]
     pub priority: i32,
-    #[serde(default)]
+    #[serde(default, alias = "last_update")]
     pub last_update: Option<DateTime<Utc>>,
-    #[serde(default)]
+    #[serde(default, alias = "source_version")]
     pub source_version: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "eTag", alias = "etag")]
     pub etag: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "last_modified")]
     pub last_modified: Option<String>,
 }
 
@@ -558,6 +584,82 @@ pub struct Installer {
     pub commands: Vec<String>,
     pub package_dependencies: Vec<String>,
     pub require_explicit_upgrade: bool,
+    /// Non-zero installer exit codes the manifest declares as success
+    /// (`InstallerSuccessCodes`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub installer_success_codes: Vec<i64>,
+    /// Manifest `ExpectedReturnCodes` entries (code + `ReturnResponse`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub expected_return_codes: Vec<ExpectedReturnCode>,
+    /// `DownloadCommandProhibited`: `download` must refuse this installer (WinGet
+    /// `APPINSTALLER_CLI_ERROR_DOWNLOAD_COMMAND_PROHIBITED`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub download_command_prohibited: bool,
+    /// `Markets.AllowedMarkets`: when non-empty, only these markets may use the installer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_markets: Vec<String>,
+    /// `Markets.ExcludedMarkets`: markets that may not use the installer (ignored when
+    /// `allowed_markets` is set, as in WinGet).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_markets: Vec<String>,
+    /// `UnsupportedOSArchitectures`: OS architectures the installer must not run on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_os_architectures: Vec<String>,
+    /// `UpgradeBehavior` (`install`, `uninstallPrevious` or `deny`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_behavior: Option<String>,
+    /// Every dependency kind the installer declares (root `Dependencies` are inherited only
+    /// when the installer declares none of any kind, as in WinGet).
+    #[serde(skip_serializing_if = "InstallerDependencies::is_empty")]
+    pub dependencies: InstallerDependencies,
+    /// `AppsAndFeaturesEntries`: the ARP identities the installer writes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub apps_and_features_entries: Vec<AppsAndFeaturesEntry>,
+}
+
+/// The `Dependencies` an installer declares.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct InstallerDependencies {
+    pub windows_features: Vec<String>,
+    pub windows_libraries: Vec<String>,
+    pub package_dependencies: Vec<PackageDependency>,
+    pub external_dependencies: Vec<String>,
+}
+
+impl InstallerDependencies {
+    /// True when no dependency of any kind is declared (the negation of WinGet `DependencyList::HasAny`).
+    pub fn is_empty(&self) -> bool {
+        self.windows_features.is_empty()
+            && self.windows_libraries.is_empty()
+            && self.package_dependencies.is_empty()
+            && self.external_dependencies.is_empty()
+    }
+}
+
+/// One `Dependencies.PackageDependencies` entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PackageDependency {
+    pub package_identifier: String,
+    /// `MinimumVersion`, kept as the manifest's original text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_version: Option<String>,
+}
+
+/// One `AppsAndFeaturesEntries` entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AppsAndFeaturesEntry {
+    pub display_name: Option<String>,
+    pub publisher: Option<String>,
+    pub display_version: Option<String>,
+    pub product_code: Option<String>,
+    pub upgrade_code: Option<String>,
+    pub installer_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ExpectedReturnCode {
+    pub installer_return_code: i64,
+    pub return_response: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -578,6 +680,9 @@ pub struct InstallerSwitches {
     pub custom: Option<String>,
     pub log: Option<String>,
     pub install_location: Option<String>,
+    /// `Upgrade`: appended only when the install updates an existing installation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,16 +819,6 @@ pub struct DownloadOutput {
     pub manifest_path: PathBuf,
 }
 
-/// Internal result of fetching only the installer file. Used by the install
-/// flow which downloads into a temp dir and intentionally skips the manifest
-/// YAML side effect.
-struct FetchedInstaller {
-    manifest: Manifest,
-    manifest_documents: JsonValue,
-    installer: Installer,
-    installer_path: PathBuf,
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct VersionsResult {
@@ -745,7 +840,9 @@ pub struct CacheWarmResult {
 pub struct SourceUpdateResult {
     pub name: String,
     pub kind: SourceKind,
+    /// What the update did, or the error message when `success` is false.
     pub detail: String,
+    pub success: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -775,7 +872,7 @@ impl Display for PinType {
 }
 
 /// Result of an install/uninstall/upgrade operation
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct InstallResult {
     pub package_id: String,
     pub version: String,
@@ -784,6 +881,9 @@ pub struct InstallResult {
     pub exit_code: i32,
     pub success: bool,
     pub no_op: bool,
+    /// The installer reported success but needs a restart to finish (WinGet `RebootRequired`).
+    #[serde(default)]
+    pub reboot_required: bool,
     pub warnings: Vec<String>,
 }
 
@@ -816,6 +916,7 @@ impl InstallerSwitches {
                 .install_location
                 .clone()
                 .or_else(|| fallback.install_location.clone()),
+            upgrade: self.upgrade.clone().or_else(|| fallback.upgrade.clone()),
         }
     }
 }
@@ -842,6 +943,7 @@ fn unsupported_action_result(
         exit_code: 0,
         success: true,
         no_op: true,
+        reboot_required: false,
         warnings: vec![warning.to_owned()],
     }
 }
@@ -1143,6 +1245,7 @@ impl Repository {
         explicit: bool,
         priority: i32,
     ) -> Result<()> {
+        validate_source_argument(arg)?;
         if self.uses_system_winget_sources() {
             system_winget_add_source(name, arg, kind, &normalize_source_trust_level(trust_level)?, explicit)?;
             self.refresh_system_winget_sources()?;
@@ -1214,10 +1317,7 @@ impl Repository {
             .ok_or_else(|| anyhow!("Source '{name}' not found."))?;
         let source = self.store.sources.remove(idx);
         // Clean up cached state for this source
-        let state_dir = self.source_state_dir(&source);
-        if state_dir.exists() {
-            let _ = fs::remove_dir_all(&state_dir);
-        }
+        self.remove_source_caches(&source);
         self.save_store()?;
         Ok(())
     }
@@ -1237,10 +1337,7 @@ impl Repository {
             .ok_or_else(|| anyhow!("Source '{name}' not found."))?;
 
         let source = self.store.sources[idx].clone();
-        let state_dir = self.source_state_dir(&source);
-        if state_dir.exists() {
-            let _ = fs::remove_dir_all(&state_dir);
-        }
+        self.remove_source_caches(&source);
 
         if let Some(default_source) = SourceStore::default()
             .sources
@@ -1268,10 +1365,7 @@ impl Repository {
 
         // Remove cached state for all current sources
         for source in &self.store.sources {
-            let state_dir = self.source_state_dir(source);
-            if state_dir.exists() {
-                let _ = fs::remove_dir_all(&state_dir);
-            }
+            self.remove_source_caches(source);
         }
         self.store = SourceStore::default();
         self.save_store()?;
@@ -1405,19 +1499,31 @@ impl Repository {
             self.refresh_system_winget_sources()?;
         }
 
-        let indexes = self.resolve_source_indexes(source_name)?;
+        // Like `winget source update`, updating without a name refreshes every source,
+        // explicit ones included; only search resolution skips explicit sources.
+        let indexes = match source_name {
+            Some(_) => self.resolve_source_indexes(source_name)?,
+            None => (0..self.store.sources.len()).collect(),
+        };
         let mut results = Vec::new();
 
+        // One failing source must not stop the others or discard their refreshed metadata:
+        // record the failure in its result, keep going, and save what succeeded.
         for index in indexes {
-            let detail = match self.store.sources[index].kind {
-                SourceKind::PreIndexed => self.update_preindexed(index)?,
-                SourceKind::Rest => self.update_rest(index)?,
+            let outcome = match self.store.sources[index].kind {
+                SourceKind::PreIndexed => self.update_preindexed(index),
+                SourceKind::Rest => self.update_rest(index),
+            };
+            let (success, detail) = match outcome {
+                Ok(detail) => (true, detail),
+                Err(error) => (false, format!("{error:#}")),
             };
 
             results.push(SourceUpdateResult {
                 name: self.store.sources[index].name.clone(),
                 kind: self.store.sources[index].kind,
                 detail,
+                success,
             });
         }
 
@@ -1446,6 +1552,18 @@ impl Repository {
     }
 
     pub fn list(&mut self, query: &ListQuery) -> Result<ListResponse> {
+        self.list_with_pin_filter(query, true)
+    }
+
+    /// Like [`Repository::list`], but never hides upgrade rows because of a
+    /// pin. Explicit (named) upgrades use this: the caller evaluates the pin
+    /// against the requested target version and reports a pinned package
+    /// instead of silently finding nothing to upgrade.
+    pub fn list_ignoring_pins(&mut self, query: &ListQuery) -> Result<ListResponse> {
+        self.list_with_pin_filter(query, false)
+    }
+
+    fn list_with_pin_filter(&mut self, query: &ListQuery, apply_pins: bool) -> Result<ListResponse> {
         if (query.include_unknown || query.include_pinned) && !query.upgrade_only {
             bail!("--include-unknown and --include-pinned require --upgrade-available");
         }
@@ -1522,6 +1640,7 @@ impl Repository {
             // catalog name is the parity-faithful substitute pinget has
             // available without taking a WinRT dependency.
             warnings.extend(self.enrich_correlated_via_index(&mut installed, query.source.as_deref())?);
+            warnings.extend(self.resolve_rest_correlated_versions(&mut installed));
         }
 
         // For `upgrade`, collapse multiple installed entries that map to the
@@ -1549,15 +1668,19 @@ impl Repository {
                 .then_with(|| left.local_id.cmp(&right.local_id))
         });
 
-        let pins = if query.upgrade_only {
-            self.list_pins(query.source.as_deref())?
+        // Load every pin: source-less pins apply to all sources, and the
+        // source match in `find_applicable_pin` is case-insensitive.
+        // `--include-pinned` relaxes only Pinning pins; Blocking and Gating
+        // pins still apply.
+        let pins = if query.upgrade_only && apply_pins {
+            self.list_pins(None)?
         } else {
             Vec::new()
         };
         let mut list_matches = matches
             .into_iter()
             .map(|package| list_match_from_installed(package, &self.store.sources))
-            .filter(|item| !query.upgrade_only || query.include_pinned || !is_upgrade_blocked_by_pin(item, &pins))
+            .filter(|item| !query.upgrade_only || !upgrade_blocked_by_pin(item, &pins, query.include_pinned))
             .collect::<Vec<_>>();
         if !query.upgrade_only {
             list_matches = suppress_duplicate_available_versions(list_matches);
@@ -1717,6 +1840,60 @@ impl Repository {
         }
 
         Ok(Vec::new())
+    }
+
+    /// Rows correlated to a REST source (such as msstore) through that
+    /// source's installed.db carry no available version, so they could never
+    /// show as upgradeable. Resolve the latest version with an exact-id single
+    /// lookup against the source, the same request `search` makes.
+    fn resolve_rest_correlated_versions(&mut self, installed: &mut [InstalledPackage]) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut failed_sources = HashSet::new();
+        for package in installed.iter_mut() {
+            let Some(correlated) = package.correlated.as_mut() else {
+                continue;
+            };
+            if correlated.source_kind != SourceKind::Rest || correlated.version.is_some() {
+                continue;
+            }
+            let Some(source_index) = self
+                .store
+                .sources
+                .iter()
+                .position(|source| source.name.eq_ignore_ascii_case(&correlated.source_name))
+            else {
+                continue;
+            };
+            if failed_sources.contains(&source_index) {
+                continue;
+            }
+            let query = PackageQuery {
+                id: Some(correlated.id.clone()),
+                source: Some(correlated.source_name.clone()),
+                exact: true,
+                ..PackageQuery::default()
+            };
+            match self.search_source(source_index, &query, SearchSemantics::Single) {
+                Ok(found) => {
+                    if let Some(hit) = found
+                        .matches
+                        .into_iter()
+                        .find(|candidate| candidate.display.id.eq_ignore_ascii_case(&correlated.id))
+                    {
+                        correlated.version = hit.display.version;
+                        correlated.channel = hit.display.channel;
+                    }
+                }
+                Err(error) => {
+                    failed_sources.insert(source_index);
+                    warnings.push(format!(
+                        "Failed when searching source '{}'; results will not be included: {error:#}",
+                        correlated.source_name
+                    ));
+                }
+            }
+        }
+        warnings
     }
 
     /// Correlates installed packages against the v2 pre-indexed catalog using
@@ -2046,12 +2223,14 @@ impl Repository {
                     }
                 }
 
-                // RequireExplicitUpgrade is set on the installer manifest
-                // for the latest catalog version. winget hides these from
-                // bulk `upgrade` (Edge, Steam, Discord and others). We
-                // peek at the first versionData entry (latest by sort
-                // order) and read its manifest to mirror that filtering.
-                if let Some(latest) = entries.first() {
+                // RequireExplicitUpgrade is set on the installer manifest.
+                // winget hides these from bulk `upgrade` (Edge, Steam,
+                // Discord and others). Read the manifest of the version the
+                // row would upgrade to: versionData is not sorted, so take
+                // the entry matching the correlated available version, else
+                // the highest version.
+                let target_version = installed[idx].correlated.as_ref().and_then(|c| c.version.clone());
+                if let Some(latest) = upgrade_target_version_entry(&entries, target_version.as_deref()) {
                     let bytes_result = self.get_cached_source_file(
                         "V2_M",
                         &source,
@@ -2131,7 +2310,9 @@ impl Repository {
             None => return Ok(Vec::new()),
         };
         let sql = if source_id.is_some() {
-            format!("SELECT package_id, version, source_id, {pin_type_column} FROM pin WHERE source_id = ?1")
+            format!(
+                "SELECT package_id, version, source_id, {pin_type_column} FROM pin WHERE source_id = ?1 COLLATE NOCASE"
+            )
         } else {
             format!("SELECT package_id, version, source_id, {pin_type_column} FROM pin")
         };
@@ -2154,16 +2335,7 @@ impl Repository {
     pub fn add_pin(&self, package_id: &str, version: &str, source_id: &str, pin_type: PinType) -> Result<()> {
         let db_path = pins_db_path(&self.app_root);
         let conn = Self::open_sqlite_connection(db_path)?;
-        execute_batch_sql(
-            &conn,
-            "CREATE TABLE IF NOT EXISTS pin (
-                package_id TEXT NOT NULL,
-                version TEXT NOT NULL DEFAULT '*',
-                source_id TEXT NOT NULL DEFAULT '',
-                type INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (package_id, source_id)
-            )",
-        )?;
+        ensure_pin_schema(&conn)?;
         let pin_type_column = resolve_pin_type_column(&conn)?.unwrap_or("type");
         let type_int: i64 = match pin_type {
             PinType::Pinning => 2,
@@ -2195,7 +2367,7 @@ impl Repository {
         let count = if let Some(source_id) = source_id {
             execute_sql(
                 &conn,
-                "DELETE FROM pin WHERE package_id = ?1 AND source_id = ?2",
+                "DELETE FROM pin WHERE package_id = ?1 COLLATE NOCASE AND source_id = ?2 COLLATE NOCASE",
                 vec![
                     SqlValue::Text(package_id.to_owned()),
                     SqlValue::Text(source_id.to_owned()),
@@ -2204,7 +2376,7 @@ impl Repository {
         } else {
             execute_sql(
                 &conn,
-                "DELETE FROM pin WHERE package_id = ?1",
+                "DELETE FROM pin WHERE package_id = ?1 COLLATE NOCASE",
                 vec![SqlValue::Text(package_id.to_owned())],
             )?
         };
@@ -2222,7 +2394,7 @@ impl Repository {
             let conn = Self::open_sqlite_connection(db_path)?;
             execute_sql(
                 &conn,
-                "DELETE FROM pin WHERE source_id = ?1",
+                "DELETE FROM pin WHERE source_id = ?1 COLLATE NOCASE",
                 vec![SqlValue::Text(source_id.to_owned())],
             )?;
             conn.cacheflush().context("failed to flush pin database")?;
@@ -2260,19 +2432,19 @@ impl Repository {
         self.source_state_dir(source).join("rest-information.json")
     }
 
-    fn rest_manifest_cache_path(
-        &self,
-        source: &SourceRecord,
-        package_id: &str,
-        version: &str,
-        channel: &str,
-    ) -> PathBuf {
-        let key = format!("{}|{}|{}|{}", source.identifier, package_id, version, channel);
-        let digest = sha256_hex(key.as_bytes());
-        cache_root(&self.app_root)
-            .join("REST_M")
-            .join(sanitize_path_segment(&source.identifier))
-            .join(format!("{digest}.json"))
+    /// Best-effort removal of everything cached for a source: its state directory and its
+    /// per-identifier file caches (`REST_M` is the manifest cache older builds wrote).
+    fn remove_source_caches(&self, source: &SourceRecord) {
+        let state_dir = self.source_state_dir(source);
+        if state_dir.exists() {
+            let _ = fs::remove_dir_all(&state_dir);
+        }
+        for bucket in SOURCE_FILE_CACHE_BUCKETS {
+            let cache_dir = temp_cache_path(&self.app_root, bucket, &source.identifier);
+            if cache_dir.exists() {
+                let _ = fs::remove_dir_all(&cache_dir);
+            }
+        }
     }
 
     // ── Install / download ──
@@ -2286,35 +2458,46 @@ impl Repository {
         request: &InstallRequest,
         download_dir: &Path,
     ) -> Result<DownloadOutput> {
-        let fetched = self.fetch_installer_for_request(request, download_dir)?;
-        let manifest_yaml =
-            build_download_manifest_yaml(&fetched.manifest, &fetched.manifest_documents, &fetched.installer)
-                .context("failed to render manifest YAML")?;
-        let manifest_filename = derive_download_manifest_filename(&fetched.manifest, &fetched.installer);
+        self.ensure_hash_override_allowed(request.ignore_security_hash)?;
+        let (manifest, manifest_documents) = self.resolve_manifest_and_documents_for_install(request)?;
+        let installer = select_installer(&manifest.installers, &request.query)
+            .ok_or_else(|| anyhow!("No applicable installer found for the current system"))?;
+        // `winget download` gates: the package agreements must be accepted (DownloadCommand's
+        // `ShowPromptsForSinglePackage`), then an installer marked `DownloadCommandProhibited` is
+        // refused (`EnsureSupportForDownload`). Install does not apply these download-only checks.
+        self.ensure_package_agreements_accepted(&manifest, request)?;
+        ensure_installer_download_supported(&installer)?;
+        let installer_path =
+            self.fetch_installer_for_request(request, &manifest, &installer, request.rename.as_deref(), download_dir)?;
+        let manifest_yaml = build_download_manifest_yaml(&manifest, &manifest_documents, &installer)
+            .context("failed to render manifest YAML")?;
+        let manifest_filename = derive_download_manifest_filename(&manifest, &installer);
         let manifest_path = download_dir.join(&manifest_filename);
         fs::write(&manifest_path, manifest_yaml.as_bytes())
             .with_context(|| format!("failed to write manifest to {}", manifest_path.display()))?;
 
         Ok(DownloadOutput {
-            manifest: fetched.manifest,
-            installer_path: fetched.installer_path,
+            manifest,
+            installer_path,
             manifest_path,
         })
     }
 
-    /// Fetches the installer file without emitting the YAML manifest. Used by
-    /// the install flow, which downloads into a temp dir and only needs the
-    /// installer path — emitting a manifest there would litter the temp dir
-    /// and turn a benign YAML-write failure into an installation failure.
+    /// Fetches the file of an installer the caller already selected, without
+    /// emitting the YAML manifest. The install flow passes the manifest and
+    /// installer it resolved, so the downloaded (and hash-verified) file always
+    /// belongs to the installer that is then dispatched; resolving again here
+    /// could return a different manifest (a newly published version, a source
+    /// refresh) whose file would run with the first one's type and switches.
     fn fetch_installer_for_request(
         &mut self,
         request: &InstallRequest,
+        manifest: &Manifest,
+        installer: &Installer,
+        rename: Option<&str>,
         download_dir: &Path,
-    ) -> Result<FetchedInstaller> {
+    ) -> Result<PathBuf> {
         self.ensure_hash_override_allowed(request.ignore_security_hash)?;
-        let (manifest, manifest_documents) = self.resolve_manifest_and_documents_for_install(request)?;
-        let installer = select_installer(&manifest.installers, &request.query)
-            .ok_or_else(|| anyhow!("No applicable installer found for the current system"))?;
         if installer
             .installer_type
             .as_deref()
@@ -2327,16 +2510,15 @@ impl Repository {
             .url
             .as_deref()
             .ok_or_else(|| anyhow!("Installer has no URL"))?;
+        let installer_type = installer
+            .installer_type
+            .as_deref()
+            .unwrap_or("exe")
+            .to_ascii_lowercase();
+        let expected_hash = installer_expected_hash(installer, request.ignore_security_hash)?;
 
+        let filename = installer_download_file_name(url, rename, &installer_type, manifest)?;
         fs::create_dir_all(download_dir)?;
-        let filename = request.rename.as_deref().unwrap_or_else(|| {
-            url.rsplit('/')
-                .next()
-                .unwrap_or("installer")
-                .split('?')
-                .next()
-                .unwrap_or("installer")
-        });
         let dest = download_dir.join(filename);
 
         self.emit_install_progress(InstallProgress::DownloadingInstaller {
@@ -2346,19 +2528,15 @@ impl Repository {
         let actual_hash = download_installer_to_file(&self.user_agent, url, &dest)?;
 
         self.emit_install_progress(InstallProgress::VerifyingInstaller { path: dest.clone() });
-        if let Err(error) =
-            verify_installer_hash_hex(installer.sha256.as_deref(), &actual_hash, request.ignore_security_hash)
+        if let Some(expected_hash) = expected_hash
+            && let Err(error) =
+                verify_installer_hash_hex(Some(expected_hash), &actual_hash, request.ignore_security_hash)
         {
             let _ = fs::remove_file(&dest);
             return Err(error);
         }
 
-        Ok(FetchedInstaller {
-            manifest,
-            manifest_documents,
-            installer,
-            installer_path: dest,
-        })
+        Ok(dest)
     }
 
     pub fn install(&mut self, query: &PackageQuery, silent: bool) -> Result<InstallResult> {
@@ -2378,6 +2556,17 @@ impl Repository {
     }
 
     pub fn install_request(&mut self, request: &InstallRequest) -> Result<InstallResult> {
+        self.install_request_with_visited(request, &mut HashSet::new())
+    }
+
+    /// `visited` holds the lowercased ids of every package already on the current dependency
+    /// chain or already handled, shared across the whole recursion so a dependency cycle (or a
+    /// self-dependency) is skipped instead of recursing forever, as WinGet's dependency graph does.
+    fn install_request_with_visited(
+        &mut self,
+        request: &InstallRequest,
+        visited: &mut HashSet<String>,
+    ) -> Result<InstallResult> {
         // Refuse a disabled override before any side effect (agreement prompt, dependency
         // installs) and on paths that never fetch an installer (no-op, msstore, dependencies-only).
         self.ensure_hash_override_allowed(request.ignore_security_hash)?;
@@ -2412,9 +2601,27 @@ impl Repository {
             apply_install_scope(request, existing_match.as_ref().and_then(|item| item.scope.as_deref()))?;
         let request = &effective_request;
 
+        // Select the installer first: it decides which dependencies apply, and a manifest with no
+        // applicable installer must fail before any dependency is installed.
+        self.emit_install_progress(InstallProgress::SelectingInstaller);
+        let mut installer = select_installer(&manifest.installers, &request.query)
+            .ok_or_else(|| anyhow!("No applicable installer found"))?;
+
+        // Installing a different version over an existing installation is an update (WinGet converts
+        // such an install to the upgrade flow). A same-version reinstall (repair, --force) is not.
+        let is_update = existing_match
+            .as_ref()
+            .is_some_and(|existing| install_is_update(&existing.installed_version, &manifest.version));
+        ensure_upgrade_allowed(&installer, is_update)?;
+        if !is_update {
+            // The `Upgrade` switch only applies when updating an existing installation.
+            installer.switches.upgrade = None;
+        }
+
         self.ensure_package_agreements_accepted(&manifest, request)?;
         self.emit_install_progress(InstallProgress::InstallingDependencies);
-        self.install_dependencies(&manifest, request, &mut HashSet::new())?;
+        visited.insert(manifest.id.to_lowercase());
+        self.install_dependencies(&manifest, &installer, request, visited)?;
 
         if request.dependencies_only {
             return Ok(InstallResult {
@@ -2425,28 +2632,20 @@ impl Repository {
                 exit_code: 0,
                 success: true,
                 no_op: false,
+                reboot_required: false,
                 warnings: Vec::new(),
             });
         }
 
-        self.emit_install_progress(InstallProgress::SelectingInstaller);
-        let installer = select_installer(&manifest.installers, &request.query)
-            .ok_or_else(|| anyhow!("No applicable installer found"))?;
-
-        if request.uninstall_previous {
-            let mut uninstall_request = UninstallRequest::new(PackageQuery {
-                id: request.query.id.clone().or_else(|| Some(manifest.id.clone())),
-                query: request.query.query.clone().or_else(|| Some(manifest.id.clone())),
-                source: request.query.source.clone(),
-                exact: true,
-                version: request.query.version.clone(),
-                ..PackageQuery::default()
-            });
-            uninstall_request.product_code = installer.product_code.clone();
-            uninstall_request.mode = InstallerMode::Silent;
-            uninstall_request.all_versions = true;
-            uninstall_request.force = true;
-            let _ = self.uninstall_request(&uninstall_request);
+        let mut warnings = Vec::new();
+        if (request.uninstall_previous || (is_update && upgrade_behavior_is(&installer, "uninstallPrevious")))
+            && let Some(previous) = existing_match.as_ref()
+        {
+            // Remove the installed version that was found above, not whatever the
+            // install query (which may pin the *new* version) happens to match.
+            let exit_code = uninstall_package(previous, &create_uninstall_previous_request(previous), &mut warnings)
+                .with_context(|| format!("Failed to uninstall the previous version of {}", manifest.id))?;
+            ensure_previous_version_uninstalled(&manifest.id, exit_code)?;
         }
 
         let installer_type = installer.installer_type.as_deref().unwrap_or("exe").to_lowercase();
@@ -2459,7 +2658,13 @@ impl Repository {
             (PathBuf::new(), PathBuf::from(store_target))
         } else {
             let temp_dir = std::env::temp_dir().join("pinget-install");
-            let fetched_path = self.fetch_installer_for_request(request, &temp_dir)?.installer_path;
+            let fetched_path = self.fetch_installer_for_request(
+                request,
+                &manifest,
+                &installer,
+                install_download_rename(request, &installer_type),
+                &temp_dir,
+            )?;
             let prepared_path = prepare_installer_for_execution(&fetched_path, &installer_type)?;
             (prepared_path.clone(), prepared_path)
         };
@@ -2471,7 +2676,6 @@ impl Repository {
         self.emit_install_progress(InstallProgress::WaitingForInstaller {
             installer_type: installer_type.clone(),
         });
-        let mut warnings = Vec::new();
         let exit_code = dispatch_installer(
             &installer_path,
             &installer_type,
@@ -2481,17 +2685,14 @@ impl Repository {
             &mut warnings,
         )?;
         self.emit_install_progress(InstallProgress::InstallerFinished { exit_code });
-
-        Ok(InstallResult {
-            package_id: manifest.id.clone(),
-            version: manifest.version.clone(),
+        Ok(completed_install_result(
+            &manifest,
+            &installer,
             installer_path,
             installer_type,
             exit_code,
-            success: exit_code == 0,
-            no_op: false,
             warnings,
-        })
+        ))
     }
 
     fn find_installed_package_for_install(
@@ -2517,23 +2718,28 @@ impl Repository {
             include_pinned: false,
         })?;
 
+        let correlation_codes = ManifestCorrelationCodes::from_manifest(manifest);
         if let Some(found) = installed_matches.matches.into_iter().find(|candidate| {
             candidate.id.eq_ignore_ascii_case(&manifest.id)
                 || candidate.local_id.eq_ignore_ascii_case(&manifest.id)
                 || manifest_matches_installed_package_family_name(manifest, &candidate.package_family_names)
+                || correlation_codes.matches(&candidate.product_codes, &candidate.upgrade_codes)
         }) {
             return Ok(Some(found));
         }
 
-        if manifest.installers.iter().any(|installer| {
-            installer
-                .package_family_name
-                .as_deref()
-                .is_some_and(|pfn| !pfn.trim().is_empty())
-        }) {
+        if !correlation_codes.is_empty()
+            || manifest.installers.iter().any(|installer| {
+                installer
+                    .package_family_name
+                    .as_deref()
+                    .is_some_and(|pfn| !pfn.trim().is_empty())
+            })
+        {
             let all_installed = collect_installed_packages(request.query.install_scope.as_deref())?;
             if let Some(found) = all_installed.into_iter().find(|candidate| {
                 manifest_matches_installed_package_family_name(manifest, &candidate.package_family_names)
+                    || correlation_codes.matches(&candidate.product_codes, &candidate.upgrade_codes)
             }) {
                 return Ok(Some(list_match_from_installed(found, &self.store.sources)));
             }
@@ -2558,6 +2764,7 @@ impl Repository {
                 exit_code: 0,
                 success: true,
                 no_op: true,
+                reboot_required: false,
                 warnings: vec!["Package is already installed; skipping because --no-upgrade was specified.".to_owned()],
             });
         }
@@ -2576,6 +2783,7 @@ impl Repository {
                 exit_code: 0,
                 success: true,
                 no_op: true,
+                reboot_required: false,
                 warnings: vec![
                     "Package is already installed and up to date; rerun with --force to reinstall.".to_owned(),
                 ],
@@ -2605,7 +2813,7 @@ impl Repository {
             ));
         }
 
-        let mut warnings = vec![REPAIR_REINSTALL_WARNING.to_owned()];
+        let mut warnings = Vec::new();
         let installed_match = if request.manifest_path.is_some() {
             None
         } else {
@@ -2620,6 +2828,31 @@ impl Repository {
             installed.matches.into_iter().next()
         };
 
+        // An installed MSI is repaired in place with `msiexec /f <ProductCode>`, as WinGet does.
+        // Re-running `msiexec /i` on the same package is a maintenance run without REINSTALL
+        // that changes nothing yet reports success.
+        if let Some(installed) = installed_match.as_ref()
+            && let Some(product_code) = msi_repair_product_code(installed)
+        {
+            let exit_code = run_msi_repair(&product_code, request)?;
+            let outcome = classify_installer_exit_code(&Installer::default(), "msi", exit_code);
+            if outcome.reboot_required {
+                warnings.push(INSTALL_REBOOT_REQUIRED_WARNING.to_owned());
+            }
+            return Ok(InstallResult {
+                package_id: installed.id.clone(),
+                version: installed.installed_version.clone(),
+                installer_path: PathBuf::new(),
+                installer_type: "msi".to_owned(),
+                exit_code,
+                success: outcome.success,
+                no_op: false,
+                reboot_required: outcome.reboot_required,
+                warnings,
+            });
+        }
+
+        warnings.insert(0, REPAIR_REINSTALL_WARNING.to_owned());
         let mut result =
             self.install_request(&Self::create_repair_install_request(request, installed_match.as_ref()))?;
         warnings.extend(result.warnings);
@@ -2666,15 +2899,10 @@ impl Repository {
         }
 
         let matches = self.resolve_uninstall_matches(request)?;
-        let mut exit_code = 0;
         let mut warnings = Vec::new();
-
-        for installed in &matches {
-            exit_code = uninstall_package(installed, request, &mut warnings)?;
-            if exit_code != 0 && !request.all_versions {
-                break;
-            }
-        }
+        let exit_code = uninstall_each_match(&matches, request.all_versions, |installed| {
+            uninstall_package(installed, request, &mut warnings)
+        })?;
 
         let installed = matches
             .first()
@@ -2688,6 +2916,7 @@ impl Repository {
             exit_code,
             success: exit_code == 0,
             no_op: false,
+            reboot_required: false,
             warnings,
         })
     }
@@ -2726,6 +2955,7 @@ impl Repository {
     fn install_dependencies(
         &mut self,
         manifest: &Manifest,
+        installer: &Installer,
         request: &InstallRequest,
         visited: &mut HashSet<String>,
     ) -> Result<()> {
@@ -2733,30 +2963,54 @@ impl Repository {
             return Ok(());
         }
 
-        let dependency_ids = manifest
-            .package_dependencies
-            .iter()
-            .chain(
-                manifest
-                    .installers
-                    .iter()
-                    .flat_map(|installer| installer.package_dependencies.iter()),
-            )
-            .filter(|value| !value.trim().is_empty())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-
-        for dependency_id in dependency_ids {
-            if !visited.insert(dependency_id.clone()) {
+        for dependency in selected_installer_dependencies(manifest, installer) {
+            let dependency_id = dependency.package_identifier.clone();
+            // Already installed in this run, or a dependency loop back to a package on the chain.
+            if !visited.insert(dependency_id.to_lowercase()) {
                 continue;
             }
 
-            let dependency_request = Self::create_dependency_install_request(dependency_id.clone(), request);
-            let result = self.install_request(&dependency_request)?;
+            let mut dependency_request = Self::create_dependency_install_request(dependency_id.clone(), request);
+            if let Some(minimum_version) = dependency.minimum_version.as_deref() {
+                // WinGet's DependencyNodeProcessor: an installed version that satisfies
+                // `MinimumVersion` is skipped; otherwise the latest available version is
+                // installed (upgrading an older one), and it must itself satisfy the minimum.
+                let installed_version = self.installed_dependency_version(&dependency_request)?;
+                if installed_version
+                    .as_deref()
+                    .is_some_and(|version| dependency_version_satisfies(version, minimum_version))
+                {
+                    continue;
+                }
+                let available = self.resolve_manifest_for_install(&dependency_request)?;
+                ensure_dependency_minimum_version(&dependency_id, &available.version, minimum_version)?;
+                dependency_request.no_upgrade = false;
+                dependency_request.query.version = Some(available.version);
+            }
+            let result = self.install_request_with_visited(&dependency_request, visited)?;
             ensure_dependency_installed(&dependency_id, &result)?;
         }
 
         Ok(())
+    }
+
+    /// Installed version of a dependency (by exact id), if it is installed.
+    fn installed_dependency_version(&mut self, dependency_request: &InstallRequest) -> Result<Option<String>> {
+        let Some(id) = dependency_request.query.id.as_deref() else {
+            return Ok(None);
+        };
+        let installed = self.list(&ListQuery {
+            id: Some(id.to_owned()),
+            source: dependency_request.query.source.clone(),
+            exact: true,
+            count: Some(100),
+            ..ListQuery::default()
+        })?;
+        Ok(installed
+            .matches
+            .into_iter()
+            .find(|candidate| candidate.id.eq_ignore_ascii_case(id) || candidate.local_id.eq_ignore_ascii_case(id))
+            .map(|candidate| candidate.installed_version))
     }
 
     fn create_dependency_install_request(dependency_id: String, request: &InstallRequest) -> InstallRequest {
@@ -2858,6 +3112,14 @@ impl Repository {
 
         if let Some(path) = &request.manifest_path {
             let manifest = self.load_manifest_from_path(path)?;
+            // Like WinGet's manifest correlation, the product and upgrade codes the manifest
+            // declares (including `AppsAndFeaturesEntries`) identify the installed package even
+            // when it is not correlated to the manifest's package id.
+            if request.product_code.is_none()
+                && let Some(matches) = self.installed_matches_for_manifest_codes(&manifest, request)?
+            {
+                return Ok(matches);
+            }
             effective_query = PackageQuery {
                 query: Some(manifest.id.clone()),
                 id: Some(manifest.id.clone()),
@@ -2907,6 +3169,42 @@ impl Repository {
         })
     }
 
+    /// Installed packages whose product or upgrade codes match the codes declared by `manifest`.
+    /// `None` when the manifest declares no codes or nothing installed matches them.
+    fn installed_matches_for_manifest_codes(
+        &self,
+        manifest: &Manifest,
+        request: &UninstallRequest,
+    ) -> Result<Option<Vec<ListMatch>>> {
+        let codes = ManifestCorrelationCodes::from_manifest(manifest);
+        if codes.is_empty() {
+            return Ok(None);
+        }
+        let matches = collect_installed_packages(request.query.install_scope.as_deref())?
+            .into_iter()
+            .filter(|candidate| codes.matches(&candidate.product_codes, &candidate.upgrade_codes))
+            .filter(|candidate| {
+                request
+                    .query
+                    .version
+                    .as_deref()
+                    .is_none_or(|version| candidate.installed_version.eq_ignore_ascii_case(version))
+            })
+            .map(|candidate| list_match_from_installed(candidate, &self.store.sources))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        if !request.all_versions && matches.len() > 1 && !request.force {
+            bail!("Multiple installed packages matched the query; refine the query or use --all-versions.");
+        }
+        Ok(Some(if request.all_versions {
+            matches
+        } else {
+            matches.into_iter().take(1).collect()
+        }))
+    }
+
     fn load_manifest_from_path(&self, manifest_path: &Path) -> Result<Manifest> {
         self.load_manifest_from_path_with_documents(manifest_path)
             .map(|(manifest, _)| manifest)
@@ -2916,10 +3214,11 @@ impl Repository {
     /// `LocalManifestFiles` admin setting gates install, repair, download, and uninstall alike.
     fn load_manifest_from_path_with_documents(&self, manifest_path: &Path) -> Result<(Manifest, JsonValue)> {
         self.ensure_admin_setting_enabled("LocalManifestFiles", "--manifest")?;
-        let resolved = resolve_manifest_path(manifest_path)?;
-        let bytes =
-            fs::read(&resolved).with_context(|| format!("failed to read manifest from {}", resolved.display()))?;
-        parse_yaml_manifest_bundle(&bytes)
+        let parts = resolve_manifest_paths(manifest_path)?
+            .into_iter()
+            .map(|path| fs::read(&path).with_context(|| format!("failed to read manifest from {}", path.display())))
+            .collect::<Result<Vec<_>>>()?;
+        parse_yaml_manifest_bundle_parts(&parts)
     }
 
     fn find_single_match(&mut self, query: &PackageQuery) -> Result<(LocatedMatch, Vec<String>)> {
@@ -3181,11 +3480,10 @@ impl Repository {
                     &located.display.id,
                     &source.name,
                 )?;
-                let (bytes, cache_path) =
-                    self.get_or_fetch_rest_manifest(&source, package_id, &selected.version, &selected.channel)?;
+                let bytes = self.fetch_rest_manifest(&source, package_id, &selected.version, &selected.channel)?;
                 let (manifest, manifest_documents) =
                     parse_rest_manifest(&bytes, package_id, &selected.version, &selected.channel)?;
-                Ok((manifest, manifest_documents, vec![cache_path]))
+                Ok((manifest, manifest_documents, Vec::new()))
             }
         }
     }
@@ -3265,8 +3563,7 @@ impl Repository {
                     .collect(),
             }),
             Err(error) if can_fallback_to_v1(&error) => {
-                let (rows, truncated) = query_v1_matches(&connection, query, semantics)?;
-                let grouped = group_v1_rows(rows);
+                let (grouped, truncated) = query_v1_matches(&connection, query, semantics)?;
 
                 Ok(SearchSourceMatches {
                     truncated,
@@ -3315,12 +3612,14 @@ impl Repository {
             .header(CONTENT_TYPE, "application/json")
             .body(serde_json::to_vec(&body).context("failed to serialize REST search request")?)
             .send()
-            .context("REST search request failed")?
-            .error_for_status()
-            .context("REST search request returned an error")?;
-        let json =
-            serde_json::from_slice::<JsonValue>(&response.bytes().context("failed to read REST search response")?)
-                .context("failed to parse REST search response")?;
+            .context("REST search request failed")?;
+        let Some(body) = read_rest_response_body(response, "REST search")? else {
+            return Ok(SearchSourceMatches {
+                truncated: false,
+                matches: Vec::new(),
+            });
+        };
+        let json = serde_json::from_slice::<JsonValue>(&body).context("failed to parse REST search response")?;
         let data = json
             .get("Data")
             .and_then(JsonValue::as_array)
@@ -3491,7 +3790,11 @@ impl Repository {
         let result = self.update_preindexed(source_index);
         self.record_preindexed_refresh_attempt(lock_key, result.is_ok());
         let detail = result?;
-        self.save_store()?;
+        // In direct mode the source list belongs to WinGet and cannot be written by Pinget;
+        // the refreshed index is already on disk, so only persist metadata elsewhere.
+        if self.source_mode != EffectiveSourceMode::SystemWingetDirect {
+            self.save_store()?;
+        }
         Ok(detail)
     }
 
@@ -3666,7 +3969,7 @@ impl Repository {
 
         if persist {
             let cache = RestInfoCache {
-                expires_at: Utc::now() + Duration::seconds(i64::try_from(max_age).unwrap_or(i64::MAX)),
+                expires_at: rest_information_cache_expiry(Utc::now(), max_age),
                 value: info.clone(),
             };
             write_json(self.rest_information_cache_path(&source), &cache)?;
@@ -3706,9 +4009,15 @@ impl Repository {
         relative_path: &str,
         expected_hash: Option<&str>,
     ) -> Result<CachedBytes> {
-        let normalized_relative = relative_path.replace('\\', "/");
-        let cache_path =
-            temp_cache_path(&self.app_root, bucket, &source.identifier).join(normalized_relative.replace('/', "\\"));
+        let segments = validated_source_relative_segments(relative_path)?;
+        let normalized_relative = segments.join("/");
+        let cache_dir = temp_cache_path(&self.app_root, bucket, &source.identifier);
+        let cache_path = segments
+            .iter()
+            .fold(cache_dir.clone(), |path, segment| path.join(segment));
+        if !cache_path.starts_with(&cache_dir) {
+            bail!("source file path '{relative_path}' escapes the source cache");
+        }
 
         if cache_path.exists() {
             let cached = fs::read(&cache_path).context("failed to read cached source file")?;
@@ -3720,11 +4029,7 @@ impl Repository {
             }
         }
 
-        let url = format!(
-            "{}/{}",
-            source.arg.trim_end_matches('/'),
-            normalized_relative.trim_start_matches('/')
-        );
+        let url = format!("{}/{}", source.arg.trim_end_matches('/'), normalized_relative);
         let response = self
             .client
             .get(url)
@@ -3749,25 +4054,20 @@ impl Repository {
         })
     }
 
-    fn get_or_fetch_rest_manifest(
+    /// Fetches a REST manifest. Like the C# implementation (and WinGet), REST manifests are
+    /// not cached on disk: a persistent cache keyed by version never noticed a republished
+    /// manifest, and msstore versions are all "Unknown".
+    fn fetch_rest_manifest(
         &mut self,
         source: &SourceRecord,
         package_id: &str,
         version: &str,
         channel: &str,
-    ) -> Result<(Vec<u8>, PathBuf)> {
-        let cache_path = self.rest_manifest_cache_path(source, package_id, version, channel);
-        if cache_path.exists() {
-            return Ok((
-                fs::read(&cache_path).context("failed to read cached REST manifest")?,
-                cache_path,
-            ));
-        }
-
+    ) -> Result<Vec<u8>> {
         let info = self.load_rest_information_by_name(&source.name)?;
         let contract = choose_contract(&info.server_supported_versions)
             .ok_or_else(|| anyhow!("no compatible REST contract for {}", source.name))?;
-        let url = format!("{}/packageManifests/{}", source.arg.trim_end_matches('/'), package_id);
+        let url = rest_package_manifest_url(&source.arg, package_id);
         let params = build_rest_manifest_query_params(version, channel, &info);
 
         let response = self
@@ -3776,20 +4076,13 @@ impl Repository {
             .header("Version", contract)
             .query(&params)
             .send()
-            .context("REST manifest request failed")?
-            .error_for_status()
-            .context("REST manifest request returned an error")?;
-        let bytes = response
-            .bytes()
-            .context("failed to read REST manifest response")?
-            .to_vec();
-
-        if let Some(parent) = cache_path.parent() {
-            fs::create_dir_all(parent).context("failed to create REST manifest cache directory")?;
-        }
-        fs::write(&cache_path, &bytes).context("failed to write REST manifest cache")?;
-
-        Ok((bytes, cache_path))
+            .context("REST manifest request failed")?;
+        read_rest_response_body(response, "REST manifest")?.ok_or_else(|| {
+            anyhow!(
+                "No manifest found for package '{package_id}' version '{version}' in source '{}'",
+                source.name
+            )
+        })
     }
 
     fn load_rest_information_by_name(&mut self, name: &str) -> Result<RestInformation> {
@@ -3911,6 +4204,7 @@ impl Repository {
                         name: source.name.clone(),
                         kind: source.kind,
                         detail: detail.clone(),
+                        success: true,
                     })
             })
             .collect())
@@ -3961,7 +4255,6 @@ fn list_query_needs_available_lookup(query: &ListQuery) -> bool {
         || query.moniker.is_some()
         || query.tag.is_some()
         || query.command.is_some()
-        || query.source.is_some()
 }
 
 fn package_query_from_list_query(query: &ListQuery) -> PackageQuery {
@@ -3987,7 +4280,7 @@ fn package_query_from_list_query(query: &ListQuery) -> PackageQuery {
 }
 
 fn allow_loose_list_correlation(query: &ListQuery) -> bool {
-    query.query.is_some() || query.id.is_some() || query.name.is_some()
+    !query.exact && (query.query.is_some() || query.id.is_some() || query.name.is_some())
 }
 
 fn installed_package_has_upgrade(package: &InstalledPackage) -> bool {
@@ -4100,7 +4393,30 @@ fn find_applicable_pin<'a>(item: &ListMatch, pins: &'a [PinRecord]) -> Option<&'
     source_specific.or(source_agnostic)
 }
 
+/// Whether `pin` prevents upgrading to `target_version`, following WinGet's pin
+/// semantics: Blocking always blocks, Pinning blocks unless pinned packages are
+/// included (`--include-pinned` or an explicit single-package upgrade), and
+/// Gating only allows versions inside the gated range.
+pub fn pin_blocks_upgrade(pin: &PinRecord, target_version: &str, include_pinned: bool) -> bool {
+    match pin.pin_type {
+        PinType::Blocking => true,
+        PinType::Pinning => !include_pinned,
+        PinType::Gating => {
+            !target_version.trim().is_empty() && !version_matches_pin_pattern(target_version, &pin.version)
+        }
+    }
+}
+
+/// Pin check for the implicit (`upgrade` / `upgrade --all`) path.
+#[cfg(test)]
 fn is_upgrade_blocked_by_pin(item: &ListMatch, pins: &[PinRecord]) -> bool {
+    upgrade_blocked_by_pin(item, pins, false)
+}
+
+/// Whether a pin hides `item` from the upgrade list. `include_pinned` relaxes
+/// only Pinning pins, as in WinGet's `EvaluatePinnedStateForVersion`: Blocking
+/// pins still block and Gating pins still reject versions outside their range.
+fn upgrade_blocked_by_pin(item: &ListMatch, pins: &[PinRecord], include_pinned: bool) -> bool {
     let Some(available_version) = item.available_version.as_deref() else {
         return false;
     };
@@ -4108,27 +4424,33 @@ fn is_upgrade_blocked_by_pin(item: &ListMatch, pins: &[PinRecord]) -> bool {
         return false;
     };
 
-    match pin.pin_type {
-        PinType::Blocking => true,
-        PinType::Gating | PinType::Pinning => !version_matches_pin_pattern(available_version, &pin.version),
-    }
+    pin_blocks_upgrade(pin, available_version, include_pinned)
 }
 
+/// Mirrors WinGet's `GatedVersion::IsValidVersion`: a pattern ending in `.*`
+/// matches versions whose leading parts equal the pattern's parts (missing
+/// version parts count as 0); any other pattern must equal the version. Parts
+/// are compared as versions, so `1.2.*` matches `1.2`, `1.2.0` and `1.2.5` but
+/// not `1.20`, and `1.2` equals `1.2.0`.
 fn version_matches_pin_pattern(version: &str, pattern: &str) -> bool {
-    if pattern.trim().is_empty() || pattern == "*" {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern == "*" {
         return true;
     }
 
-    if !pattern.contains('*') {
-        return version.eq_ignore_ascii_case(pattern);
+    let gate_parts = pattern.split('.').map(str::trim).collect::<Vec<_>>();
+    let Some((last, prefix)) = gate_parts.split_last() else {
+        return true;
+    };
+    if *last != "*" {
+        return compare_version(version, pattern) == Ordering::Equal;
     }
 
-    if pattern.ends_with('*') && pattern.matches('*').count() == 1 {
-        let prefix = &pattern[..pattern.len() - 1];
-        return version.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase());
-    }
-
-    version.eq_ignore_ascii_case(pattern)
+    let version_parts = version.trim().split('.').map(str::trim).collect::<Vec<_>>();
+    prefix.iter().enumerate().all(|(index, gate_part)| {
+        let version_part = version_parts.get(index).copied().unwrap_or("0");
+        compare_version(version_part, gate_part) == Ordering::Equal
+    })
 }
 
 fn list_match_from_installed(package: InstalledPackage, sources: &[SourceRecord]) -> ListMatch {
@@ -4899,6 +5221,23 @@ fn leading_version_number(value: &str) -> Option<&str> {
 /// range, the available side must be a peer that also exposes ARP bounds so
 /// the two versions compare on the same scale. Returns `None` when no entry
 /// has bounds; the caller should fall back to `packages.latest_version`.
+/// The versionData entry whose manifest describes the upgrade target: the
+/// entry equal to `target_version` when there is one, otherwise the highest
+/// version. versionData lists versions in file order, not sorted.
+fn upgrade_target_version_entry<'a>(
+    entries: &'a [PackageVersionDataEntry],
+    target_version: Option<&str>,
+) -> Option<&'a PackageVersionDataEntry> {
+    target_version
+        .filter(|version| !version.trim().is_empty())
+        .and_then(|version| {
+            entries
+                .iter()
+                .find(|entry| compare_version(&entry.version, version) == Ordering::Equal)
+        })
+        .or_else(|| entries.iter().max_by(|a, b| compare_version(&a.version, &b.version)))
+}
+
 fn latest_arp_anchored_version(entries: &[PackageVersionDataEntry]) -> Option<String> {
     entries
         .iter()
@@ -5082,7 +5421,8 @@ fn collect_uninstall_view(
             Ok(key) => key,
             Err(_) => continue,
         };
-        if read_reg_dword(&subkey, "SystemComponent") == Some(1) || read_reg_string(&subkey, "ParentKeyName").is_some()
+        if is_arp_flag_set(read_reg_dword(&subkey, "SystemComponent"))
+            || read_reg_string(&subkey, "ParentKeyName").is_some()
         {
             continue;
         }
@@ -5092,7 +5432,14 @@ fn collect_uninstall_view(
         };
 
         let local_id = format!(r"ARP\{scope}\{arch}\{key_name}");
-        let installed_version = read_reg_string(&subkey, "DisplayVersion").unwrap_or_else(|| "Unknown".to_owned());
+        let installed_version = determine_arp_version(&ArpVersionValues {
+            display_version: read_reg_string(&subkey, "DisplayVersion"),
+            version_major: read_reg_dword(&subkey, "VersionMajor"),
+            version_minor: read_reg_dword(&subkey, "VersionMinor"),
+            major_version: read_reg_dword(&subkey, "MajorVersion"),
+            minor_version: read_reg_dword(&subkey, "MinorVersion"),
+            version: read_reg_dword(&subkey, "Version"),
+        });
         let publisher = read_reg_string(&subkey, "Publisher");
         let install_location = read_reg_string(&subkey, "InstallLocation");
         let winget_package_identifier = read_reg_string(&subkey, "WinGetPackageIdentifier");
@@ -5266,11 +5613,9 @@ fn parse_msix_package_full_name(value: &str) -> Option<ParsedMsixPackageFullName
         return None;
     }
 
-    let family_name = if resource_id.is_empty() {
-        format!("{name}_{publisher_id}")
-    } else {
-        format!("{name}_{resource_id}_{publisher_id}")
-    };
+    // The package family name is always `Name_PublisherId`; the resource id
+    // only appears in the full name.
+    let family_name = format!("{name}_{publisher_id}");
 
     Some(ParsedMsixPackageFullName {
         version: version.to_owned(),
@@ -5290,9 +5635,85 @@ fn is_msix_split_resource_package(resource_id: &str) -> bool {
     resource_id.trim().to_ascii_lowercase().starts_with("split.")
 }
 
+/// Version-related values of an ARP (Uninstall) registry key. DWORD fields are
+/// `None` when the value is missing or not a DWORD.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Default, Clone)]
+struct ArpVersionValues {
+    display_version: Option<String>,
+    version_major: Option<u32>,
+    version_minor: Option<u32>,
+    major_version: Option<u32>,
+    minor_version: Option<u32>,
+    version: Option<u32>,
+}
+
+/// Mirrors WinGet's `ARPHelper::DetermineVersion`: `DisplayVersion`, then
+/// `VersionMajor.VersionMinor`, then `MajorVersion.MinorVersion` (when either
+/// part is nonzero), then the packed `Version` DWORD, then `Unknown`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn determine_arp_version(values: &ArpVersionValues) -> String {
+    if let Some(display_version) = values.display_version.as_deref().filter(|value| !value.is_empty()) {
+        return display_version.to_owned();
+    }
+
+    for (major, minor) in [
+        (values.version_major, values.version_minor),
+        (values.major_version, values.minor_version),
+    ] {
+        let major = major.unwrap_or(0);
+        let minor = minor.unwrap_or(0);
+        if major != 0 || minor != 0 {
+            return format!("{major}.{minor}");
+        }
+    }
+
+    if let Some(version) = values.version.filter(|value| *value != 0) {
+        return format!("{}.{}.{}", version >> 24, (version >> 16) & 0xFF, version & 0xFFFF);
+    }
+
+    "Unknown".to_owned()
+}
+
+/// Whether `path` is inside the Windows directory (`%SystemRoot%`), where
+/// inbox MSIX packages live.
 #[cfg(windows)]
 fn is_windows_system_path(path: &str) -> bool {
-    path.trim().to_ascii_lowercase().starts_with(r"c:\windows\")
+    windows_directory().is_some_and(|windows_dir| is_path_under_windows_directory(path, &windows_dir))
+}
+
+#[cfg(windows)]
+fn windows_directory() -> Option<String> {
+    static WINDOWS_DIR: OnceLock<Option<String>> = OnceLock::new();
+    WINDOWS_DIR
+        .get_or_init(|| {
+            const BUFFER_LEN: u32 = 260;
+            let mut buffer = [0u16; BUFFER_LEN as usize];
+            // SAFETY: the buffer is valid for `BUFFER_LEN` UTF-16 units.
+            let length = unsafe {
+                windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW(buffer.as_mut_ptr(), BUFFER_LEN)
+            } as usize;
+            if length > 0 && length < buffer.len() {
+                Some(String::from_utf16_lossy(&buffer[..length]))
+            } else {
+                std::env::var("SystemRoot")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            }
+        })
+        .clone()
+}
+
+/// Case-insensitive prefix test of `path` against `windows_dir` plus a
+/// trailing separator, so `C:\WindowsApps` is not treated as `C:\Windows`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_path_under_windows_directory(path: &str, windows_dir: &str) -> bool {
+    let windows_dir = windows_dir.trim().trim_end_matches(['\\', '/']);
+    if windows_dir.is_empty() {
+        return false;
+    }
+    let prefix = format!("{}\\", windows_dir.to_lowercase());
+    path.trim().replace('/', "\\").to_lowercase().starts_with(&prefix)
 }
 
 #[cfg(windows)]
@@ -5306,6 +5727,12 @@ fn read_reg_string(key: &RegKey, value_name: &str) -> Option<String> {
 #[cfg(windows)]
 fn read_reg_dword(key: &RegKey, value_name: &str) -> Option<u32> {
     key.get_value::<u32, _>(value_name).ok()
+}
+
+/// WinGet treats any nonzero DWORD flag (e.g. `SystemComponent`) as set.
+#[cfg(windows)]
+fn is_arp_flag_set(value: Option<u32>) -> bool {
+    value.is_some_and(|value| value != 0)
 }
 
 fn ensure_app_dirs(app_root: &Path) -> Result<()> {
@@ -5517,10 +5944,61 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
         .with_context(|| format!("failed to replace {} with {}", target.display(), source.display()))
 }
 
+/// `source add` accepts only secure remote URLs, like WinGet's RestSourceFactory::Add
+/// (SOURCE_NOT_REMOTE / SOURCE_NOT_SECURE) and the pre-indexed forms (SOURCE_NOT_SECURE).
+/// Manifests carry installer URLs and hashes, so a plain-HTTP source can be tampered with
+/// in transit. Pinget fetches pre-indexed sources over HTTP(S) only, so a local path is
+/// "not remote" for both kinds.
+fn validate_source_argument(arg: &str) -> Result<()> {
+    let lower = arg.trim().to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        bail!("The source argument '{arg}' is not remote; only https:// sources are supported.");
+    }
+    if !lower.starts_with("https://") {
+        bail!("The source argument '{arg}' is not secure; only https:// sources are supported.");
+    }
+    let has_host = reqwest::Url::parse(arg.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(|host| !host.is_empty()))
+        .unwrap_or(false);
+    if !has_host {
+        bail!("The source argument '{arg}' is not a valid https:// URL.");
+    }
+    Ok(())
+}
+
+/// Per-identifier source file caches under [`cache_root`].
+const SOURCE_FILE_CACHE_BUCKETS: [&str; 4] = ["REST_M", "V1_M", "V2_M", "V2_PVD"];
+
 fn temp_cache_path(app_root: &Path, bucket: &str, identifier: &str) -> PathBuf {
     cache_root(app_root)
         .join(bucket)
         .join(sanitize_path_segment(identifier))
+}
+
+/// Splits a relative path taken from a source index (V1 pathparts, V2 `rP`, or a
+/// `packages/<id>/...` path built from an index id) into segments that are safe to
+/// join under the source file cache. The index is source data, so a path that is
+/// rooted, drive- or UNC-qualified, or walks up with `..` is rejected rather than
+/// allowed to write outside the cache.
+fn validated_source_relative_segments(relative_path: &str) -> Result<Vec<String>> {
+    let normalized = relative_path.replace('\\', "/");
+    let unsafe_path = || anyhow!("source index path '{relative_path}' is not a safe relative path");
+    if normalized.is_empty() || normalized.starts_with('/') {
+        return Err(unsafe_path());
+    }
+
+    normalized
+        .split('/')
+        .map(|segment| {
+            let dots_or_spaces_only = segment.trim_end_matches(['.', ' ']).is_empty();
+            if dots_or_spaces_only || segment.contains([':', '\0']) {
+                Err(unsafe_path())
+            } else {
+                Ok(segment.to_owned())
+            }
+        })
+        .collect()
 }
 
 fn load_store(app_root: &Path) -> Result<SourceStore> {
@@ -6278,23 +6756,85 @@ fn add_packaged_yaml_key_value(entry: &mut BTreeMap<String, Option<String>>, lin
         return;
     };
 
-    entry.insert(
-        key.trim().to_owned(),
-        Some(unquote_yaml_scalar(value.trim()).to_owned()),
-    );
+    entry.insert(key.trim().to_owned(), Some(unquote_yaml_scalar(value.trim())));
 }
 
-fn unquote_yaml_scalar(value: &str) -> &str {
-    if value.len() >= 2 {
-        let bytes = value.as_bytes();
-        let first = bytes[0] as char;
-        let last = bytes[value.len() - 1] as char;
-        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-            return &value[1..value.len() - 1];
-        }
+/// Reads a flow scalar: single-quoted (`''` is a literal `'`), double-quoted (backslash
+/// escapes), or plain.
+fn unquote_yaml_scalar(value: &str) -> String {
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        return value[1..value.len() - 1].replace("''", "'");
+    }
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        return unescape_yaml_double_quoted(&value[1..value.len() - 1]);
     }
 
-    value
+    value.to_owned()
+}
+
+fn unescape_yaml_double_quoted(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            result.push(ch);
+            continue;
+        }
+
+        let Some(escape) = chars.next() else {
+            result.push('\\');
+            break;
+        };
+        let hex_digits = match escape {
+            'x' => 2,
+            'u' => 4,
+            'U' => 8,
+            _ => 0,
+        };
+        if hex_digits > 0 {
+            let digits: String = chars.clone().take(hex_digits).collect();
+            let decoded = if digits.len() == hex_digits && digits.chars().all(|digit| digit.is_ascii_hexdigit()) {
+                u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32)
+            } else {
+                None
+            };
+            if let Some(decoded) = decoded {
+                result.push(decoded);
+                for _ in 0..hex_digits {
+                    chars.next();
+                }
+            } else {
+                result.push('\\');
+                result.push(escape);
+            }
+            continue;
+        }
+
+        match escape {
+            '0' => result.push('\0'),
+            'a' => result.push('\u{7}'),
+            'b' => result.push('\u{8}'),
+            't' | '\t' => result.push('\t'),
+            'n' => result.push('\n'),
+            'v' => result.push('\u{b}'),
+            'f' => result.push('\u{c}'),
+            'r' => result.push('\r'),
+            'e' => result.push('\u{1b}'),
+            ' ' => result.push(' '),
+            '"' => result.push('"'),
+            '/' => result.push('/'),
+            '\\' => result.push('\\'),
+            'N' => result.push('\u{85}'),
+            '_' => result.push('\u{a0}'),
+            'L' => result.push('\u{2028}'),
+            'P' => result.push('\u{2029}'),
+            other => {
+                result.push('\\');
+                result.push(other);
+            }
+        }
+    }
+    result
 }
 
 fn map_packaged_source_entry(entry: &BTreeMap<String, Option<String>>) -> Option<SourceRecord> {
@@ -6364,7 +6904,7 @@ fn parse_packaged_datetime(value: &str) -> Option<DateTime<Utc>> {
 fn render_packaged_sources_yaml(store: &SourceStore) -> String {
     let mut lines = vec!["Sources:".to_owned()];
     for source in &store.sources {
-        lines.push(format!("  - Name: {}", source.name));
+        lines.push(format!("  - Name: {}", yaml_scalar(&source.name)));
         lines.push(format!("    Type: {}", packaged_source_type(source.kind)));
         lines.push(format!("    Arg: {}", yaml_scalar(&source.arg)));
         lines.push(format!("    Data: {}", yaml_scalar(&source.identifier)));
@@ -6379,6 +6919,22 @@ fn render_packaged_sources_yaml(store: &SourceStore) -> String {
         lines.push(format!("    Explicit: {}", source.explicit));
         lines.push(format!("    Priority: {}", source.priority));
         lines.push("    IsTombstone: false".to_owned());
+    }
+    // A removed default source is only remembered as a tombstone; without one the
+    // defaults come back on the next load (WinGet SourceList::RemoveSource).
+    for default_source in SourceStore::default().sources {
+        if store
+            .sources
+            .iter()
+            .any(|source| source.name.eq_ignore_ascii_case(&default_source.name))
+        {
+            continue;
+        }
+        lines.push(format!("  - Name: {}", yaml_scalar(&default_source.name)));
+        lines.push("    Type: ''".to_owned());
+        lines.push("    Arg: ''".to_owned());
+        lines.push("    Data: ''".to_owned());
+        lines.push("    IsTombstone: true".to_owned());
     }
     lines.push(String::new());
     lines.join("\n")
@@ -6395,7 +6951,7 @@ fn render_packaged_metadata_yaml(store: &SourceStore) -> String {
             continue;
         }
 
-        lines.push(format!("  - Name: {}", source.name));
+        lines.push(format!("  - Name: {}", yaml_scalar(&source.name)));
         if let Some(last_update) = source.last_update {
             lines.push(format!("    LastUpdate: {}", last_update.timestamp()));
         }
@@ -6413,12 +6969,10 @@ fn render_packaged_metadata_yaml(store: &SourceStore) -> String {
     lines.join("\n")
 }
 
+/// Always single-quoted, so a value that YAML would read as something else (a quoted
+/// ETag, `#comment`, `true`, a number) round-trips as the same string.
 fn yaml_scalar(value: &str) -> String {
-    if value.chars().any(|ch| ch.is_whitespace() || ch == ':') {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    } else {
-        value.to_owned()
-    }
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn uses_packaged_layout(app_root: &Path) -> bool {
@@ -6556,6 +7110,12 @@ fn packaged_source_type(kind: SourceKind) -> &'static str {
 }
 
 fn sanitize_path_segment(value: &str) -> String {
+    // An empty or dot-only identifier (a REST server picks its SourceIdentifier) would
+    // otherwise name the parent directory itself.
+    if value.trim_end_matches(['.', ' ']).is_empty() {
+        return "_".to_owned();
+    }
+
     value
         .chars()
         .map(|ch| match ch {
@@ -6570,12 +7130,90 @@ fn load_json_object(path: &Path) -> Result<JsonMap<String, JsonValue>> {
         return Ok(JsonMap::new());
     }
 
-    let bytes = fs::read(path).context("failed to read JSON file")?;
-    let value: JsonValue = serde_json::from_slice(&bytes).context("failed to parse JSON file")?;
+    let text = fs::read_to_string(path).context("failed to read JSON file")?;
+    let value = parse_lenient_json(&text).context("failed to parse JSON file")?;
     Ok(match value {
         JsonValue::Object(object) => object,
         _ => JsonMap::new(),
     })
+}
+
+/// Parses settings JSON the way WinGet accepts it: a leading UTF-8 BOM, `//`
+/// and `/* */` comments, and trailing commas are allowed.
+fn parse_lenient_json(text: &str) -> serde_json::Result<JsonValue> {
+    serde_json::from_str(&strip_json_comments_and_trailing_commas(
+        text.strip_prefix('\u{feff}').unwrap_or(text),
+    ))
+}
+
+/// Removes comments and trailing commas outside string literals. Comments are
+/// replaced with whitespace so parse error positions stay meaningful.
+fn strip_json_comments_and_trailing_commas(text: &str) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(text.len());
+    // Byte offset in `output` of a comma followed only by whitespace/comments so far.
+    let mut pending_comma: Option<usize> = None;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        match ch {
+            '"' => {
+                pending_comma = None;
+                output.push(ch);
+                index += 1;
+                while index < chars.len() {
+                    let string_char = chars[index];
+                    output.push(string_char);
+                    index += 1;
+                    if string_char == '\\' {
+                        if let Some(&escaped) = chars.get(index) {
+                            output.push(escaped);
+                            index += 1;
+                        }
+                    } else if string_char == '"' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'/') => {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                index += 2;
+                while index < chars.len() && !(chars[index] == '*' && chars.get(index + 1) == Some(&'/')) {
+                    if chars[index] == '\n' {
+                        output.push('\n');
+                    }
+                    index += 1;
+                }
+                index = (index + 2).min(chars.len());
+                output.push(' ');
+            }
+            '}' | ']' => {
+                if let Some(comma) = pending_comma.take() {
+                    output.replace_range(comma..=comma, " ");
+                }
+                output.push(ch);
+                index += 1;
+            }
+            ',' => {
+                pending_comma = Some(output.len());
+                output.push(ch);
+                index += 1;
+            }
+            _ => {
+                if !ch.is_whitespace() {
+                    pending_comma = None;
+                }
+                output.push(ch);
+                index += 1;
+            }
+        }
+    }
+
+    output
 }
 
 fn save_json_object(path: PathBuf, value: &JsonMap<String, JsonValue>) -> Result<()> {
@@ -6822,39 +7460,54 @@ fn query_v1_matches(
 ) -> Result<(Vec<V1SearchRow>, bool)> {
     let (where_clause, params) = build_preindexed_where_clause(query, false, semantics);
     let limit = source_fetch_results(query, semantics);
-    let sql = format!(
-        "SELECT manifest.rowid, manifest.id, versions.version, channels.channel, ids.id, names.name, monikers.moniker \
-         FROM manifest \
+    let params: Vec<SqlValue> = params.into_iter().map(SqlValue::Text).collect();
+    const V1_JOINS: &str = "FROM manifest \
          JOIN ids ON manifest.id = ids.rowid \
          JOIN names ON manifest.name = names.rowid \
          LEFT JOIN monikers ON manifest.moniker = monikers.rowid \
          JOIN versions ON manifest.version = versions.rowid \
-         JOIN channels ON manifest.channel = channels.rowid \
-         WHERE {where_clause} LIMIT {}",
-        limit + 1
-    );
-    let mut rows = query_rows(
+         JOIN channels ON manifest.channel = channels.rowid";
+
+    // The V1 manifest table has one row per version, so the result limit must apply to
+    // distinct packages: limiting manifest rows let a few many-versioned packages crowd
+    // out the rest and under-reported truncation.
+    let mut package_rowids = query_rows(
         connection,
-        &sql,
-        params.into_iter().map(SqlValue::Text).collect(),
-        |row| {
-            Ok(V1SearchRow {
-                manifest_rowid: row_i64(row, 0)?,
-                package_rowid: row_i64(row, 1)?,
-                version: row_string(row, 2)?,
-                channel: row_string(row, 3)?,
-                id: row_string(row, 4)?,
-                name: row_string(row, 5)?,
-                moniker: row_opt_string(row, 6)?,
-                match_criteria: None,
-            })
-        },
+        &format!(
+            "SELECT DISTINCT manifest.id {V1_JOINS} WHERE {where_clause} LIMIT {}",
+            limit + 1
+        ),
+        params.clone(),
+        |row| row_i64(row, 0),
     )?;
+    let truncated = package_rowids.len() > limit;
+    package_rowids.truncate(limit);
+    if package_rowids.is_empty() {
+        return Ok((Vec::new(), truncated));
+    }
+
+    let package_list = package_rowids.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT manifest.rowid, manifest.id, versions.version, channels.channel, ids.id, names.name, monikers.moniker \
+         {V1_JOINS} \
+         WHERE ({where_clause}) AND manifest.id IN ({package_list})"
+    );
+    let rows = query_rows(connection, &sql, params, |row| {
+        Ok(V1SearchRow {
+            manifest_rowid: row_i64(row, 0)?,
+            package_rowid: row_i64(row, 1)?,
+            version: row_string(row, 2)?,
+            channel: row_string(row, 3)?,
+            id: row_string(row, 4)?,
+            name: row_string(row, 5)?,
+            moniker: row_opt_string(row, 6)?,
+            match_criteria: None,
+        })
+    })?;
+    let mut rows = group_v1_rows(rows);
     for row in &mut rows {
         row.match_criteria = infer_preindexed_match_criteria_v1(connection, row, query, semantics)?;
     }
-    let truncated = rows.len() > limit;
-    rows.truncate(limit);
     Ok((rows, truncated))
 }
 
@@ -7026,7 +7679,7 @@ fn build_preindexed_where_clause(query: &PackageQuery, v2: bool, semantics: Sear
 
 fn single_field_condition(column: &str, value: &str, exact: bool, params: &mut Vec<String>) -> String {
     params.push(match_parameter(value, exact));
-    format!("{column} LIKE ?{}", params.len())
+    format!("{column} LIKE ?{} ESCAPE '\\'", params.len())
 }
 
 fn mapped_field_condition(
@@ -7064,12 +7717,27 @@ fn mapped_field_condition(
         "{rowid_column} IN (SELECT {map_table_name}.{map_owner_column} \
          FROM {map_table_name} JOIN {table_name} ON \
          {map_table_name}.{value_name} = {table_name}.rowid \
-         WHERE {table_name}.{map_value_column} LIKE ?{parameter})"
+         WHERE {table_name}.{map_value_column} LIKE ?{parameter} ESCAPE '\\')"
     )
 }
 
+/// Builds the LIKE pattern for user input. `%` and `_` in the input are escaped with `\`
+/// (every LIKE using this pattern declares `ESCAPE '\'`), so they match literally instead
+/// of acting as wildcards; only the substring `%...%` wrapper is a wildcard.
 fn match_parameter(value: &str, exact: bool) -> String {
-    if exact { value.to_owned() } else { format!("%{value}%") }
+    let escaped = escape_like_pattern(value);
+    if exact { escaped } else { format!("%{escaped}%") }
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn build_rest_search_body(
@@ -7082,17 +7750,32 @@ fn build_rest_search_body(
         "MaximumResults".to_owned(),
         JsonValue::from(source_fetch_results(query, semantics) as u64),
     );
-    let exact_match = query.exact || semantics == SearchSemantics::Single;
+    // WinGet's GetSearchRequestForSingle uses CaseInsensitive unless --exact is given; in
+    // the REST contract `Exact` is case-sensitive. Many-search uses Substring.
+    let match_type = if query.exact {
+        "Exact"
+    } else if semantics == SearchSemantics::Single {
+        "CaseInsensitive"
+    } else {
+        "Substring"
+    };
 
     if let Some(value) = &query.query {
         if semantics == SearchSemantics::Single {
-            let mut filters = vec![
-                rest_filter("PackageIdentifier", value, true),
-                rest_filter("PackageName", value, true),
-                rest_filter("Moniker", value, true),
+            // The REST contract evaluates `(Query || Inclusions...) && Filters...`, so the
+            // alternative identity fields must be Inclusions (ORed). As Filters they would be
+            // ANDed and only match a package whose id, name and moniker are all equal.
+            let inclusions = vec![
+                rest_filter("PackageIdentifier", value, match_type),
+                rest_filter("PackageName", value, match_type),
+                rest_filter("Moniker", value, match_type),
             ];
+            root.insert("Inclusions".to_owned(), JsonValue::Array(inclusions));
+            let mut filters = Vec::new();
             append_required_rest_filters(&mut filters, info);
-            root.insert("Filters".to_owned(), JsonValue::Array(filters));
+            if !filters.is_empty() {
+                root.insert("Filters".to_owned(), JsonValue::Array(filters));
+            }
             return Ok(JsonValue::Object(root));
         }
 
@@ -7100,26 +7783,33 @@ fn build_rest_search_body(
             "Query".to_owned(),
             serde_json::json!({
                 "KeyWord": value,
-                "MatchType": if exact_match { "Exact" } else { "Substring" },
+                "MatchType": match_type,
             }),
         );
     }
 
+    // Tag and command filters stay exact for many-search; a single lookup uses the
+    // single-lookup match type like WinGet's SearchSourceApplyFilters.
+    let tag_match_type = if semantics == SearchSemantics::Single {
+        match_type
+    } else {
+        "Exact"
+    };
     let mut filters = Vec::new();
     if let Some(value) = &query.id {
-        filters.push(rest_filter("PackageIdentifier", value, exact_match));
+        filters.push(rest_filter("PackageIdentifier", value, match_type));
     }
     if let Some(value) = &query.name {
-        filters.push(rest_filter("PackageName", value, exact_match));
+        filters.push(rest_filter("PackageName", value, match_type));
     }
     if let Some(value) = &query.moniker {
-        filters.push(rest_filter("Moniker", value, exact_match));
+        filters.push(rest_filter("Moniker", value, match_type));
     }
     if let Some(value) = &query.tag {
-        filters.push(rest_filter("Tag", value, true));
+        filters.push(rest_filter("Tag", value, tag_match_type));
     }
     if let Some(value) = &query.command {
-        filters.push(rest_filter("Command", value, true));
+        filters.push(rest_filter("Command", value, tag_match_type));
     }
     append_required_rest_filters(&mut filters, info);
 
@@ -7136,8 +7826,65 @@ fn append_required_rest_filters(filters: &mut Vec<JsonValue>, info: &RestInforma
         .iter()
         .any(|field| field.eq_ignore_ascii_case("Market"))
     {
-        filters.push(rest_filter("Market", &default_market(), true));
+        filters.push(rest_filter("Market", &default_market(), "Exact"));
     }
+}
+
+/// Reads a REST response body, or `None` for the responses WinGet treats as an empty
+/// result: 204 No Content (HttpClientHelper), and 404 with a JSON body that carries both
+/// `code` and `message` (RestInterface_1_0 CustomRestCallResponseHandler). Any other
+/// non-success status stays an error.
+fn read_rest_response_body(response: Response, what: &str) -> Result<Option<Vec<u8>>> {
+    let status = response.status();
+    if status == StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+
+    if status == StatusCode::NOT_FOUND {
+        let is_json = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim_start().to_ascii_lowercase().starts_with("application/json"));
+        if is_json {
+            let body = response
+                .bytes()
+                .with_context(|| format!("failed to read {what} response"))?;
+            if serde_json::from_slice::<JsonValue>(&body)
+                .ok()
+                .and_then(|json| json.as_object().cloned())
+                .is_some_and(|object| object.contains_key("code") && object.contains_key("message"))
+            {
+                return Ok(None);
+            }
+        }
+        bail!("{what} request returned an error: HTTP status {status}");
+    }
+
+    let response = response
+        .error_for_status()
+        .with_context(|| format!("{what} request returned an error"))?;
+    Ok(Some(
+        response
+            .bytes()
+            .with_context(|| format!("failed to read {what} response"))?
+            .to_vec(),
+    ))
+}
+
+/// `<arg>/packageManifests/<id>` with the id percent-encoded as one path segment, the
+/// way C# `Uri.EscapeDataString` (and WinGet's `append_path(.., true)`) encode it: a `#`,
+/// `?`, `/` or `%` in an id must not change which resource is requested.
+fn rest_package_manifest_url(arg: &str, package_id: &str) -> String {
+    let mut encoded = String::with_capacity(package_id.len());
+    for byte in package_id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("{}/packageManifests/{encoded}", arg.trim_end_matches('/'))
 }
 
 fn build_rest_manifest_query_params(
@@ -7177,12 +7924,12 @@ fn build_rest_manifest_query_params(
     params
 }
 
-fn rest_filter(field: &str, value: &str, exact: bool) -> JsonValue {
+fn rest_filter(field: &str, value: &str, match_type: &str) -> JsonValue {
     serde_json::json!({
         "PackageMatchField": field,
         "RequestMatch": {
             "KeyWord": value,
-            "MatchType": if exact { "Exact" } else { "Substring" },
+            "MatchType": match_type,
         }
     })
 }
@@ -7326,7 +8073,7 @@ fn find_mapped_value_v2(
     let sql = format!(
         "SELECT {table_name}.{value_name} FROM {map_table_name} \
          JOIN {table_name} ON {map_table_name}.{value_name} = {table_name}.rowid \
-         WHERE {map_table_name}.package = ?1 AND {table_name}.{value_name} LIKE ?2"
+         WHERE {map_table_name}.package = ?1 AND {table_name}.{value_name} LIKE ?2 ESCAPE '\\'"
     );
     let values = query_rows(
         connection,
@@ -7352,7 +8099,7 @@ fn find_mapped_value_v1(
     let sql = format!(
         "SELECT {table_name}.{value_name} FROM {map_table_name} \
          JOIN {table_name} ON {map_table_name}.{value_name} = {table_name}.rowid \
-         WHERE {map_table_name}.manifest = ?1 AND {table_name}.{value_name} LIKE ?2"
+         WHERE {map_table_name}.manifest = ?1 AND {table_name}.{value_name} LIKE ?2 ESCAPE '\\'"
     );
     let values = query_rows(
         connection,
@@ -7480,8 +8227,21 @@ fn build_download_manifest_yaml(manifest: &Manifest, documents: &JsonValue, inst
     }
 
     // Replace the multi-installer array with the single resolved installer so
-    // the emitted manifest describes the file the user actually downloaded.
-    let mut single_installer = serde_json::Map::new();
+    // the emitted manifest describes the file the user actually downloaded. Like
+    // WinGet's YamlWriter, keep every field of that installer's entry (switches,
+    // nested installers, dependencies, return codes, ...); the typed values below
+    // only fill in what the entry inherits from the root.
+    let mut single_installer = document
+        .get("Installers")
+        .and_then(JsonValue::as_array)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .filter_map(JsonValue::as_object)
+                .find(|entry| download_manifest_entry_matches(entry, &document, installer))
+        })
+        .cloned()
+        .unwrap_or_default();
     if let Some(arch) = installer.architecture.as_ref() {
         single_installer.insert("Architecture".to_owned(), JsonValue::String(arch.clone()));
     }
@@ -7521,6 +8281,33 @@ fn build_download_manifest_yaml(manifest: &Manifest, documents: &JsonValue, inst
 
     let value = JsonValue::Object(document);
     serde_yaml::to_string(&value).context("failed to serialize manifest YAML")
+}
+
+/// True when a manifest `Installers` entry (with root-level fallbacks) is the selected installer.
+fn download_manifest_entry_matches(
+    entry: &JsonMap<String, JsonValue>,
+    root: &JsonMap<String, JsonValue>,
+    installer: &Installer,
+) -> bool {
+    let field = |key: &str| {
+        entry
+            .get(key)
+            .or_else(|| root.get(key))
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let same = |key: &str, expected: Option<&String>| match (field(key), expected.map(|value| value.trim())) {
+        (Some(actual), Some(expected)) => actual.eq_ignore_ascii_case(expected),
+        (None, None) => true,
+        (None, Some(expected)) => expected.is_empty(),
+        (Some(_), None) => false,
+    };
+    same("InstallerUrl", installer.url.as_ref())
+        && same("Architecture", installer.architecture.as_ref())
+        && same("InstallerType", installer.installer_type.as_ref())
+        && same("Scope", installer.scope.as_ref())
+        && same("InstallerLocale", installer.locale.as_ref())
 }
 
 /// Computes the file name `winget download` uses for the YAML manifest
@@ -7594,26 +8381,34 @@ fn sanitize_filename_component(value: &str) -> String {
         .collect()
 }
 
-fn resolve_manifest_path(manifest_path: &Path) -> Result<PathBuf> {
+/// Resolves `--manifest` to the files to load: the file itself, or every `*.yaml`/`*.yml` file
+/// in a directory, since a WinGet multi-file manifest (version, defaultLocale, installer and
+/// locale files) is passed as its directory.
+fn resolve_manifest_paths(manifest_path: &Path) -> Result<Vec<PathBuf>> {
     if manifest_path.is_file() {
-        return Ok(manifest_path.to_path_buf());
+        return Ok(vec![manifest_path.to_path_buf()]);
     }
 
     if !manifest_path.is_dir() {
         bail!("Manifest path not found: {}", manifest_path.display());
     }
 
-    let candidate = fs::read_dir(manifest_path)?
+    let mut candidates = fs::read_dir(manifest_path)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
+        .filter(|path| path.is_file())
         .filter(|path| {
             path.extension()
                 .and_then(|value| value.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
         })
-        .min();
+        .collect::<Vec<_>>();
+    candidates.sort();
 
-    candidate.ok_or_else(|| anyhow!("No manifest file found under: {}", manifest_path.display()))
+    if candidates.is_empty() {
+        bail!("No manifest file found under: {}", manifest_path.display());
+    }
+    Ok(candidates)
 }
 
 fn score_text_match(
@@ -7722,23 +8517,52 @@ fn parse_rest_version_identities(item: &JsonValue) -> (Vec<String>, Vec<String>,
 }
 
 fn parse_yaml_manifest_bundle(bytes: &[u8]) -> Result<(Manifest, JsonValue)> {
-    let mut merged = YamlMapping::new();
+    parse_yaml_manifest_bundle_parts(&[bytes])
+}
+
+/// Parses the YAML documents of one or more manifest files (a multi-file manifest directory)
+/// into one manifest. Root fields merge version, then defaultLocale, then installer documents;
+/// non-default `locale` documents stay in the structured output but never override the
+/// default-locale root fields.
+fn parse_yaml_manifest_bundle_parts<B: AsRef<[u8]>>(parts: &[B]) -> Result<(Manifest, JsonValue)> {
+    let mut mappings = Vec::new();
     let mut documents = Vec::new();
-    let raw_versions = raw_package_versions(bytes);
-    for (index, document) in serde_yaml::Deserializer::from_slice(bytes).enumerate() {
-        let mut value = YamlValue::deserialize(document).context("failed to deserialize YAML document")?;
-        // `YamlValue` resolves plain scalars by YAML type, so `PackageVersion: 1.10` would
-        // become the float 1.1. WinGet treats manifest scalars as strings; restore the text.
-        if let (Some(Some(raw_version)), Some(mapping)) = (raw_versions.get(index), value.as_mapping_mut()) {
-            let key = YamlValue::from("PackageVersion");
-            if mapping.contains_key(&key) {
-                mapping.insert(key, YamlValue::String(raw_version.clone()));
+    for bytes in parts {
+        let bytes = bytes.as_ref();
+        let raw_versions = raw_package_versions(bytes);
+        let raw_documents = serde_yaml::Deserializer::from_slice(bytes);
+        for ((index, document), raw_document) in serde_yaml::Deserializer::from_slice(bytes)
+            .enumerate()
+            .zip(raw_documents)
+        {
+            let mut value = YamlValue::deserialize(document).context("failed to deserialize YAML document")?;
+            // The model reads every scalar as text, like WinGet: re-read the document so numbers
+            // keep their source text (`Tags: [1.10]`, `MinimumVersion: 14.30`). The structured
+            // document below keeps the typed values.
+            let model_value = serde::de::DeserializeSeed::deserialize(RawScalarSeed(&value), raw_document).ok();
+            // `YamlValue` resolves plain scalars by YAML type, so `PackageVersion: 1.10` would
+            // become the float 1.1. WinGet treats manifest scalars as strings; restore the text.
+            if let (Some(Some(raw_version)), Some(mapping)) = (raw_versions.get(index), value.as_mapping_mut()) {
+                let key = YamlValue::from("PackageVersion");
+                if mapping.contains_key(&key) {
+                    mapping.insert(key, YamlValue::String(raw_version.clone()));
+                }
+            }
+            documents.push(serde_json::to_value(&value).context("failed to convert YAML manifest document")?);
+            if let YamlValue::Mapping(mapping) = model_value.unwrap_or(value) {
+                mappings.push(mapping);
             }
         }
-        documents.push(serde_json::to_value(&value).context("failed to convert YAML manifest document")?);
-        if let Some(mapping) = value.as_mapping() {
-            merge_yaml_mapping(&mut merged, mapping);
-        }
+    }
+
+    let mut ordered = mappings
+        .iter()
+        .filter_map(|mapping| yaml_manifest_merge_rank(mapping).map(|rank| (rank, mapping)))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(rank, _)| *rank);
+    let mut merged = YamlMapping::new();
+    for (_, mapping) in ordered {
+        merge_yaml_mapping(&mut merged, mapping);
     }
 
     let id = yaml_string_from_root(&merged, "PackageIdentifier")
@@ -7782,6 +8606,26 @@ fn parse_yaml_manifest_bundle(bytes: &[u8]) -> Result<(Manifest, JsonValue)> {
         },
         collapse_structured_document(&JsonValue::Array(documents)),
     ))
+}
+
+/// Merge order of a manifest document into the root manifest: version, then defaultLocale, then
+/// installer, then anything else (singleton/merged). `None` for a non-default `locale` document.
+fn yaml_manifest_merge_rank(mapping: &YamlMapping) -> Option<u8> {
+    let manifest_type = mapping
+        .get(YamlValue::from("ManifestType"))
+        .and_then(YamlValue::as_str)
+        .unwrap_or_default();
+    if manifest_type.eq_ignore_ascii_case("locale") {
+        None
+    } else if manifest_type.eq_ignore_ascii_case("version") {
+        Some(0)
+    } else if manifest_type.eq_ignore_ascii_case("defaultLocale") {
+        Some(1)
+    } else if manifest_type.eq_ignore_ascii_case("installer") {
+        Some(2)
+    } else {
+        Some(3)
+    }
 }
 
 fn parse_yaml_manifest(bytes: &[u8]) -> Result<Manifest> {
@@ -7846,6 +8690,9 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
     let top_nested_installer_type = json_string(selected, "NestedInstallerType");
     let top_nested_installer_files = json_nested_installer_files(selected);
     let top_msstore_product_identifier = json_string(selected, "MSStoreProductIdentifier");
+    let top_installer_success_codes = json_return_code_list(selected, "InstallerSuccessCodes");
+    let top_expected_return_codes = json_expected_return_codes(selected);
+    let top_dependencies = json_dependencies(selected);
 
     let installers = selected
         .get("Installers")
@@ -7853,7 +8700,21 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
         .map(|items| {
             items
                 .iter()
-                .map(|item| Installer {
+                .map(|item| {
+                    // Installer-level values win; the version-level object supplies defaults.
+                    let inherited = |key: &str| if item.get(key).is_some() { item } else { selected };
+                    let dependencies = match json_dependencies(item) {
+                        dependencies if dependencies.is_empty() => top_dependencies.clone(),
+                        dependencies => dependencies,
+                    };
+                    (
+                        item,
+                        inherited("Markets"),
+                        inherited("UnsupportedOSArchitectures"),
+                        dependencies,
+                    )
+                })
+                .map(|(item, markets_source, unsupported_source, dependencies)| Installer {
                     platforms: {
                         let platforms = json_string_list(item, "Platform");
                         if platforms.is_empty() {
@@ -7888,8 +8749,33 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
                     upgrade_code: json_string(item, "UpgradeCode"),
                     switches: json_installer_switches(item).with_fallback(&installer_switch_defaults),
                     commands: json_string_list(item, "Commands"),
-                    package_dependencies: json_package_dependencies(item),
+                    package_dependencies: package_dependency_ids(&dependencies),
                     require_explicit_upgrade: json_bool(item, "RequireExplicitUpgrade"),
+                    installer_success_codes: if item.get("InstallerSuccessCodes").is_some() {
+                        json_return_code_list(item, "InstallerSuccessCodes")
+                    } else {
+                        top_installer_success_codes.clone()
+                    },
+                    expected_return_codes: if item.get("ExpectedReturnCodes").is_some() {
+                        json_expected_return_codes(item)
+                    } else {
+                        top_expected_return_codes.clone()
+                    },
+                    download_command_prohibited: if item.get("DownloadCommandProhibited").is_some() {
+                        json_bool(item, "DownloadCommandProhibited")
+                    } else {
+                        json_bool(selected, "DownloadCommandProhibited")
+                    },
+                    allowed_markets: json_markets(markets_source, "AllowedMarkets"),
+                    excluded_markets: json_markets(markets_source, "ExcludedMarkets"),
+                    unsupported_os_architectures: json_string_list(unsupported_source, "UnsupportedOSArchitectures"),
+                    upgrade_behavior: json_string(item, "UpgradeBehavior")
+                        .or_else(|| json_string(selected, "UpgradeBehavior")),
+                    dependencies,
+                    apps_and_features_entries: match json_apps_and_features_entries(item) {
+                        entries if entries.is_empty() => json_apps_and_features_entries(selected),
+                        entries => entries,
+                    },
                 })
                 .collect::<Vec<_>>()
         })
@@ -7947,6 +8833,11 @@ fn collapse_structured_document(document: &JsonValue) -> JsonValue {
     match document {
         JsonValue::Array(documents) if documents.len() == 1 && is_merged_manifest_document(&documents[0]) => {
             merge_manifest_documents(&split_merged_manifest_document(&documents[0]))
+        }
+        // A lone singleton document is already the whole manifest; only multi-file parts
+        // (version/defaultLocale/installer) need merging.
+        JsonValue::Array(documents) if documents.len() == 1 && !is_multi_file_manifest_part(&documents[0]) => {
+            documents[0].clone()
         }
         JsonValue::Array(documents) => merge_manifest_documents(documents),
         JsonValue::Object(_) if is_merged_manifest_document(document) => {
@@ -8033,6 +8924,17 @@ fn merge_manifest_documents(documents: &[JsonValue]) -> JsonValue {
     singleton.remove("DefaultLocale");
 
     JsonValue::Object(singleton)
+}
+
+fn is_multi_file_manifest_part(document: &JsonValue) -> bool {
+    document
+        .get("ManifestType")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|manifest_type| {
+            ["version", "defaultLocale", "installer", "locale"]
+                .iter()
+                .any(|part| manifest_type.eq_ignore_ascii_case(part))
+        })
 }
 
 fn is_merged_manifest_document(document: &JsonValue) -> bool {
@@ -8271,6 +9173,7 @@ fn build_rest_manifest_documents(
 fn parse_yaml_installers(root: &YamlMapping) -> Vec<Installer> {
     let base = installer_defaults(root);
     let base_switches = yaml_installer_switches(root);
+    let root_dependencies = yaml_dependencies(root);
     if let Some(items) = root.get(YamlValue::from("Installers")).and_then(YamlValue::as_sequence) {
         let installers = items
             .iter()
@@ -8279,9 +9182,17 @@ fn parse_yaml_installers(root: &YamlMapping) -> Vec<Installer> {
                 let mut merged = base.clone();
                 merge_yaml_mapping(&mut merged, item);
                 let switches = yaml_installer_switches(item).with_fallback(&base_switches);
-                installer_from_yaml(&merged, switches)
+                let mut installer = installer_from_yaml(&merged, switches);
+                // WinGet: installer `Dependencies` of any kind override the root ones entirely;
+                // only an installer that declares none inherits the root dependencies.
+                if installer.dependencies.is_empty() {
+                    installer.dependencies = root_dependencies.clone();
+                    installer.package_dependencies = package_dependency_ids(&installer.dependencies);
+                }
+                installer
             })
             .collect::<Vec<_>>();
+
         if !installers.is_empty() {
             return installers;
         }
@@ -8290,7 +9201,10 @@ fn parse_yaml_installers(root: &YamlMapping) -> Vec<Installer> {
     if base.is_empty() {
         Vec::new()
     } else {
-        vec![installer_from_yaml(&base, base_switches)]
+        let mut installer = installer_from_yaml(&base, base_switches);
+        installer.dependencies = root_dependencies;
+        installer.package_dependencies = package_dependency_ids(&installer.dependencies);
+        vec![installer]
     }
 }
 
@@ -8312,6 +9226,13 @@ fn installer_defaults(root: &YamlMapping) -> YamlMapping {
         "PackageFamilyName",
         "UpgradeCode",
         "Commands",
+        "InstallerSuccessCodes",
+        "ExpectedReturnCodes",
+        "Markets",
+        "UnsupportedOSArchitectures",
+        "UpgradeBehavior",
+        "DownloadCommandProhibited",
+        "AppsAndFeaturesEntries",
     ];
     let mut defaults = YamlMapping::new();
     for key in keys {
@@ -8343,6 +9264,302 @@ fn installer_from_yaml(root: &YamlMapping, switches: InstallerSwitches) -> Insta
         commands: yaml_string_list(root, "Commands"),
         package_dependencies: yaml_package_dependencies(root),
         require_explicit_upgrade: yaml_scalar_bool(root, "RequireExplicitUpgrade"),
+        installer_success_codes: yaml_return_code_list(root, "InstallerSuccessCodes"),
+        expected_return_codes: yaml_expected_return_codes(root),
+        download_command_prohibited: yaml_scalar_bool(root, "DownloadCommandProhibited"),
+        allowed_markets: yaml_markets(root, "AllowedMarkets"),
+        excluded_markets: yaml_markets(root, "ExcludedMarkets"),
+        unsupported_os_architectures: yaml_string_list(root, "UnsupportedOSArchitectures"),
+        upgrade_behavior: yaml_string(root, "UpgradeBehavior"),
+        dependencies: yaml_dependencies(root),
+        apps_and_features_entries: yaml_apps_and_features_entries(root),
+    }
+}
+
+fn yaml_markets(root: &YamlMapping, key: &str) -> Vec<String> {
+    root.get(YamlValue::from("Markets"))
+        .and_then(YamlValue::as_mapping)
+        .map(|markets| yaml_string_list(markets, key))
+        .unwrap_or_default()
+}
+
+fn yaml_dependencies(root: &YamlMapping) -> InstallerDependencies {
+    let Some(dependencies) = root
+        .get(YamlValue::from("Dependencies"))
+        .and_then(YamlValue::as_mapping)
+    else {
+        return InstallerDependencies::default();
+    };
+    InstallerDependencies {
+        windows_features: yaml_string_list(dependencies, "WindowsFeatures"),
+        windows_libraries: yaml_string_list(dependencies, "WindowsLibraries"),
+        package_dependencies: dependencies
+            .get(YamlValue::from("PackageDependencies"))
+            .and_then(YamlValue::as_sequence)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(YamlValue::as_mapping)
+                    .filter_map(|item| {
+                        Some(PackageDependency {
+                            package_identifier: yaml_string(item, "PackageIdentifier")?,
+                            minimum_version: yaml_string(item, "MinimumVersion")
+                                .map(|value| value.trim().to_owned())
+                                .filter(|value| !value.is_empty()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        external_dependencies: yaml_string_list(dependencies, "ExternalDependencies"),
+    }
+}
+
+fn yaml_apps_and_features_entries(root: &YamlMapping) -> Vec<AppsAndFeaturesEntry> {
+    root.get(YamlValue::from("AppsAndFeaturesEntries"))
+        .and_then(YamlValue::as_sequence)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(YamlValue::as_mapping)
+                .map(|item| AppsAndFeaturesEntry {
+                    display_name: yaml_string(item, "DisplayName"),
+                    publisher: yaml_string(item, "Publisher"),
+                    display_version: yaml_string(item, "DisplayVersion"),
+                    product_code: yaml_string(item, "ProductCode"),
+                    upgrade_code: yaml_string(item, "UpgradeCode"),
+                    installer_type: yaml_string(item, "InstallerType"),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_markets(value: &JsonValue, key: &str) -> Vec<String> {
+    value
+        .get("Markets")
+        .map(|markets| json_string_list(markets, key))
+        .unwrap_or_default()
+}
+
+fn json_dependencies(value: &JsonValue) -> InstallerDependencies {
+    let Some(dependencies) = value.get("Dependencies").filter(|value| value.is_object()) else {
+        return InstallerDependencies::default();
+    };
+    InstallerDependencies {
+        windows_features: json_string_list(dependencies, "WindowsFeatures"),
+        windows_libraries: json_string_list(dependencies, "WindowsLibraries"),
+        package_dependencies: dependencies
+            .get("PackageDependencies")
+            .and_then(JsonValue::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        Some(PackageDependency {
+                            package_identifier: json_string(item, "PackageIdentifier")?,
+                            minimum_version: json_string(item, "MinimumVersion")
+                                .map(|value| value.trim().to_owned())
+                                .filter(|value| !value.is_empty()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        external_dependencies: json_string_list(dependencies, "ExternalDependencies"),
+    }
+}
+
+fn json_apps_and_features_entries(value: &JsonValue) -> Vec<AppsAndFeaturesEntry> {
+    value
+        .get("AppsAndFeaturesEntries")
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.is_object())
+                .map(|item| AppsAndFeaturesEntry {
+                    display_name: json_string(item, "DisplayName"),
+                    publisher: json_string(item, "Publisher"),
+                    display_version: json_string(item, "DisplayVersion"),
+                    product_code: json_string(item, "ProductCode"),
+                    upgrade_code: json_string(item, "UpgradeCode"),
+                    installer_type: json_string(item, "InstallerType"),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Ids of the declared package dependencies, in manifest order.
+fn package_dependency_ids(dependencies: &InstallerDependencies) -> Vec<String> {
+    dependencies
+        .package_dependencies
+        .iter()
+        .map(|dependency| dependency.package_identifier.clone())
+        .collect()
+}
+
+fn parse_return_code(value: &str) -> Option<i64> {
+    let value = value.trim();
+    // Manifest scalars are read as text, so a YAML hex integer (`0x8A150001`) arrives as such.
+    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        return i64::from_str_radix(hex, 16).ok();
+    }
+    value.parse::<i64>().ok()
+}
+
+fn yaml_return_code(value: &YamlValue) -> Option<i64> {
+    match value {
+        YamlValue::Number(number) => number.as_i64(),
+        YamlValue::String(text) => parse_return_code(text),
+        YamlValue::Tagged(tagged) => yaml_return_code(&tagged.value),
+        _ => None,
+    }
+}
+
+fn yaml_return_code_list(root: &YamlMapping, key: &str) -> Vec<i64> {
+    root.get(YamlValue::from(key))
+        .and_then(YamlValue::as_sequence)
+        .map(|items| items.iter().filter_map(yaml_return_code).collect())
+        .unwrap_or_default()
+}
+
+fn yaml_expected_return_codes(root: &YamlMapping) -> Vec<ExpectedReturnCode> {
+    root.get(YamlValue::from("ExpectedReturnCodes"))
+        .and_then(YamlValue::as_sequence)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(YamlValue::as_mapping)
+                .filter_map(|item| {
+                    Some(ExpectedReturnCode {
+                        installer_return_code: yaml_return_code(item.get(YamlValue::from("InstallerReturnCode"))?)?,
+                        return_response: yaml_string(item, "ReturnResponse")?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_return_code(value: &JsonValue) -> Option<i64> {
+    match value {
+        JsonValue::Number(number) => number.as_i64(),
+        JsonValue::String(text) => parse_return_code(text),
+        _ => None,
+    }
+}
+
+fn json_return_code_list(value: &JsonValue, key: &str) -> Vec<i64> {
+    value
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .map(|items| items.iter().filter_map(json_return_code).collect())
+        .unwrap_or_default()
+}
+
+fn json_expected_return_codes(value: &JsonValue) -> Vec<ExpectedReturnCode> {
+    value
+        .get("ExpectedReturnCodes")
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(ExpectedReturnCode {
+                        installer_return_code: json_return_code(item.get("InstallerReturnCode")?)?,
+                        return_response: json_string(item, "ReturnResponse")?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Win32 `ERROR_SUCCESS_REBOOT_REQUIRED`. WinGet maps it to
+/// `RebootRequiredToFinish` for MSI/WiX/Burn installers, which counts as a
+/// successful install that needs a restart.
+const ERROR_SUCCESS_REBOOT_REQUIRED: i64 = 3010;
+
+const INSTALL_REBOOT_REQUIRED_WARNING: &str =
+    "The installer reported that a restart is required to finish the installation.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallerExitOutcome {
+    success: bool,
+    reboot_required: bool,
+}
+
+fn installer_return_code_matches(code: i64, exit_code: i32) -> bool {
+    code == i64::from(exit_code) || code == i64::from(exit_code.cast_unsigned())
+}
+
+/// Classifies an installer exit code the way WinGet does: 0 and any
+/// `InstallerSuccessCodes` entry are successes; an `ExpectedReturnCodes`
+/// entry (or, when the manifest does not list the code, the installer type's
+/// default known codes) of `rebootRequiredToFinish` is a success that needs a
+/// restart. Everything else is a failure.
+fn classify_installer_exit_code(installer: &Installer, installer_type: &str, exit_code: i32) -> InstallerExitOutcome {
+    if exit_code == 0
+        || installer
+            .installer_success_codes
+            .iter()
+            .any(|code| installer_return_code_matches(*code, exit_code))
+    {
+        return InstallerExitOutcome {
+            success: true,
+            reboot_required: false,
+        };
+    }
+
+    let reboot_required_to_finish = match installer
+        .expected_return_codes
+        .iter()
+        .find(|entry| installer_return_code_matches(entry.installer_return_code, exit_code))
+    {
+        Some(entry) => entry.return_response.eq_ignore_ascii_case("rebootRequiredToFinish"),
+        None => {
+            matches!(installer_type, "msi" | "wix" | "burn")
+                && installer_return_code_matches(ERROR_SUCCESS_REBOOT_REQUIRED, exit_code)
+        }
+    };
+    InstallerExitOutcome {
+        success: reboot_required_to_finish,
+        reboot_required: reboot_required_to_finish,
+    }
+}
+
+/// Builds the result of a finished installer run from its classified exit code. A
+/// reboot-required success is surfaced both as `reboot_required` and as a warning.
+fn completed_install_result(
+    manifest: &Manifest,
+    installer: &Installer,
+    installer_path: PathBuf,
+    installer_type: String,
+    exit_code: i32,
+    mut warnings: Vec<String>,
+) -> InstallResult {
+    // A zip's exit code comes from its nested installer, so classify it with the nested type.
+    let outcome = classify_installer_exit_code(
+        installer,
+        &effective_installer_type(installer, &installer_type),
+        exit_code,
+    );
+    if outcome.reboot_required {
+        warnings.push(INSTALL_REBOOT_REQUIRED_WARNING.to_owned());
+    }
+
+    InstallResult {
+        package_id: manifest.id.clone(),
+        version: manifest.version.clone(),
+        installer_path,
+        installer_type,
+        exit_code,
+        success: outcome.success,
+        no_op: false,
+        reboot_required: outcome.reboot_required,
+        warnings,
     }
 }
 
@@ -8385,6 +9602,7 @@ fn yaml_installer_switches_from_mapping(mapping: Option<&YamlMapping>) -> Instal
         custom: string("Custom"),
         log: string("Log"),
         install_location: string("InstallLocation"),
+        upgrade: string("Upgrade"),
     }
 }
 
@@ -8418,7 +9636,7 @@ fn yaml_scalar_string(value: &YamlValue) -> Option<String> {
 fn yaml_string_list(root: &YamlMapping, key: &str) -> Vec<String> {
     root.get(YamlValue::from(key))
         .and_then(YamlValue::as_sequence)
-        .map(|items| items.iter().filter_map(YamlValue::as_str).map(str::to_owned).collect())
+        .map(|items| items.iter().filter_map(yaml_scalar_string).collect())
         .unwrap_or_default()
 }
 
@@ -8478,6 +9696,159 @@ fn yaml_agreement_list(root: &YamlMapping) -> Vec<PackageAgreement> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Package dependencies of the selected installer, falling back to the manifest-level
+/// `Dependencies` (WinGet inherits root `Dependencies` into installers that declare none).
+/// Blank ids are dropped and duplicates removed case-insensitively, keeping manifest order.
+#[cfg(test)]
+fn selected_installer_package_dependencies(manifest: &Manifest, installer: &Installer) -> Vec<String> {
+    selected_installer_dependencies(manifest, installer)
+        .into_iter()
+        .map(|dependency| dependency.package_identifier)
+        .collect()
+}
+
+/// Package dependencies (with `MinimumVersion`) of the selected installer. An installer that
+/// declares dependencies of any kind uses only its own; otherwise the root ones apply. A
+/// duplicated id keeps its first position and the highest minimum version, like WinGet.
+fn selected_installer_dependencies(manifest: &Manifest, installer: &Installer) -> Vec<PackageDependency> {
+    let declared = if !installer.dependencies.is_empty() {
+        installer.dependencies.package_dependencies.clone()
+    } else {
+        let ids = if installer.package_dependencies.is_empty() {
+            &manifest.package_dependencies
+        } else {
+            &installer.package_dependencies
+        };
+        ids.iter()
+            .map(|id| PackageDependency {
+                package_identifier: id.clone(),
+                minimum_version: None,
+            })
+            .collect()
+    };
+
+    let mut result: Vec<PackageDependency> = Vec::new();
+    for dependency in declared {
+        let id = dependency.package_identifier.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(existing) = result
+            .iter_mut()
+            .find(|existing| existing.package_identifier.eq_ignore_ascii_case(id))
+        {
+            if let Some(minimum) = dependency.minimum_version
+                && existing
+                    .minimum_version
+                    .as_deref()
+                    .is_none_or(|current| compare_version(&minimum, current) == Ordering::Greater)
+            {
+                existing.minimum_version = Some(minimum);
+            }
+            continue;
+        }
+        result.push(PackageDependency {
+            package_identifier: id.to_owned(),
+            minimum_version: dependency.minimum_version,
+        });
+    }
+    result
+}
+
+/// True when `version` satisfies a dependency's `MinimumVersion`.
+fn dependency_version_satisfies(version: &str, minimum_version: &str) -> bool {
+    !is_unknown_version(version) && compare_version(version, minimum_version) != Ordering::Less
+}
+
+/// WinGet `DependenciesFlowNoMinVersion`: the version that would be installed must satisfy the
+/// dependency's `MinimumVersion`.
+fn ensure_dependency_minimum_version(
+    dependency_id: &str,
+    available_version: &str,
+    minimum_version: &str,
+) -> Result<()> {
+    if dependency_version_satisfies(available_version, minimum_version) {
+        return Ok(());
+    }
+    bail!(
+        "No suitable version of dependency {dependency_id} was found: {available_version} is older than the required minimum version {minimum_version}"
+    )
+}
+
+/// WinGet `APPINSTALLER_CLI_ERROR_DOWNLOAD_COMMAND_PROHIBITED`.
+fn ensure_installer_download_supported(installer: &Installer) -> Result<()> {
+    if installer.download_command_prohibited {
+        bail!("Installer is prohibited from being downloaded for later offline installation.");
+    }
+    Ok(())
+}
+
+fn upgrade_behavior_is(installer: &Installer, behavior: &str) -> bool {
+    installer
+        .upgrade_behavior
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(behavior))
+}
+
+/// True when installing `target_version` over `installed_version` changes the installed version.
+fn install_is_update(installed_version: &str, target_version: &str) -> bool {
+    compare_version(installed_version, target_version) != Ordering::Equal
+}
+
+/// WinGet `APPINSTALLER_CLI_ERROR_INSTALL_UPGRADE_NOT_SUPPORTED`: `UpgradeBehavior: deny` blocks
+/// updating an existing installation with this installer.
+fn ensure_upgrade_allowed(installer: &Installer, is_update: bool) -> Result<()> {
+    if is_update && upgrade_behavior_is(installer, "deny") {
+        bail!(
+            "The package cannot be upgraded using WinGet. Please use the method provided by the publisher for upgrading this package."
+        );
+    }
+    Ok(())
+}
+
+/// The product and upgrade codes a manifest declares (installer `ProductCode`/`UpgradeCode`
+/// and every `AppsAndFeaturesEntries` entry), used to find its installed package.
+#[derive(Debug, Default)]
+struct ManifestCorrelationCodes {
+    product_codes: Vec<String>,
+    upgrade_codes: Vec<String>,
+}
+
+impl ManifestCorrelationCodes {
+    fn from_manifest(manifest: &Manifest) -> Self {
+        let mut codes = Self::default();
+        let push = |list: &mut Vec<String>, value: Option<&String>| {
+            if let Some(value) = value.map(|value| value.trim()).filter(|value| !value.is_empty())
+                && !list.iter().any(|existing| existing.eq_ignore_ascii_case(value))
+            {
+                list.push(value.to_owned());
+            }
+        };
+        for installer in &manifest.installers {
+            push(&mut codes.product_codes, installer.product_code.as_ref());
+            push(&mut codes.upgrade_codes, installer.upgrade_code.as_ref());
+            for entry in &installer.apps_and_features_entries {
+                push(&mut codes.product_codes, entry.product_code.as_ref());
+                push(&mut codes.upgrade_codes, entry.upgrade_code.as_ref());
+            }
+        }
+        codes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.product_codes.is_empty() && self.upgrade_codes.is_empty()
+    }
+
+    fn matches(&self, installed_product_codes: &[String], installed_upgrade_codes: &[String]) -> bool {
+        let any = |declared: &[String], installed: &[String]| {
+            installed
+                .iter()
+                .any(|code| declared.iter().any(|declared| declared.eq_ignore_ascii_case(code)))
+        };
+        any(&self.product_codes, installed_product_codes) || any(&self.upgrade_codes, installed_upgrade_codes)
+    }
 }
 
 fn yaml_package_dependencies(root: &YamlMapping) -> Vec<String> {
@@ -8638,6 +10009,85 @@ fn json_installer_switches(value: &JsonValue) -> InstallerSwitches {
         custom: string("Custom"),
         log: string("Log"),
         install_location: string("InstallLocation"),
+        upgrade: string("Upgrade"),
+    }
+}
+
+/// Re-deserializes a YAML document guided by `self.0`, the same document already parsed as a
+/// `YamlValue`, turning every number scalar into its original source text. serde_yaml keeps the
+/// source representation only when a scalar is deserialized as a string, so `1.10` would
+/// otherwise become the float `1.1`.
+struct RawScalarSeed<'a>(&'a YamlValue);
+
+impl<'de> serde::de::DeserializeSeed<'de> for RawScalarSeed<'_> {
+    type Value = YamlValue;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match self.0 {
+            YamlValue::Number(_) => String::deserialize(deserializer).map(YamlValue::String),
+            YamlValue::Sequence(items) => deserializer.deserialize_seq(RawScalarSequenceVisitor(items)),
+            YamlValue::Mapping(mapping) => deserializer.deserialize_map(RawScalarMappingVisitor(mapping)),
+            other => {
+                serde::de::IgnoredAny::deserialize(deserializer)?;
+                Ok(other.clone())
+            }
+        }
+    }
+}
+
+struct RawScalarSequenceVisitor<'a>(&'a [YamlValue]);
+
+impl<'de> serde::de::Visitor<'de> for RawScalarSequenceVisitor<'_> {
+    type Value = YamlValue;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a YAML sequence")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut items = Vec::with_capacity(self.0.len());
+        for shape in self.0 {
+            let item = sequence
+                .next_element_seed(RawScalarSeed(shape))?
+                .ok_or_else(|| serde::de::Error::custom("YAML sequence shape mismatch"))?;
+            items.push(item);
+        }
+        if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom("YAML sequence shape mismatch"));
+        }
+        Ok(YamlValue::Sequence(items))
+    }
+}
+
+struct RawScalarMappingVisitor<'a>(&'a YamlMapping);
+
+impl<'de> serde::de::Visitor<'de> for RawScalarMappingVisitor<'_> {
+    type Value = YamlValue;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a YAML mapping")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut result = YamlMapping::new();
+        while let Some(key) = map.next_key::<YamlValue>()? {
+            let shape = self
+                .0
+                .get(&key)
+                .ok_or_else(|| serde::de::Error::custom("YAML mapping shape mismatch"))?;
+            let value = map.next_value_seed(RawScalarSeed(shape))?;
+            result.insert(key, value);
+        }
+        Ok(YamlValue::Mapping(result))
     }
 }
 
@@ -8791,10 +10241,18 @@ fn decompress_mszyml_payload(payload: &[u8]) -> Result<String> {
 }
 
 fn cache_control_max_age(response: &Response) -> u64 {
-    response
-        .headers()
-        .get(reqwest::header::CACHE_CONTROL)
-        .and_then(|value| value.to_str().ok())
+    parse_cache_control_max_age(
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+/// Seconds to cache a REST `/information` response: the Cache-Control max-age, or
+/// [`REST_INFORMATION_DEFAULT_MAX_AGE_SECONDS`] when absent or unparsable.
+fn parse_cache_control_max_age(header: Option<&str>) -> u64 {
+    header
         .and_then(|header| {
             header.split(',').find_map(|part| {
                 let trimmed = part.trim();
@@ -8803,7 +10261,17 @@ fn cache_control_max_age(response: &Response) -> u64 {
                     .and_then(|value| value.parse::<u64>().ok())
             })
         })
-        .unwrap_or(60)
+        .unwrap_or(REST_INFORMATION_DEFAULT_MAX_AGE_SECONDS)
+}
+
+/// When a REST `/information` cache entry expires. A server-supplied max-age is clamped
+/// to [`REST_INFORMATION_MAX_AGE_SECONDS`] so a huge value can neither overflow the
+/// timestamp arithmetic nor pin stale source information for years.
+fn rest_information_cache_expiry(now: DateTime<Utc>, max_age_seconds: u64) -> DateTime<Utc> {
+    let seconds = max_age_seconds.min(REST_INFORMATION_MAX_AGE_SECONDS);
+    Duration::try_seconds(i64::try_from(seconds).unwrap_or_default())
+        .and_then(|lifetime| now.checked_add_signed(lifetime))
+        .unwrap_or(now)
 }
 
 fn choose_contract(server_versions: &[String]) -> Option<&'static str> {
@@ -8852,6 +10320,17 @@ fn os_geographic_region() -> Option<String> {
 }
 
 fn select_installer(installers: &[Installer], query: &PackageQuery) -> Option<Installer> {
+    select_installer_for_system(installers, query, &default_market(), preferred_installer_locales())
+}
+
+/// Installer selection with the host's market (`Markets` filter) and preferred UI languages
+/// (installer locale preference when no `--locale` is requested) passed in explicitly.
+fn select_installer_for_system(
+    installers: &[Installer],
+    query: &PackageQuery,
+    market: &str,
+    preferred_locales: &[String],
+) -> Option<Installer> {
     let requested_locale = query.locale.as_deref();
     let requested_architecture = query.installer_architecture.as_deref();
     let requested_type = query.installer_type.as_deref();
@@ -8877,9 +10356,18 @@ fn select_installer(installers: &[Installer], query: &PackageQuery) -> Option<In
             )
         })
         .filter(|(_, installer)| installer_matches_architecture(installer, requested_architecture, system_architecture))
+        .filter(|(_, installer)| !installer_unsupported_on_architecture(installer, system_architecture))
+        .filter(|(_, installer)| installer_matches_market(installer, market))
+        .filter(|(_, installer)| installer_matches_locale(installer.locale.as_deref(), requested_locale))
         .max_by_key(|(index, installer)| {
             (
-                installer_rank(installer, requested_locale, requested_architecture, system_architecture),
+                installer_rank(
+                    installer,
+                    requested_locale,
+                    preferred_locales,
+                    requested_architecture,
+                    system_architecture,
+                ),
                 std::cmp::Reverse(*index),
             )
         })
@@ -8924,11 +10412,15 @@ fn installer_matches_platform(
         return true;
     };
 
-    installer
-        .platforms
-        .iter()
-        .any(|platform| platform.eq_ignore_ascii_case(effective_platform))
+    // WinGet does not filter on Platform for install, and Windows.Universal (UWP) packages run on
+    // desktop Windows: unless a platform was requested explicitly, Universal installers apply.
+    installer.platforms.iter().any(|platform| {
+        platform.eq_ignore_ascii_case(effective_platform)
+            || (requested_platform.is_none() && platform.eq_ignore_ascii_case(UNIVERSAL_PLATFORM))
+    })
 }
+
+const UNIVERSAL_PLATFORM: &str = "Windows.Universal";
 
 fn installer_matches_os_version(
     installer: &Installer,
@@ -8947,9 +10439,22 @@ fn installer_matches_os_version(
         parse_dotted_version(minimum_os_version),
         parse_dotted_version(actual_os_version),
     ) {
-        (Some(minimum), Some(actual)) => actual.cmp(&minimum) != Ordering::Less,
+        (Some(minimum), Some(actual)) => compare_dotted_versions(&actual, &minimum) != Ordering::Less,
         _ => minimum_os_version.eq_ignore_ascii_case(actual_os_version),
     }
+}
+
+/// Compares dotted numeric versions component by component, treating missing trailing
+/// components as zero, so `10.0.19041` equals `10.0.19041.0`.
+fn compare_dotted_versions(left: &[u64], right: &[u64]) -> Ordering {
+    (0..left.len().max(right.len()))
+        .map(|index| {
+            let left = left.get(index).copied().unwrap_or(0);
+            let right = right.get(index).copied().unwrap_or(0);
+            left.cmp(&right)
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
 }
 
 fn installer_matches_architecture(
@@ -8971,9 +10476,30 @@ fn installer_matches_architecture(
         .any(|candidate| architecture.eq_ignore_ascii_case(candidate))
 }
 
+/// WinGet `MarketFilter`: a non-empty `AllowedMarkets` must contain the market; otherwise the
+/// market must not be in `ExcludedMarkets`. Compared case-insensitively.
+fn installer_matches_market(installer: &Installer, market: &str) -> bool {
+    let contains = |markets: &[String]| markets.iter().any(|value| value.trim().eq_ignore_ascii_case(market));
+    if !installer.allowed_markets.is_empty() {
+        contains(&installer.allowed_markets)
+    } else {
+        !contains(&installer.excluded_markets)
+    }
+}
+
+/// WinGet `MachineArchitectureComparator`: an installer listing the system architecture in
+/// `UnsupportedOSArchitectures` is not applicable (it would otherwise run under emulation).
+fn installer_unsupported_on_architecture(installer: &Installer, system_architecture: &str) -> bool {
+    installer
+        .unsupported_os_architectures
+        .iter()
+        .any(|value| value.trim().eq_ignore_ascii_case(system_architecture))
+}
+
 fn installer_rank(
     installer: &Installer,
     requested_locale: Option<&str>,
+    preferred_locales: &[String],
     requested_architecture: Option<&str>,
     system_architecture: &str,
 ) -> (i32, i32, i32) {
@@ -8983,7 +10509,10 @@ fn installer_rank(
         requested_architecture.is_some(),
         system_architecture,
     );
-    let locale_rank = locale_rank(installer.locale.as_deref(), requested_locale);
+    let locale_rank = match requested_locale {
+        Some(_) => locale_rank(installer.locale.as_deref(), requested_locale),
+        None => preferred_locale_rank(installer.locale.as_deref(), preferred_locales),
+    };
     let command_rank = if installer.commands.is_empty() { 0 } else { 1 };
     (architecture_rank, locale_rank, command_rank)
 }
@@ -9016,18 +10545,14 @@ fn architecture_rank(
         .unwrap_or(-1)
 }
 
-/// True when at least one installer in `manifest.installers` targets an
-/// architecture the host can run. winget hides upgrades whose latest
-/// version publishes no compatible installer.
+/// True when the host can use at least one installer in `manifest.installers`, applying the
+/// same applicability rules as install (architecture, platform, minimum OS version). winget
+/// hides upgrades whose latest version publishes no applicable installer.
 fn manifest_has_compatible_installer(manifest: &Manifest) -> bool {
     if manifest.installers.is_empty() {
         return true;
     }
-    let allowed = preferred_architectures(current_architecture());
-    manifest.installers.iter().any(|installer| {
-        let arch = installer.architecture.as_deref().unwrap_or("neutral");
-        allowed.iter().any(|candidate| candidate.eq_ignore_ascii_case(arch))
-    })
+    select_installer(&manifest.installers, &PackageQuery::default()).is_some()
 }
 
 fn preferred_architectures(system_architecture: &str) -> &'static [&'static str] {
@@ -9037,6 +10562,90 @@ fn preferred_architectures(system_architecture: &str) -> &'static [&'static str]
         "x86" => &["x86", "neutral"],
         _ => &["neutral"],
     }
+}
+
+/// A requested `--locale` is a requirement, not a preference: an installer that declares a
+/// different language is not applicable. Installers that declare no locale stay applicable.
+fn installer_matches_locale(installer_locale: Option<&str>, requested_locale: Option<&str>) -> bool {
+    locale_rank(installer_locale, requested_locale) >= 0
+}
+
+/// Locale preference without `--locale`, after WinGet's `LocaleComparator`: the first preferred
+/// language that an installer matches decides (an exact tag beats the same language), an
+/// installer declaring no locale beats one whose locale matches no preference, and with no
+/// preferences at all the locale does not rank installers.
+fn preferred_locale_rank(installer_locale: Option<&str>, preferred_locales: &[String]) -> i32 {
+    if preferred_locales.is_empty() {
+        return 0;
+    }
+    let Some(installer_locale) = installer_locale.map(str::trim).filter(|value| !value.is_empty()) else {
+        return 1;
+    };
+    let count = i32::try_from(preferred_locales.len()).unwrap_or(i32::MAX / 4);
+    preferred_locales
+        .iter()
+        .zip(0..)
+        .find_map(|(preferred, index)| {
+            let preferred = preferred.trim();
+            let weight = 2 + (count - index) * 2;
+            if installer_locale.eq_ignore_ascii_case(preferred) {
+                Some(weight + 1)
+            } else if same_locale_language(installer_locale, preferred) {
+                Some(weight)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn same_locale_language(left: &str, right: &str) -> bool {
+    left.split('-')
+        .next()
+        .zip(right.split('-').next())
+        .is_some_and(|(left, right)| !left.is_empty() && left.eq_ignore_ascii_case(right))
+}
+
+/// The user's preferred UI languages (BCP-47 tags, most preferred first), which WinGet uses as
+/// the installer locale preference when no locale is requested.
+fn preferred_installer_locales() -> &'static [String] {
+    static CELL: OnceLock<Vec<String>> = OnceLock::new();
+    CELL.get_or_init(read_preferred_ui_languages)
+}
+
+#[cfg(windows)]
+fn read_preferred_ui_languages() -> Vec<String> {
+    use windows_sys::Win32::Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};
+
+    let mut count = 0u32;
+    let mut length = 0u32;
+    // SAFETY: a null buffer with a zero length asks only for the required length.
+    if unsafe { GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, std::ptr::null_mut(), &mut length) } == 0
+        || length == 0
+    {
+        return Vec::new();
+    }
+    let mut buffer = vec![0u16; length as usize];
+    // SAFETY: `buffer` holds `length` UTF-16 units, as the previous call requested.
+    if unsafe { GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, buffer.as_mut_ptr(), &mut length) } == 0 {
+        return Vec::new();
+    }
+    buffer
+        .split(|unit| *unit == 0)
+        .filter(|tag| !tag.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn read_preferred_ui_languages() -> Vec<String> {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|value| value.split(['.', '@']).next().unwrap_or_default().replace('_', "-"))
+        .find(|value| !value.is_empty() && value != "C" && value != "POSIX")
+        .into_iter()
+        .collect()
 }
 
 fn locale_rank(installer_locale: Option<&str>, requested_locale: Option<&str>) -> i32 {
@@ -9339,12 +10948,24 @@ fn compare_numeric_tokens(left: &str, right: &str) -> Ordering {
     left.len().cmp(&right.len()).then_with(|| left.cmp(right))
 }
 
+/// Drops a leading non-digit prefix such as the `v` in `v1.2`, as WinGet's `Version::Assign`
+/// does: when the first digit comes before the first `.` (or there is no `.`), everything
+/// before that digit is trimmed. Versions with no digit at all are left untouched.
+fn trim_version_prefix(value: &str) -> &str {
+    let value = value.trim();
+    match (value.find(|ch: char| ch.is_ascii_digit()), value.find('.')) {
+        (Some(digit), Some(split)) if digit < split => &value[digit..],
+        (Some(digit), None) => &value[digit..],
+        _ => value,
+    }
+}
+
 fn tokenize_version(value: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut current_is_digit = None;
 
-    for ch in value.chars() {
+    for ch in trim_version_prefix(value).chars() {
         if ch == '.' || ch == '-' || ch == '_' || ch == '+' {
             if !current.is_empty() {
                 parts.push(std::mem::take(&mut current));
@@ -9382,14 +11003,157 @@ fn verify_hash(expected_hash: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Chooses the on-disk name of a downloaded installer. A `--rename` value must
+/// already be a plain file name. A name taken from the URL is percent-decoded
+/// and used only when it is a safe single path segment (otherwise the
+/// `<id>.<version>` fallback WinGet uses applies), and it always receives an
+/// extension that matches the installer type so it cannot be launched as
+/// something else.
+fn installer_download_file_name(
+    url: &str,
+    rename: Option<&str>,
+    installer_type: &str,
+    manifest: &Manifest,
+) -> Result<String> {
+    if let Some(rename) = rename {
+        if !is_safe_file_name(rename) {
+            bail!("Invalid --rename value '{rename}': it must be a plain file name without path separators.");
+        }
+        return Ok(rename.to_owned());
+    }
+
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let segment = path.rsplit('/').next().unwrap_or_default();
+    let decoded = percent_decode_url_segment(segment);
+    let name = if is_safe_file_name(&decoded) {
+        decoded
+    } else {
+        make_safe_file_name(&format!("{}.{}", manifest.id, manifest.version))
+    };
+    Ok(with_installer_extension(name, installer_type))
+}
+
+fn percent_decode_url_segment(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (
+                (bytes[index + 1] as char).to_digit(16),
+                (bytes[index + 2] as char).to_digit(16),
+            )
+        {
+            decoded.push(u8::try_from(high * 16 + low).unwrap_or(b'_'));
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| segment.to_owned())
+}
+
+const MAX_INSTALLER_FILE_NAME_LENGTH: usize = 200;
+
+fn is_safe_file_name(name: &str) -> bool {
+    if name.is_empty()
+        || name.chars().count() > MAX_INSTALLER_FILE_NAME_LENGTH
+        || name == "."
+        || name == ".."
+        || name.ends_with(['.', ' '])
+        || name.starts_with(' ')
+        || name
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    !is_reserved_windows_device_name(stem)
+}
+
+fn is_reserved_windows_device_name(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
+}
+
+fn make_safe_file_name(value: &str) -> String {
+    let replaced = value
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    let trimmed = replaced.trim().trim_end_matches('.').trim_end();
+    let truncated = trimmed.chars().take(MAX_INSTALLER_FILE_NAME_LENGTH).collect::<String>();
+    if is_safe_file_name(&truncated) {
+        truncated
+    } else {
+        "installer".to_owned()
+    }
+}
+
+/// Extensions accepted for each installer type; the first one is appended when
+/// the name does not already end with an accepted extension.
+fn installer_type_extensions(installer_type: &str) -> &'static [&'static str] {
+    match installer_type {
+        "exe" | "burn" | "inno" | "nullsoft" | "nsis" | "portable" => &[".exe"],
+        "msi" | "wix" => &[".msi"],
+        "msix" | "appx" => &[".msix", ".msixbundle", ".appx", ".appxbundle"],
+        "zip" => &[".zip"],
+        _ => &[],
+    }
+}
+
+fn with_installer_extension(name: String, installer_type: &str) -> String {
+    let extensions = installer_type_extensions(installer_type);
+    let lower = name.to_ascii_lowercase();
+    match extensions.first() {
+        Some(default_extension) if !extensions.iter().any(|extension| lower.ends_with(extension)) => {
+            format!("{name}{default_extension}")
+        }
+        _ => name,
+    }
+}
+
+const MISSING_INSTALLER_HASH_ERROR: &str = "The manifest does not provide an InstallerSha256 for this installer; use --ignore-security-hash to install it anyway.";
+
+/// Returns the hash the downloaded installer must match, or `None` when no
+/// verification applies (the user overrode it, or an msstore installer has no
+/// hash). Like WinGet, every other installer type requires `InstallerSha256`.
+fn installer_expected_hash(installer: &Installer, ignore_security_hash: bool) -> Result<Option<&str>> {
+    let expected_hash = installer.sha256.as_deref().filter(|value| !value.trim().is_empty());
+    if expected_hash.is_some() || ignore_security_hash {
+        return Ok(expected_hash);
+    }
+    if installer
+        .installer_type
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("msstore"))
+    {
+        return Ok(None);
+    }
+    bail!(MISSING_INSTALLER_HASH_ERROR)
+}
+
 #[cfg(test)]
 fn verify_installer_hash(expected_hash: Option<&str>, bytes: &[u8], ignore_security_hash: bool) -> Result<()> {
-    let Some(expected_hash) = expected_hash else {
-        return Ok(());
-    };
     if ignore_security_hash {
         return Ok(());
     }
+    let Some(expected_hash) = expected_hash.filter(|value| !value.trim().is_empty()) else {
+        bail!(MISSING_INSTALLER_HASH_ERROR);
+    };
 
     if !hash_matches(Some(expected_hash), bytes) {
         let actual = sha256_hex(bytes);
@@ -9399,12 +11163,12 @@ fn verify_installer_hash(expected_hash: Option<&str>, bytes: &[u8], ignore_secur
 }
 
 fn verify_installer_hash_hex(expected_hash: Option<&str>, actual_hash: &str, ignore_security_hash: bool) -> Result<()> {
-    let Some(expected_hash) = expected_hash else {
-        return Ok(());
-    };
     if ignore_security_hash {
         return Ok(());
     }
+    let Some(expected_hash) = expected_hash.filter(|value| !value.trim().is_empty()) else {
+        bail!(MISSING_INSTALLER_HASH_ERROR);
+    };
 
     if !actual_hash.eq_ignore_ascii_case(expected_hash) {
         bail!("Installer hash mismatch. Expected: {expected_hash}, Got: {actual_hash}");
@@ -9727,6 +11491,33 @@ fn pins_db_path(app_root: &Path) -> PathBuf {
     }
 }
 
+/// Creates WinGet's pinning database schema (`PinningIndex` 1.0) when it is
+/// missing. WinGet opens `pinning.db` through `SQLiteStorageBase`, which reads
+/// `metadata.majorVersion` / `minorVersion`; a file without them is treated as
+/// corrupt and deleted, losing every pin. The pin table and its unique index
+/// match `Pinning_1_0/PinTable.cpp`.
+///
+/// WinGet declares `metadata` as `WITHOUT ROWID`, which turso only parses
+/// behind an experimental flag (even for `CREATE TABLE IF NOT EXISTS` on an
+/// existing table), so a missing table is created as a plain rowid table with
+/// the same columns. WinGet only selects and upserts named values in it, which
+/// behaves the same. An existing `metadata` table is left untouched.
+fn ensure_pin_schema(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "metadata")? {
+        execute_batch_sql(
+            conn,
+            "CREATE TABLE [metadata]([name] TEXT PRIMARY KEY NOT NULL,[value] TEXT NOT NULL);
+             INSERT OR IGNORE INTO [metadata] ([name], [value]) VALUES ('majorVersion', '1');
+             INSERT OR IGNORE INTO [metadata] ([name], [value]) VALUES ('minorVersion', '0');",
+        )?;
+    }
+    execute_batch_sql(
+        conn,
+        "CREATE TABLE IF NOT EXISTS pin (package_id TEXT NOT NULL, source_id TEXT NOT NULL, type INT64 NOT NULL, version TEXT NOT NULL);
+         CREATE UNIQUE INDEX IF NOT EXISTS pin_index ON pin (package_id, source_id);",
+    )
+}
+
 fn resolve_pin_type_column(conn: &Connection) -> Result<Option<&'static str>> {
     let mut has_current_column = false;
     let mut has_legacy_column = false;
@@ -9825,6 +11616,32 @@ fn ensure_dependency_installed(dependency_id: &str, result: &InstallResult) -> R
     )
 }
 
+/// File name override for the installer the install flow downloads. Like WinGet, `--rename`
+/// on a portable names the command alias, never the binary, which keeps the name from its
+/// URL; other installer types keep honoring it.
+fn install_download_rename<'a>(request: &'a InstallRequest, installer_type: &str) -> Option<&'a str> {
+    if installer_type.eq_ignore_ascii_case("portable") {
+        None
+    } else {
+        request.rename.as_deref()
+    }
+}
+
+/// The installer type that actually runs: a `zip` whose `NestedInstallerType` is an installer
+/// (not `portable`) runs that nested installer, so its exit codes follow the nested type.
+fn effective_installer_type(installer: &Installer, installer_type: &str) -> String {
+    if installer_type.eq_ignore_ascii_case("zip")
+        && let Some(nested) = installer
+            .nested_installer_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("portable"))
+    {
+        return nested.to_ascii_lowercase();
+    }
+    installer_type.to_owned()
+}
+
 fn apply_install_scope(request: &InstallRequest, installed_scope: Option<&str>) -> Result<InstallRequest> {
     let mut effective = request.clone();
     let scope = request
@@ -9842,8 +11659,22 @@ fn apply_install_scope(request: &InstallRequest, installed_scope: Option<&str>) 
 
 #[cfg(windows)]
 fn program_files_dir() -> Result<PathBuf> {
+    known_folder_dir(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles, "Program Files")
+}
+
+/// `Program Files (x86)`, where WinGet roots machine-scope x86 portables.
+#[cfg(windows)]
+fn program_files_x86_dir() -> Result<PathBuf> {
+    known_folder_dir(
+        &windows_sys::Win32::UI::Shell::FOLDERID_ProgramFilesX86,
+        "Program Files (x86)",
+    )
+}
+
+#[cfg(windows)]
+fn known_folder_dir(folder_id: &windows_sys::core::GUID, label: &str) -> Result<PathBuf> {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
 
     struct KnownFolderPath(*mut u16);
     impl Drop for KnownFolderPath {
@@ -9855,13 +11686,13 @@ fn program_files_dir() -> Result<PathBuf> {
 
     let mut raw = std::ptr::null_mut();
     // SAFETY: The folder ID and output pointer are valid; no user token is required.
-    let status = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut raw) };
+    let status = unsafe { SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &mut raw) };
     let folder = KnownFolderPath(raw);
     if status < 0 {
-        bail!("failed to resolve the Program Files known folder (HRESULT {status:#x})");
+        bail!("failed to resolve the {label} known folder (HRESULT {status:#x})");
     }
     if folder.0.is_null() {
-        bail!("the Program Files known folder is unavailable");
+        bail!("the {label} known folder is unavailable");
     }
     let mut length = 0;
     loop {
@@ -9876,7 +11707,7 @@ fn program_files_dir() -> Result<PathBuf> {
     let wide = unsafe { std::slice::from_raw_parts(folder.0, length) };
     let path = PathBuf::from(OsString::from_wide(wide));
     if !path.is_absolute() {
-        bail!("Program Files is not an absolute path: {}", path.display());
+        bail!("{label} is not an absolute path: {}", path.display());
     }
     Ok(path)
 }
@@ -9887,11 +11718,40 @@ fn local_app_data_dir() -> Result<PathBuf> {
 }
 
 #[cfg(windows)]
-fn zip_install_root(scope: PortableScope) -> Result<PathBuf> {
-    match scope {
-        PortableScope::User => Ok(local_app_data_dir()?.join("Programs")),
-        PortableScope::Machine => Ok(program_files_dir()?.join("WinGet").join("Programs")),
+const MSIEXEC_EXE: &str = "msiexec.exe";
+#[cfg(windows)]
+const CMD_EXE: &str = "cmd.exe";
+#[cfg(windows)]
+const WINDOWS_POWERSHELL_EXE: &str = r"WindowsPowerShell\v1.0\powershell.exe";
+
+/// Absolute path of a tool under the Windows system directory (`System32`). Launching
+/// msiexec, cmd or powershell by bare name lets ShellExecute / CreateProcess pick up a
+/// planted copy from the current or application directory, sometimes elevated; WinGet runs
+/// `%windir%\system32\msiexec.exe` for the same reason.
+#[cfg(windows)]
+fn system_tool_path(relative: &str) -> Result<PathBuf> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0u16; 260];
+    loop {
+        let capacity = u32::try_from(buffer.len()).context("system directory buffer is too large")?;
+        // SAFETY: `buffer` is a writable UTF-16 buffer of `capacity` units.
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), capacity) } as usize;
+        if length == 0 {
+            return Err(std::io::Error::last_os_error()).context("resolving the Windows system directory");
+        }
+        if length < buffer.len() {
+            buffer.truncate(length);
+            break;
+        }
+        // The buffer was too small; `length` is the required size including the terminator.
+        buffer.resize(length, 0);
     }
+    let directory = PathBuf::from(OsString::from_wide(&buffer));
+    if !directory.is_absolute() {
+        bail!("the Windows system directory is not absolute: {}", directory.display());
+    }
+    Ok(directory.join(relative))
 }
 
 #[cfg(windows)]
@@ -9909,7 +11769,7 @@ fn dispatch_installer(
             &installer_direct_msi_arguments(installer_type, request, manifest, installer_path, installer),
         ),
         "msi" | "wix" => shell_execute_installer(
-            Path::new("msiexec.exe"),
+            &system_tool_path(MSIEXEC_EXE)?,
             &installer_shell_execute_arguments(installer_type, request, manifest, installer_path, installer),
             should_elevate_msi_shell_execute(installer),
         ),
@@ -9919,7 +11779,7 @@ fn dispatch_installer(
             // Pass the path through the environment rather than interpolating it into the
             // script: the file name comes from the manifest URL, and PowerShell treats both
             // ASCII and typographic quotes as string delimiters.
-            let mut cmd = Command::new("powershell");
+            let mut cmd = Command::new(system_tool_path(WINDOWS_POWERSHELL_EXE)?);
             cmd.arg("-NoProfile")
                 .arg("-NonInteractive")
                 .arg("-Command")
@@ -9935,8 +11795,7 @@ fn dispatch_installer(
             // A `zip` at the top-level installer position is treated as portable when
             // `NestedInstallerType=portable` is specified — that's the shape every
             // portable in the winget catalog uses (e.g. BurntSushi.ripgrep.MSVC).
-            // Anything else still falls through to the historical extract-to-Programs
-            // behavior, which isn't really correct but at least doesn't regress.
+            // Any other nested type names the installer inside the archive to run.
             if installer
                 .nested_installer_type
                 .as_deref()
@@ -9944,18 +11803,7 @@ fn dispatch_installer(
             {
                 return install_portable(installer_path, request, manifest, installer, scope, warnings);
             }
-            let target = zip_install_root(scope)?;
-            fs::create_dir_all(&target)?;
-            let file = fs::File::open(installer_path)?;
-            let mut archive = ZipArchive::new(file)?;
-            for index in 0..archive.len() {
-                let entry = archive.by_index(index)?;
-                if zip_entry_is_symlink(&entry) {
-                    bail!("installer archive contains a symbolic link: {}", entry.name());
-                }
-            }
-            archive.extract(&target)?;
-            Ok(0)
+            install_nested_archive_installer(installer_path, request, manifest, installer, warnings)
         }
         "portable" => install_portable(
             installer_path,
@@ -9973,6 +11821,95 @@ fn dispatch_installer(
             false,
         ),
     }
+}
+
+/// The installer type and archive-relative path of the installer a non-portable `zip` runs.
+/// Fails when the manifest does not name one, instead of extracting the archive and reporting
+/// success without running anything.
+#[cfg(any(windows, test))]
+fn nested_archive_installer_target(installer: &Installer) -> Result<(String, String)> {
+    let nested_type = installer
+        .nested_installer_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("the zip installer does not declare a NestedInstallerType"))?
+        .to_ascii_lowercase();
+    if matches!(nested_type.as_str(), "zip" | "portable" | "msstore") {
+        bail!("unsupported NestedInstallerType for a zip installer: {nested_type}");
+    }
+    let nested_file = installer
+        .nested_installer_files
+        .first()
+        .ok_or_else(|| anyhow!("the zip installer does not declare NestedInstallerFiles"))?;
+    let relative = normalize_portable_relative_path(&nested_file.relative_file_path)?;
+    Ok((nested_type, relative))
+}
+
+/// Runs the installer nested in a `zip` (`NestedInstallerType` exe, msi, inno, …), as WinGet
+/// does: the archive is extracted into a fresh temporary directory (never into a shared
+/// Programs folder), the `NestedInstallerFiles` entry is dispatched with the nested type and
+/// the same manifest switches, and the extracted files are removed afterwards.
+#[cfg(windows)]
+fn install_nested_archive_installer(
+    installer_path: &Path,
+    request: &InstallRequest,
+    manifest: &Manifest,
+    installer: &Installer,
+    warnings: &mut Vec<String>,
+) -> Result<i32> {
+    static NESTED_EXTRACT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let (nested_type, relative) = nested_archive_installer_target(installer)?;
+    let extract_dir = std::env::temp_dir().join("pinget-install").join(format!(
+        "extracted-{}-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        NESTED_EXTRACT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if extract_dir.exists() {
+        bail!(
+            "temporary extraction directory already exists: {}",
+            extract_dir.display()
+        );
+    }
+    fs::create_dir_all(&extract_dir)
+        .with_context(|| format!("failed to create extraction directory: {}", extract_dir.display()))?;
+
+    let result = (|| -> Result<i32> {
+        let file = fs::File::open(installer_path)
+            .with_context(|| format!("failed to open installer zip: {}", installer_path.display()))?;
+        let mut archive = ZipArchive::new(file).context("failed to read installer zip")?;
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index)?;
+            if zip_entry_is_symlink(&entry) {
+                bail!("installer archive contains a symbolic link: {}", entry.name());
+            }
+            if entry.enclosed_name().is_none() {
+                bail!("installer archive contains an unsafe path: {}", entry.name());
+            }
+        }
+        archive
+            .extract(&extract_dir)
+            .with_context(|| format!("failed to extract zip into: {}", extract_dir.display()))?;
+
+        let nested_path = safe_portable_path(&extract_dir, &relative)?;
+        if !nested_path.is_file() {
+            bail!("nested installer '{relative}' is not present in the installer archive");
+        }
+        let nested_path = prepare_installer_for_execution(&nested_path, &nested_type)?;
+        dispatch_installer(&nested_path, &nested_type, request, manifest, installer, warnings)
+    })();
+
+    if let Err(error) = fs::remove_dir_all(&extract_dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warnings.push(format!(
+            "Could not remove the extracted installer files '{}': {error}",
+            extract_dir.display()
+        ));
+    }
+    result
 }
 
 #[cfg(windows)]
@@ -10004,11 +11941,12 @@ fn run_msstore_installer(request: &InstallRequest, manifest: &Manifest, installe
         script,
     ];
 
+    let powershell = system_tool_path(WINDOWS_POWERSHELL_EXE)?;
     if is_machine {
-        return shell_execute_installer(Path::new("powershell.exe"), &args, true);
+        return shell_execute_installer(&powershell, &args, true);
     }
 
-    let mut cmd = Command::new("powershell");
+    let mut cmd = Command::new(&powershell);
     cmd.args(&args);
     let status = cmd.status().context("failed to run MSStore installer via PowerShell")?;
     Ok(status.code().unwrap_or(-1))
@@ -10579,24 +12517,29 @@ fn installer_command_arguments_with_options(
         args.extend(default_installer_arguments(installer_type, request.mode));
     }
 
+    let log_path = request.log_path.as_ref().map(|path| path.display().to_string());
+    let install_path = request.install_location.as_deref();
     append_switches(
         &mut args,
         resolve_template_switch(
             installer.switches.log.as_deref(),
             default_log_switch(installer_type),
-            request.log_path.as_ref().map(|path| path.display().to_string()),
-            "<LOGPATH>",
+            log_path.as_deref(),
+            install_path,
         ),
     );
     append_switches(&mut args, installer.switches.custom.clone());
     append_switches(&mut args, request.custom.clone());
-    append_switches(
+    // WinGet appends `Upgrade` after the custom switches when updating an existing installation;
+    // the install flow clears it for a fresh install.
+    append_switches(&mut args, installer.switches.upgrade.clone());
+    append_install_location_switch(
         &mut args,
         resolve_template_switch(
             installer.switches.install_location.as_deref(),
             default_install_location_switch(installer_type),
-            request.install_location.clone(),
-            "<INSTALLPATH>",
+            log_path.as_deref(),
+            install_path,
         ),
     );
     args
@@ -10605,7 +12548,15 @@ fn installer_command_arguments_with_options(
 #[cfg(any(windows, test))]
 fn join_windows_arguments(args: &[String]) -> String {
     args.iter()
-        .map(|arg| quote_windows_argument(arg))
+        .enumerate()
+        .map(|(index, arg)| {
+            // A trailing NSIS `/D=` must reach the installer verbatim (no quotes).
+            if index + 1 == args.len() && arg.starts_with("/D=") {
+                arg.clone()
+            } else {
+                quote_windows_argument(arg)
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -10651,7 +12602,9 @@ fn default_installer_arguments(installer_type: &str, mode: InstallerMode) -> Vec
             ],
             "burn" | "wix" | "msi" => vec!["/passive".to_owned(), "/norestart".to_owned()],
             "nullsoft" | "nsis" => vec!["/S".to_owned()],
-            _ => vec!["/SILENT".to_owned()],
+            // Like WinGet (GetDefaultKnownSwitches), a generic `exe` gets no guessed switches:
+            // installers that reject unknown arguments would abort.
+            _ => Vec::new(),
         },
         InstallerMode::Silent => match installer_type {
             "inno" => vec![
@@ -10662,7 +12615,7 @@ fn default_installer_arguments(installer_type: &str, mode: InstallerMode) -> Vec
             ],
             "burn" | "wix" | "msi" => vec!["/quiet".to_owned(), "/norestart".to_owned()],
             "nullsoft" | "nsis" => vec!["/S".to_owned()],
-            _ => vec!["/S".to_owned()],
+            _ => Vec::new(),
         },
     }
 }
@@ -10690,12 +12643,60 @@ fn default_install_location_switch(installer_type: &str) -> Option<&'static str>
 fn resolve_template_switch(
     manifest_value: Option<&str>,
     fallback: Option<&str>,
-    replacement: Option<String>,
-    token: &str,
+    log_path: Option<&str>,
+    install_path: Option<&str>,
 ) -> Option<String> {
     let template = manifest_value.filter(|value| !value.trim().is_empty()).or(fallback)?;
-    let replacement = replacement?;
-    Some(template.replace(token, &replacement))
+    populate_switch_template(template, log_path, install_path)
+}
+
+/// Replaces `<LOGPATH>` / `<INSTALLPATH>` (case-insensitively). A switch that
+/// contains a token with no supplied value is dropped; a token-less switch is
+/// kept as-is.
+#[cfg(any(windows, test))]
+fn populate_switch_template(template: &str, log_path: Option<&str>, install_path: Option<&str>) -> Option<String> {
+    let mut value = template.to_owned();
+    for (token, replacement) in [("<LOGPATH>", log_path), ("<INSTALLPATH>", install_path)] {
+        if find_ignore_ascii_case(&value, token).is_some() {
+            let replacement = replacement.filter(|replacement| !replacement.trim().is_empty())?;
+            value = replace_ignore_ascii_case(&value, token, replacement);
+        }
+    }
+    Some(value)
+}
+
+#[cfg(any(windows, test))]
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.to_ascii_lowercase().find(&needle.to_ascii_lowercase())
+}
+
+#[cfg(any(windows, test))]
+fn replace_ignore_ascii_case(value: &str, token: &str, replacement: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut rest = value;
+    // ASCII lowercasing keeps byte offsets stable, so indexes map back to `rest`.
+    while let Some(index) = find_ignore_ascii_case(rest, token) {
+        result.push_str(&rest[..index]);
+        result.push_str(replacement);
+        rest = &rest[index + token.len()..];
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Appends the install-location switch. NSIS requires `/D=<path>` to be the
+/// last argument and unquoted even when the path contains spaces, so it is
+/// kept as a single argument (see `join_windows_arguments`).
+#[cfg(any(windows, test))]
+fn append_install_location_switch(args: &mut Vec<String>, value: Option<String>) {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    if let Some(directory) = value.trim().strip_prefix("/D=") {
+        args.push(format!("/D={}", directory.trim().trim_matches('"')));
+    } else {
+        args.extend(split_installer_switches(&value));
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -10728,6 +12729,48 @@ fn split_installer_switches(value: &str) -> Vec<String> {
     }
 
     args
+}
+
+/// Runs `uninstall` for each match and reports the first failing exit code, so a
+/// later successful version cannot mask an earlier failure under `--all-versions`.
+fn uninstall_each_match(
+    matches: &[ListMatch],
+    all_versions: bool,
+    mut uninstall: impl FnMut(&ListMatch) -> Result<i32>,
+) -> Result<i32> {
+    let mut first_failure = 0;
+    for installed in matches {
+        let exit_code = uninstall(installed)?;
+        if exit_code != 0 {
+            if first_failure == 0 {
+                first_failure = exit_code;
+            }
+            if !all_versions {
+                break;
+            }
+        }
+    }
+    Ok(first_failure)
+}
+
+/// Builds the request used by `--uninstall-previous` to remove the installed
+/// version that the install flow already located.
+fn create_uninstall_previous_request(previous: &ListMatch) -> UninstallRequest {
+    let mut request = UninstallRequest::new(PackageQuery {
+        id: Some(previous.id.clone()),
+        exact: true,
+        ..PackageQuery::default()
+    });
+    request.mode = InstallerMode::Silent;
+    request.force = true;
+    request
+}
+
+fn ensure_previous_version_uninstalled(package_id: &str, exit_code: i32) -> Result<()> {
+    if exit_code != 0 {
+        bail!("Failed to uninstall the previous version of {package_id} (exit code: {exit_code})");
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -10763,10 +12806,95 @@ fn uninstall_package(installed: &ListMatch, request: &UninstallRequest, warnings
     );
 }
 
+/// One registry location to look up for an `ARP\<User|Machine>\<X64|X86>\<subkey>`
+/// local id: the hive, whether to use the 32-bit registry view, and the full
+/// key path (including the entry's subkey).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArpUninstallKeyCandidate {
+    machine: bool,
+    wow64_32: bool,
+    key_path: String,
+}
+
+/// Maps an ARP local id to the exact registry keys it was read from, so
+/// uninstall does not pick a same-named entry from another hive or view.
+/// Returns `None` when the local id is not a well-formed ARP id.
+#[cfg(any(windows, test))]
+fn arp_uninstall_key_candidates(local_id: &str) -> Option<Vec<ArpUninstallKeyCandidate>> {
+    const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+    const WOW64_UNINSTALL: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+
+    let (prefix, rest) = local_id.split_once('\\')?;
+    if !prefix.eq_ignore_ascii_case("ARP") {
+        return None;
+    }
+    let mut parts = rest.splitn(3, '\\');
+    let scope = parts.next()?;
+    let arch = parts.next()?;
+    let subkey_name = parts.next()?;
+    if subkey_name.trim().is_empty() || subkey_name.contains('\\') {
+        return None;
+    }
+    let machine = if scope.eq_ignore_ascii_case("Machine") {
+        true
+    } else if scope.eq_ignore_ascii_case("User") {
+        false
+    } else {
+        return None;
+    };
+    let x86 = if arch.eq_ignore_ascii_case("X86") {
+        true
+    } else if arch.eq_ignore_ascii_case("X64") {
+        false
+    } else {
+        return None;
+    };
+
+    let candidate = |wow64_32: bool, root: &str| ArpUninstallKeyCandidate {
+        machine,
+        wow64_32,
+        key_path: format!(r"{root}\{subkey_name}"),
+    };
+    Some(match (machine, x86) {
+        (_, false) => vec![candidate(false, UNINSTALL)],
+        (true, true) => vec![candidate(true, UNINSTALL)],
+        // HKCU is shared between views; 32-bit user entries live under the
+        // explicit WOW6432Node path.
+        (false, true) => vec![candidate(false, WOW64_UNINSTALL), candidate(true, UNINSTALL)],
+    })
+}
+
+/// `cmd.exe` arguments for running an ARP `UninstallString` verbatim: `/S`
+/// strips only the outer quotes so the command's own quoting (and characters
+/// like parentheses) survive; `/D` skips AutoRun commands.
+#[cfg(any(windows, test))]
+fn cmd_uninstall_arguments(uninstall_line: &str) -> String {
+    format!("/D /S /C \"{uninstall_line}\"")
+}
+
 #[cfg(windows)]
 fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Result<Option<i32>> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
+    if let Some(candidates) = arp_uninstall_key_candidates(&installed.local_id) {
+        for candidate in candidates {
+            let root = RegKey::predef(if candidate.machine {
+                HKEY_LOCAL_MACHINE
+            } else {
+                HKEY_CURRENT_USER
+            });
+            let view = if candidate.wow64_32 {
+                KEY_WOW64_32KEY
+            } else {
+                KEY_WOW64_64KEY
+            };
+            let Ok(subkey) = root.open_subkey_with_flags(&candidate.key_path, KEY_READ | view) else {
+                continue;
+            };
+            let subkey_name = candidate.key_path.rsplit('\\').next().unwrap_or_default();
+            return run_arp_uninstall_entry(installed, request, subkey_name, &subkey).map(Some);
+        }
+        return Ok(None);
+    }
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -10792,49 +12920,7 @@ fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Resul
                             continue;
                         }
 
-                        if is_msi_arp_entry(read_reg_dword(&subkey, "WindowsInstaller"))
-                            && let Some(exit_code) =
-                                try_run_msi_uninstall(installed, &subkey_name, product_code.as_deref(), request)?
-                        {
-                            return Ok(Some(exit_code));
-                        }
-
-                        let quiet_uninstall_cmd = subkey.get_value::<String, _>("QuietUninstallString").ok();
-                        let uninstall_cmd: String = if request.mode == InstallerMode::Interactive {
-                            subkey.get_value("UninstallString").ok()
-                        } else {
-                            quiet_uninstall_cmd
-                                .clone()
-                                .or_else(|| subkey.get_value("UninstallString").ok())
-                        }
-                        .context("No uninstall command found in registry")?;
-
-                        if is_winget_uninstall_command(&uninstall_cmd)
-                            && let Some(exit_code) = try_uninstall_via_winget(installed, request)?
-                        {
-                            return Ok(Some(exit_code));
-                        }
-
-                        let log_path = request.log_path.as_ref().map(|value| value.display().to_string());
-                        let uninstall_line = build_uninstall_command_with_mode(
-                            &uninstall_cmd,
-                            request.mode,
-                            quiet_uninstall_cmd.is_some(),
-                            log_path.as_deref(),
-                        );
-                        // `UninstallString` is a complete command line and may already contain
-                        // its own quotes (e.g. `"C:\path with spaces\unins.exe"`). Passing it
-                        // through Command::arg causes Rust's CRT-style quoting to backslash-escape
-                        // those embedded quotes (`\"...\"`), which cmd.exe does not understand and
-                        // rejects with "is not recognized as an internal or external command".
-                        // Use `cmd /S /C "<line>"`: `/S` makes cmd strip only the outermost pair
-                        // of quotes, leaving the embedded quotes intact. `raw_arg` bypasses Rust's
-                        // automatic quoting so we can feed cmd the literal command line.
-                        let mut cmd = Command::new("cmd");
-                        cmd.raw_arg("/S /C");
-                        cmd.raw_arg(format!("\"{uninstall_line}\""));
-                        let status = cmd.status().context("failed to run uninstaller")?;
-                        return Ok(Some(status.code().unwrap_or(-1)));
+                        return run_arp_uninstall_entry(installed, request, &subkey_name, &subkey).map(Some);
                     }
                 }
             }
@@ -10842,6 +12928,59 @@ fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Resul
     }
 
     Ok(None)
+}
+
+#[cfg(windows)]
+fn run_arp_uninstall_entry(
+    installed: &ListMatch,
+    request: &UninstallRequest,
+    subkey_name: &str,
+    subkey: &RegKey,
+) -> Result<i32> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    let product_code = subkey.get_value::<String, _>("ProductCode").ok();
+    if is_msi_arp_entry(read_reg_dword(subkey, "WindowsInstaller"))
+        && let Some(exit_code) = try_run_msi_uninstall(installed, subkey_name, product_code.as_deref(), request)?
+    {
+        return Ok(exit_code);
+    }
+
+    let quiet_uninstall_cmd = subkey.get_value::<String, _>("QuietUninstallString").ok();
+    let uninstall_cmd: String = if request.mode == InstallerMode::Interactive {
+        subkey.get_value("UninstallString").ok()
+    } else {
+        quiet_uninstall_cmd
+            .clone()
+            .or_else(|| subkey.get_value("UninstallString").ok())
+    }
+    .context("No uninstall command found in registry")?;
+
+    if is_winget_uninstall_command(&uninstall_cmd)
+        && let Some(exit_code) = try_uninstall_via_winget(installed, request)?
+    {
+        return Ok(exit_code);
+    }
+
+    let log_path = request.log_path.as_ref().map(|value| value.display().to_string());
+    let uninstall_line = build_uninstall_command_with_mode(
+        &uninstall_cmd,
+        request.mode,
+        quiet_uninstall_cmd.is_some(),
+        log_path.as_deref(),
+    );
+    // `UninstallString` is a complete command line and may already contain
+    // its own quotes (e.g. `"C:\path with spaces\unins.exe"`). Passing it
+    // through Command::arg causes Rust's CRT-style quoting to backslash-escape
+    // those embedded quotes (`\"...\"`), which cmd.exe does not understand and
+    // rejects with "is not recognized as an internal or external command".
+    // `raw_arg` bypasses Rust's automatic quoting so cmd receives the literal
+    // command line (see `cmd_uninstall_arguments`).
+    let mut cmd = Command::new(system_tool_path(CMD_EXE)?);
+    cmd.raw_arg(cmd_uninstall_arguments(&uninstall_line));
+    let status = cmd.status().context("failed to run uninstaller")?;
+    Ok(status.code().unwrap_or(-1))
 }
 
 #[cfg(windows)]
@@ -10853,7 +12992,7 @@ fn try_uninstall_msix(installed: &ListMatch) -> Result<Option<i32>> {
     }
 
     let package_full_name = installed.local_id.strip_prefix("MSIX\\");
-    let mut cmd = Command::new("powershell");
+    let mut cmd = Command::new(system_tool_path(WINDOWS_POWERSHELL_EXE)?);
     cmd.arg("-NoProfile").arg("-Command").arg(build_msix_uninstall_script(
         package_full_name,
         &installed.package_family_names,
@@ -10914,7 +13053,8 @@ fn build_uninstall_command_with_mode(
     log_path: Option<&str>,
 ) -> String {
     let uninstall_cmd = log_path
-        .map(|value| uninstall_cmd.replace("<LOGPATH>", value))
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| replace_ignore_ascii_case(uninstall_cmd, "<LOGPATH>", value))
         .unwrap_or_else(|| uninstall_cmd.to_owned());
     if mode == InstallerMode::Interactive || has_quiet_command {
         return uninstall_cmd;
@@ -11044,6 +13184,61 @@ fn build_msix_uninstall_script(package_full_name: Option<&str>, package_family_n
     )
 }
 
+/// The product code to repair with msiexec when the installed package is a Windows Installer
+/// (MSI/WiX) ARP entry, or None when repair has to fall back to reinstalling.
+fn msi_repair_product_code(installed: &ListMatch) -> Option<String> {
+    if !installed
+        .installer_category
+        .as_deref()
+        .is_some_and(|category| category.eq_ignore_ascii_case("msi"))
+    {
+        return None;
+    }
+    // The installed scan records the ARP subkey name (the ProductCode for MSI entries) too.
+    installed
+        .product_codes
+        .iter()
+        .map(|code| code.trim())
+        .find(|code| code.len() > 2 && code.starts_with('{') && code.ends_with('}'))
+        .map(str::to_owned)
+}
+
+/// `msiexec` arguments for repairing an installed product, matching WinGet's
+/// GetMsiExecRepairArgs (`/f` defaults to `omus`) plus pinget's `--log` support.
+fn build_msi_repair_arguments(product_code: &str, mode: InstallerMode, log_path: Option<&Path>) -> Vec<String> {
+    let mut args = vec!["/f".to_owned(), product_code.to_owned()];
+    match mode {
+        InstallerMode::Interactive => {}
+        InstallerMode::SilentWithProgress => args.extend(["/passive".to_owned(), "/norestart".to_owned()]),
+        InstallerMode::Silent => args.extend(["/quiet".to_owned(), "/norestart".to_owned()]),
+    }
+    if let Some(log_path) = log_path {
+        args.push("/log".to_owned());
+        args.push(log_path.display().to_string());
+    }
+    args
+}
+
+#[cfg(windows)]
+fn run_msi_repair(product_code: &str, request: &RepairRequest) -> Result<i32> {
+    use std::process::Command;
+
+    let status = Command::new(system_tool_path(MSIEXEC_EXE)?)
+        .args(build_msi_repair_arguments(
+            product_code,
+            request.mode,
+            request.log_path.as_deref(),
+        ))
+        .status()
+        .context("failed to run msiexec repair")?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+#[cfg(not(windows))]
+fn run_msi_repair(_product_code: &str, _request: &RepairRequest) -> Result<i32> {
+    bail!("Repairing packages is only supported on Windows")
+}
+
 #[cfg(any(windows, test))]
 fn is_msi_arp_entry(windows_installer: Option<u32>) -> bool {
     windows_installer == Some(1)
@@ -11070,7 +13265,7 @@ fn try_run_msi_uninstall(
         return Ok(None);
     };
 
-    let mut cmd = Command::new("msiexec");
+    let mut cmd = Command::new(system_tool_path(MSIEXEC_EXE)?);
     cmd.arg("/x").arg(uninstall_code);
     match request.mode {
         InstallerMode::Interactive => {}
@@ -11091,7 +13286,10 @@ fn try_run_msi_uninstall(
 
 #[cfg(windows)]
 fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest, warnings: &mut Vec<String>) -> Result<i32> {
-    let existing_entry = read_portable_entry_for_installed(installed)?;
+    let (existing_entry, recorded_links) = match read_portable_entry_for_installed(installed)? {
+        Some(record) => (Some(record.entry), record.symlinks),
+        None => (None, Vec::new()),
+    };
     let known_symlink = existing_entry
         .as_ref()
         .and_then(|entry| entry.portable_symlink_full_path.as_ref())
@@ -11116,13 +13314,13 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest, warning
         );
     };
 
-    if request.preserve {
-        return Ok(0);
-    }
-
     let path = Path::new(location);
-    let removed = if path.is_dir() {
-        remove_portable_directory(path, existing_entry.as_ref(), warnings)?;
+    // `--preserve` keeps the package files, but like WinGet the package is still
+    // unregistered: its command links and ARP entry are removed below.
+    let removed = if request.preserve {
+        true
+    } else if path.is_dir() {
+        remove_portable_directory(path, existing_entry.as_ref(), request.purge, warnings)?;
         true
     } else if path.is_file() {
         fs::remove_file(path)?;
@@ -11133,12 +13331,22 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest, warning
 
     if removed || request.force {
         // Once the files are gone (or the user forced past missing files), drop
-        // the symlink shim and ARP entry too so the package fully disappears.
+        // the symlink shims and ARP entry too so the package fully disappears.
+        let scope = installed_portable_scope(installed)?;
+        if is_owned_portable_directory(
+            true,
+            existing_entry
+                .as_ref()
+                .and_then(|entry| entry.install_location.as_deref()),
+            path,
+        )? {
+            remove_recorded_portable_links(&recorded_links, path, scope, warnings);
+        }
         let boundary = portable_link_target_boundary(existing_entry.as_ref(), Some(path))?;
         try_remove_portable_symlinks(
             known_symlink.as_deref().map(Path::new),
             boundary.as_deref(),
-            installed_portable_scope(installed)?,
+            scope,
             warnings,
         );
         if let Err(error) = remove_portable_registry_entry(installed) {
@@ -11150,18 +13358,54 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest, warning
     bail!("Portable package location not found: {location}")
 }
 
+/// Removes every command link the package recorded (one per nested file), as long as it
+/// still points into the package's install location.
+#[cfg(windows)]
+fn remove_recorded_portable_links(
+    links: &[PathBuf],
+    install_location: &Path,
+    scope: PortableScope,
+    warnings: &mut Vec<String>,
+) {
+    if links.is_empty() {
+        return;
+    }
+    let links_root = match winget_links_dir(scope) {
+        Ok(path) => path,
+        Err(error) => {
+            warnings.push(format!("Could not locate the portable links directory: {error:#}"));
+            return;
+        }
+    };
+    for link in links {
+        if let Err(error) = remove_owned_portable_link(link, &links_root, Some(install_location)) {
+            warnings.push(format!("Could not remove the portable command link: {error:#}"));
+        }
+    }
+}
+
+/// Removes a portable package's files from `path`. Like WinGet (PortableInstaller.cpp
+/// RemoveInstallDirectory), only the files the package installed are deleted; a directory the
+/// package created is then removed only when nothing else is left in it, and is deleted with
+/// everything in it only with `--purge`. User data (settings, logs) written next to the
+/// binary survives a normal uninstall.
 #[cfg(windows)]
 fn remove_portable_directory(
     path: &Path,
     entry: Option<&ExistingPortableEntry>,
+    purge: bool,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let matches_location =
         is_owned_portable_directory(true, entry.and_then(|entry| entry.install_location.as_deref()), path)?;
-    if matches_location && entry.and_then(|entry| entry.install_directory_created) == Some(1) {
+    let directory_created = matches_location && entry.and_then(|entry| entry.install_directory_created) == Some(1);
+    if directory_created && purge {
         ensure_not_portable_reparse_point(path)?;
         fs::remove_dir_all(path)?;
-    } else if let Some(files) = entry
+        return Ok(());
+    }
+
+    if let Some(files) = entry
         .filter(|_| matches_location)
         .and_then(|entry| entry.files.as_deref())
     {
@@ -11176,16 +13420,35 @@ fn remove_portable_directory(
         {
             remove_tracked_portable_files(path, &[relative], &[])?;
         }
-        warnings.push(format!(
-            "The portable directory '{}' was preserved because complete file ownership information is unavailable; remove any remaining package files manually.",
-            path.display()
-        ));
+        if !directory_created {
+            warnings.push(format!(
+                "The portable directory '{}' was preserved because complete file ownership information is unavailable; remove any remaining package files manually.",
+                path.display()
+            ));
+        }
+    }
+
+    if directory_created {
+        ensure_not_portable_reparse_point(path)?;
+        let empty = fs::read_dir(path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .next()
+            .transpose()?
+            .is_none();
+        if empty {
+            fs::remove_dir(path).with_context(|| format!("removing {}", path.display()))?;
+        } else {
+            warnings.push(format!(
+                "Files remain in the portable install directory '{}'; they were preserved. Use --purge to remove them.",
+                path.display()
+            ));
+        }
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn read_portable_entry_for_installed(installed: &ListMatch) -> Result<Option<ExistingPortableEntry>> {
+fn read_portable_entry_for_installed(installed: &ListMatch) -> Result<Option<ExistingPortableRecord>> {
     if let Some((prefix, rest)) = installed.local_id.split_once('\\')
         && prefix.eq_ignore_ascii_case("ARP")
     {
@@ -11217,7 +13480,12 @@ fn read_portable_entry_for_installed(installed: &ListMatch) -> Result<Option<Exi
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("reading the portable registry entry"),
         };
-        return Ok(Some(portable_entry_from_registry(&subkey, subkey_name.to_owned())));
+        let entry = portable_entry_from_registry(&subkey, subkey_name.to_owned());
+        return Ok(Some(ExistingPortableRecord {
+            symlinks: portable_symlinks_from_registry(&subkey, &entry),
+            entry,
+            registry_32: view == KEY_WOW64_32KEY,
+        }));
     }
     Ok(None)
 }
@@ -11417,12 +13685,13 @@ fn uninstall_package(_installed: &ListMatch, _request: &UninstallRequest, _warni
 ///   2. Existing `InstallLocation` from the registry ARP entry (so upgrades
 ///      with no explicit location still preserve the user's custom path)
 ///   3. WinGet's default portable root for the selected scope
-/// - If an existing pinget-owned install lives in that directory
-///   (`InstallDirectoryCreated=1`), cleans its contents before extracting the
-///   new version so leftover files from older versions don't pile up.
-/// - Extracts the zip (or copies the standalone binary), then writes the ARP
-///   registry entry that `winget list` and pinget's `collect_uninstall_view`
-///   both read from.
+/// - On upgrade, removes only the files the previous version installed (its
+///   tracked file list) that the new version no longer ships, so files the
+///   user added to the directory survive, as with WinGet.
+/// - Extracts the zip (or copies the standalone binary), creates a command
+///   link for every nested file (or the standalone binary), then writes the
+///   ARP registry entry that `winget list` and pinget's
+///   `collect_uninstall_view` both read from.
 #[cfg(windows)]
 fn install_portable(
     installer_path: &Path,
@@ -11433,7 +13702,12 @@ fn install_portable(
     warnings: &mut Vec<String>,
 ) -> Result<i32> {
     let source_identifier = portable_source_identifier(&request.query);
-    let existing_entry = read_existing_portable_entry(&manifest.id, scope)?;
+    let x86_machine_layout = portable_uses_x86_machine_layout(scope, installer);
+    let (existing_entry, previous_links, registry_32) = match read_existing_portable_entry(&manifest.id, scope)? {
+        // Upgrade in place: keep the registry view the existing entry lives in.
+        Some(record) => (Some(record.entry), record.symlinks, record.registry_32),
+        None => (None, Vec::new(), x86_machine_layout),
+    };
     // Reuse the existing subkey name on upgrade so we don't orphan the prior
     // entry by writing to a different one.
     let subkey_name = existing_entry
@@ -11461,12 +13735,12 @@ fn install_portable(
         &existing_entry,
         &subkey_name,
         scope,
+        x86_machine_layout,
     )?)?;
 
-    // If we created this directory on a previous install, wipe it clean so the
-    // new version doesn't co-exist with leftovers from the previous one. We do
-    // not touch a directory we don't own (InstallDirectoryCreated != 1), to
-    // avoid stomping user data.
+    // A directory we created on a previous install (InstallDirectoryCreated=1)
+    // is ours to remove on uninstall; the files in it are still only removed
+    // when we tracked them, so user data in it survives upgrades.
     let prev_dir_created = is_owned_portable_directory(
         existing_entry
             .as_ref()
@@ -11481,20 +13755,18 @@ fn install_portable(
     let installer_type = installer.installer_type.as_deref().unwrap_or("");
     let is_zip = installer_type.eq_ignore_ascii_case("zip");
     let payload = read_portable_payload(installer_path, is_zip)?;
-    let nested_path = if is_zip {
-        installer
-            .nested_installer_files
-            .first()
-            .map(|file| normalize_portable_relative_path(&file.relative_file_path))
-            .transpose()?
-    } else {
-        None
-    };
-    if let Some(path) = nested_path.as_deref()
-        && !payload.files.iter().any(|file| file.eq_ignore_ascii_case(path))
-    {
-        bail!("portable target '{path}' is not present in the installer archive");
+    let standalone_file_name = installer_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("portable installer has no valid filename"))?;
+    let links = determine_portable_links(installer, is_zip, request.rename.as_deref(), Some(standalone_file_name))?;
+    // Every nested file the manifest names must ship in the archive, not just the first.
+    for path in links.iter().filter_map(|link| link.relative_path.as_deref()) {
+        if !payload.files.iter().any(|file| file.eq_ignore_ascii_case(path)) {
+            bail!("portable target '{path}' is not present in the installer archive");
+        }
     }
+    let nested_path = links.iter().find_map(|link| link.relative_path.clone());
     let same_existing_location = is_owned_portable_directory(
         true,
         existing_entry
@@ -11518,8 +13790,7 @@ fn install_portable(
     } else {
         Vec::new()
     };
-    if same_existing_location && !prev_dir_created && existing_entry.as_ref().is_some_and(|entry| entry.files.is_none())
-    {
+    if same_existing_location && existing_entry.as_ref().is_some_and(|entry| entry.files.is_none()) {
         if let Some(target) = existing_entry
             .as_ref()
             .and_then(|entry| entry.portable_target_full_path.as_deref())
@@ -11548,14 +13819,6 @@ fn install_portable(
     {
         bail!("the portable installer is inside the directory that would be cleaned");
     }
-    if prev_dir_created && dir_existed {
-        clean_directory_contents(&target_dir).with_context(|| {
-            format!(
-                "failed to clean existing portable install directory: {}",
-                target_dir.display()
-            )
-        })?;
-    }
 
     fs::create_dir_all(&target_dir)
         .with_context(|| format!("failed to create portable install directory: {}", target_dir.display()))?;
@@ -11579,70 +13842,62 @@ fn install_portable(
             .map(|path| target_dir.join(path))
             .unwrap_or_else(|| target_dir.clone())
     } else {
-        // Standalone portable: copy the downloaded file into target_dir using
-        // its original filename. winget would optionally rename to the
-        // PortableCommandAlias; pinget keeps the original name for now.
-        let basename = installer_path
-            .file_name()
-            .ok_or_else(|| anyhow!("portable installer has no filename"))?;
-        let copied = target_dir.join(basename);
+        // Standalone portable: copy the downloaded file into target_dir under
+        // its original (URL-derived) name; like WinGet, `--rename` names the
+        // command alias, not the binary.
+        let copied = target_dir.join(standalone_file_name);
         fs::copy(installer_path, &copied)
             .with_context(|| format!("failed to copy portable binary into: {}", target_dir.display()))?;
         copied
     };
 
-    if !prev_dir_created && same_existing_location && !previous_files.is_empty() {
-        let current_files: HashSet<String> = payload.files.iter().map(|path| path.to_lowercase()).collect();
-        let obsolete: Vec<String> = previous_files
-            .into_iter()
-            .filter(|file| !current_files.contains(&file.to_lowercase()))
-            .collect();
-        remove_tracked_portable_files(&target_dir, &obsolete, &[])?;
+    if same_existing_location {
+        remove_obsolete_portable_files(&target_dir, &payload, &previous_files, &previous_directories)?;
     }
 
-    // Create the Links\<alias>.exe shim so users can invoke the portable from
-    // any shell, matching winget's portable workflow. Failures are non-fatal —
-    // when the user lacks SeCreateSymbolicLink (no Developer Mode, not admin)
-    // we still leave the package installed at install_location.
-    let alias = determine_portable_alias(installer);
-    let symlink_full_path = match alias.as_deref() {
-        Some(alias) if !alias.is_empty() => {
-            match try_create_portable_symlink(&portable_target_full_path, alias, scope, existing_entry.as_ref()) {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    warnings.push(format!(
-                        "Could not create the portable command link '{alias}': {error:#}"
-                    ));
-                    None
-                }
+    // Create a Links\<alias>.exe shim for every command so users can invoke
+    // the portable from any shell, matching winget's portable workflow.
+    // Failures are non-fatal — when the user lacks SeCreateSymbolicLink (no
+    // Developer Mode, not admin) we still leave the package installed.
+    let mut symlinks = Vec::new();
+    for link in &links {
+        let target = link
+            .relative_path
+            .as_deref()
+            .map(|path| target_dir.join(path))
+            .unwrap_or_else(|| portable_target_full_path.clone());
+        match try_create_portable_symlink(&target, &link.alias, scope, existing_entry.as_ref(), &previous_links) {
+            Ok(path) => symlinks.push(path),
+            Err(error) => warnings.push(format!(
+                "Could not create the portable command link '{}': {error:#}",
+                link.alias
+            )),
+        }
+    }
+    let symlink_full_path = symlinks.first().cloned();
+
+    for previous in &previous_links {
+        let mut kept = false;
+        for new in &symlinks {
+            if paths_equal_case_insensitive(previous, new)? {
+                kept = true;
+                break;
             }
         }
-        _ => None,
-    };
-
-    if let Some(previous) = existing_entry
-        .as_ref()
-        .and_then(|entry| entry.portable_symlink_full_path.as_deref())
-    {
-        let same_link = match symlink_full_path.as_deref() {
-            Some(new) => paths_equal_case_insensitive(previous, new)?,
-            None => false,
-        };
-        if !same_link {
-            let result = winget_links_dir(scope).and_then(|links| {
-                let boundary = portable_link_target_boundary(
-                    existing_entry.as_ref(),
-                    existing_entry
-                        .as_ref()
-                        .and_then(|entry| entry.install_location.as_deref()),
-                )?;
-                remove_owned_portable_link(previous, &links, boundary.as_deref())
-            });
-            if let Err(error) = result {
-                warnings.push(format!(
-                    "Could not remove the previous portable command link: {error:#}"
-                ));
-            }
+        if kept {
+            continue;
+        }
+        let result = winget_links_dir(scope).and_then(|links_dir| {
+            let boundary = existing_entry
+                .as_ref()
+                .and_then(|entry| entry.install_location.as_deref())
+                .filter(|location| location.is_absolute());
+            remove_owned_portable_link(previous, &links_dir, boundary)
+        });
+        if let Err(error) = result {
+            warnings.push(format!(
+                "Could not remove the previous portable command link: {error:#}"
+            ));
         }
     }
 
@@ -11665,11 +13920,13 @@ fn install_portable(
             install_location: &target_dir,
             portable_target_full_path: &portable_target_full_path,
             portable_symlink_full_path: symlink_full_path.as_deref(),
+            symlinks: &symlinks,
             install_directory_created,
             added_to_path,
             files: &payload.files,
             directories: &created_directories,
             source_identifier: &source_identifier,
+            registry_32,
             manifest,
         },
         scope,
@@ -11710,7 +13967,7 @@ fn cleanup_previous_portable_install(
             ));
             return Ok(());
         }
-        remove_portable_directory(old_location, previous, warnings)
+        remove_portable_directory(old_location, previous, false, warnings)
     })();
     if let Err(error) = result {
         warnings.push(format!(
@@ -11917,6 +14174,31 @@ fn ensure_not_portable_reparse_point(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// After a portable upgrade extracted the new payload into the same directory, removes what the
+/// previous version installed (its tracked files and created directories) that the new version
+/// no longer ships. Like WinGet, nothing else is touched, so files the user added survive.
+#[cfg(any(windows, test))]
+fn remove_obsolete_portable_files(
+    target_dir: &Path,
+    payload: &PortablePayload,
+    previous_files: &[String],
+    previous_directories: &[String],
+) -> Result<()> {
+    let current_files: HashSet<String> = payload.files.iter().map(|path| path.to_lowercase()).collect();
+    let current_directories: HashSet<String> = payload.directories.iter().map(|path| path.to_lowercase()).collect();
+    let obsolete_files: Vec<String> = previous_files
+        .iter()
+        .filter(|file| !current_files.contains(&file.to_lowercase()))
+        .cloned()
+        .collect();
+    let obsolete_directories: Vec<String> = previous_directories
+        .iter()
+        .filter(|directory| !current_directories.contains(&directory.to_lowercase()))
+        .cloned()
+        .collect();
+    remove_tracked_portable_files(target_dir, &obsolete_files, &obsolete_directories)
+}
+
 #[cfg(any(windows, test))]
 fn remove_tracked_portable_files(root: &Path, files: &[String], directories: &[String]) -> Result<()> {
     let file_paths = files
@@ -11960,37 +14242,92 @@ struct PortableArpEntry<'a> {
     install_location: &'a Path,
     portable_target_full_path: &'a Path,
     portable_symlink_full_path: Option<&'a Path>,
+    symlinks: &'a [PathBuf],
     install_directory_created: bool,
     added_to_path: bool,
     files: &'a [String],
     directories: &'a [String],
     source_identifier: &'a str,
+    registry_32: bool,
     manifest: &'a Manifest,
 }
 
-/// Picks the portable command alias from the manifest. Mirrors winget's
-/// resolution: nested-installer files first (used by zip+portable manifests),
-/// then the top-level `Commands` field (used by standalone portable manifests).
-/// Returns None when the manifest doesn't declare a command — the package
-/// still installs, just without a Links\ shim.
-#[cfg(windows)]
-fn determine_portable_alias(installer: &Installer) -> Option<String> {
-    installer
-        .nested_installer_files
-        .iter()
-        .find_map(|file| {
-            file.portable_command_alias
-                .as_deref()
-                .filter(|alias| !alias.is_empty())
-                .map(str::to_owned)
-                .or_else(|| {
-                    Path::new(&file.relative_file_path)
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .map(str::to_owned)
+/// One `Links\<alias>.exe` command link a portable install creates.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortableCommandLink {
+    /// Link name without the `.exe` the link always gets.
+    alias: String,
+    /// Archive-relative path of the linked nested file; `None` links the standalone binary.
+    relative_path: Option<String>,
+}
+
+/// The command links of a portable install, as WinGet resolves them (PortableFlow.cpp
+/// GetDesiredStateForPortableInstall): an archive links every `NestedInstallerFiles` entry,
+/// named by its `PortableCommandAlias` or else its file name; a standalone binary gets one
+/// link named by `--rename`, else `Commands[0]`, else its own file name.
+#[cfg(any(windows, test))]
+fn determine_portable_links(
+    installer: &Installer,
+    is_archive: bool,
+    rename: Option<&str>,
+    standalone_file_name: Option<&str>,
+) -> Result<Vec<PortableCommandLink>> {
+    let non_empty = |value: &str| -> Option<String> {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    };
+    if is_archive {
+        return installer
+            .nested_installer_files
+            .iter()
+            .map(|file| {
+                let relative = normalize_portable_relative_path(&file.relative_file_path)?;
+                let alias = file
+                    .portable_command_alias
+                    .as_deref()
+                    .and_then(non_empty)
+                    .unwrap_or_else(|| relative.rsplit('\\').next().unwrap_or(&relative).to_owned());
+                Ok(PortableCommandLink {
+                    alias: portable_link_alias(&alias),
+                    relative_path: Some(relative),
                 })
+            })
+            .collect();
+    }
+    let alias = rename
+        .and_then(non_empty)
+        .or_else(|| installer.commands.first().and_then(|command| non_empty(command)))
+        .or_else(|| standalone_file_name.and_then(non_empty));
+    Ok(alias
+        .map(|alias| PortableCommandLink {
+            alias: portable_link_alias(&alias),
+            relative_path: None,
         })
-        .or_else(|| installer.commands.first().cloned())
+        .into_iter()
+        .collect())
+}
+
+/// Links are always `<alias>.exe`; like WinGet's AppendExtension, an alias that already ends in
+/// `.exe` does not get a second one.
+#[cfg(any(windows, test))]
+fn portable_link_alias(alias: &str) -> String {
+    alias
+        .len()
+        .checked_sub(4)
+        .and_then(|split| Some((alias.get(..split)?, alias.get(split..)?)))
+        .filter(|(stem, extension)| !stem.is_empty() && extension.eq_ignore_ascii_case(".exe"))
+        .map_or_else(|| alias.to_owned(), |(stem, _)| stem.to_owned())
+}
+
+/// The primary (first) command alias of a portable installer.
+#[cfg(test)]
+fn determine_portable_alias(installer: &Installer) -> Option<String> {
+    determine_portable_links(installer, !installer.nested_installer_files.is_empty(), None, None)
+        .ok()?
+        .into_iter()
+        .next()
+        .map(|link| link.alias)
 }
 
 #[cfg(windows)]
@@ -12007,6 +14344,7 @@ fn try_create_portable_symlink(
     alias: &str,
     scope: PortableScope,
     existing_entry: Option<&ExistingPortableEntry>,
+    previous_links: &[PathBuf],
 ) -> Result<PathBuf> {
     use std::os::windows::fs::symlink_file;
     let links_dir = winget_links_dir(scope)?;
@@ -12018,17 +14356,21 @@ fn try_create_portable_symlink(
     let link_path = links_dir.join(format!("{alias}.exe"));
 
     if link_path.symlink_metadata().is_ok() {
-        let Some(previous) = existing_entry.and_then(|entry| entry.portable_symlink_full_path.as_deref()) else {
-            bail!("the portable command link already exists: {}", link_path.display());
-        };
-        if !paths_equal_case_insensitive(&link_path, previous)? {
+        let mut owned = false;
+        for previous in previous_links {
+            if paths_equal_case_insensitive(&link_path, previous)? {
+                owned = true;
+                break;
+            }
+        }
+        if !owned {
             bail!("the portable command link already exists: {}", link_path.display());
         }
-        let boundary = portable_link_target_boundary(
-            existing_entry,
-            existing_entry.and_then(|entry| entry.install_location.as_deref()),
-        )?;
-        remove_owned_portable_link(&link_path, &links_dir, boundary.as_deref())?;
+        // A link this package recorded: it must still point into the previous install.
+        let boundary = existing_entry
+            .and_then(|entry| entry.install_location.as_deref())
+            .filter(|location| location.is_absolute());
+        remove_owned_portable_link(&link_path, &links_dir, boundary)?;
     }
 
     symlink_file(target, &link_path).with_context(|| format!("linking {}", link_path.display()))?;
@@ -12313,39 +14655,91 @@ struct ExistingPortableEntry {
     subkey_name: String,
 }
 
+/// A portable ARP entry found by package id, with the extra state pinget tracks for it: every
+/// command link it created and whether the entry lives in the 32-bit registry view.
 #[cfg(windows)]
-fn read_existing_portable_entry(package_id: &str, scope: PortableScope) -> Result<Option<ExistingPortableEntry>> {
-    let hive = match scope {
-        PortableScope::User => RegKey::predef(HKEY_CURRENT_USER),
-        PortableScope::Machine => RegKey::predef(HKEY_LOCAL_MACHINE),
-    };
-    let uninstall = match hive.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Uninstall") {
-        Ok(uninstall) => uninstall,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("opening portable uninstall registry entries"),
-    };
-    for name in uninstall.enum_keys() {
-        let name = name.context("enumerating portable uninstall registry entries")?;
-        let subkey = match uninstall.open_subkey(&name) {
-            Ok(subkey) => subkey,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).with_context(|| format!("reading portable registry entry {name}")),
+struct ExistingPortableRecord {
+    entry: ExistingPortableEntry,
+    symlinks: Vec<PathBuf>,
+    registry_32: bool,
+}
+
+/// Registry views searched for an existing portable entry. HKCU is shared between views; a
+/// machine-scope entry can be in either view, because WinGet writes x86 portables to
+/// WOW6432Node (PortableARPEntry.cpp).
+#[cfg(windows)]
+fn portable_registry_views(scope: PortableScope) -> &'static [bool] {
+    match scope {
+        PortableScope::User => &[false],
+        PortableScope::Machine => &[false, true],
+    }
+}
+
+#[cfg(windows)]
+fn read_existing_portable_entry(package_id: &str, scope: PortableScope) -> Result<Option<ExistingPortableRecord>> {
+    for &registry_32 in portable_registry_views(scope) {
+        let hive = match scope {
+            PortableScope::User => RegKey::predef(HKEY_CURRENT_USER),
+            PortableScope::Machine => RegKey::predef(HKEY_LOCAL_MACHINE),
         };
-        if !read_reg_string(&subkey, "WinGetPackageIdentifier")
-            .as_deref()
-            .is_some_and(|id| id.eq_ignore_ascii_case(package_id))
+        let view = if registry_32 { KEY_WOW64_32KEY } else { KEY_WOW64_64KEY };
+        let uninstall = match hive
+            .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Uninstall", KEY_READ | view)
         {
-            continue;
+            Ok(uninstall) => uninstall,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("opening portable uninstall registry entries"),
+        };
+        for name in uninstall.enum_keys() {
+            let name = name.context("enumerating portable uninstall registry entries")?;
+            let subkey = match uninstall.open_subkey_with_flags(&name, KEY_READ | view) {
+                Ok(subkey) => subkey,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).with_context(|| format!("reading portable registry entry {name}")),
+            };
+            if !read_reg_string(&subkey, "WinGetPackageIdentifier")
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(package_id))
+            {
+                continue;
+            }
+            if !read_reg_string(&subkey, "WinGetInstallerType")
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("portable"))
+            {
+                continue;
+            }
+            let entry = portable_entry_from_registry(&subkey, name);
+            return Ok(Some(ExistingPortableRecord {
+                symlinks: portable_symlinks_from_registry(&subkey, &entry),
+                entry,
+                registry_32,
+            }));
         }
-        if !read_reg_string(&subkey, "WinGetInstallerType")
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("portable"))
-        {
-            continue;
-        }
-        return Ok(Some(portable_entry_from_registry(&subkey, name)));
     }
     Ok(None)
+}
+
+/// Every command link recorded for a portable entry: pinget's `PingetPortableSymlinks` list
+/// (one per nested file) plus WinGet's single `PortableSymlinkFullPath`.
+#[cfg(windows)]
+fn portable_symlinks_from_registry(subkey: &RegKey, entry: &ExistingPortableEntry) -> Vec<PathBuf> {
+    let mut links: Vec<PathBuf> = entry.portable_symlink_full_path.iter().cloned().collect();
+    for link in subkey
+        .get_value::<Vec<String>, _>("PingetPortableSymlinks")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|link| !link.is_empty())
+        .map(PathBuf::from)
+    {
+        if !links
+            .iter()
+            .any(|known| known.as_os_str().eq_ignore_ascii_case(link.as_os_str()))
+        {
+            links.push(link);
+        }
+    }
+    links
 }
 
 #[cfg(windows)]
@@ -12373,6 +14767,7 @@ fn resolve_portable_install_location(
     existing: &Option<ExistingPortableEntry>,
     subkey_name: &str,
     scope: PortableScope,
+    x86_machine_layout: bool,
 ) -> Result<PathBuf> {
     Ok(resolve_portable_install_location_pure(
         request.install_location.as_deref(),
@@ -12381,7 +14776,7 @@ fn resolve_portable_install_location(
             .and_then(|e| e.install_location.as_deref())
             .and_then(Path::to_str),
         subkey_name,
-        &default_portable_root(scope)?,
+        &default_portable_root(scope, x86_machine_layout)?,
     ))
 }
 
@@ -12410,11 +14805,24 @@ fn resolve_portable_install_location_pure(
 }
 
 #[cfg(windows)]
-fn default_portable_root(scope: PortableScope) -> Result<PathBuf> {
+fn default_portable_root(scope: PortableScope, x86_machine_layout: bool) -> Result<PathBuf> {
     match scope {
         PortableScope::User => Ok(local_app_data_dir()?.join("Microsoft").join("WinGet").join("Packages")),
+        PortableScope::Machine if x86_machine_layout => Ok(program_files_x86_dir()?.join("WinGet").join("Packages")),
         PortableScope::Machine => Ok(program_files_dir()?.join("WinGet").join("Packages")),
     }
+}
+
+/// Like WinGet (PortableInstaller.cpp GetPortableInstallRoot, PortableARPEntry.cpp), a
+/// machine-scope x86 portable lives under `Program Files (x86)` and is registered in the
+/// 32-bit (WOW6432Node) uninstall view.
+#[cfg(any(windows, test))]
+fn portable_uses_x86_machine_layout(scope: PortableScope, installer: &Installer) -> bool {
+    scope == PortableScope::Machine
+        && installer
+            .architecture
+            .as_deref()
+            .is_some_and(|architecture| architecture.trim().eq_ignore_ascii_case("x86"))
 }
 
 #[cfg(windows)]
@@ -12427,23 +14835,6 @@ fn is_owned_portable_directory(
         return Ok(false);
     };
     paths_equal_case_insensitive(existing_location, target_dir)
-}
-
-#[cfg(windows)]
-fn clean_directory_contents(dir: &Path) -> Result<()> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            fs::remove_dir_all(&path)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
 }
 
 /// Writes the HKCU ARP entry winget would normally write for a portable
@@ -12459,8 +14850,13 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>, scope: PortableScope) 
         r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{}",
         entry.subkey_name
     );
+    let view = if entry.registry_32 && scope == PortableScope::Machine {
+        KEY_WOW64_32KEY
+    } else {
+        KEY_WOW64_64KEY
+    };
     let (subkey, _) = hive
-        .create_subkey(&uninstall_path)
+        .create_subkey_with_flags(&uninstall_path, KEY_READ | KEY_WRITE | view)
         .context("failed to create portable ARP registry subkey")?;
 
     let manifest = entry.manifest;
@@ -12480,6 +14876,12 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>, scope: PortableScope) 
     {
         return Err(error).context("removing the previous portable symlink registry value");
     }
+    let symlinks: Vec<String> = entry
+        .symlinks
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    subkey.set_value("PingetPortableSymlinks", &symlinks)?;
     subkey.set_value(
         "InstallDirectoryAddedToPath",
         &(if entry.added_to_path { 1u32 } else { 0u32 }),
@@ -12867,42 +15269,6 @@ mod tests {
         // None for missing values.
         let result = resolve_portable_install_location_pure(Some(""), Some(""), "Sub_Source", Path::new(r"C:\default"));
         assert_eq!(result, PathBuf::from(r"C:\default\Sub_Source"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn clean_directory_contents_removes_files_and_subdirs_but_keeps_root() {
-        let root = std::env::temp_dir().join(format!(
-            "pinget-clean-test-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        fs::create_dir_all(&root).expect("create temp dir");
-        fs::write(root.join("a.txt"), b"hello").expect("write a.txt");
-        fs::create_dir_all(root.join("nested")).expect("create nested dir");
-        fs::write(root.join("nested").join("b.txt"), b"world").expect("write nested/b.txt");
-
-        clean_directory_contents(&root).expect("clean root contents");
-
-        assert!(root.is_dir(), "root dir itself must survive");
-        assert_eq!(
-            fs::read_dir(&root).expect("read root").count(),
-            0,
-            "root must be empty after clean"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn clean_directory_contents_is_a_noop_on_nonexistent_dir() {
-        let bogus = std::env::temp_dir().join(format!(
-            "pinget-clean-test-bogus-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        assert!(!bogus.exists());
-        clean_directory_contents(&bogus).expect("clean nonexistent dir");
-        // Should not have created the dir.
-        assert!(!bogus.exists());
     }
 
     #[cfg(windows)]
@@ -13855,6 +16221,9 @@ mod tests {
                     require_explicit_upgrade: false,
                     nested_installer_type: None,
                     nested_installer_files: Vec::new(),
+                    installer_success_codes: Vec::new(),
+                    expected_return_codes: Vec::new(),
+                    ..Installer::default()
                 }],
                 require_explicit_upgrade: false,
             },
@@ -13881,6 +16250,9 @@ mod tests {
                 require_explicit_upgrade: false,
                 nested_installer_type: None,
                 nested_installer_files: Vec::new(),
+                installer_success_codes: Vec::new(),
+                expected_return_codes: Vec::new(),
+                ..Installer::default()
             }),
             cached_files: vec![PathBuf::from(r"C:\temp\cache\Test.Package.yaml")],
             warnings: vec!["cache warmed".to_owned()],
@@ -15498,7 +17870,9 @@ Installers:
         let result = download_test_installer(&root, &manifest).expect("redirected installer should verify");
 
         assert_eq!(fs::read(&result.installer_path).expect("read installer"), payload);
-        assert_eq!(result.installer_path, root.join("downloads").join("installer.msi"));
+        // The name comes from the original URL (not the redirect target); the fixture's
+        // `exe` installer type adds the matching extension.
+        assert_eq!(result.installer_path, root.join("downloads").join("installer.msi.exe"));
         for path in ["/installer.msi", "/installer.msi/", "/installer.msi/download"] {
             assert_eq!(origin.request_count(path), 1, "original URL must not be rewritten");
         }
@@ -15870,7 +18244,9 @@ Installers:
     #[test]
     fn installer_hash_verification_allows_mismatch_with_override() {
         verify_installer_hash(Some("DEADBEEF"), b"pinget", true).expect("hash override");
-        verify_installer_hash(None, b"pinget", false).expect("missing hash");
+        verify_installer_hash(None, b"pinget", true).expect("missing hash with override");
+        // A missing hash is a verification failure unless overridden (WinGet requires InstallerSha256).
+        assert!(verify_installer_hash(None, b"pinget", false).is_err());
     }
 
     #[test]
@@ -16017,6 +18393,7 @@ Installers:
             exit_code,
             success,
             no_op,
+            reboot_required: false,
             warnings: Vec::new(),
         };
 
@@ -16788,7 +19165,7 @@ Installers:
                 package_id: "Contoso.Tool".to_owned(),
                 version: "2.0.*".to_owned(),
                 source_id: "winget".to_owned(),
-                pin_type: PinType::Pinning,
+                pin_type: PinType::Gating,
             },
         ];
 
@@ -16844,10 +19221,7 @@ Installers:
 
         assert_eq!(parsed.version, "1.97.17002.0");
         assert_eq!(parsed.resource_id, "split.scale-125");
-        assert_eq!(
-            parsed.family_name,
-            "Microsoft.XboxSpeechToTextOverlay_split.scale-125_8wekyb3d8bbwe"
-        );
+        assert_eq!(parsed.family_name, "Microsoft.XboxSpeechToTextOverlay_8wekyb3d8bbwe");
         assert!(is_msix_split_resource_package(&parsed.resource_id));
     }
 

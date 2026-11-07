@@ -168,32 +168,40 @@ internal static class InstalledPackages
                         using var subkey = uninstallKey.OpenSubKey(subkeyName);
                         if (subkey is null) continue;
 
-                        var displayName = subkey.GetValue("DisplayName") as string;
-                        if (string.IsNullOrWhiteSpace(displayName)) continue;
+                        var displayName = ReadString(subkey, "DisplayName");
+                        if (displayName is null) continue;
 
                         var systemComponent = subkey.GetValue("SystemComponent");
                         if (systemComponent is int sc && sc != 0) continue;
 
-                        var installLocation = subkey.GetValue("InstallLocation") as string;
-                        if (IsWindowsSystemPath(installLocation)) continue;
+                        // WinGet's ARPHelper has no install-location filter: entries under the Windows
+                        // directory (printer drivers and the like) are listed too. Only inbox MSIX
+                        // packages are filtered by location.
+                        var installLocation = ReadString(subkey, "InstallLocation");
 
-                        if (subkey.GetValue("ParentKeyName") is string)
+                        if (ReadString(subkey, "ParentKeyName") is not null)
                             continue;
 
-                        var version = subkey.GetValue("DisplayVersion") as string ?? "Unknown";
-                        var publisher = subkey.GetValue("Publisher") as string;
-                        var packageFamilyName = subkey.GetValue("PackageFamilyName") as string;
-                        var productCode = subkey.GetValue("ProductCode") as string;
-                        var upgradeCode = subkey.GetValue("UpgradeCode") as string;
-                        var wingetPackageIdentifier = subkey.GetValue("WinGetPackageIdentifier") as string;
-                        var wingetSourceIdentifier = subkey.GetValue("WinGetSourceIdentifier") as string;
+                        var version = DetermineArpVersion(
+                            ReadString(subkey, "DisplayVersion"),
+                            ReadDword(subkey, "VersionMajor"),
+                            ReadDword(subkey, "VersionMinor"),
+                            ReadDword(subkey, "MajorVersion"),
+                            ReadDword(subkey, "MinorVersion"),
+                            ReadDword(subkey, "Version"));
+                        var publisher = ReadString(subkey, "Publisher");
+                        var packageFamilyName = ReadString(subkey, "PackageFamilyName");
+                        var productCode = ReadString(subkey, "ProductCode");
+                        var upgradeCode = ReadString(subkey, "UpgradeCode");
+                        var wingetPackageIdentifier = ReadString(subkey, "WinGetPackageIdentifier");
+                        var wingetSourceIdentifier = ReadString(subkey, "WinGetSourceIdentifier");
 
                         var localId = $@"ARP\{scopeLabel}\{effectiveArch}\{subkeyName}";
                         // Honor the WinGet ARP signal so uninstall flows through the
                         // portable uninstall path (clean dir + registry removal) instead
                         // of delegating the UninstallString to a winget subprocess that
                         // only fully cleans up entries winget itself installed.
-                        var wingetInstallerType = subkey.GetValue("WinGetInstallerType") as string;
+                        var wingetInstallerType = ReadString(subkey, "WinGetInstallerType");
                         var installerCategory =
                             wingetInstallerType is { } wit && wit.Equals("portable", StringComparison.OrdinalIgnoreCase)
                                 ? "portable"
@@ -279,49 +287,96 @@ internal static class InstalledPackages
 
             foreach (var subkeyName in appModelKey.GetSubKeyNames())
             {
-                using var subkey = appModelKey.OpenSubKey(subkeyName);
-                if (subkey is null)
-                    continue;
-
-                var installLocation = subkey.GetValue("PackageRootFolder") as string;
-                if (IsWindowsSystemPath(installLocation))
-                    continue;
-
-                var parsed = ParseMsixFullName(subkeyName);
-                if (parsed is null) continue;
-                if (IsMsixSplitResourcePackage(parsed.Value.ResourceId)) continue;
-
-                var displayName = subkey.GetValue("DisplayName") as string;
-                if (string.IsNullOrWhiteSpace(displayName))
-                    displayName = GetAppModelDisplayName(subkey);
-                if (string.IsNullOrWhiteSpace(displayName))
-                    continue;
-
-                var localId = $@"MSIX\{subkeyName}";
-                var dedupKey = $"{localId}|{displayName.ToLowerInvariant()}|{parsed.Value.Version.ToLowerInvariant()}";
-                if (!seen.Add(dedupKey)) continue;
-
-                packages.Add(new InstalledPackage
+                try
                 {
-                    Name = displayName,
-                    LocalId = localId,
-                    InstalledVersion = parsed.Value.Version,
-                    Publisher = null,
-                    Scope = scopeLabel,
-                    InstallerCategory = "msix",
-                    InstallLocation = installLocation,
-                    PackageFamilyNames = [parsed.Value.FamilyName],
-                });
+                    using var subkey = appModelKey.OpenSubKey(subkeyName);
+                    if (subkey is null)
+                        continue;
+
+                    var installLocation = ReadString(subkey, "PackageRootFolder");
+                    if (IsWindowsSystemPath(installLocation))
+                        continue;
+
+                    var parsed = ParseMsixFullName(subkeyName);
+                    if (parsed is null) continue;
+                    if (IsMsixSplitResourcePackage(parsed.Value.ResourceId)) continue;
+
+                    var displayName = ReadString(subkey, "DisplayName") ?? GetAppModelDisplayName(subkey);
+                    if (string.IsNullOrWhiteSpace(displayName))
+                        continue;
+
+                    var localId = $@"MSIX\{subkeyName}";
+                    var dedupKey = $"{localId}|{displayName.ToLowerInvariant()}|{parsed.Value.Version.ToLowerInvariant()}";
+                    if (!seen.Add(dedupKey)) continue;
+
+                    packages.Add(new InstalledPackage
+                    {
+                        Name = displayName,
+                        LocalId = localId,
+                        InstalledVersion = parsed.Value.Version,
+                        Publisher = null,
+                        Scope = scopeLabel,
+                        InstallerCategory = "msix",
+                        InstallLocation = installLocation,
+                        PackageFamilyNames = [parsed.Value.FamilyName],
+                    });
+                }
+                catch { /* skip unreadable package key */ }
             }
         }
         catch { /* AppModel registry not accessible */ }
     }
 
-    private static bool IsWindowsSystemPath(string? path)
+    /// <summary>Whether <paramref name="path"/> is inside the Windows directory (%SystemRoot%), where inbox MSIX packages live.</summary>
+    private static bool IsWindowsSystemPath(string? path) =>
+        IsPathUnderWindowsDirectory(path, Environment.GetFolderPath(Environment.SpecialFolder.Windows));
+
+    /// <summary>
+    /// Case-insensitive prefix test of <paramref name="path"/> against <paramref name="windowsDirectory"/> plus a
+    /// trailing separator, so C:\WindowsApps is not treated as C:\Windows.
+    /// </summary>
+    internal static bool IsPathUnderWindowsDirectory(string? path, string? windowsDirectory)
     {
-        if (string.IsNullOrWhiteSpace(path)) return false;
-        return path.Trim().StartsWith(@"C:\Windows\", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(windowsDirectory)) return false;
+        var prefix = windowsDirectory.Trim().TrimEnd('\\', '/') + "\\";
+        if (prefix.Length == 1) return false;
+        return path.Trim().Replace('/', '\\').StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
+
+    /// <summary>
+    /// Mirrors WinGet's ARPHelper::DetermineVersion: DisplayVersion, then VersionMajor.VersionMinor, then
+    /// MajorVersion.MinorVersion (when either part is nonzero), then the packed Version DWORD, then "Unknown".
+    /// DWORD arguments are null when the value is missing or not a DWORD.
+    /// </summary>
+    internal static string DetermineArpVersion(
+        string? displayVersion,
+        uint? versionMajor,
+        uint? versionMinor,
+        uint? majorVersion,
+        uint? minorVersion,
+        uint? version)
+    {
+        if (!string.IsNullOrEmpty(displayVersion))
+            return displayVersion;
+
+        foreach (var (major, minor) in new[] { (versionMajor, versionMinor), (majorVersion, minorVersion) })
+        {
+            var majorValue = major ?? 0;
+            var minorValue = minor ?? 0;
+            if (majorValue != 0 || minorValue != 0)
+                return $"{majorValue}.{minorValue}";
+        }
+
+        if (version is uint packed && packed != 0)
+            return $"{packed >> 24}.{(packed >> 16) & 0xFF}.{packed & 0xFFFF}";
+
+        return "Unknown";
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static uint? ReadDword(Microsoft.Win32.RegistryKey key, string name) =>
+        // REG_DWORD values come back as int; other kinds (string, QWORD, binary) do not count.
+        key.GetValue(name) is int value ? unchecked((uint)value) : null;
 
     [SupportedOSPlatform("windows")]
     private static string? GetAppModelDisplayName(Microsoft.Win32.RegistryKey packageKey)
@@ -329,13 +384,16 @@ internal static class InstalledPackages
         using var appKey = packageKey.OpenSubKey(@"App\Capabilities");
         if (appKey is null) return null;
 
-        var description = appKey.GetValue("ApplicationDescription") as string;
-        if (!string.IsNullOrWhiteSpace(description))
-            return description;
-
-        var name = appKey.GetValue("ApplicationName") as string;
-        return string.IsNullOrWhiteSpace(name) ? null : name;
+        return ReadString(appKey, "ApplicationDescription") ?? ReadString(appKey, "ApplicationName");
     }
+
+    [SupportedOSPlatform("windows")]
+    private static string? ReadString(Microsoft.Win32.RegistryKey key, string name) =>
+        NormalizeRegistryString(key.GetValue(name));
+
+    /// <summary>Registry strings are trimmed and empty values treated as missing (matches the Rust read_reg_string).</summary>
+    internal static string? NormalizeRegistryString(object? value) =>
+        value is string text && text.Trim() is { Length: > 0 } trimmed ? trimmed : null;
 
     internal static bool IsMsixSplitResourcePackage(string? resourceId) =>
         !string.IsNullOrWhiteSpace(resourceId)
@@ -356,9 +414,8 @@ internal static class InstalledPackages
         if (string.IsNullOrWhiteSpace(version) || string.IsNullOrWhiteSpace(publisherHash))
             return null;
 
-        var familyName = string.IsNullOrWhiteSpace(resourceId)
-            ? $"{name}_{publisherHash}"
-            : $"{name}_{resourceId}_{publisherHash}";
+        // The package family name is always Name_PublisherId; the resource id only appears in the full name.
+        var familyName = $"{name}_{publisherHash}";
 
         return new MsixPackageFullName(version, resourceId, familyName);
     }

@@ -1,7 +1,6 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Encodings.Web;
 using System.Text.RegularExpressions;
 using YamlDotNet.RepresentationModel;
 
@@ -84,12 +83,12 @@ internal static partial class ManifestScanner
             var version = RequiredString(model, "PackageVersion", relativePath);
             var type = RequiredString(model, "ManifestType", relativePath);
             var schemaVersion = RequiredString(model, "ManifestVersion", relativePath);
-            if (!IdentifierPattern().IsMatch(id))
+            if (!IsValidPackageIdentifier(id))
                 throw new PublisherException($"Unsafe PackageIdentifier '{id}' in {relativePath}.");
             if (casing.TryGetValue(id, out var existingId) && !string.Equals(existingId, id, StringComparison.Ordinal))
                 throw new PublisherException($"PackageIdentifier differs only by casing: '{existingId}' and '{id}'.");
             casing[id] = id;
-            if (!VersionPattern().IsMatch(version))
+            if (!VersionPattern().IsMatch(version) || !IsWindowsSafeName(version))
                 throw new PublisherException($"Unsafe PackageVersion '{version}' in {relativePath}.");
             if (!DocumentTypes.Contains(type))
                 throw new PublisherException($"Unsupported ManifestType '{type}' in {relativePath}.");
@@ -148,7 +147,11 @@ internal static partial class ManifestScanner
     {
         try
         {
-            using var reader = new StringReader(new UTF8Encoding(false, true).GetString(bytes));
+            // The inventory hashes the raw bytes; the parser sees the content without a UTF-8 BOM.
+            var content = bytes.AsSpan();
+            if (content.StartsWith((ReadOnlySpan<byte>)[0xEF, 0xBB, 0xBF]))
+                content = content[3..];
+            using var reader = new StringReader(new UTF8Encoding(false, true).GetString(content));
             var stream = new YamlStream();
             stream.Load(reader);
             if (stream.Documents.Count != 1 || stream.Documents[0].RootNode is not YamlMappingNode mapping)
@@ -224,33 +227,124 @@ internal static partial class ManifestScanner
             or "WindowsFeatures" or "WindowsLibraries" or "ExternalDependencies" or "DocumentLabel"
             or "InvocationParameter" or "ReturnResponse" or "AllowedMarkets" or "ExcludedMarkets"
             or "UnsupportedOSArchitectures" or "UnsupportedArguments" or "ElevationRequirement"
-            or "RepairBehavior" or "InstallerIdentifier" or "ProductId" or "StoreProductId";
+            or "RepairBehavior" or "InstallerIdentifier" or "ProductId" or "StoreProductId"
+            or "Author" or "InstallationNotes" or "Upgrade";
 
+    /// <summary>
+    /// Types an untyped scalar exactly like the Rust publisher (serde_yaml 0.9 core schema):
+    /// only plain scalars are inferred; quoted, literal and folded scalars stay strings.
+    /// </summary>
     private static JsonNode ConvertScalar(YamlScalarNode scalar)
     {
         var value = scalar.Value ?? string.Empty;
-        if (scalar.Style == YamlDotNet.Core.ScalarStyle.Plain
-            && (value is "~" || value.Equals("null", StringComparison.OrdinalIgnoreCase)))
+        if (scalar.Style is not (YamlDotNet.Core.ScalarStyle.Plain or YamlDotNet.Core.ScalarStyle.Any))
+            return JsonValue.Create(value)!;
+        if (value is "" or "~" or "null" or "Null" or "NULL")
             return null!;
-        if (scalar.Style == YamlDotNet.Core.ScalarStyle.Plain
-            && (value.Equals("true", StringComparison.OrdinalIgnoreCase) || value.Equals("false", StringComparison.OrdinalIgnoreCase)))
-            return JsonValue.Create(value.Equals("true", StringComparison.OrdinalIgnoreCase))!;
-        if (scalar.Style == YamlDotNet.Core.ScalarStyle.Plain
-            && long.TryParse(value, System.Globalization.NumberStyles.AllowLeadingSign, System.Globalization.CultureInfo.InvariantCulture, out var integer)
-            && !value.Contains('.'))
-            return JsonValue.Create(integer)!;
-        if (scalar.Style == YamlDotNet.Core.ScalarStyle.Plain
-            && ulong.TryParse(value, System.Globalization.NumberStyles.AllowLeadingSign, System.Globalization.CultureInfo.InvariantCulture, out var unsignedInteger))
-            return JsonValue.Create(unsignedInteger)!;
-        if (scalar.Style == YamlDotNet.Core.ScalarStyle.Plain
-            && (value.Contains('.') || value.Contains('e') || value.Contains('E'))
-            && double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var floating))
+        if (value is "true" or "True" or "TRUE")
+            return JsonValue.Create(true)!;
+        if (value is "false" or "False" or "FALSE")
+            return JsonValue.Create(false)!;
+        if (TryParseYamlInteger(value, out var integer))
+        {
+            if (integer >= 0 && integer <= ulong.MaxValue)
+                return JsonValue.Create((ulong)integer)!;
+            if (integer < 0 && integer >= long.MinValue)
+                return JsonValue.Create((long)integer)!;
+            throw new PublisherException($"YAML integer '{value}' is outside the supported 64-bit range.");
+        }
+        if (!DigitsButNotNumber(value) && TryParseYamlFloat(value, out var floating))
         {
             if (!double.IsFinite(floating))
                 throw new PublisherException("Non-finite YAML numbers cannot be preserved in JSON-compatible manifests.");
             return JsonNode.Parse(FormatFloatingPoint(floating))!;
         }
         return JsonValue.Create(value)!;
+    }
+
+    // Leading zero(s) followed by digits is a string in YAML 1.2 (serde_yaml digits_but_not_number).
+    private static bool DigitsButNotNumber(string value)
+    {
+        var unsigned = value.StartsWith('-') || value.StartsWith('+') ? value[1..] : value;
+        return unsigned.Length > 1 && unsigned[0] == '0' && unsigned.Skip(1).All(char.IsAsciiDigit);
+    }
+
+    // serde_yaml visit_int: optional sign, 0x/0o/0b prefixes, decimal without leading zeros,
+    // within the u128/i128 range it tries (larger magnitudes fall through to float parsing).
+    private static bool TryParseYamlInteger(string value, out System.Numerics.BigInteger result)
+    {
+        result = default;
+        var negative = value.StartsWith('-');
+        var unsigned = value.StartsWith('+') || negative ? value[1..] : value;
+        if (unsigned.StartsWith('+') || unsigned.StartsWith('-'))
+            return false;
+        var parsed = false;
+        foreach (var (prefix, radix) in new[] { ("0x", 16), ("0o", 8), ("0b", 2) })
+            if (unsigned.StartsWith(prefix, StringComparison.Ordinal) && TryParseRadix(unsigned[2..], radix, out result))
+            {
+                parsed = true;
+                break;
+            }
+        if (!parsed && (DigitsButNotNumber(value) || !TryParseRadix(unsigned, 10, out result)))
+            return false;
+        if (!negative)
+            return true;
+        if (result > (System.Numerics.BigInteger)Int128.MaxValue + 1)
+            return false;
+        result = -result;
+        return true;
+    }
+
+    private static bool TryParseRadix(string digits, int radix, out System.Numerics.BigInteger result)
+    {
+        result = System.Numerics.BigInteger.Zero;
+        if (digits.Length == 0)
+            return false;
+        foreach (var character in digits)
+        {
+            var digit = character switch
+            {
+                >= '0' and <= '9' => character - '0',
+                >= 'a' and <= 'z' => character - 'a' + 10,
+                >= 'A' and <= 'Z' => character - 'A' + 10,
+                _ => int.MaxValue,
+            };
+            if (digit >= radix)
+                return false;
+            result = (result * radix) + digit;
+            if (result > UInt128.MaxValue)
+                return false;
+        }
+        return true;
+    }
+
+    // Rust f64 FromStr grammar after serde_yaml strips one leading '+'; .inf/.nan spellings are non-finite.
+    private static bool TryParseYamlFloat(string value, out double result)
+    {
+        result = 0;
+        var unsigned = value.StartsWith('+') ? value[1..] : value;
+        if (unsigned.StartsWith('+') || (value.StartsWith('+') && unsigned.StartsWith('-')))
+            return false;
+        if (unsigned is ".inf" or ".Inf" or ".INF")
+        {
+            result = double.PositiveInfinity;
+            return true;
+        }
+        if (value is "-.inf" or "-.Inf" or "-.INF")
+        {
+            result = double.NegativeInfinity;
+            return true;
+        }
+        if (value is ".nan" or ".NaN" or ".NAN")
+        {
+            result = double.NaN;
+            return true;
+        }
+        if (!FloatPattern().IsMatch(unsigned)
+            || !double.TryParse(unsigned, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out result))
+            return false;
+        // An overflowing literal such as 1e999 is not a YAML float; it stays a string.
+        return double.IsFinite(result);
     }
 
     private static string FormatFloatingPoint(double value)
@@ -293,6 +387,10 @@ internal static partial class ManifestScanner
                      .ThenBy(x => x.Key.Version, StringComparer.Ordinal))
         {
             var docs = entry.Value;
+            var manifestVersions = docs.Select(d => OptionalString(d.Model, "ManifestVersion"))
+                .Distinct(StringComparer.Ordinal).ToArray();
+            if (manifestVersions.Length > 1)
+                throw new PublisherException($"Inconsistent ManifestVersion values ({string.Join(", ", manifestVersions)}) across the manifest files of {entry.Key.Id} {entry.Key.Version}.");
             var singleton = docs.Where(d => d.Type == "singleton").ToList();
             if (singleton.Count > 1)
                 throw new PublisherException($"Duplicate singleton manifest for {entry.Key.Id} {entry.Key.Version}.");
@@ -387,27 +485,36 @@ internal static partial class ManifestScanner
             var latest = group.First(m => m.Version.Equals(latestVersion, StringComparison.OrdinalIgnoreCase)
                 && m.Locale.Equals(m.DefaultLocale, StringComparison.OrdinalIgnoreCase));
             var all = group.ToArray();
+            RejectOverlappingArpRanges(latest.PackageId, all.OrderBy(m => m.Version, VersionComparer.Instance));
             var sidecarYaml = BuildVersionData(all);
             var compressed = MsZipCompressor.Compress(sidecarYaml);
             var tags = Values(all, "Tags");
             var commands = Values(all, "Commands");
-            var pfns = Values(all, "PackageFamilyName");
-            var products = Values(all, "ProductCode");
-            var upgradeCodes = Values(all, "UpgradeCode");
+            var pfns = new List<string>();
+            var products = new List<string>();
+            var upgradeCodes = new List<string>();
             var normalizedNames = new HashSet<string>(StringComparer.Ordinal);
             var normalizedPublishers = new HashSet<string>(StringComparer.Ordinal);
             foreach (var manifest in all)
             {
-                foreach (var pair in AppEntries(manifest.Model))
+                // System reference strings come from each installer after WinGet's root-default
+                // inheritance, never from the root scope itself (Manifest::GetSystemReferenceStrings).
+                foreach (var installer in EffectiveInstallers(manifest.Model))
                 {
-                    if (pair.DisplayName is not null)
-                        normalizedNames.Add(NormalizeName(pair.DisplayName));
-                    if (pair.Publisher is not null)
-                        normalizedPublishers.Add(NormalizePublisher(pair.Publisher));
-                    if (pair.ProductCode is not null)
-                        products = products.Append(pair.ProductCode).ToArray();
-                    if (pair.UpgradeCode is not null)
-                        upgradeCodes = upgradeCodes.Append(pair.UpgradeCode).ToArray();
+                    if (installer.PackageFamilyName is not null)
+                        pfns.Add(installer.PackageFamilyName);
+                    if (installer.ProductCode is not null)
+                        products.Add(installer.ProductCode);
+                    upgradeCodes.AddRange(StringValues(installer.Installer["UpgradeCode"]));
+                    foreach (var entry in installer.Entries)
+                    {
+                        if (OptionalString(entry, "DisplayName") is { } displayName)
+                            normalizedNames.Add(NormalizeName(displayName));
+                        if (OptionalString(entry, "Publisher") is { } entryPublisher)
+                            normalizedPublishers.Add(NormalizePublisher(entryPublisher));
+                        products.AddRange(StringValues(entry["ProductCode"]));
+                        upgradeCodes.AddRange(StringValues(entry["UpgradeCode"]));
+                    }
                 }
                 foreach (var scope in CatalogScopes(manifest.Model))
                 {
@@ -420,12 +527,8 @@ internal static partial class ManifestScanner
                 }
             }
 
-            var arpVersions = all.SelectMany(m => AppEntries(m.Model))
-                .SelectMany(entry => new[] { entry.DisplayVersion })
-                .Where(v => !string.IsNullOrWhiteSpace(v))
-                .Cast<string>()
-                .OrderBy(v => v, VersionComparer.Instance)
-                .ToArray();
+            // WinGet fills the package row's ARP bounds from the latest version only (Interface_2_0 PrepareForPackaging).
+            var latestArpRange = ArpVersionRange(latest.Model);
             packages.Add(new IndexedPackage(
                 group.Key,
                 RequiredString(latest.Model, "PackageName", latest.RelativePath),
@@ -434,13 +537,14 @@ internal static partial class ManifestScanner
                 all,
                 tags,
                 commands,
-                pfns,
-                DistinctTerms(products),
-                DistinctTerms(upgradeCodes),
+                // WinGet stores these correlation values case-folded and folds exact lookups the same way.
+                DistinctTerms(pfns.Select(FoldAsciiCase)),
+                DistinctTerms(products.Select(FoldAsciiCase)),
+                DistinctTerms(upgradeCodes.Select(FoldAsciiCase)),
                 DistinctTerms(normalizedNames),
                 DistinctTerms(normalizedPublishers),
-                arpVersions.FirstOrDefault(),
-                arpVersions.LastOrDefault(),
+                latestArpRange?.Min,
+                latestArpRange?.Max,
                 sidecarYaml,
                 compressed,
                 System.Security.Cryptography.SHA256.HashData(compressed)));
@@ -470,16 +574,10 @@ internal static partial class ManifestScanner
         foreach (var manifest in sorted)
         {
             builder.Append("  - v: ").Append(QuoteYaml(manifest.Version)).Append('\n');
-            var arpVersions = AppEntries(manifest.Model)
-                .Select(entry => entry.DisplayVersion)
-                .Where(value => !string.IsNullOrWhiteSpace(value))
-                .Cast<string>()
-                .OrderBy(value => value, VersionComparer.Instance)
-                .ToArray();
-            if (arpVersions.Length > 0)
+            if (ArpVersionRange(manifest.Model) is { } range)
             {
-                builder.Append("    aMiV: ").Append(QuoteYaml(arpVersions[0])).Append('\n');
-                builder.Append("    aMaV: ").Append(QuoteYaml(arpVersions[^1])).Append('\n');
+                builder.Append("    aMiV: ").Append(QuoteYaml(range.Min)).Append('\n');
+                builder.Append("    aMaV: ").Append(QuoteYaml(range.Max)).Append('\n');
             }
             builder.Append("    rP: ").Append(QuoteYaml(manifest.RelativePath)).Append('\n');
             builder.Append("    s256H: ").Append(QuoteYaml(manifest.Hash)).Append('\n');
@@ -489,6 +587,9 @@ internal static partial class ManifestScanner
 
     private static IReadOnlyList<string> Values(IReadOnlyList<MergedManifest> manifests, string key) =>
         DistinctTerms(manifests.SelectMany(m => CatalogScopes(m.Model).SelectMany(obj => StringValues(obj[key]))));
+
+    private static string FoldAsciiCase(string value) =>
+        new(value.Select(c => c is >= 'A' and <= 'Z' ? (char)(c + 32) : c).ToArray());
 
     private static IReadOnlyList<string> DistinctTerms(IEnumerable<string> terms) =>
         terms.Where(s => !string.IsNullOrWhiteSpace(s)).Order(StringComparer.Ordinal)
@@ -518,18 +619,112 @@ internal static partial class ManifestScanner
         }
     }
 
-    private static IEnumerable<(string? DisplayName, string? Publisher, string? ProductCode, string? UpgradeCode, string? DisplayVersion)> AppEntries(JsonObject model)
+    /// <summary>An installer after WinGet's root-default inheritance (<c>ManifestYamlPopulator::PopulateManifestInternal</c>).</summary>
+    /// <param name="InstallerType">
+    /// <c>EffectiveInstallerType</c>: the nested type for zip installers, lowercase, <c>appx</c> as <c>msix</c>.
+    /// </param>
+    private sealed record EffectiveInstaller(
+        JsonObject Installer,
+        string InstallerType,
+        string? PackageFamilyName,
+        string? ProductCode,
+        IReadOnlyList<JsonObject> Entries);
+
+    /// <summary>WinGet <c>ConvertToInstallerTypeEnum</c> spelling: case-insensitive, <c>appx</c> is <c>msix</c>.</summary>
+    private static string InstallerTypeName(string? value)
     {
-        foreach (var obj in CatalogScopes(model))
+        var lower = FoldAsciiCase(value ?? string.Empty);
+        return lower == "appx" ? "msix" : lower;
+    }
+
+    /// <summary><c>DoesInstallerTypeWriteAppsAndFeaturesEntry</c>, which equals <c>DoesInstallerTypeUseProductCode</c>.</summary>
+    private static bool InstallerTypeWritesArpEntry(string installerType) =>
+        installerType is "exe" or "inno" or "msi" or "nullsoft" or "wix" or "burn" or "portable";
+
+    /// <summary><c>DoesInstallerTypeUsePackageFamilyName</c>.</summary>
+    private static bool InstallerTypeUsesPackageFamilyName(string installerType) =>
+        installerType is "msix" or "msstore";
+
+    /// <summary><c>DoesInstallerTypeSupportArpVersionRange</c>.</summary>
+    private static bool InstallerTypeSupportsArpVersionRange(string installerType) =>
+        installerType is "exe" or "inno" or "msi" or "nullsoft" or "wix" or "burn" or "msix";
+
+    private static string? NonEmptyString(JsonObject model, string key) =>
+        OptionalString(model, key) is { Length: > 0 } value ? value : null;
+
+    private static List<JsonObject> ArpEntries(JsonObject model) =>
+        model["AppsAndFeaturesEntries"] is JsonArray entries ? entries.OfType<JsonObject>().ToList() : [];
+
+    /// <summary>
+    /// Applies WinGet's root defaults to every installer: root <c>AppsAndFeaturesEntries</c>,
+    /// <c>PackageFamilyName</c> and <c>ProductCode</c> are copied only into installers that lack them and
+    /// whose effective type uses them.
+    /// </summary>
+    private static IEnumerable<EffectiveInstaller> EffectiveInstallers(JsonObject root)
+    {
+        if (root["Installers"] is not JsonArray installers)
+            yield break;
+        var rootEntries = ArpEntries(root);
+        foreach (var installer in installers.OfType<JsonObject>())
         {
-            if (obj["AppsAndFeaturesEntries"] is JsonArray entries)
-                foreach (var entry in entries.OfType<JsonObject>())
-                    yield return (
-                        OptionalString(entry, "DisplayName"),
-                        OptionalString(entry, "Publisher"),
-                        OptionalString(entry, "ProductCode"),
-                        OptionalString(entry, "UpgradeCode"),
-                        OptionalString(entry, "DisplayVersion"));
+            var baseType = InstallerTypeName(OptionalString(installer, "InstallerType") ?? OptionalString(root, "InstallerType"));
+            var installerType = baseType == "zip"
+                ? InstallerTypeName(OptionalString(installer, "NestedInstallerType") ?? OptionalString(root, "NestedInstallerType"))
+                : baseType;
+            var entries = ArpEntries(installer);
+            if (entries.Count == 0 && InstallerTypeWritesArpEntry(installerType))
+                entries = rootEntries;
+            var entryUsesPackageFamilyName = entries.Any(entry =>
+                InstallerTypeUsesPackageFamilyName(InstallerTypeName(OptionalString(entry, "InstallerType"))));
+            var packageFamilyName = NonEmptyString(installer, "PackageFamilyName")
+                ?? (InstallerTypeUsesPackageFamilyName(installerType) || entryUsesPackageFamilyName
+                    ? NonEmptyString(root, "PackageFamilyName") : null);
+            var productCode = NonEmptyString(installer, "ProductCode")
+                ?? (InstallerTypeWritesArpEntry(installerType) ? NonEmptyString(root, "ProductCode") : null);
+            yield return new EffectiveInstaller(installer, installerType, packageFamilyName, productCode, entries);
+        }
+    }
+
+    /// <summary>
+    /// <c>Manifest::GetArpVersionRange</c>: <c>DisplayVersion</c> of the effective ARP entries of installers
+    /// whose effective type supports ARP version ranges.
+    /// </summary>
+    private static (string Min, string Max)? ArpVersionRange(JsonObject model)
+    {
+        // Ties between equal versions keep the ordinal-first spelling, like the Rust publisher.
+        var versions = EffectiveInstallers(model)
+            .Where(installer => InstallerTypeSupportsArpVersionRange(installer.InstallerType))
+            .SelectMany(installer => installer.Entries)
+            .Select(entry => OptionalString(entry, "DisplayVersion"))
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Cast<string>()
+            .OrderBy(value => value, VersionComparer.Instance)
+            .ThenBy(value => value, StringComparer.Ordinal)
+            .ToArray();
+        return versions.Length == 0 ? null : (versions[0], versions[^1]);
+    }
+
+    /// <summary>
+    /// Rejects packages whose versions declare overlapping ARP version ranges, which WinGet's index refuses
+    /// with <c>APPINSTALLER_CLI_ERROR_ARP_VERSION_VALIDATION_FAILED</c> (<c>Interface_1_5.cpp</c>).
+    /// </summary>
+    private static void RejectOverlappingArpRanges(string id, IEnumerable<MergedManifest> ascendingVersions)
+    {
+        var ranges = ascendingVersions
+            .Select(manifest => (manifest.Version, Range: ArpVersionRange(manifest.Model)))
+            .Where(item => item.Range is not null)
+            .Select(item => (item.Version, item.Range!.Value.Min, item.Range!.Value.Max))
+            .ToArray();
+        for (var index = 0; index < ranges.Length; index++)
+        {
+            for (var other = index + 1; other < ranges.Length; other++)
+            {
+                var (version, min, max) = ranges[index];
+                var (otherVersion, otherMin, otherMax) = ranges[other];
+                if (VersionComparer.Instance.Compare(min, otherMax) <= 0 && VersionComparer.Instance.Compare(max, otherMin) >= 0)
+                    throw new PublisherException(
+                        $"ARP version ranges overlap for {id}: {version} [{min}, {max}] and {otherVersion} [{otherMin}, {otherMax}]");
+            }
         }
     }
 
@@ -557,42 +752,78 @@ internal static partial class ManifestScanner
     private static string NormalizePublisher(string value) =>
         Devolutions.Pinget.Core.NameNormalization.NormalizePublisher(value);
 
-    private static string QuoteYaml(string value) =>
-        $"\"{JsonEncodedText.Encode(value, JavaScriptEncoder.UnsafeRelaxedJsonEscaping)}\"";
+    private static string QuoteYaml(string value) => JsonQuote(value);
+
+    /// <summary>
+    /// Quotes a string exactly like serde_json (the Rust publisher): only <c>"</c>, <c>\</c> and
+    /// U+0000-U+001F are escaped (short forms or lowercase <c>\u00xx</c>); everything else,
+    /// including non-BMP characters, is emitted as raw UTF-8.
+    /// </summary>
+    internal static string JsonQuote(string value)
+    {
+        var builder = new StringBuilder(value.Length + 2).Append('"');
+        foreach (var character in value)
+        {
+            switch (character)
+            {
+                case '"': builder.Append("\\\""); break;
+                case '\\': builder.Append("\\\\"); break;
+                case '\b': builder.Append("\\b"); break;
+                case '\t': builder.Append("\\t"); break;
+                case '\n': builder.Append("\\n"); break;
+                case '\f': builder.Append("\\f"); break;
+                case '\r': builder.Append("\\r"); break;
+                case < ' ': builder.Append("\\u00").Append(((int)character).ToString("x2", System.Globalization.CultureInfo.InvariantCulture)); break;
+                default: builder.Append(character); break;
+            }
+        }
+        return builder.Append('"').ToString();
+    }
 
     private static byte[] CanonicalJson(JsonObject model)
     {
-        using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
-            WriteCanonical(writer, model);
-        stream.WriteByte((byte)'\n');
-        return stream.ToArray();
+        var builder = new StringBuilder();
+        WriteCanonical(builder, model);
+        builder.Append('\n');
+        return new UTF8Encoding(false, true).GetBytes(builder.ToString());
     }
 
-    private static void WriteCanonical(Utf8JsonWriter writer, JsonNode? node)
+    private static void WriteCanonical(StringBuilder builder, JsonNode? node)
     {
         switch (node)
         {
             case JsonObject obj:
-                writer.WriteStartObject();
+                builder.Append('{');
+                var firstProperty = true;
                 foreach (var pair in obj.OrderBy(p => p.Key, StringComparer.Ordinal))
                 {
-                    writer.WritePropertyName(pair.Key);
-                    WriteCanonical(writer, pair.Value);
+                    if (!firstProperty)
+                        builder.Append(',');
+                    firstProperty = false;
+                    builder.Append(JsonQuote(pair.Key)).Append(':');
+                    WriteCanonical(builder, pair.Value);
                 }
-                writer.WriteEndObject();
+                builder.Append('}');
                 break;
             case JsonArray array:
-                writer.WriteStartArray();
-                foreach (var item in array)
-                    WriteCanonical(writer, item);
-                writer.WriteEndArray();
+                builder.Append('[');
+                for (var index = 0; index < array.Count; index++)
+                {
+                    if (index > 0)
+                        builder.Append(',');
+                    WriteCanonical(builder, array[index]);
+                }
+                builder.Append(']');
+                break;
+            case null:
+                builder.Append("null");
+                break;
+            case JsonValue value when value.TryGetValue<string>(out var text):
+                builder.Append(JsonQuote(text));
                 break;
             default:
-                if (node is null)
-                    writer.WriteNullValue();
-                else
-                    node.WriteTo(writer);
+                // Numbers and booleans have no characters that need escaping.
+                builder.Append(node.ToJsonString());
                 break;
         }
     }
@@ -608,7 +839,7 @@ internal static partial class ManifestScanner
     private static void ValidatePathSegment(string value, string label)
     {
         if (value is "." or ".." || value.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
-            || value.Contains('/') || value.Contains('\\') || value.Contains(':'))
+            || value.Contains('/') || value.Contains('\\') || value.Contains(':') || !IsWindowsSafeName(value))
             throw new PublisherException($"Unsafe {label} path component: '{value}'.");
     }
 
@@ -704,8 +935,42 @@ internal static partial class ManifestScanner
         }
     }
 
-    [GeneratedRegex(@"^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$", RegexOptions.CultureInvariant)]
-    private static partial Regex IdentifierPattern();
+    /// <summary>
+    /// WinGet's manifest-schema PackageIdentifier rule: 2-8 dot-separated segments of 1-32
+    /// characters, at most 128 characters, without whitespace, control or path/URL metacharacters;
+    /// plus Windows path-safety rejections for the output directory name.
+    /// </summary>
+    internal static bool IsValidPackageIdentifier(string id)
+    {
+        var segments = id.Split('.');
+        return id.EnumerateRunes().Count() <= 128
+            && segments.Length is >= 2 and <= 8
+            && segments.All(segment => segment.EnumerateRunes().Count() is >= 1 and <= 32
+                && !segment.EnumerateRunes().Any(IsIdentifierForbiddenRune))
+            && IsWindowsSafeName(id);
+    }
+
+    private static bool IsIdentifierForbiddenRune(Rune rune) =>
+        Rune.IsWhiteSpace(rune) || rune.Value == 0xFEFF || Rune.IsControl(rune)
+        || rune.Value is '.' or '\\' or '/' or ':' or '*' or '?' or '"' or '<' or '>' or '|';
+
+    /// <summary>
+    /// Rejects names Windows silently rewrites or maps to devices: a trailing <c>.</c> or space, and
+    /// reserved device names (also when followed by an extension, e.g. <c>NUL.txt</c>).
+    /// </summary>
+    internal static bool IsWindowsSafeName(string value)
+    {
+        if (value.EndsWith('.') || value.EndsWith(' '))
+            return false;
+        var stem = value.Split('.')[0].TrimEnd(' ').ToUpperInvariant();
+        if (stem is "CON" or "PRN" or "AUX" or "NUL" or "CONIN$" or "CONOUT$")
+            return false;
+        return !(stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) || stem.StartsWith("LPT", StringComparison.Ordinal))
+            && (char.IsAsciiDigit(stem[3]) || stem[3] is '\u00B9' or '\u00B2' or '\u00B3'));
+    }
+
+    [GeneratedRegex(@"^-?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$", RegexOptions.CultureInvariant)]
+    private static partial Regex FloatPattern();
 
     [GeneratedRegex(@"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$", RegexOptions.CultureInvariant)]
     private static partial Regex VersionPattern();

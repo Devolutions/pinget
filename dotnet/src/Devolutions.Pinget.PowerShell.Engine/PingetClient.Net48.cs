@@ -65,7 +65,8 @@ public sealed class PingetClient : IDisposable
         _packageManager.AddSource(
             name,
             argument,
-            string.IsNullOrWhiteSpace(type) ? "Microsoft.Rest" : type,
+            // Like WinGet, an omitted source type means Microsoft.PreIndexed.Package.
+            string.IsNullOrWhiteSpace(type) ? "Microsoft.PreIndexed.Package" : type,
             trustLevel == PSSourceTrustLevel.Default ? "None" : trustLevel.ToString(),
             explicitSource,
             priority);
@@ -148,7 +149,8 @@ public sealed class PingetClient : IDisposable
         string? downloadDirectory,
         bool skipMicrosoftStoreLicense,
         PSWindowsPlatform platform,
-        string? targetOsVersion)
+        string? targetOsVersion,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var warnings = new List<string>();
         AddDownloadCompatibilityWarnings(warnings, skipDependencies, skipMicrosoftStoreLicense);
@@ -161,12 +163,12 @@ public sealed class PingetClient : IDisposable
             null,
             null,
             0,
-            PSPackageFieldMatchOption.EqualsCaseInsensitive);
+            matchOption);
         SetIfNotNull(queryObject, "version", version ?? GetCatalogVersion(inputObject));
         SetIfNotNull(queryObject, "locale", locale);
         SetIfNotNull(queryObject, "installer_architecture", architecture == PSProcessorArchitecture.Default ? null : architecture.ToString());
         SetIfNotNull(queryObject, "installer_type", installerType == PSPackageInstallerType.Default ? null : installerType.ToString());
-        SetIfNotNull(queryObject, "install_scope", scope == PSPackageInstallScope.Any ? null : scope.ToString());
+        SetIfNotNull(queryObject, "install_scope", PSEnumMapping.ToInstallScope(scope));
         SetIfNotNull(queryObject, "platform", ToInstallerPlatform(platform));
         SetIfNotNull(queryObject, "os_version", Normalize(targetOsVersion));
 
@@ -266,7 +268,8 @@ public sealed class PingetClient : IDisposable
         PSPackageInstallScope scope,
         PSProcessorArchitecture architecture,
         PSPackageInstallMode mode,
-        PSPackageInstallerType installerType)
+        PSPackageInstallerType installerType,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var warnings = HeaderWarnings(header);
         var request = BuildInstallRequest(
@@ -288,7 +291,8 @@ public sealed class PingetClient : IDisposable
             scope,
             architecture,
             mode,
-            installerType);
+            installerType,
+            matchOption);
 
         var result = RequiredObject(_packageManager.InstallJson(ToJsonString(request)));
         warnings.AddRange(WarningsFrom(result));
@@ -305,7 +309,8 @@ public sealed class PingetClient : IDisposable
         string[]? query,
         bool force,
         string? log,
-        PSPackageUninstallMode mode)
+        PSPackageUninstallMode mode,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var request = new JsonObject
         {
@@ -318,7 +323,7 @@ public sealed class PingetClient : IDisposable
                 null,
                 null,
                 0,
-                PSPackageFieldMatchOption.EqualsCaseInsensitive),
+                matchOption),
             ["force"] = force,
             ["mode"] = ToInstallerMode(mode),
         };
@@ -350,7 +355,8 @@ public sealed class PingetClient : IDisposable
         PSProcessorArchitecture architecture,
         PSPackageInstallMode mode,
         PSPackageInstallerType installerType,
-        bool includeUnknown)
+        bool includeUnknown,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var warnings = HeaderWarnings(header);
         var listQuery = new JsonObject
@@ -363,47 +369,52 @@ public sealed class PingetClient : IDisposable
             // -Version is the upgrade target; a list "version" would filter on the installed version.
             ["upgrade_only"] = true,
             ["include_unknown"] = includeUnknown,
-            ["exact"] = true,
+            ["exact"] = PSEnumMapping.UsesExactMatch(matchOption),
         };
 
         var matches = RequiredObject(_packageManager.ListJson(ToJsonString(listQuery)));
         warnings.AddRange(WarningsFrom(matches));
-        var results = new List<PSInstallResult>();
-        foreach (var match in RequiredArray(matches, "Matches").OfType<JsonObject>())
-        {
-            var matchSource = OptionalString(match, "SourceName");
-            var request = BuildInstallRequest(
-                null,
-                Normalize(version) ?? OptionalString(match, "AvailableVersion"),
-                RequiredString(match, "Id"),
-                null,
-                null,
-                matchSource,
-                null,
-                allowHashMismatch,
-                overrideArguments,
-                custom,
-                location,
-                log,
-                force,
-                skipDependencies,
-                locale,
-                scope,
-                architecture,
-                mode,
-                installerType);
-            var result = RequiredObject(_packageManager.InstallJson(ToJsonString(request)));
-            warnings.AddRange(WarningsFrom(result));
-            results.Add(ToPsInstallResult(result, request, new PSInstalledCatalogPackage(
-                RequiredString(match, "Id"),
-                RequiredString(match, "Name"),
-                matchSource ?? string.Empty,
-                null,
-                RequiredString(match, "InstalledVersion"),
-                OptionalString(match, "AvailableVersion") is { } availableVersion ? new[] { availableVersion } : Array.Empty<string>(),
-                OptionalString(match, "Publisher"),
-                OptionalString(match, "Scope"))));
-        }
+        var results = UpdateBatch.Run(
+            RequiredArray(matches, "Matches").OfType<JsonObject>(),
+            match => (RequiredString(match, "Id"), OptionalString(match, "Name"), OptionalString(match, "SourceName")),
+            match =>
+            {
+                var matchSource = OptionalString(match, "SourceName");
+                var request = BuildInstallRequest(
+                    null,
+                    Normalize(version) ?? OptionalString(match, "AvailableVersion"),
+                    RequiredString(match, "Id"),
+                    null,
+                    null,
+                    matchSource,
+                    null,
+                    allowHashMismatch,
+                    overrideArguments,
+                    custom,
+                    location,
+                    log,
+                    force,
+                    skipDependencies,
+                    locale,
+                    scope,
+                    architecture,
+                    mode,
+                    installerType,
+                    // Each upgrade target is installed by its exact package id.
+                    PSPackageFieldMatchOption.EqualsCaseInsensitive);
+                var result = RequiredObject(_packageManager.InstallJson(ToJsonString(request)));
+                warnings.AddRange(WarningsFrom(result));
+                return ToPsInstallResult(result, request, new PSInstalledCatalogPackage(
+                    RequiredString(match, "Id"),
+                    RequiredString(match, "Name"),
+                    matchSource ?? string.Empty,
+                    null,
+                    RequiredString(match, "InstalledVersion"),
+                    OptionalString(match, "AvailableVersion") is { } availableVersion ? new[] { availableVersion } : Array.Empty<string>(),
+                    OptionalString(match, "Publisher"),
+                    OptionalString(match, "Scope")));
+            },
+            warnings);
 
         return new CollectionResult<PSInstallResult>(results, warnings, Bool(matches, "Truncated"));
     }
@@ -419,7 +430,8 @@ public sealed class PingetClient : IDisposable
         bool allowHashMismatch,
         bool force,
         string? log,
-        PSPackageRepairMode mode)
+        PSPackageRepairMode mode,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var request = new JsonObject
         {
@@ -432,7 +444,7 @@ public sealed class PingetClient : IDisposable
                 null,
                 null,
                 0,
-                PSPackageFieldMatchOption.EqualsCaseInsensitive),
+                matchOption),
             ["ignore_security_hash"] = allowHashMismatch,
             ["force"] = force,
             ["mode"] = ToInstallerMode(mode),
@@ -474,7 +486,7 @@ public sealed class PingetClient : IDisposable
         SetIfNotNull(result, "command", Normalize(command));
         if (count != 0)
             result["count"] = count;
-        result["exact"] = UsesExactMatch(matchOption);
+        result["exact"] = PSEnumMapping.UsesExactMatch(matchOption);
         return result;
     }
 
@@ -499,7 +511,7 @@ public sealed class PingetClient : IDisposable
         SetIfNotNull(result, "command", Normalize(command));
         if (count != 0)
             result["count"] = count;
-        result["exact"] = UsesExactMatch(matchOption);
+        result["exact"] = PSEnumMapping.UsesExactMatch(matchOption);
         return result;
     }
 
@@ -522,7 +534,8 @@ public sealed class PingetClient : IDisposable
         PSPackageInstallScope scope,
         PSProcessorArchitecture architecture,
         PSPackageInstallMode mode,
-        PSPackageInstallerType installerType)
+        PSPackageInstallerType installerType,
+        PSPackageFieldMatchOption matchOption)
     {
         var queryObject = BuildPackageQuery(
             id ?? inputObject?.Id,
@@ -533,12 +546,12 @@ public sealed class PingetClient : IDisposable
             null,
             null,
             0,
-            PSPackageFieldMatchOption.EqualsCaseInsensitive);
+            matchOption);
         SetIfNotNull(queryObject, "version", version ?? GetCatalogVersion(inputObject));
         SetIfNotNull(queryObject, "locale", locale);
         SetIfNotNull(queryObject, "installer_architecture", architecture == PSProcessorArchitecture.Default ? null : architecture.ToString());
         SetIfNotNull(queryObject, "installer_type", installerType == PSPackageInstallerType.Default ? null : installerType.ToString());
-        SetIfNotNull(queryObject, "install_scope", scope == PSPackageInstallScope.Any ? null : scope.ToString());
+        SetIfNotNull(queryObject, "install_scope", PSEnumMapping.ToInstallScope(scope));
 
         var request = new JsonObject
         {
@@ -567,7 +580,7 @@ public sealed class PingetClient : IDisposable
             Source = identity.Source,
             CorrelationData = OptionalString(result, "installer_path") ?? string.Empty,
             InstallerErrorCode = unchecked((uint)Int(result, "exit_code")),
-            RebootRequired = false,
+            RebootRequired = Bool(result, "reboot_required"),
             Status = OperationStatus(result),
         };
     }
@@ -584,7 +597,7 @@ public sealed class PingetClient : IDisposable
             Source = identity.Source,
             CorrelationData = OptionalString(result, "installer_path") ?? string.Empty,
             UninstallerErrorCode = unchecked((uint)Int(result, "exit_code")),
-            RebootRequired = false,
+            RebootRequired = Bool(result, "reboot_required"),
             Status = OperationStatus(result),
         };
     }
@@ -601,13 +614,13 @@ public sealed class PingetClient : IDisposable
             Source = identity.Source,
             CorrelationData = OptionalString(result, "installer_path") ?? string.Empty,
             RepairErrorCode = unchecked((uint)Int(result, "exit_code")),
-            RebootRequired = false,
+            RebootRequired = Bool(result, "reboot_required"),
             Status = OperationStatus(result),
         };
     }
 
     private static string OperationStatus(JsonObject result) =>
-        Bool(result, "success") ? "Ok" : Bool(result, "no_op") ? "NoOp" : "Error";
+        InstallResultStatus.From(Bool(result, "success"), Bool(result, "no_op"));
 
     private static (string Name, string? Source) ResolveIdentity(string id, string? name, string? source) =>
         (string.IsNullOrWhiteSpace(name) ? id : name!, Normalize(source));
@@ -709,9 +722,6 @@ public sealed class PingetClient : IDisposable
             return installedPackage.InstalledVersion;
         return null;
     }
-
-    private static bool UsesExactMatch(PSPackageFieldMatchOption matchOption) =>
-        matchOption == PSPackageFieldMatchOption.Equals || matchOption == PSPackageFieldMatchOption.EqualsCaseInsensitive;
 
     private static string? JoinQuery(string[]? query)
     {

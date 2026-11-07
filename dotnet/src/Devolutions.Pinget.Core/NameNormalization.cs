@@ -22,6 +22,8 @@ internal static partial class NameNormalization
         Unknown,
         X86,
         X64,
+        Arm,
+        Arm64,
     }
 
     internal readonly record struct NormalizedName(string Name, Architecture Architecture, string Locale);
@@ -143,6 +145,10 @@ internal static partial class NameNormalization
             return Architecture.X64;
         if (Remove(ArchitectureX32(), ref value) || Remove(Architecture32Bit(), ref value))
             return Architecture.X86;
+        if (Remove(ArchitectureArm64(), ref value))
+            return Architecture.Arm64;
+        if (Remove(ArchitectureArm(), ref value))
+            return Architecture.Arm;
         return Architecture.Unknown;
     }
 
@@ -223,6 +229,10 @@ internal static partial class NameNormalization
     private static partial Regex ArchitectureX32();
     [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])(X64|AMD64|X86([\p{Pd}\p{Pc}]64))(?=\P{Nd}|$)(?:\sEDITION)?", RegexOptions.IgnoreCase)]
     private static partial Regex ArchitectureX64();
+    [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])(ARM64|AARCH64)(?=\P{Nd}|$)(?:\sEDITION)?", RegexOptions.IgnoreCase)]
+    private static partial Regex ArchitectureArm64();
+    [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])(ARM32)(?=\P{Nd}|$)(?:\sEDITION)?", RegexOptions.IgnoreCase)]
+    private static partial Regex ArchitectureArm();
     [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])(32[\p{Pd}\p{Pc}\p{Z}]?BIT)S?(?:\sEDITION)?", RegexOptions.IgnoreCase)]
     private static partial Regex Architecture32Bit();
     [GeneratedRegex(@"(?<=^|[^\p{L}\p{Nd}])(64[\p{Pd}\p{Pc}\p{Z}]?BIT)S?(?:\sEDITION)?", RegexOptions.IgnoreCase)]
@@ -339,6 +349,6 @@ internal static partial class NameNormalization
         "AB", "AD", "AG", "APS", "AS", "ASA", "BV", "CO", "COMPANY", "CORP", "CORPORATION", "CV",
         "DOO", "EV", "GES", "GESMBH", "GMBH", "HOLDING", "HOLDINGS", "INC", "INCORPORATED", "KG",
         "KS", "LIMITED", "LLC", "LP", "LTD", "LTDA", "MBH", "NV", "PLC", "PS", "PTY", "PVT", "SA",
-        "SARL", "SC", "SCA", "SL", "SOFTWARE", "SP", "SPA", "SRL", "SRO", "SUBSIDIARY",
+        "SARL", "SC", "SCA", "SL", "SP", "SPA", "SRL", "SRO", "SUBSIDIARY",
     ];
 }

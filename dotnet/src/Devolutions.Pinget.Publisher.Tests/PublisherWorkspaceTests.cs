@@ -68,13 +68,13 @@ public sealed class PublisherWorkspaceTests
             new[] { "Matrix", "OtherCmd", "matrix-cli" },
             ReadMappedValues(database, "commands2", "command", "commands2_map", "command", "Pinget.Test.Matrix"));
         Assert.Equal(
-            new[] { "{00112233-4455-6677-8899-AABBCCDDEEFF}" },
+            new[] { "{00112233-4455-6677-8899-aabbccddeeff}" },
             ReadCorrelation(database, "productcodes2", "productcode", "Pinget.Test.Matrix"));
         Assert.Equal(
-            new[] { "{11223344-5566-7788-99AA-BBCCDDEEFF00}" },
+            new[] { "{11223344-5566-7788-99aa-bbccddeeff00}" },
             ReadCorrelation(database, "upgradecodes2", "upgradecode", "Pinget.Test.Matrix"));
         Assert.Equal(
-            new[] { "Pinget.Matrix_1234567890abc" },
+            new[] { "pinget.matrix_1234567890abc" },
             ReadCorrelation(database, "pfns2", "pfn", "Pinget.Test.Matrix"));
         Assert.Equal(
             new[] { "matrice", "matrixdesktop", "matrixpackage" },
@@ -89,7 +89,8 @@ public sealed class PublisherWorkspaceTests
             command.Parameters.AddWithValue("$id", "Pinget.Test.Matrix");
             using var reader = command.ExecuteReader();
             Assert.True(reader.Read());
-            Assert.Equal("1.9.0", reader.GetString(0));
+            // WinGet stores the latest version's ARP range on the package row.
+            Assert.Equal("1.10.0", reader.GetString(0));
             Assert.Equal("1.10.0", reader.GetString(1));
             var sidecarHash = (byte[])reader[2];
             Assert.Equal(32, sidecarHash.Length);
@@ -365,7 +366,7 @@ public sealed class PublisherWorkspaceTests
         var state = Path.Combine(temp.Path, "not-created");
         var workspace = new PublisherWorkspace(state);
 
-        Assert.Throws<PublisherException>(() => workspace.Status());
+        Assert.Throws<PublisherException>(workspace.Status);
         Assert.Throws<PublisherException>(() => workspace.Diff(input));
 
         Assert.False(Directory.Exists(state));
@@ -380,11 +381,11 @@ public sealed class PublisherWorkspaceTests
         var workspace = new PublisherWorkspace(state);
         _ = workspace.Build(new PublisherBuildOptions(input, state));
         using (var database = new SqliteConnection(new SqliteConnectionStringBuilder
-               {
-                   DataSource = Path.Combine(state, "publisher.db"),
-                   Mode = SqliteOpenMode.ReadWrite,
-                   Pooling = false,
-               }.ToString()))
+        {
+            DataSource = Path.Combine(state, "publisher.db"),
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false,
+        }.ToString()))
         {
             database.Open();
             using var command = database.CreateCommand();
@@ -413,11 +414,11 @@ public sealed class PublisherWorkspaceTests
         var workspace = new PublisherWorkspace(state);
         _ = workspace.Build(new PublisherBuildOptions(input, state));
         using (var database = new SqliteConnection(new SqliteConnectionStringBuilder
-               {
-                   DataSource = Path.Combine(state, "publisher.db"),
-                   Mode = SqliteOpenMode.ReadWrite,
-                   Pooling = false,
-               }.ToString()))
+        {
+            DataSource = Path.Combine(state, "publisher.db"),
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false,
+        }.ToString()))
         {
             database.Open();
             using var command = database.CreateCommand();
@@ -476,11 +477,11 @@ public sealed class PublisherWorkspaceTests
         Directory.CreateDirectory(state);
         var databasePath = Path.Combine(state, "publisher.db");
         using (var database = new SqliteConnection(new SqliteConnectionStringBuilder
-               {
-                   DataSource = databasePath,
-                   Mode = SqliteOpenMode.ReadWriteCreate,
-                   Pooling = false,
-               }.ToString()))
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadWriteCreate,
+            Pooling = false,
+        }.ToString()))
         {
             database.Open();
             using var command = database.CreateCommand();

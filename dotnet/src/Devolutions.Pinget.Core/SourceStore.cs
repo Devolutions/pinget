@@ -404,6 +404,31 @@ internal static class SourceStoreManager
 
     private static void SavePackagedStore(string root, SourceStore store)
     {
+        var userSourcesPath = GetPackagedUserSourcesPath(root);
+        var userSourcesDirectory = Path.GetDirectoryName(userSourcesPath);
+        if (!string.IsNullOrWhiteSpace(userSourcesDirectory))
+            Directory.CreateDirectory(userSourcesDirectory);
+        File.WriteAllText(userSourcesPath, RenderPackagedUserSourcesYaml(store));
+
+        File.WriteAllText(Path.Combine(root, PackagedMetadataFileName), RenderPackagedMetadataYaml(store));
+    }
+
+    internal static string RenderPackagedUserSourcesYaml(SourceStore store)
+    {
+        // A removed default source is only remembered as a tombstone; without one the
+        // defaults come back on the next load (WinGet SourceList::RemoveSource).
+        var tombstones = SourceStore.Default().Sources
+            .Where(defaultSource => !store.Sources.Any(source =>
+                string.Equals(source.Name, defaultSource.Name, StringComparison.OrdinalIgnoreCase)))
+            .Select(defaultSource => new Dictionary<string, object?>
+            {
+                ["Name"] = defaultSource.Name,
+                ["Type"] = "",
+                ["Arg"] = "",
+                ["Data"] = "",
+                ["IsTombstone"] = true,
+            });
+
         var sourceDocument = new Dictionary<string, object?>
         {
             ["Sources"] = store.Sources.Select(source => new Dictionary<string, object?>
@@ -416,9 +441,14 @@ internal static class SourceStoreManager
                 ["Explicit"] = source.Explicit,
                 ["Priority"] = source.Priority,
                 ["IsTombstone"] = false,
-            }).ToList(),
+            }).Concat(tombstones).ToList(),
         };
 
+        return YamlEmitter.EmitDocument(sourceDocument);
+    }
+
+    internal static string RenderPackagedMetadataYaml(SourceStore store)
+    {
         var metadataDocument = new Dictionary<string, object?>
         {
             ["Sources"] = store.Sources.Select(source => new Dictionary<string, object?>
@@ -436,13 +466,7 @@ internal static class SourceStoreManager
                               entry["LastModified"] is not null).ToList(),
         };
 
-        var userSourcesPath = GetPackagedUserSourcesPath(root);
-        var userSourcesDirectory = Path.GetDirectoryName(userSourcesPath);
-        if (!string.IsNullOrWhiteSpace(userSourcesDirectory))
-            Directory.CreateDirectory(userSourcesDirectory);
-        File.WriteAllText(userSourcesPath, YamlEmitter.EmitDocument(sourceDocument));
-
-        File.WriteAllText(Path.Combine(root, PackagedMetadataFileName), YamlEmitter.EmitDocument(metadataDocument));
+        return YamlEmitter.EmitDocument(metadataDocument);
     }
 
     private static bool TryGetPackagedLocalStateRoot(string root, out string localStateRoot)
@@ -628,20 +652,91 @@ internal static class SourceStoreManager
         yamlSource[key] = UnquoteYamlScalar(value);
     }
 
-    private static string? UnquoteYamlScalar(string value)
+    /// <summary>
+    /// Reads a flow scalar: single-quoted (<c>''</c> is a literal <c>'</c>), double-quoted
+    /// (backslash escapes), or plain.
+    /// </summary>
+    internal static string UnquoteYamlScalar(string value)
     {
         if (string.IsNullOrEmpty(value))
             return string.Empty;
 
-        if ((value.StartsWith('"') && value.EndsWith('"')) ||
-            (value.StartsWith('\'') && value.EndsWith('\'')))
-        {
-            return value[1..^1];
-        }
+        if (value.Length >= 2 && value.StartsWith('\'') && value.EndsWith('\''))
+            return value[1..^1].Replace("''", "'");
+
+        if (value.Length >= 2 && value.StartsWith('"') && value.EndsWith('"'))
+            return UnescapeYamlDoubleQuoted(value[1..^1]);
 
         return value;
     }
 
-    internal static string SanitizePathSegment(string value) => string.Concat(value.Select(c =>
-        @"\/:*?""<>|".Contains(c) ? '_' : c));
+    private static string UnescapeYamlDoubleQuoted(string value)
+    {
+        var result = new System.Text.StringBuilder(value.Length);
+        for (var i = 0; i < value.Length; i++)
+        {
+            var ch = value[i];
+            if (ch != '\\')
+            {
+                result.Append(ch);
+                continue;
+            }
+
+            if (i + 1 >= value.Length)
+            {
+                result.Append('\\');
+                break;
+            }
+
+            var escape = value[++i];
+            var hexDigits = escape switch { 'x' => 2, 'u' => 4, 'U' => 8, _ => 0 };
+            if (hexDigits > 0)
+            {
+                var digits = i + hexDigits < value.Length ? value.Substring(i + 1, hexDigits) : null;
+                if (digits is not null &&
+                    uint.TryParse(digits, System.Globalization.NumberStyles.AllowHexSpecifier, System.Globalization.CultureInfo.InvariantCulture, out var code) &&
+                    code <= 0x10FFFF && (code < 0xD800 || code > 0xDFFF))
+                {
+                    result.Append(char.ConvertFromUtf32((int)code));
+                    i += hexDigits;
+                }
+                else
+                {
+                    result.Append('\\').Append(escape);
+                }
+
+                continue;
+            }
+
+            switch (escape)
+            {
+                case '0': result.Append('\0'); break;
+                case 'a': result.Append('\a'); break;
+                case 'b': result.Append('\b'); break;
+                case 't' or '\t': result.Append('\t'); break;
+                case 'n': result.Append('\n'); break;
+                case 'v': result.Append('\v'); break;
+                case 'f': result.Append('\f'); break;
+                case 'r': result.Append('\r'); break;
+                case 'e': result.Append('\u001b'); break;
+                case ' ': result.Append(' '); break;
+                case '"': result.Append('"'); break;
+                case '/': result.Append('/'); break;
+                case '\\': result.Append('\\'); break;
+                case 'N': result.Append('\u0085'); break;
+                case '_': result.Append((char)0x00A0); break;
+                case 'L': result.Append((char)0x2028); break;
+                case 'P': result.Append((char)0x2029); break;
+                default: result.Append('\\').Append(escape); break;
+            }
+        }
+
+        return result.ToString();
+    }
+
+    // An empty or dot-only identifier (a REST server picks its SourceIdentifier) would
+    // otherwise name the parent directory itself.
+    internal static string SanitizePathSegment(string value) => value.TrimEnd('.', ' ').Length == 0
+        ? "_"
+        : string.Concat(value.Select(c => @"\/:*?""<>|".Contains(c) ? '_' : c));
 }

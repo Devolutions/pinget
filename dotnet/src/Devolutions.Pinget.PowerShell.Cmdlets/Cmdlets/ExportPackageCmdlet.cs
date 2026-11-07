@@ -45,7 +45,8 @@ public sealed class ExportPackageCmdlet : InstallerSelectionCmdlet
             DownloadDirectory,
             SkipMicrosoftStoreLicense,
             Platform,
-            TargetOSVersion);
+            TargetOSVersion,
+            MatchOption);
 
         foreach (var warning in result.Warnings)
             WriteWarning(warning);

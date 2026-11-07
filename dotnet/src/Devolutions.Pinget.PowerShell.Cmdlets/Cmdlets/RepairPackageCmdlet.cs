@@ -28,7 +28,7 @@ public sealed class RepairPackageCmdlet : PackageCmdlet
             return;
 
         using var client = PingetClient.Open();
-        var result = client.RepairPackage(PSCatalogPackage, Version, Id, Name, Moniker, Source, Query, AllowHashMismatch, Force, Log, Mode);
+        var result = client.RepairPackage(PSCatalogPackage, Version, Id, Name, Moniker, Source, Query, AllowHashMismatch, Force, Log, Mode, MatchOption);
         foreach (var warning in result.Warnings)
             WriteWarning(warning);
         WriteObject(result.Value);

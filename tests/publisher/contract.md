@@ -171,6 +171,28 @@ inventory, and rejects untracked destination files rather than adopting or
 deleting them. The marker and private state DB are Pinget contracts, not
 WinGet-defined structures.
 
+Publication recovers from an interrupted run of either implementation. It
+removes publisher temporaries, adopts untracked files whose relative path and
+SHA-256 equal the snapshot being published (also in a destination without a
+marker that holds nothing else), and refuses snapshot paths that differ only by
+casing from a published path. The package swap is a three-step commit: the
+marker is first rewritten to the new publication with
+`pendingCommit: { previous: <prior marker or null> }`, then `source2.msix` is
+replaced, then `pendingCommit` is dropped. A marker with `pendingCommit` is
+resolved by the next publish (and read the same way by `verify`): when
+`source2.msix` matches the marker it is committed, otherwise `previous` is
+restored together with the interrupted run's fully copied artifacts. Re-verifying
+the package about to be replaced checks digests and signer only, so an expired
+or rotated signing certificate never blocks the next publication; the newly
+signed package must have a currently valid, trusted certificate.
+
+Index content follows WinGet's manifest model: root `AppsAndFeaturesEntries`,
+`ProductCode` and `PackageFamilyName` apply only to installers that lack them
+and whose effective type uses them; per-version ARP ranges come from
+exe/inno/msi/nullsoft/wix/burn/msix installers; overlapping ranges across
+versions fail the build; the package row holds the latest version's range; and
+package rows are ordered by `OrdinalIgnoreCase` identifier.
+
 The producer emits Windows Compression API MSZIP framing. Native independent
 validation and core reader regression tests cover sidecars spanning multiple
 32 KiB blocks, including the version-data record after the first block; this

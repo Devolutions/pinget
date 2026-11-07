@@ -265,6 +265,68 @@ public record Installer
     public List<string> Commands { get; init; } = [];
     public List<string> PackageDependencies { get; init; } = [];
     public bool RequireExplicitUpgrade { get; init; }
+    /// <summary>Non-zero installer exit codes the manifest declares as success (<c>InstallerSuccessCodes</c>).</summary>
+    public List<long> InstallerSuccessCodes { get; init; } = [];
+    /// <summary>Manifest <c>ExpectedReturnCodes</c> entries (code + <c>ReturnResponse</c>).</summary>
+    public List<ExpectedReturnCode> ExpectedReturnCodes { get; init; } = [];
+    /// <summary><c>DownloadCommandProhibited</c>: <c>download</c> must refuse this installer.</summary>
+    public bool DownloadCommandProhibited { get; init; }
+    /// <summary><c>Markets.AllowedMarkets</c>: when non-empty, only these markets may use the installer.</summary>
+    public List<string> AllowedMarkets { get; init; } = [];
+    /// <summary><c>Markets.ExcludedMarkets</c> (ignored when <see cref="AllowedMarkets"/> is set, as in WinGet).</summary>
+    public List<string> ExcludedMarkets { get; init; } = [];
+    /// <summary><c>UnsupportedOSArchitectures</c>: OS architectures the installer must not run on.</summary>
+    public List<string> UnsupportedOSArchitectures { get; init; } = [];
+    /// <summary><c>UpgradeBehavior</c> (<c>install</c>, <c>uninstallPrevious</c> or <c>deny</c>).</summary>
+    public string? UpgradeBehavior { get; init; }
+    /// <summary>
+    /// Every dependency kind the installer declares (root <c>Dependencies</c> are inherited only when the
+    /// installer declares none of any kind, as in WinGet).
+    /// </summary>
+    public InstallerDependencies Dependencies { get; init; } = new();
+    /// <summary><c>AppsAndFeaturesEntries</c>: the ARP identities the installer writes.</summary>
+    public List<AppsAndFeaturesEntry> AppsAndFeaturesEntries { get; init; } = [];
+}
+
+/// <summary>The <c>Dependencies</c> an installer declares.</summary>
+public record InstallerDependencies
+{
+    public List<string> WindowsFeatures { get; init; } = [];
+    public List<string> WindowsLibraries { get; init; } = [];
+    public List<PackageDependency> PackageDependencies { get; init; } = [];
+    public List<string> ExternalDependencies { get; init; } = [];
+
+    /// <summary>WinGet <c>DependencyList::HasAny</c> negated: no dependency of any kind.</summary>
+    public bool IsEmpty =>
+        WindowsFeatures.Count == 0 &&
+        WindowsLibraries.Count == 0 &&
+        PackageDependencies.Count == 0 &&
+        ExternalDependencies.Count == 0;
+}
+
+/// <summary>One <c>Dependencies.PackageDependencies</c> entry.</summary>
+public record PackageDependency
+{
+    public required string PackageIdentifier { get; init; }
+    /// <summary><c>MinimumVersion</c>, kept as the manifest's original text.</summary>
+    public string? MinimumVersion { get; init; }
+}
+
+/// <summary>One <c>AppsAndFeaturesEntries</c> entry.</summary>
+public record AppsAndFeaturesEntry
+{
+    public string? DisplayName { get; init; }
+    public string? Publisher { get; init; }
+    public string? DisplayVersion { get; init; }
+    public string? ProductCode { get; init; }
+    public string? UpgradeCode { get; init; }
+    public string? InstallerType { get; init; }
+}
+
+public record ExpectedReturnCode
+{
+    public long InstallerReturnCode { get; init; }
+    public required string ReturnResponse { get; init; }
 }
 
 public record NestedInstallerFile
@@ -285,6 +347,9 @@ public record InstallerSwitches
     public string? Custom { get; init; }
     public string? Log { get; init; }
     public string? InstallLocation { get; init; }
+    /// <summary><c>Upgrade</c>: appended only when the install updates an existing installation.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Upgrade { get; init; }
 
     public InstallerSwitches MergeWith(InstallerSwitches fallback) => new()
     {
@@ -294,6 +359,7 @@ public record InstallerSwitches
         Custom = Custom ?? fallback.Custom,
         Log = Log ?? fallback.Log,
         InstallLocation = InstallLocation ?? fallback.InstallLocation,
+        Upgrade = Upgrade ?? fallback.Upgrade,
     };
 
     public bool IsEmpty() =>
@@ -302,7 +368,8 @@ public record InstallerSwitches
         string.IsNullOrWhiteSpace(Interactive) &&
         string.IsNullOrWhiteSpace(Custom) &&
         string.IsNullOrWhiteSpace(Log) &&
-        string.IsNullOrWhiteSpace(InstallLocation);
+        string.IsNullOrWhiteSpace(InstallLocation) &&
+        string.IsNullOrWhiteSpace(Upgrade);
 }
 
 public enum InstallerMode
@@ -618,7 +685,9 @@ public record SourceUpdateResult
 {
     public required string Name { get; init; }
     public required SourceKind Kind { get; init; }
+    /// <summary>What the update did, or the error message when <see cref="Success"/> is false.</summary>
     public required string Detail { get; init; }
+    public bool Success { get; init; } = true;
 }
 
 public record PinRecord
@@ -638,6 +707,8 @@ public record InstallResult
     public int ExitCode { get; init; }
     public bool Success { get; init; }
     public bool NoOp { get; init; }
+    /// <summary>The installer reported success but needs a restart to finish (WinGet <c>RebootRequired</c>).</summary>
+    public bool RebootRequired { get; init; }
     public List<string> Warnings { get; init; } = [];
 }
 
@@ -879,6 +950,7 @@ internal static class StructuredOutput
         AddString(document, "Custom", switches.Custom);
         AddString(document, "Log", switches.Log);
         AddString(document, "InstallLocation", switches.InstallLocation);
+        AddString(document, "Upgrade", switches.Upgrade);
         return document;
     }
 

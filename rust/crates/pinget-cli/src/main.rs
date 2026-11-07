@@ -3,19 +3,44 @@
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use pinget_core::{
-    CacheWarmResult, Documentation, InstallProgress, InstallRequest, InstallResult, InstallerMode, ListMatch,
-    ListQuery, ListResponse, Manifest, PackageAgreement, PackageQuery, PinRecord, PinType, RepairRequest, Repository,
-    RepositoryOptions, SearchMatch, SearchResponse, ShowResult, SourceKind, SourceRecord, SourceUpdateResult,
-    UninstallRequest, VersionsResult,
+    CacheWarmResult, Documentation, InstallProgress, InstallRequest, InstallResult, Installer, InstallerMode,
+    ListMatch, ListQuery, ListResponse, Manifest, PackageAgreement, PackageQuery, PinRecord, PinType, RepairRequest,
+    Repository, RepositoryOptions, SearchMatch, SearchResponse, ShowResult, SourceKind, SourceRecord,
+    SourceUpdateResult, UninstallRequest, VersionsResult, pin_blocks_upgrade,
 };
 use pinget_publisher::{BuildOptions as PublisherBuildOptions, PublishOptions as PublisherPublishOptions, Signing};
 
+mod error_codes;
+mod file_hash;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const UPGRADE_UNSUPPORTED_WARNING: &str = "Upgrading packages is not supported on this platform; no changes were made.";
+const COUNT_OUT_OF_BOUNDS_ERROR: &str = "The requested number of results must be between 1 and 1000.";
+const NO_APPLICABLE_UPGRADE_MESSAGE: &str = "No applicable upgrade found.";
+
+/// `--count` accepts 1..=1000, as in WinGet.
+fn parse_count(value: &str) -> std::result::Result<usize, String> {
+    match value.trim().parse::<usize>() {
+        Ok(count) if (1..=1000).contains(&count) => Ok(count),
+        _ => Err(COUNT_OUT_OF_BOUNDS_ERROR.to_owned()),
+    }
+}
+
+/// A named `upgrade` that selected nothing is an error (WinGet reports
+/// `APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE`); `upgrade --all` with nothing to do is not.
+fn no_applicable_upgrade(all: bool) -> Result<()> {
+    if all {
+        println!("{NO_APPLICABLE_UPGRADE_MESSAGE}");
+        Ok(())
+    } else {
+        bail!("{NO_APPLICABLE_UPGRADE_MESSAGE}")
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "pinget", about = "Pinget: portable winget in pure Rust", version = VERSION)]
@@ -26,6 +51,53 @@ struct Cli {
     info: bool,
     #[arg(long = "output", short = 'o', global = true, value_parser = ["json", "text", "yaml"])]
     output: Option<String>,
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
+/// Flags WinGet accepts on every command (`Argument::GetCommon`) plus
+/// `--accept-source-agreements`, so scripts written for WinGet parse unchanged.
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct CommonArgs {
+    /// Suppress prompts; package agreements must then be accepted on the command line.
+    #[arg(long = "disable-interactivity", global = true)]
+    disable_interactivity: bool,
+    /// Suppress warning output.
+    #[arg(long = "ignore-warnings", visible_alias = "nowarn", global = true)]
+    ignore_warnings: bool,
+    // The flags below are accepted for compatibility and have no effect in Pinget.
+    #[arg(long = "accept-source-agreements", global = true, hide = true)]
+    #[allow(dead_code)]
+    accept_source_agreements: bool,
+    #[arg(long = "wait", global = true, hide = true)]
+    #[allow(dead_code)]
+    wait: bool,
+    #[arg(long = "verbose-logs", visible_alias = "verbose", global = true, hide = true)]
+    #[allow(dead_code)]
+    verbose_logs: bool,
+    #[arg(long = "no-vt", global = true, hide = true)]
+    #[allow(dead_code)]
+    no_vt: bool,
+    #[arg(long = "no-progress", global = true, hide = true)]
+    #[allow(dead_code)]
+    no_progress: bool,
+}
+
+static IGNORE_WARNINGS: AtomicBool = AtomicBool::new(false);
+static DISABLE_INTERACTIVITY: AtomicBool = AtomicBool::new(false);
+
+fn apply_common_args(common: CommonArgs) {
+    IGNORE_WARNINGS.store(common.ignore_warnings, Ordering::Relaxed);
+    DISABLE_INTERACTIVITY.store(common.disable_interactivity, Ordering::Relaxed);
+}
+
+fn warnings_enabled() -> bool {
+    !IGNORE_WARNINGS.load(Ordering::Relaxed)
+}
+
+/// The agreements prompt needs a terminal on both ends and must not run under `--disable-interactivity`.
+fn agreements_prompt_allowed(disable_interactivity: bool, stdin_is_terminal: bool, stderr_is_terminal: bool) -> bool {
+    !disable_interactivity && stdin_is_terminal && stderr_is_terminal
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,7 +316,7 @@ struct UpgradeArgs {
     os_version: Option<String>,
     #[arg(long = "scope")]
     install_scope: Option<String>,
-    #[arg(long, short = 'n')]
+    #[arg(long, short = 'n', value_parser = parse_count)]
     count: Option<usize>,
     #[arg(long, short = 'e')]
     exact: bool,
@@ -283,14 +355,13 @@ struct ExportArgs {
 
 #[derive(Args)]
 struct ErrorArgs {
+    #[arg(allow_negative_numbers = true)]
     input: String,
 }
 
 #[derive(Args)]
 struct ValidateArgs {
     manifest: String,
-    #[arg(long = "ignore-warnings")]
-    ignore_warnings: bool,
 }
 
 #[derive(Args, Clone)]
@@ -303,6 +374,8 @@ struct DownloadArgs {
     download_directory: Option<String>,
     #[arg(long = "ignore-security-hash")]
     ignore_security_hash: bool,
+    #[arg(long = "accept-package-agreements")]
+    accept_package_agreements: bool,
 }
 
 #[derive(Subcommand)]
@@ -326,7 +399,8 @@ struct SourceAddArgs {
     name_option: Option<String>,
     #[arg(short = 'a', long = "arg")]
     arg_option: Option<String>,
-    #[arg(short = 't', long = "type", default_value = "rest")]
+    /// Source type; WinGet treats an omitted type as `Microsoft.PreIndexed.Package`.
+    #[arg(short = 't', long = "type", default_value = "Microsoft.PreIndexed.Package")]
     kind: String,
     #[arg(long = "trust-level")]
     trust_level: Option<String>,
@@ -560,7 +634,7 @@ struct SearchArgs {
     command: Option<String>,
     #[arg(long, short = 's')]
     source: Option<String>,
-    #[arg(long, short = 'n')]
+    #[arg(long, short = 'n', value_parser = parse_count)]
     count: Option<usize>,
     #[arg(long, short = 'e')]
     exact: bool,
@@ -588,7 +662,7 @@ struct ListArgs {
     command: Option<String>,
     #[arg(long, short = 's')]
     source: Option<String>,
-    #[arg(long, short = 'n')]
+    #[arg(long, short = 'n', value_parser = parse_count)]
     count: Option<usize>,
     #[arg(long, short = 'e')]
     exact: bool,
@@ -623,6 +697,7 @@ fn resolve_output_format(cli: &Cli) -> Result<OutputFormat> {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    apply_common_args(cli.common);
     let output = resolve_output_format(&cli)?;
 
     if cli.info {
@@ -707,8 +782,16 @@ fn run() -> Result<()> {
             }
 
             let mut list_query = ListQuery::from(args.clone());
-            list_query.include_pinned = list_query.include_pinned || has_explicit_upgrade_selector(&args);
-            let result = repository.list(&list_query)?;
+            let explicit_selector = has_explicit_upgrade_selector(&args);
+            list_query.include_pinned = list_query.include_pinned || explicit_selector;
+            // A named upgrade checks pins below against the requested target
+            // version and reports a pinned package; the list itself only hides
+            // pinned rows for implicit upgrades.
+            let result = if explicit_selector {
+                repository.list_ignoring_pins(&list_query)?
+            } else {
+                repository.list(&list_query)?
+            };
             let mode = if args.silent {
                 InstallerMode::Silent
             } else {
@@ -724,7 +807,7 @@ fn run() -> Result<()> {
             } else {
                 let upgradeable = select_upgrade_targets(&result.matches, &args)?;
                 if upgradeable.is_empty() {
-                    println!("No applicable upgrade found.");
+                    no_applicable_upgrade(args.all)?;
                 } else {
                     let pins = repository.list_pins(None)?;
                     let mut success_count = 0usize;
@@ -736,13 +819,15 @@ fn run() -> Result<()> {
                             m.installed_version,
                             m.available_version.as_deref().unwrap_or("?")
                         );
-                        if let Some(pin) = find_matching_pin(m, &pins)
-                            && pin.pin_type == PinType::Blocking
-                        {
-                            println!(
-                                "  Package is blocked by pin {}; remove the pin before upgrading.",
-                                pin.version
-                            );
+                        let target_version = args.version.as_deref().or(m.available_version.as_deref());
+                        if let Some(message) = find_matching_pin(m, &pins).and_then(|pin| {
+                            upgrade_pin_block_message(
+                                pin,
+                                target_version.unwrap_or_default(),
+                                list_query.include_pinned,
+                            )
+                        }) {
+                            println!("  {message}");
                             failure_count += 1;
                             continue;
                         }
@@ -814,7 +899,7 @@ fn run() -> Result<()> {
             match command {
                 SourceCommands::List => print_sources(repository.list_sources()),
                 SourceCommands::Update { source } => {
-                    print_source_updates(repository.update_sources(source.as_deref())?)
+                    print_source_updates(repository.update_sources(source.as_deref())?)?
                 }
                 SourceCommands::Export => print_source_export(&repository)?,
                 SourceCommands::Add(args) => {
@@ -876,7 +961,7 @@ fn run() -> Result<()> {
             do_export(&mut repository, &args)?;
         }
         Commands::ErrorLookup(args) => {
-            print_error_lookup(&args.input);
+            print_error_lookup(&args.input)?;
         }
         Commands::Settings {
             command,
@@ -934,13 +1019,15 @@ fn run() -> Result<()> {
             print_features();
         }
         Commands::Validate(args) => {
-            print_validate(&args.manifest, args.ignore_warnings)?;
+            print_validate(&args.manifest, !warnings_enabled())?;
         }
         Commands::Download(args) => {
-            let mut repository = Repository::open()?;
+            // Download shows the package agreements prompt like install (WinGet DownloadCommand).
+            let mut repository = open_repository_with_install_progress()?;
             let mut request = InstallRequest::new(args.query.into());
             request.manifest_path = args.manifest;
             request.ignore_security_hash = args.ignore_security_hash;
+            request.accept_package_agreements = args.accept_package_agreements;
             do_download(&mut repository, &request, args.download_directory.as_deref())?;
         }
         Commands::Pin { command } => {
@@ -979,7 +1066,9 @@ fn run() -> Result<()> {
                         )
                     } else {
                         let target = resolve_single_available_pin_target(&mut repository, &query)?;
-                        (target.id, target.source_name, target.version)
+                        let installed_version =
+                            installed_version_for_pin(&mut repository, &target.id, &target.source_name);
+                        (target.id, target.source_name, installed_version)
                     };
 
                     let existing = repository.list_pins(Some(source_id.as_str()))?;
@@ -991,19 +1080,8 @@ fn run() -> Result<()> {
                         bail!("A pin for the selected package already exists. Rerun with --force to replace it.");
                     }
 
-                    let pin_type = if args.blocking {
-                        PinType::Blocking
-                    } else {
-                        PinType::Pinning
-                    };
-                    let pin_version =
-                        if let Some(version) = args.version.as_deref().filter(|value| !value.trim().is_empty()) {
-                            version.to_owned()
-                        } else if args.blocking {
-                            "*".to_owned()
-                        } else {
-                            resolved_version.unwrap_or_else(|| "*".to_owned())
-                        };
+                    let pin_type = pin_type_for_add(args.blocking, args.version.as_deref());
+                    let pin_version = pin_version_for_add(args.version.as_deref(), args.blocking, resolved_version);
 
                     repository.add_pin(&package_id, &pin_version, &source_id, pin_type)?;
                     println!("Pin added for {package_id}");
@@ -1439,9 +1517,32 @@ fn print_sources(sources: Vec<SourceRecord>) {
     }
 }
 
-fn print_source_updates(results: Vec<SourceUpdateResult>) {
-    for result in results {
-        println!("{} [{}]: {}", result.name, result.kind, result.detail);
+fn print_source_updates(results: Vec<SourceUpdateResult>) -> Result<()> {
+    for result in &results {
+        println!("{}", format_source_update(result));
+    }
+    source_update_outcome(&results)
+}
+
+fn format_source_update(result: &SourceUpdateResult) -> String {
+    if result.success {
+        format!("{} [{}]: {}", result.name, result.kind, result.detail)
+    } else {
+        format!("{} [{}]: failed: {}", result.name, result.kind, result.detail)
+    }
+}
+
+/// Every source is attempted and reported, but the command still fails when any did.
+fn source_update_outcome(results: &[SourceUpdateResult]) -> Result<()> {
+    let failed: Vec<_> = results
+        .iter()
+        .filter(|result| !result.success)
+        .map(|result| result.name.as_str())
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        bail!("{} source(s) failed to update: {}", failed.len(), failed.join(", "))
     }
 }
 
@@ -1687,11 +1788,39 @@ fn print_show(result: ShowResult) {
         if !installer.commands.is_empty() {
             print_indented_field("Commands", &installer.commands.join(", "));
         }
-        if !installer.package_dependencies.is_empty() {
-            print_indented_field("Dependencies", &installer.package_dependencies.join(", "));
-        }
+        print_installer_dependencies(installer);
     } else if !result.manifest.installers.is_empty() {
         println!("  No applicable installer found; see logs for more details.");
+    }
+}
+
+/// Prints the selected installer's dependencies: package dependencies (with WinGet's
+/// `[>= MinimumVersion]` suffix), then the Windows feature, Windows library and external ones.
+fn print_installer_dependencies(installer: &Installer) {
+    let dependencies = &installer.dependencies;
+    let packages = if dependencies.package_dependencies.is_empty() {
+        installer.package_dependencies.clone()
+    } else {
+        dependencies
+            .package_dependencies
+            .iter()
+            .map(|dependency| match dependency.minimum_version.as_deref() {
+                Some(minimum) => format!("{} [>= {minimum}]", dependency.package_identifier),
+                None => dependency.package_identifier.clone(),
+            })
+            .collect()
+    };
+    if !packages.is_empty() {
+        print_indented_field("Dependencies", &packages.join(", "));
+    }
+    if !dependencies.windows_features.is_empty() {
+        print_indented_field("Windows Features", &dependencies.windows_features.join(", "));
+    }
+    if !dependencies.windows_libraries.is_empty() {
+        print_indented_field("Windows Libraries", &dependencies.windows_libraries.join(", "));
+    }
+    if !dependencies.external_dependencies.is_empty() {
+        print_indented_field("External Dependencies", &dependencies.external_dependencies.join(", "));
     }
 }
 
@@ -1709,13 +1838,24 @@ fn print_cache_warm(result: CacheWarmResult) {
 
 fn print_warnings(warnings: &[String]) {
     for warning in warnings {
-        write_stderr_line(format_args!("warning: {warning}"));
+        print_warning(format_args!("{warning}"));
+    }
+}
+
+/// Writes a `warning:` line to stderr unless `--ignore-warnings` was given.
+fn print_warning(message: fmt::Arguments<'_>) {
+    if warnings_enabled() {
+        write_stderr_line(format_args!("warning: {message}"));
     }
 }
 
 fn open_repository_with_install_progress() -> Result<Repository> {
     let mut options = RepositoryOptions::for_current_user()?.with_install_progress(print_install_progress);
-    if io::stdin().is_terminal() && io::stderr().is_terminal() {
+    if agreements_prompt_allowed(
+        DISABLE_INTERACTIVITY.load(Ordering::Relaxed),
+        io::stdin().is_terminal(),
+        io::stderr().is_terminal(),
+    ) {
         options = options.with_package_agreements_prompt(prompt_package_agreements);
     }
     Repository::open_with_options(options)
@@ -1938,14 +2078,12 @@ fn get_os_version() -> String {
     }
 }
 
-fn print_hash(file_path: &str, _msix: bool) -> Result<()> {
-    use std::fs;
-
-    use sha2::{Digest, Sha256};
-    let data = fs::read(file_path).map_err(|e| anyhow::anyhow!("failed to read file '{}': {}", file_path, e))?;
-    let hash = Sha256::digest(&data);
-    let hex = hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    println!("SHA256: {hex}");
+fn print_hash(file_path: &str, msix: bool) -> Result<()> {
+    let path = Path::new(file_path);
+    println!("SHA256: {}", file_hash::sha256_file_hex(path)?);
+    if msix {
+        println!("SignatureSha256: {}", file_hash::msix_signature_sha256_hex(path)?);
+    }
     Ok(())
 }
 
@@ -2041,25 +2179,12 @@ fn build_export_payload(
     (export, package_count)
 }
 
-fn print_error_lookup(input: &str) {
-    let code = if input.starts_with("0x") || input.starts_with("0X") {
-        u32::from_str_radix(&input[2..], 16).ok()
-    } else {
-        input
-            .parse::<u32>()
-            .ok()
-            .or_else(|| input.parse::<i32>().ok().and_then(|value| u32::try_from(value).ok()))
+fn print_error_lookup(input: &str) -> Result<()> {
+    let Some(code) = error_codes::parse_error_code(input) else {
+        bail!("Could not parse '{input}' as an error code");
     };
 
-    let code = match code {
-        Some(c) => c,
-        None => {
-            println!("Could not parse input '{input}' as an error code.");
-            return;
-        }
-    };
-
-    if let Some((symbol, description)) = lookup_hresult(code) {
+    if let Some((symbol, description)) = error_codes::lookup_hresult(code) {
         // Upstream only shows the symbol for APPINSTALLER codes (0x8A15xxxx)
         if code & 0xFFFF0000 == 0x8A150000 {
             println!("0x{code:08x} : {symbol}");
@@ -2071,118 +2196,7 @@ fn print_error_lookup(input: &str) {
         println!("0x{code:08x}");
         println!("Unknown error code");
     }
-}
-
-fn lookup_hresult(code: u32) -> Option<(&'static str, &'static str)> {
-    match code {
-        0x00000000 => Some(("S_OK", "Operation successful")),
-        0x80004001 => Some(("E_NOTIMPL", "Not implemented")),
-        0x80004002 => Some(("E_NOINTERFACE", "No such interface supported")),
-        0x80004003 => Some(("E_POINTER", "Invalid pointer")),
-        0x80004004 => Some(("E_ABORT", "Operation aborted")),
-        0x80004005 => Some(("E_FAIL", "Unspecified error")),
-        0x80070002 => Some(("E_FILENOTFOUND", "The system cannot find the file specified")),
-        0x80070005 => Some(("E_ACCESSDENIED", "General access denied error")),
-        0x80070057 => Some(("E_INVALIDARG", "One or more arguments are invalid")),
-        0x8007000E => Some(("E_OUTOFMEMORY", "Ran out of memory")),
-        // winget-specific HRESULT codes
-        0x8A150001 => Some(("APPINSTALLER_CLI_ERROR_INTERNAL_ERROR", "Internal error")),
-        0x8A150002 => Some((
-            "APPINSTALLER_CLI_ERROR_INVALID_CL_ARGUMENTS",
-            "Invalid command line arguments",
-        )),
-        0x8A150003 => Some(("APPINSTALLER_CLI_ERROR_COMMAND_FAILED", "Command failed")),
-        0x8A150004 => Some(("APPINSTALLER_CLI_ERROR_MANIFEST_FAILED", "Opening manifest failed")),
-        0x8A150005 => Some((
-            "APPINSTALLER_CLI_ERROR_BLOCKED_BY_POLICY",
-            "Operation is blocked by policy",
-        )),
-        0x8A150006 => Some((
-            "APPINSTALLER_CLI_ERROR_SHELLEXEC_INSTALL_FAILED",
-            "ShellExecute install failed",
-        )),
-        0x8A150007 => Some((
-            "APPINSTALLER_CLI_ERROR_UNSUPPORTED_MANIFESTVERSION",
-            "Unsupported manifest version",
-        )),
-        0x8A150008 => Some(("APPINSTALLER_CLI_ERROR_DOWNLOAD_FAILED", "Download of installer failed")),
-        0x8A150009 => Some((
-            "APPINSTALLER_CLI_ERROR_CANNOT_WRITE_TO_UPLEVEL_INDEX",
-            "Cannot write to the package index",
-        )),
-        0x8A15000A => Some((
-            "APPINSTALLER_CLI_ERROR_INDEX_INTEGRITY_COMPROMISED",
-            "Index integrity compromised",
-        )),
-        0x8A15000B => Some(("APPINSTALLER_CLI_ERROR_SOURCES_INVALID", "Sources are invalid")),
-        0x8A15000C => Some((
-            "APPINSTALLER_CLI_ERROR_SOURCE_NAME_ALREADY_EXISTS",
-            "Source name already exists",
-        )),
-        0x8A15000D => Some(("APPINSTALLER_CLI_ERROR_INVALID_SOURCE_TYPE", "Invalid source type")),
-        0x8A15000E => Some(("APPINSTALLER_CLI_ERROR_PACKAGE_IS_BUNDLE", "Package is a bundle")),
-        0x8A15000F => Some(("APPINSTALLER_CLI_ERROR_SOURCE_DATA_MISSING", "Source data is missing")),
-        0x8A150010 => Some((
-            "APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER",
-            "None of the installers are applicable for the current system",
-        )),
-        0x8A150011 => Some((
-            "APPINSTALLER_CLI_ERROR_INSTALLER_HASH_MISMATCH",
-            "Installer hash does not match",
-        )),
-        0x8A150012 => Some((
-            "APPINSTALLER_CLI_ERROR_SOURCE_NAME_DOES_NOT_EXIST",
-            "Source name does not exist",
-        )),
-        0x8A150013 => Some((
-            "APPINSTALLER_CLI_ERROR_SOURCE_ARG_ALREADY_EXISTS",
-            "Source argument already exists",
-        )),
-        0x8A150014 => Some(("APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND", "No applications found")),
-        0x8A150015 => Some(("APPINSTALLER_CLI_ERROR_NO_SOURCES_DEFINED", "No sources defined")),
-        0x8A150016 => Some((
-            "APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND",
-            "Multiple applications found",
-        )),
-        0x8A150017 => Some((
-            "APPINSTALLER_CLI_ERROR_NO_MANIFEST_FOUND",
-            "No manifest found matching input criteria",
-        )),
-        0x8A150019 => Some(("APPINSTALLER_CLI_ERROR_NO_RANGES_PROCESSED", "No ranges processed")),
-        0x8A15001A => Some((
-            "APPINSTALLER_CLI_ERROR_EXPERIMENTAL_FEATURE_DISABLED",
-            "This feature is disabled by Group Policy",
-        )),
-        0x8A15001B => Some((
-            "APPINSTALLER_CLI_ERROR_MSSTORE_BLOCKED_BY_POLICY",
-            "This feature is blocked by Group Policy",
-        )),
-        0x8A15001C => Some((
-            "APPINSTALLER_CLI_ERROR_MSSTORE_APP_BLOCKED_BY_POLICY",
-            "This Microsoft Store app is blocked by Group Policy",
-        )),
-        0x8A150022 => Some((
-            "APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE",
-            "Upgrade version is not newer than installed version",
-        )),
-        0x8A150023 => Some((
-            "APPINSTALLER_CLI_ERROR_UPDATE_ALL_HAS_FAILURE",
-            "At least one package had a failure during upgrade --all",
-        )),
-        0x8A150024 => Some((
-            "APPINSTALLER_CLI_ERROR_INSTALLER_SECURITY_CHECK_FAILED",
-            "Installer failed security check",
-        )),
-        0x8A15002B => Some((
-            "APPINSTALLER_CLI_ERROR_PACKAGE_ALREADY_INSTALLED",
-            "The package is already installed",
-        )),
-        0x8A150038 => Some((
-            "APPINSTALLER_CLI_ERROR_PINNED_CERTIFICATE_MISMATCH",
-            "Certificate pinning mismatch",
-        )),
-        _ => None,
-    }
+    Ok(())
 }
 
 fn print_features() {
@@ -2254,8 +2268,16 @@ fn print_source_export(repository: &Repository) -> Result<()> {
 }
 
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    for line in render_table(headers, rows, get_console_width()) {
+        println!("{line}");
+    }
+}
+
+/// Lays out a table like WinGet's `TableOutput`: columns only shrink when stdout is a console
+/// (`console_width` is `Some`); redirected or piped output keeps every value intact.
+fn render_table(headers: &[&str], rows: &[Vec<String>], console_width: Option<usize>) -> Vec<String> {
     if headers.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let mut widths = headers.iter().map(|header| display_width(header)).collect::<Vec<_>>();
@@ -2289,8 +2311,9 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     }
 
     let mut total_required = table_total_width(&widths, &space_after);
-    let console_width = get_console_width();
-    if total_required >= console_width {
+    if let Some(console_width) = console_width
+        && total_required >= console_width
+    {
         let mut extra = (total_required - console_width) + 1;
         while extra > 0 {
             let mut target_index = 0;
@@ -2312,14 +2335,16 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     }
 
     let header_row = headers.iter().map(|header| header.to_string()).collect::<Vec<_>>();
-    print_table_line(&header_row, &widths, &space_after);
-    println!("{}", "-".repeat(total_required));
+    let mut lines = Vec::with_capacity(rows.len() + 2);
+    lines.push(format_table_line(&header_row, &widths, &space_after));
+    lines.push("-".repeat(total_required));
     for row in rows {
-        print_table_line(row, &widths, &space_after);
+        lines.push(format_table_line(row, &widths, &space_after));
     }
+    lines
 }
 
-fn print_table_line(values: &[String], widths: &[usize], space_after: &[bool]) {
+fn format_table_line(values: &[String], widths: &[usize], space_after: &[bool]) -> String {
     let mut line = String::new();
 
     for (index, value) in values.iter().enumerate() {
@@ -2342,7 +2367,7 @@ fn print_table_line(values: &[String], widths: &[usize], space_after: &[bool]) {
         }
     }
 
-    println!("{line}");
+    line
 }
 
 fn table_total_width(widths: &[usize], space_after: &[bool]) -> usize {
@@ -2353,7 +2378,7 @@ fn table_total_width(widths: &[usize], space_after: &[bool]) -> usize {
         .sum()
 }
 
-fn get_console_width() -> usize {
+fn get_console_width() -> Option<usize> {
     get_console_width_impl()
 }
 
@@ -2361,41 +2386,15 @@ fn display_width(value: &str) -> usize {
     value.chars().count()
 }
 
+/// Width of the console attached to stdout, as WinGet's `GetConsoleWidth` reads it: only the
+/// STD_OUTPUT handle counts, so redirected or piped output reports no width.
 #[cfg(windows)]
-fn get_console_width_impl() -> usize {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+fn get_console_width_impl() -> Option<usize> {
     use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
 
     // SAFETY: `GetStdHandle` is a leaf Win32 call that does not require Rust-side invariants.
     let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    if let Some(width) = try_console_width(stdout_handle) {
-        return width;
-    }
-
-    let mut conout = "CONOUT$\0".encode_utf16().collect::<Vec<_>>();
-    // SAFETY: the encoded `CONOUT$` buffer is NUL-terminated and all pointer arguments follow the Win32 contract.
-    let console_handle = unsafe {
-        CreateFileW(
-            conout.as_mut_ptr(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    if console_handle.is_null() || console_handle == INVALID_HANDLE_VALUE {
-        return 119;
-    }
-
-    let width = try_console_width(console_handle).unwrap_or(119);
-    // SAFETY: `console_handle` was returned by `CreateFileW` above and is closed exactly once here.
-    unsafe {
-        CloseHandle(console_handle);
-    }
-    width
+    try_console_width(stdout_handle)
 }
 
 #[cfg(windows)]
@@ -2416,15 +2415,12 @@ fn try_console_width(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u
         return None;
     }
 
-    usize::try_from(info.dwSize.X)
-        .ok()
-        .and_then(|width| width.checked_sub(2))
-        .filter(|width| *width > 0)
+    usize::try_from(info.dwSize.X).ok().filter(|width| *width > 0)
 }
 
 #[cfg(not(windows))]
-fn get_console_width_impl() -> usize {
-    120
+fn get_console_width_impl() -> Option<usize> {
+    io::stdout().is_terminal().then_some(120)
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -2438,8 +2434,48 @@ fn truncate(value: &str, width: usize) -> String {
 }
 
 fn print_validate(manifest_path: &str, ignore_warnings: bool) -> Result<()> {
-    use std::path::Path;
+    let report = validate_manifest_path(manifest_path)?;
+    let all_warnings = report.warnings;
+    let all_errors = report.errors;
 
+    if !all_warnings.is_empty() && !ignore_warnings {
+        println!("Manifest validation warning.");
+        for w in &all_warnings {
+            println!("{w}");
+        }
+    }
+
+    if !all_errors.is_empty() {
+        println!("Manifest validation failed.");
+        for e in &all_errors {
+            println!("{e}");
+        }
+        std::process::exit(1);
+    }
+
+    if all_warnings.is_empty() || ignore_warnings {
+        println!("Manifest validation succeeded.");
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ManifestValidationReport {
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// Parses a manifest file the way WinGet reads it: string-typed fields keep their original
+/// scalar text (`PackageVersion: 1.10` stays "1.10", not the number 1.1).
+fn parse_manifest_for_validation(content: &[u8]) -> Result<serde_json::Value> {
+    let content = content.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(content);
+    let content = std::str::from_utf8(content)?;
+    let value = pinget_publisher::parse_manifest_yaml(content)?;
+    Ok(serde_json::to_value(value)?)
+}
+
+fn validate_manifest_path(manifest_path: &str) -> Result<ManifestValidationReport> {
     let path = Path::new(manifest_path);
     if !path.exists() {
         bail!("Path does not exist: {manifest_path}");
@@ -2466,8 +2502,8 @@ fn print_validate(manifest_path: &str, ignore_warnings: bool) -> Result<()> {
     let schema_base = find_schema_dir();
 
     for file in &files {
-        let content = std::fs::read_to_string(file)?;
-        let yaml_value: serde_json::Value = serde_yaml::from_str(&content)
+        let content = std::fs::read(file)?;
+        let yaml_value = parse_manifest_for_validation(&content)
             .map_err(|e| anyhow::anyhow!("YAML parse error in {}: {e}", file.display()))?;
 
         let manifest_type = yaml_value
@@ -2534,26 +2570,10 @@ fn print_validate(manifest_path: &str, ignore_warnings: bool) -> Result<()> {
         }
     }
 
-    if !all_warnings.is_empty() && !ignore_warnings {
-        println!("Manifest validation warning.");
-        for w in &all_warnings {
-            println!("{w}");
-        }
-    }
-
-    if !all_errors.is_empty() {
-        println!("Manifest validation failed.");
-        for e in &all_errors {
-            println!("{e}");
-        }
-        std::process::exit(1);
-    }
-
-    if all_warnings.is_empty() || ignore_warnings {
-        println!("Manifest validation succeeded.");
-    }
-
-    Ok(())
+    Ok(ManifestValidationReport {
+        errors: all_errors,
+        warnings: all_warnings,
+    })
 }
 
 fn find_schema_dir() -> Option<PathBuf> {
@@ -2744,6 +2764,71 @@ fn resolve_single_installed_pin_target(repository: &mut Repository, query: &Pack
     }
 }
 
+/// WinGet pin kinds for `pin add`: `--blocking` blocks every upgrade, `--version`
+/// gates upgrades to a version range, and a plain pin blocks implicit upgrades.
+fn pin_type_for_add(blocking: bool, version: Option<&str>) -> PinType {
+    if blocking {
+        PinType::Blocking
+    } else if version.is_some_and(|value| !value.trim().is_empty()) {
+        PinType::Gating
+    } else {
+        PinType::Pinning
+    }
+}
+
+/// The version stored with a new pin: the requested gate, `*` for blocking pins,
+/// otherwise the installed version when it is known.
+fn pin_version_for_add(requested: Option<&str>, blocking: bool, installed_version: Option<String>) -> String {
+    if let Some(version) = requested.filter(|value| !value.trim().is_empty()) {
+        version.to_owned()
+    } else if blocking {
+        "*".to_owned()
+    } else {
+        installed_version
+            .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("Unknown"))
+            .unwrap_or_else(|| "*".to_owned())
+    }
+}
+
+/// Installed version of `package_id` (best effort) so `pin add` can record it.
+fn installed_version_for_pin(repository: &mut Repository, package_id: &str, source_name: &str) -> Option<String> {
+    let result = repository
+        .list(&ListQuery {
+            id: Some(package_id.to_owned()),
+            source: Some(source_name.to_owned()).filter(|value| !value.is_empty()),
+            exact: true,
+            count: Some(200),
+            ..ListQuery::default()
+        })
+        .ok()?;
+    result
+        .matches
+        .into_iter()
+        .find(|item| item.id.eq_ignore_ascii_case(package_id))
+        .map(|item| item.installed_version)
+}
+
+/// Message explaining why a pin stops this upgrade, or `None` when it may proceed.
+fn upgrade_pin_block_message(pin: &PinRecord, target_version: &str, include_pinned: bool) -> Option<String> {
+    if !pin_blocks_upgrade(pin, target_version, include_pinned) {
+        return None;
+    }
+    Some(match pin.pin_type {
+        PinType::Blocking => format!(
+            "Package is blocked by pin {}; remove the pin before upgrading.",
+            pin.version
+        ),
+        PinType::Gating => format!(
+            "Version {target_version} is outside the pinned version range {}; remove or update the pin before upgrading.",
+            pin.version
+        ),
+        PinType::Pinning => format!(
+            "Package is pinned at {}; use --include-pinned or remove the pin before upgrading.",
+            pin.version
+        ),
+    })
+}
+
 fn filter_pins(repository: &mut Repository, query: &PackageQuery) -> Result<Vec<PinRecord>> {
     let mut pins = repository.list_pins(query.source.as_deref())?;
     if let Some(id) = query.id.as_deref() {
@@ -2760,22 +2845,30 @@ fn filter_pins(repository: &mut Repository, query: &PackageQuery) -> Result<Vec<
     }
 
     let result = repository.search(query)?;
-    let keys = result
-        .matches
+    Ok(retain_pins_for_matches(pins, &result.matches))
+}
+
+/// Keeps the pins that belong to one of `matches`: same package id and source
+/// (both compared case-insensitively), or a source-less pin for the same id.
+fn retain_pins_for_matches(mut pins: Vec<PinRecord>, matches: &[SearchMatch]) -> Vec<PinRecord> {
+    let keys = matches
         .iter()
-        .map(|item| format!("{}|{}", item.id, item.source_name))
+        .map(|item| pin_match_key(&item.id, &item.source_name))
         .collect::<std::collections::HashSet<_>>();
-    let ids = result
-        .matches
+    let ids = matches
         .iter()
-        .map(|item| item.id.to_ascii_lowercase())
+        .map(|item| item.id.to_lowercase())
         .collect::<std::collections::HashSet<_>>();
 
     pins.retain(|pin| {
-        keys.contains(&format!("{}|{}", pin.package_id, pin.source_id))
-            || (pin.source_id.is_empty() && ids.contains(&pin.package_id.to_ascii_lowercase()))
+        keys.contains(&pin_match_key(&pin.package_id, &pin.source_id))
+            || (pin.source_id.is_empty() && ids.contains(&pin.package_id.to_lowercase()))
     });
-    Ok(pins)
+    pins
+}
+
+fn pin_match_key(package_id: &str, source: &str) -> String {
+    format!("{}|{}", package_id.to_lowercase(), source.to_lowercase())
 }
 
 fn find_matching_pin<'a>(item: &ListMatch, pins: &'a [PinRecord]) -> Option<&'a PinRecord> {
@@ -2906,7 +2999,7 @@ fn do_import<R: ImportRepository>(
     no_upgrade: bool,
     accept_package_agreements: bool,
 ) -> Result<()> {
-    let content = std::fs::read_to_string(file_path)?;
+    let content = decode_import_file(&std::fs::read(file_path)?)?;
     do_import_from_content(
         repository,
         &content,
@@ -2916,6 +3009,30 @@ fn do_import<R: ImportRepository>(
         no_upgrade,
         accept_package_agreements,
     )
+}
+
+/// Decodes an import file the way WinGet and .NET `File.ReadAllText` do: a UTF-8 BOM is skipped,
+/// and a UTF-16 LE/BE BOM selects UTF-16 (what Windows PowerShell 5.1 `Out-File` writes).
+fn decode_import_file(bytes: &[u8]) -> Result<String> {
+    fn decode_utf16(payload: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String> {
+        let (pairs, remainder) = payload.as_chunks::<2>();
+        if !remainder.is_empty() {
+            bail!("Invalid import file: truncated UTF-16 content");
+        }
+        let units = pairs.iter().map(|pair| unit(*pair)).collect::<Vec<_>>();
+        String::from_utf16(&units).map_err(|_| anyhow!("Invalid import file: malformed UTF-16 content"))
+    }
+
+    if let Some(rest) = bytes.strip_prefix(b"\xEF\xBB\xBF") {
+        return Ok(std::str::from_utf8(rest)?.to_owned());
+    }
+    if let Some(rest) = bytes.strip_prefix(b"\xFF\xFE") {
+        return decode_utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(b"\xFE\xFF") {
+        return decode_utf16(rest, u16::from_be_bytes);
+    }
+    Ok(std::str::from_utf8(bytes)?.to_owned())
 }
 
 fn do_import_from_content<R: ImportRepository>(
@@ -3007,7 +3124,7 @@ fn do_import_from_content<R: ImportRepository>(
                             }
                             Err(e) if ignore_unavailable && can_ignore_unavailable_import_failure(&e) => {
                                 println!("    UNAVAILABLE");
-                                write_stderr_line(format_args!("warning: Skipping unavailable package '{id}': {e}"));
+                                print_warning(format_args!("Skipping unavailable package '{id}': {e}"));
                                 skipped += 1;
                             }
                             Err(e) => {
@@ -3033,7 +3150,7 @@ fn do_import_from_content<R: ImportRepository>(
                 Err(e) if ignore_unavailable && can_ignore_unavailable_import_failure(&e) => {
                     failures.record_error(true);
                     println!("  [ignored unavailable] {id} ({source_name})");
-                    write_stderr_line(format_args!("warning: Skipping unavailable package '{id}': {e}"));
+                    print_warning(format_args!("Skipping unavailable package '{id}': {e}"));
                     skipped += 1;
                 }
                 Err(e) => {
@@ -3112,6 +3229,19 @@ fn can_ignore_unavailable_import_failure(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("no package matched") || message.contains("no applicable installer found")
 }
+
+#[cfg(test)]
+mod wave10_cli_tests;
+#[cfg(test)]
+mod wave11_cli_tests;
+#[cfg(test)]
+mod wave2_cli_tests;
+#[cfg(test)]
+mod wave3_cli_tests;
+#[cfg(test)]
+mod wave5_cli_tests;
+#[cfg(test)]
+mod wave8_cli_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3426,6 +3556,7 @@ mod tests {
                 exit_code: if success { 0 } else { 1 },
                 success,
                 no_op,
+                reboot_required: false,
                 warnings: Vec::new(),
             })
         }

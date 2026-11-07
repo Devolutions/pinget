@@ -273,16 +273,37 @@ internal static class PreIndexedSource
     {
         int limit = MaxResults(query, semantics);
         var (whereClause, parameters) = BuildV1Where(query, semantics);
-
-        var sql = $@"SELECT manifest.rowid, manifest.id, versions.version, channels.channel,
-                            ids.id, names.name, monikers.moniker
-                     FROM manifest
+        const string joins = @"FROM manifest
                      JOIN ids ON manifest.id = ids.rowid
                      JOIN names ON manifest.name = names.rowid
                      LEFT JOIN monikers ON manifest.moniker = monikers.rowid
                      JOIN versions ON manifest.version = versions.rowid
-                     JOIN channels ON manifest.channel = channels.rowid
-                     WHERE {whereClause} LIMIT {limit + 1}";
+                     JOIN channels ON manifest.channel = channels.rowid";
+
+        // The V1 manifest table has one row per version, so the result limit must apply to
+        // distinct packages: limiting manifest rows let a few many-versioned packages crowd
+        // out the rest and under-reported truncation.
+        var packageRowIds = new List<long>();
+        using (var idsCmd = conn.CreateCommand())
+        {
+            idsCmd.CommandText = $"SELECT DISTINCT manifest.id {joins} WHERE {whereClause} LIMIT {limit + 1}";
+            for (int i = 0; i < parameters.Count; i++)
+                idsCmd.Parameters.AddWithValue($"@p{i + 1}", parameters[i]);
+            using var idsReader = idsCmd.ExecuteReader();
+            while (idsReader.Read())
+                packageRowIds.Add(idsReader.GetInt64(0));
+        }
+
+        bool truncated = packageRowIds.Count > limit;
+        if (truncated)
+            packageRowIds.RemoveRange(limit, packageRowIds.Count - limit);
+        if (packageRowIds.Count == 0)
+            return ([], truncated);
+
+        var sql = $@"SELECT manifest.rowid, manifest.id, versions.version, channels.channel,
+                            ids.id, names.name, monikers.moniker
+                     {joins}
+                     WHERE ({whereClause}) AND manifest.id IN ({string.Join(", ", packageRowIds)})";
 
         using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
@@ -306,7 +327,6 @@ internal static class PreIndexedSource
                 Id = idVal,
                 Name = nameVal,
                 Moniker = monikerVal,
-                MatchCriteria = DetermineMatchCriteriaV1(conn, query, idVal, nameVal, monikerVal, manifestRowId, semantics)
             });
         }
 
@@ -320,10 +340,13 @@ internal static class PreIndexedSource
                 grouped[row.PackageRowId] = row;
             }
         }
-        var rows = grouped.Values.ToList();
-
-        bool truncated = rows.Count > limit;
-        if (truncated) rows.RemoveAt(rows.Count - 1);
+        // Match criteria only for the row kept per package (one lookup per package, not per version).
+        var rows = grouped.Values
+            .Select(row => row with
+            {
+                MatchCriteria = DetermineMatchCriteriaV1(conn, query, row.Id, row.Name, row.Moniker, row.ManifestRowId, semantics),
+            })
+            .ToList();
         return (rows, truncated);
     }
 
@@ -548,9 +571,13 @@ internal static class PreIndexedSource
     public static byte[] GetCachedSourceFile(
         HttpClient client, string bucket, SourceRecord source, string relativePath, string? expectedHash, string? appRoot)
     {
-        var normalizedRelative = relativePath.Replace('\\', '/');
+        var segments = ValidatedSourceRelativeSegments(relativePath);
+        var normalizedRelative = string.Join('/', segments);
         var cacheDir = TempCachePath(appRoot, bucket, source.Identifier);
-        var cachePath = Path.Combine(cacheDir, normalizedRelative.Replace('/', '\\'));
+        var cachePath = Path.Combine([cacheDir, .. segments]);
+        var cacheRoot = Path.GetFullPath(cacheDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!Path.GetFullPath(cachePath).StartsWith(cacheRoot, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Source file path '{relativePath}' escapes the source cache.");
 
         // Check cache first
         if (File.Exists(cachePath))
@@ -561,7 +588,7 @@ internal static class PreIndexedSource
         }
 
         // Download from CDN
-        var url = $"{source.Arg.TrimEnd('/')}/{normalizedRelative.TrimStart('/')}";
+        var url = $"{source.Arg.TrimEnd('/')}/{normalizedRelative}";
         using var response = client.GetAsync(url).GetAwaiter().GetResult();
         response.EnsureSuccessStatusCode();
         var bytes = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
@@ -575,6 +602,33 @@ internal static class PreIndexedSource
 
         return bytes;
     }
+
+    /// <summary>
+    /// Splits a relative path taken from a source index (V1 pathparts, V2 <c>rP</c>, or a
+    /// <c>packages/&lt;id&gt;/...</c> path built from an index id) into segments that are safe
+    /// to join under the source file cache. The index is source data, so a path that is
+    /// rooted, drive- or UNC-qualified, or walks up with <c>..</c> is rejected rather than
+    /// allowed to write outside the cache.
+    /// </summary>
+    internal static string[] ValidatedSourceRelativeSegments(string relativePath)
+    {
+        var normalized = relativePath.Replace('\\', '/');
+        if (normalized.Length == 0 || normalized.StartsWith('/'))
+            throw UnsafeSourcePath(relativePath);
+
+        var segments = normalized.Split('/');
+        foreach (var segment in segments)
+        {
+            var dotsOrSpacesOnly = segment.TrimEnd('.', ' ').Length == 0;
+            if (dotsOrSpacesOnly || segment.Contains(':') || segment.Contains('\0'))
+                throw UnsafeSourcePath(relativePath);
+        }
+
+        return segments;
+    }
+
+    private static InvalidOperationException UnsafeSourcePath(string relativePath) =>
+        new($"Source index path '{relativePath}' is not a safe relative path.");
 
     public static byte[] GetCachedSourceFileFromMsix(SourceRecord source, string relativePath, string? appRoot = null, bool identifierKeyed = false)
     {
@@ -601,7 +655,27 @@ internal static class PreIndexedSource
         throw new InvalidOperationException($"Source file '{relativePath}' not found in MSIX for {source.Name}");
     }
 
-    private static string TempCachePath(string? appRoot, string bucket, string sourceIdentifier)
+    // Per-identifier source file caches; REST_M is the REST manifest cache older Rust builds wrote.
+    private static readonly string[] SourceFileCacheBuckets = ["REST_M", "V1_M", "V2_M", "V2_PVD"];
+
+    /// <summary>Best-effort removal of a source's per-identifier file caches.</summary>
+    internal static void RemoveSourceFileCaches(string? appRoot, string sourceIdentifier)
+    {
+        foreach (var bucket in SourceFileCacheBuckets)
+        {
+            var cacheDir = TempCachePath(appRoot, bucket, sourceIdentifier);
+            try
+            {
+                if (Directory.Exists(cacheDir))
+                    Directory.Delete(cacheDir, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    internal static string TempCachePath(string? appRoot, string bucket, string sourceIdentifier)
     {
         return Path.Combine(
             SourceStoreManager.GetPackagedFileCacheRoot(appRoot),
@@ -754,7 +828,7 @@ internal static class PreIndexedSource
     private static string SingleFieldCondition(string column, string value, bool exact, List<string> parameters)
     {
         parameters.Add(MatchParameter(value, exact));
-        return $"{column} LIKE @p{parameters.Count}";
+        return $"{column} LIKE @p{parameters.Count} ESCAPE '\\'";
     }
 
     private static string MappedFieldCondition(
@@ -785,11 +859,29 @@ internal static class PreIndexedSource
         // owner-id set a single time, collapsing the search back to milliseconds.
         return $"{rowidColumn} IN (SELECT {mapTableName}.{mapOwnerColumn} FROM {mapTableName} " +
                $"JOIN {tableName} ON {mapTableName}.{valueName} = {tableName}.rowid " +
-               $"WHERE {tableName}.{mapValueColumn} LIKE @p{paramNum})";
+               $"WHERE {tableName}.{mapValueColumn} LIKE @p{paramNum} ESCAPE '\\')";
     }
 
-    private static string MatchParameter(string value, bool exact)
-        => exact ? value : $"%{value}%";
+    // Builds the LIKE pattern for user input. `%` and `_` in the input are escaped with `\`
+    // (every LIKE using this pattern declares `ESCAPE '\'`), so they match literally instead
+    // of acting as wildcards; only the substring `%...%` wrapper is a wildcard.
+    internal static string MatchParameter(string value, bool exact)
+    {
+        var escaped = EscapeLikePattern(value);
+        return exact ? escaped : $"%{escaped}%";
+    }
+
+    private static string EscapeLikePattern(string value)
+    {
+        var builder = new System.Text.StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            if (character is '\\' or '%' or '_')
+                builder.Append('\\');
+            builder.Append(character);
+        }
+        return builder.ToString();
+    }
 
     private static bool ColumnExists(SqliteConnection conn, string table, string column)
     {
@@ -848,10 +940,10 @@ internal static class PreIndexedSource
     private static string? FindMappedValue(SqliteConnection conn, string table, string mapTable,
         string valueName, string ownerColumn, long ownerRowId, string query, bool exact)
     {
-        var likeParam = exact ? query : $"%{query}%";
+        var likeParam = MatchParameter(query, exact);
         var sql = $"SELECT {table}.{valueName} FROM {mapTable} " +
                   $"JOIN {table} ON {mapTable}.{valueName} = {table}.rowid " +
-                  $"WHERE {mapTable}.{ownerColumn} = @owner AND {table}.{valueName} LIKE @q";
+                  $"WHERE {mapTable}.{ownerColumn} = @owner AND {table}.{valueName} LIKE @q ESCAPE '\\'";
         using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         cmd.Parameters.AddWithValue("@owner", ownerRowId);

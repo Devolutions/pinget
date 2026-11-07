@@ -24,6 +24,10 @@ use zip::ZipArchive;
 
 mod msix;
 mod psign;
+#[cfg(test)]
+mod wave12_tests;
+#[cfg(test)]
+mod wave6_tests;
 
 const SUPPORTED_MANIFEST_VERSIONS: &[&str] = &[
     "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0",
@@ -653,7 +657,13 @@ pub fn verify_published_destination(
     psign_tool: Option<&Path>,
     trusted_ca: &[PathBuf],
 ) -> Result<VerifyReport> {
-    verify_destination_with_tool(destination, psign_tool, trusted_ca)
+    verify_destination_with_tool(
+        destination,
+        psign_tool,
+        trusted_ca,
+        psign::SignaturePolicy::Published,
+        &BTreeMap::new(),
+    )
 }
 
 /// Packages, signs when requested, verifies and publishes one immutable snapshot.
@@ -670,7 +680,13 @@ fn publish_after_copy(options: &PublishOptions, after_copy: impl FnOnce(&Path) -
     reject_reparse_components(&options.state)?;
     reject_reparse_components(&options.destination)?;
     validate_package_identity(&options.name, &options.publisher)?;
-    validate_msix_version(&options.version)?;
+    // Publish the canonical four-part version so the AppX identity, the ownership marker and
+    // later comparisons agree with the .NET publisher (`01.0.0.0` -> `1.0.0.0`).
+    let normalized = PublishOptions {
+        version: normalize_msix_version(&options.version)?,
+        ..options.clone()
+    };
+    let options = &normalized;
     if let Some(url) = &options.timestamp_url
         && (!matches!(options.signing, Signing::Pfx { .. })
             || !(url.starts_with("https://") || url.starts_with("http://"))
@@ -702,18 +718,41 @@ fn publish_after_copy(options: &PublishOptions, after_copy: impl FnOnce(&Path) -
     fs::create_dir_all(&destination_abs)?;
     let destination = fs::canonicalize(&destination_abs)?;
     ensure_disjoint_roots(&state, &destination)?;
-    ensure_owned_destination(&destination)?;
     let marker_path = destination.join(".pinget-publisher.json");
-    let prior = read_owner_marker(&marker_path)?;
+    // An interrupted package swap is completed or rolled back before anything else looks at the marker.
+    let prior = finalize_pending_commit(&destination, read_owner_marker(&marker_path)?)?;
+    match prior.as_ref() {
+        Some(owner) => remove_stale_publication_temporaries(&destination, &owner.artifacts)?,
+        None => {
+            ensure_adoptable_unowned_destination(&destination, &snapshot_metadata.artifacts)?;
+            remove_stale_publication_temporaries(&destination, &BTreeMap::new())?;
+        }
+    }
     let unsigned_development = matches!(options.signing, Signing::UnsignedDevelopment);
     if let Some(owner) = prior.as_ref() {
-        let verified = verify_destination_with_tool(&destination, options.psign_tool.as_deref(), &options.trusted_ca)?;
+        let reuse = owner.build_id == build_id
+            && compare_quad_version(&options.version, &owner.package_version)? == std::cmp::Ordering::Equal;
+        // The package about to be replaced only needs intact digests and the expected signer: an
+        // expired or rotated signing certificate must not block the next publication.
+        let policy = if reuse {
+            psign::SignaturePolicy::Published
+        } else {
+            psign::SignaturePolicy::Superseded
+        };
+        // Fully copied artifacts of this snapshot left by an interrupted publication are adopted.
+        let verified = verify_destination_with_tool(
+            &destination,
+            options.psign_tool.as_deref(),
+            &options.trusted_ca,
+            policy,
+            &snapshot_metadata.artifacts,
+        )?;
         if owner.package_name != options.name || owner.publisher != options.publisher {
             return Err(PublisherError::Invalid(
                 "destination is owned by a different package identity".to_owned(),
             ));
         }
-        if owner.build_id == build_id && owner.package_version == options.version {
+        if reuse {
             if owner.unsigned_development != unsigned_development {
                 return Err(PublisherError::Invalid(
                     "the package version has already been published with a different signing mode".to_owned(),
@@ -762,6 +801,7 @@ fn publish_after_copy(options: &PublishOptions, after_copy: impl FnOnce(&Path) -
             }
         }
     }
+    reject_case_variant_paths(&destination, prior.as_ref(), &snapshot_metadata.artifacts)?;
     let temporary = destination.join(format!(".publish-{build_id}.staging"));
     if temporary.exists() {
         remove_owned_staging(&temporary)?;
@@ -798,16 +838,18 @@ fn build_snapshot(
         params![format!("{{{}}}", uuid_string(build_id)), Utc::now().timestamp().to_string()],
     )?;
     let transaction = db.transaction()?;
-    let mut by_package: BTreeMap<String, Vec<PackageManifest>> = BTreeMap::new();
-    let mut package_spellings = BTreeMap::<String, String>::new();
+    // Keyed and ordered like the .NET publisher's OrdinalIgnoreCase grouping, so package rows
+    // get the same rowids on both sides.
+    let mut by_package: BTreeMap<Vec<u16>, Vec<PackageManifest>> = BTreeMap::new();
+    let mut package_spellings = BTreeMap::<Vec<u16>, String>::new();
     for ((id, _), documents) in groups {
         let package = merge_documents(&id, documents)?;
-        let key = package.id.to_ascii_lowercase();
+        let key = ordinal_ignore_case_key(&package.id);
         if let Some(previous) = package_spellings.get(&key)
             && previous != &package.id
         {
             return Err(PublisherError::Invalid(format!(
-                "PackageIdentifier casing is inconsistent across manifests: {previous} and {}",
+                "PackageIdentifier differs only by casing: '{previous}' and '{}'.",
                 package.id
             )));
         }
@@ -831,6 +873,7 @@ fn build_snapshot(
             .last()
             .ok_or_else(|| PublisherError::Invalid("empty package version group".to_owned()))?
             .clone();
+        reject_overlapping_arp_ranges(&latest.id, &versions)?;
         let mut version_records = Vec::new();
         for package in &versions {
             let mut locale_docs = package.locale_docs.clone();
@@ -890,6 +933,8 @@ fn build_snapshot(
         );
         write_relative(&feed, &sidecar_relative, &sidecar_bytes)?;
         let fields = catalog_fields_all(&versions)?;
+        // WinGet fills the package row's ARP bounds from the latest version only (Interface_2_0 PrepareForPackaging).
+        let (arp_min_version, arp_max_version) = arp_version_range(std::slice::from_ref(&latest))?.unzip();
         let row_id =
             i64::try_from(row_index + 1).map_err(|_| PublisherError::Invalid("too many package rows".to_owned()))?;
         transaction.execute(
@@ -900,8 +945,8 @@ fn build_snapshot(
                 latest.name,
                 latest.moniker,
                 latest.version,
-                fields.7,
-                fields.8,
+                arp_min_version,
+                arp_max_version,
                 Sha256::digest(&sidecar_bytes).as_slice()
             ],
         )?;
@@ -933,14 +978,16 @@ fn scan_manifests(root: &Path) -> Result<(Inventory, ManifestGroups)> {
     let mut documents = Vec::new();
     scan_directory(root, root, &mut files, &mut case_paths, &mut documents)?;
     let mut grouped: BTreeMap<(String, String), Vec<ManifestDocument>> = BTreeMap::new();
-    let mut identifiers: BTreeMap<String, String> = BTreeMap::new();
+    // Folded like .NET OrdinalIgnoreCase (full Unicode simple case mapping, not ASCII only): ids that
+    // differ only by casing would share one directory on case-insensitive file systems.
+    let mut identifiers: BTreeMap<Vec<u16>, String> = BTreeMap::new();
     for document in documents {
         let spelling = identifiers
-            .entry(document.id.to_ascii_lowercase())
+            .entry(ordinal_ignore_case_key(&document.id))
             .or_insert_with(|| document.id.clone());
         if spelling != &document.id {
             return Err(PublisherError::Invalid(format!(
-                "case-conflicting package identifiers: {spelling} and {}",
+                "PackageIdentifier differs only by casing: '{spelling}' and '{}'.",
                 document.id
             )));
         }
@@ -1027,7 +1074,10 @@ fn scan_directory(
             )));
         }
         files.insert(path_key, sha256_hex(&bytes));
-        let deserializer = serde_yaml::Deserializer::from_slice(&bytes);
+        // The inventory hashes the raw bytes; the parser gets the content without a UTF-8 BOM,
+        // which serde_yaml otherwise splits into spurious extra documents.
+        let content = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+        let deserializer = serde_yaml::Deserializer::from_slice(content);
         let mut any_document = false;
         for document in deserializer {
             if any_document {
@@ -1095,6 +1145,12 @@ fn scan_directory(
         }
     }
     Ok(())
+}
+
+/// Parses one manifest YAML document the way WinGet reads it: string-typed manifest fields keep
+/// their original scalar text (`PackageVersion: 1.10` stays `"1.10"`, not the number 1.1).
+pub fn parse_manifest_yaml(content: &str) -> std::result::Result<Value, serde_yaml::Error> {
+    serde::de::DeserializeSeed::deserialize(ManifestValue, serde_yaml::Deserializer::from_str(content))
 }
 
 struct ManifestValue;
@@ -1323,6 +1379,7 @@ fn merge_documents(id: &str, documents: Vec<ManifestDocument>) -> Result<Package
     let mut locales: Vec<(String, Value)> = Vec::new();
     let mut installer: Option<Value> = None;
     let mut seen_locale = BTreeSet::new();
+    let mut manifest_version: Option<String> = None;
     for document in documents {
         if !document.id.eq_ignore_ascii_case(id) {
             return Err(PublisherError::Invalid(format!(
@@ -1330,6 +1387,21 @@ fn merge_documents(id: &str, documents: Vec<ManifestDocument>) -> Result<Package
                 document.id,
                 document.path.display()
             )));
+        }
+        let document_version = document
+            .document
+            .as_mapping()
+            .and_then(|mapping| optional_string(mapping, "ManifestVersion"));
+        match (&manifest_version, document_version) {
+            (Some(expected), Some(actual)) if expected != &actual => {
+                return Err(PublisherError::Invalid(format!(
+                    "inconsistent ManifestVersion {actual} in {} (expected {expected}) for {id} {}",
+                    document.path.display(),
+                    document.version
+                )));
+            }
+            (None, actual) => manifest_version = actual,
+            _ => {}
         }
         match document.kind.as_str() {
             "singleton" => replace_once(&mut singleton, document.document, "singleton manifest")?,
@@ -1366,6 +1438,7 @@ fn merge_documents(id: &str, documents: Vec<ManifestDocument>) -> Result<Package
         {
             return Err(PublisherError::Invalid(format!("no installers found for {id}")));
         }
+        required_string(mapping, "Publisher", Path::new("<singleton>"))?;
         return Ok(PackageManifest {
             id: required_string(mapping, "PackageIdentifier", Path::new("<singleton>"))?,
             name: required_string(mapping, "PackageName", Path::new("<singleton>"))?,
@@ -1445,6 +1518,7 @@ fn merge_documents(id: &str, documents: Vec<ManifestDocument>) -> Result<Package
         merged.insert(Value::String("Localization".to_owned()), Value::Sequence(localizations));
     }
     set_string(&mut merged, "ManifestType", "singleton");
+    required_string(&merged, "Publisher", Path::new("<defaultLocale>"))?;
     let locale_docs = vec![LocaleDocument {
         locale: default_locale_name,
         document: canonicalize_value(Value::Mapping(merged)),
@@ -1486,7 +1560,6 @@ fn catalog_fields_all(packages: &[PackageManifest]) -> Result<CatalogFields> {
     let mut upgrade_codes = BTreeSet::new();
     let mut normalized_names = BTreeSet::new();
     let mut normalized_publishers = BTreeSet::new();
-    let mut arp_versions = BTreeSet::new();
     for document in packages.iter().flat_map(|package| &package.locale_docs) {
         let map = as_mapping(&document.document)?;
         extend_strings(&mut tags, map, "Tags");
@@ -1500,9 +1573,6 @@ fn catalog_fields_all(packages: &[PackageManifest]) -> Result<CatalogFields> {
         for nested in scopes {
             extend_strings(&mut tags, nested, "Tags");
             extend_strings(&mut commands, nested, "Commands");
-            extend_strings(&mut pfns, nested, "PackageFamilyName");
-            extend_strings(&mut product_codes, nested, "ProductCode");
-            extend_strings(&mut upgrade_codes, nested, "UpgradeCode");
             if let Some(value) = optional_string(nested, "PackageName") {
                 let normalized = pinget_core::normalize_catalog_name(&value);
                 if !normalized.name.is_empty() {
@@ -1515,57 +1585,210 @@ fn catalog_fields_all(packages: &[PackageManifest]) -> Result<CatalogFields> {
                     normalized_publishers.insert(normalized);
                 }
             }
-            if let Some(entries) = map_get(nested, "AppsAndFeaturesEntries").and_then(Value::as_sequence) {
-                for entry in entries {
-                    if let Some(entry_map) = entry.as_mapping() {
-                        if let Some(value) = optional_string(entry_map, "DisplayName") {
-                            let normalized = pinget_core::normalize_catalog_name(&value);
-                            if !normalized.name.is_empty() {
-                                normalized_names.insert(normalized.name);
-                            }
-                        }
-                        if let Some(value) = optional_string(entry_map, "Publisher") {
-                            let normalized = pinget_core::normalize_catalog_publisher(&value);
-                            if !normalized.is_empty() {
-                                normalized_publishers.insert(normalized);
-                            }
-                        }
-                        if let Some(value) =
-                            optional_string(entry_map, "DisplayVersion").filter(|value| !value.trim().is_empty())
-                        {
-                            arp_versions.insert(value);
-                        }
-                        extend_strings(&mut product_codes, entry_map, "ProductCode");
-                        extend_strings(&mut upgrade_codes, entry_map, "UpgradeCode");
+        }
+        // System reference strings come from each installer after WinGet's root-default
+        // inheritance, never from the root scope itself (Manifest::GetSystemReferenceStrings).
+        for installer in effective_installers(map) {
+            pfns.extend(installer.package_family_name);
+            product_codes.extend(installer.product_code);
+            extend_strings(&mut upgrade_codes, installer.installer, "UpgradeCode");
+            for entry in installer.entries {
+                if let Some(value) = optional_string(entry, "DisplayName") {
+                    let normalized = pinget_core::normalize_catalog_name(&value);
+                    if !normalized.name.is_empty() {
+                        normalized_names.insert(normalized.name);
                     }
                 }
-            }
-            if let Some(installers) = map_get(nested, "Installers").and_then(Value::as_sequence) {
-                for installer in installers {
-                    if let Some(installer_map) = installer.as_mapping() {
-                        extend_strings(&mut pfns, installer_map, "PackageFamilyName");
-                        extend_strings(&mut product_codes, installer_map, "ProductCode");
-                        extend_strings(&mut upgrade_codes, installer_map, "UpgradeCode");
+                if let Some(value) = optional_string(entry, "Publisher") {
+                    let normalized = pinget_core::normalize_catalog_publisher(&value);
+                    if !normalized.is_empty() {
+                        normalized_publishers.insert(normalized);
                     }
                 }
+                extend_strings(&mut product_codes, entry, "ProductCode");
+                extend_strings(&mut upgrade_codes, entry, "UpgradeCode");
             }
         }
     }
-    let mut versions: Vec<String> = arp_versions.into_iter().collect();
-    versions.sort_by(|left, right| compare_winget_versions(left, right));
-    let min = versions.first().cloned();
-    let max = versions.last().cloned();
+    let (min, max) = arp_version_range(packages)?.unzip();
     Ok((
         canonical_terms(tags),
         canonical_terms(commands),
-        canonical_terms(pfns),
-        canonical_terms(product_codes),
-        canonical_terms(upgrade_codes),
+        // WinGet stores these correlation values case-folded and folds exact lookups the same way.
+        canonical_terms(fold_case_terms(pfns)),
+        canonical_terms(fold_case_terms(product_codes)),
+        canonical_terms(fold_case_terms(upgrade_codes)),
         canonical_terms(normalized_names),
         canonical_terms(normalized_publishers),
         min,
         max,
     ))
+}
+
+/// An installer after WinGet's root-default inheritance (`ManifestYamlPopulator::PopulateManifestInternal`).
+struct EffectiveInstaller<'a> {
+    installer: &'a Mapping,
+    /// `EffectiveInstallerType`: the nested type for zip installers, lowercase, `appx` as `msix`.
+    installer_type: String,
+    package_family_name: Option<String>,
+    product_code: Option<String>,
+    entries: Vec<&'a Mapping>,
+}
+
+/// WinGet `ConvertToInstallerTypeEnum` spelling: case-insensitive, `appx` is `msix`.
+fn installer_type_name(value: Option<String>) -> String {
+    let value = value.unwrap_or_default().to_ascii_lowercase();
+    if value == "appx" { "msix".to_owned() } else { value }
+}
+
+/// `DoesInstallerTypeWriteAppsAndFeaturesEntry`, which equals `DoesInstallerTypeUseProductCode`.
+fn installer_type_writes_arp_entry(installer_type: &str) -> bool {
+    matches!(
+        installer_type,
+        "exe" | "inno" | "msi" | "nullsoft" | "wix" | "burn" | "portable"
+    )
+}
+
+/// `DoesInstallerTypeUsePackageFamilyName`.
+fn installer_type_uses_package_family_name(installer_type: &str) -> bool {
+    matches!(installer_type, "msix" | "msstore")
+}
+
+/// `DoesInstallerTypeSupportArpVersionRange`.
+fn installer_type_supports_arp_version_range(installer_type: &str) -> bool {
+    matches!(
+        installer_type,
+        "exe" | "inno" | "msi" | "nullsoft" | "wix" | "burn" | "msix"
+    )
+}
+
+fn non_empty_string(mapping: &Mapping, key: &str) -> Option<String> {
+    optional_string(mapping, key).filter(|value| !value.is_empty())
+}
+
+fn arp_entries(mapping: &Mapping) -> Vec<&Mapping> {
+    map_get(mapping, "AppsAndFeaturesEntries")
+        .and_then(Value::as_sequence)
+        .map(|entries| entries.iter().filter_map(Value::as_mapping).collect())
+        .unwrap_or_default()
+}
+
+/// Applies WinGet's root defaults to every installer: root `AppsAndFeaturesEntries`,
+/// `PackageFamilyName` and `ProductCode` are copied only into installers that lack them and
+/// whose effective type uses them.
+fn effective_installers(root: &Mapping) -> Vec<EffectiveInstaller<'_>> {
+    let root_entries = arp_entries(root);
+    let Some(installers) = map_get(root, "Installers").and_then(Value::as_sequence) else {
+        return Vec::new();
+    };
+    installers
+        .iter()
+        .filter_map(Value::as_mapping)
+        .map(|installer| {
+            let base = installer_type_name(
+                optional_string(installer, "InstallerType").or_else(|| optional_string(root, "InstallerType")),
+            );
+            let installer_type = if base == "zip" {
+                installer_type_name(
+                    optional_string(installer, "NestedInstallerType")
+                        .or_else(|| optional_string(root, "NestedInstallerType")),
+                )
+            } else {
+                base
+            };
+            let mut entries = arp_entries(installer);
+            if entries.is_empty() && installer_type_writes_arp_entry(&installer_type) {
+                entries.clone_from(&root_entries);
+            }
+            let entry_uses_package_family_name = entries.iter().any(|entry| {
+                installer_type_uses_package_family_name(&installer_type_name(optional_string(entry, "InstallerType")))
+            });
+            let package_family_name = non_empty_string(installer, "PackageFamilyName").or_else(|| {
+                (installer_type_uses_package_family_name(&installer_type) || entry_uses_package_family_name)
+                    .then(|| non_empty_string(root, "PackageFamilyName"))
+                    .flatten()
+            });
+            let product_code = non_empty_string(installer, "ProductCode").or_else(|| {
+                installer_type_writes_arp_entry(&installer_type)
+                    .then(|| non_empty_string(root, "ProductCode"))
+                    .flatten()
+            });
+            EffectiveInstaller {
+                installer,
+                installer_type,
+                package_family_name,
+                product_code,
+                entries,
+            }
+        })
+        .collect()
+}
+
+/// `Manifest::GetArpVersionRange` over the given manifests: `DisplayVersion` of the effective
+/// ARP entries of installers whose effective type supports ARP version ranges.
+fn arp_version_range(packages: &[PackageManifest]) -> Result<Option<(String, String)>> {
+    let mut versions = Vec::new();
+    for document in packages.iter().flat_map(|package| &package.locale_docs) {
+        for installer in effective_installers(as_mapping(&document.document)?) {
+            if installer_type_supports_arp_version_range(&installer.installer_type) {
+                versions.extend(
+                    installer
+                        .entries
+                        .iter()
+                        .filter_map(|entry| optional_string(entry, "DisplayVersion"))
+                        .filter(|value| !value.trim().is_empty()),
+                );
+            }
+        }
+    }
+    // Ties between equal versions keep the ordinal-first spelling, like the .NET publisher.
+    versions.sort_by(|left, right| compare_winget_versions(left, right).then_with(|| compare_utf16(left, right)));
+    Ok(versions.first().cloned().zip(versions.last().cloned()))
+}
+
+/// Rejects packages whose versions declare overlapping ARP version ranges, which WinGet's index
+/// refuses with `APPINSTALLER_CLI_ERROR_ARP_VERSION_VALIDATION_FAILED` (`Interface_1_5.cpp`).
+fn reject_overlapping_arp_ranges(id: &str, versions: &[PackageManifest]) -> Result<()> {
+    let mut ranges = Vec::new();
+    for package in versions {
+        if let Some((min, max)) = arp_version_range(std::slice::from_ref(package))? {
+            ranges.push((&package.version, min, max));
+        }
+    }
+    for (index, (version, min, max)) in ranges.iter().enumerate() {
+        for (other_version, other_min, other_max) in &ranges[index + 1..] {
+            if compare_winget_versions(min, other_max).is_le() && compare_winget_versions(max, other_min).is_ge() {
+                return Err(PublisherError::Invalid(format!(
+                    "ARP version ranges overlap for {id}: {version} [{min}, {max}] and {other_version} [{other_min}, {other_max}]"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Case-folds like .NET `StringComparer.OrdinalIgnoreCase`: each character's simple uppercase
+/// mapping (characters without a single-character uppercase form are kept).
+fn ordinal_ignore_case_fold(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            let mut upper = character.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => single,
+                _ => character,
+            }
+        })
+        .collect()
+}
+
+/// Sort and lookup key matching .NET `OrdinalIgnoreCase` ordering (UTF-16 code units).
+fn ordinal_ignore_case_key(value: &str) -> Vec<u16> {
+    ordinal_ignore_case_fold(value).encode_utf16().collect()
+}
+
+fn fold_case_terms(terms: BTreeSet<String>) -> BTreeSet<String> {
+    terms.into_iter().map(|term| term.to_ascii_lowercase()).collect()
 }
 
 fn canonical_terms(terms: BTreeSet<String>) -> Vec<String> {
@@ -2003,6 +2226,186 @@ fn remove_owned_staging(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Removes temporaries an interrupted publish (Rust or .NET) left in an owned destination, so
+/// they do not fail the untracked-file verification of the next publish. Must run under the
+/// destination writer lock. Paths tracked by the ownership marker are never treated as temporary.
+fn remove_stale_publication_temporaries(destination: &Path, tracked: &BTreeMap<String, String>) -> Result<()> {
+    let mut pending = vec![destination.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if is_reparse_point(&metadata) {
+                return Err(PublisherError::Invalid(format!(
+                    "symlink or reparse point is not allowed: {}",
+                    path.display()
+                )));
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let at_root = directory == destination;
+            if metadata.is_dir() {
+                if at_root && is_rust_publish_staging_name(&name) {
+                    remove_owned_staging(&path)?;
+                } else {
+                    pending.push(path);
+                }
+                continue;
+            }
+            let relative = path
+                .strip_prefix(destination)
+                .map_err(|_| PublisherError::Invalid("published path escaped destination".to_owned()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if is_publication_temporary_name(&name, at_root) && !tracked.contains_key(&relative) {
+                fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Temporary files written by the Rust or .NET publisher while publishing.
+fn is_publication_temporary_name(name: &str, at_root: bool) -> bool {
+    let rust_temporary = at_root
+        && (name == ".pinget-publisher.json.new"
+            || (name.starts_with(".source2.") && name.ends_with(".new") && name.len() > ".source2..new".len()));
+    rust_temporary || is_dotnet_atomic_temporary_name(name)
+}
+
+/// Allows publishing into a destination without an ownership marker only when it is empty or
+/// holds nothing but what an interrupted first publication of this snapshot left behind:
+/// publisher temporaries, Rust staging directories and fully copied artifacts of the snapshot.
+fn ensure_adoptable_unowned_destination(destination: &Path, snapshot: &BTreeMap<String, String>) -> Result<()> {
+    let mut pending = vec![destination.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if is_reparse_point(&metadata) {
+                return Err(PublisherError::Invalid(format!(
+                    "symlink or reparse point is not allowed: {}",
+                    path.display()
+                )));
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let at_root = directory == destination;
+            if metadata.is_dir() {
+                if !(at_root && is_rust_publish_staging_name(&name)) {
+                    pending.push(path);
+                }
+                continue;
+            }
+            let relative = path
+                .strip_prefix(destination)
+                .map_err(|_| PublisherError::Invalid("published path escaped destination".to_owned()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let adoptable = is_publication_temporary_name(&name, at_root)
+                || match snapshot.get(&relative) {
+                    Some(expected) => sha256_hex(&fs::read(&path)?) == *expected,
+                    None => false,
+                };
+            if !adoptable {
+                return Err(PublisherError::Invalid(format!(
+                    "refusing to publish into non-empty unowned destination: {}",
+                    destination.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses snapshot paths that differ only by casing from a path already in the destination
+/// (for example after a PackageIdentifier casing change): on case-insensitive file systems the
+/// files would land under the old spelling while the index references the new one.
+fn reject_case_variant_paths(
+    destination: &Path,
+    prior: Option<&OwnerMarker>,
+    snapshot: &BTreeMap<String, String>,
+) -> Result<()> {
+    fn prefixes(path: &str) -> impl Iterator<Item = &str> {
+        path.match_indices('/')
+            .map(|(index, _)| &path[..index])
+            .chain(std::iter::once(path))
+    }
+    let mut existing = BTreeMap::new();
+    let mut known = destination_entry_paths(destination)?;
+    known.extend(prior.into_iter().flat_map(|owner| owner.artifacts.keys().cloned()));
+    for path in &known {
+        for prefix in prefixes(path) {
+            existing
+                .entry(ordinal_ignore_case_fold(prefix))
+                .or_insert_with(|| prefix.to_owned());
+        }
+    }
+    for path in snapshot.keys() {
+        for prefix in prefixes(path) {
+            if let Some(spelling) = existing.get(&ordinal_ignore_case_fold(prefix))
+                && spelling != prefix
+            {
+                return Err(PublisherError::Invalid(format!(
+                    "publication path '{prefix}' differs only by casing from the published path '{spelling}'; keep the previous casing or publish to a new destination"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Relative paths of every file and directory under `root`.
+fn destination_entry_paths(root: &Path) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if is_reparse_point(&metadata) {
+                return Err(PublisherError::Invalid(format!(
+                    "symlink or reparse point is not allowed: {}",
+                    path.display()
+                )));
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| PublisherError::Invalid("published path escaped destination".to_owned()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            paths.push(relative);
+            if metadata.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+/// `.publish-<build-id>.staging`, created by the Rust publisher in the destination root.
+fn is_rust_publish_staging_name(name: &str) -> bool {
+    name.strip_prefix(".publish-")
+        .and_then(|rest| rest.strip_suffix(".staging"))
+        .is_some_and(is_lower_hex_hash)
+}
+
+/// `<file>.<32-hex-guid>.tmp`, created by the .NET publisher's atomic copy and marker writes.
+fn is_dotnet_atomic_temporary_name(name: &str) -> bool {
+    name.strip_suffix(".tmp")
+        .and_then(|rest| rest.rsplit_once('.'))
+        .is_some_and(|(stem, guid)| {
+            !stem.is_empty()
+                && guid.len() == 32
+                && guid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 fn acquire_destination_lock(destination: &Path) -> Result<WriterLock> {
     let parent = destination
         .parent()
@@ -2066,6 +2469,18 @@ struct OwnerMarker {
     unsigned_development: bool,
     published_utc: String,
     artifacts: BTreeMap<String, String>,
+    /// Present while `source2.msix` is being replaced; see [`resolve_pending_commit`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_commit: Option<PendingCommit>,
+}
+
+/// Commit record written before the package swap: the marker describes the new publication, and
+/// `previous` is the marker to restore if the swap did not happen (`None` for a first publication).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingCommit {
+    #[serde(default)]
+    previous: Option<Box<OwnerMarker>>,
 }
 
 #[derive(Default)]
@@ -2137,10 +2552,17 @@ fn package_and_publish(
             })?;
             let psign_tool = psign::require_psign_tool(options.psign_tool.as_deref())?;
             psign::sign(&psign_tool, &msix, path, &password, options.timestamp_url.as_deref())?;
-            psign::verify(&psign_tool, &msix, &options.publisher, &options.trusted_ca)?;
+            psign::verify(
+                &psign_tool,
+                &msix,
+                &options.publisher,
+                &options.trusted_ca,
+                psign::SignaturePolicy::NewlySigned,
+            )?;
         }
         Signing::UnsignedDevelopment => {}
     }
+    let previous_marker = prior.clone();
     let mut marker = prior.unwrap_or_else(|| OwnerMarker {
         schema_version: 1,
         owner: "Pinget.Publisher".to_owned(),
@@ -2152,6 +2574,7 @@ fn package_and_publish(
         unsigned_development,
         published_utc: String::new(),
         artifacts: BTreeMap::new(),
+        pending_commit: None,
     });
     marker.package_version = options.version.clone();
     marker.build_id = build_id.to_owned();
@@ -2179,17 +2602,33 @@ fn package_and_publish(
                 .parent()
                 .ok_or_else(|| PublisherError::Invalid(format!("invalid publication path {relative}")))?;
             rollback.create_directories(destination, parent)?;
-            let mut output = OpenOptions::new().write(true).create_new(true).open(&target)?;
-            rollback.files.push(target.clone());
-            let mut input = File::open(source)?;
-            std::io::copy(&mut input, &mut output)?;
-            output.sync_all()?;
-            drop(output);
-            if metadata.artifacts.get(relative) != Some(&sha256_hex(&fs::read(&target)?)) {
-                return Err(PublisherError::Invalid(format!(
-                    "copied publication hash mismatch: {relative}"
-                )));
+            // Copy through a temporary so an interrupted publication never leaves a truncated
+            // artifact under its final name; stale temporaries are removed by the next publish.
+            let file_name = target
+                .file_name()
+                .ok_or_else(|| PublisherError::Invalid(format!("invalid publication path {relative}")))?
+                .to_string_lossy()
+                .into_owned();
+            let copy = parent.join(format!("{file_name}.{}.tmp", unique_temporary_suffix()));
+            let result = (|| -> Result<()> {
+                let mut output = OpenOptions::new().write(true).create_new(true).open(&copy)?;
+                let mut input = File::open(&source)?;
+                std::io::copy(&mut input, &mut output)?;
+                output.sync_all()?;
+                drop(output);
+                if metadata.artifacts.get(relative) != Some(&sha256_hex(&fs::read(&copy)?)) {
+                    return Err(PublisherError::Invalid(format!(
+                        "copied publication hash mismatch: {relative}"
+                    )));
+                }
+                fs::rename(&copy, &target)?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = fs::remove_file(&copy);
+                return Err(error);
             }
+            rollback.files.push(target.clone());
         }
     }
     after_copy(destination)?;
@@ -2207,35 +2646,39 @@ fn package_and_publish(
     marker.published_utc = Utc::now().to_rfc3339();
     marker.artifacts = published_inventory_excluding(destination, &[temporary, staged_package.as_path()])?;
     marker.artifacts.insert("source2.msix".to_owned(), package_hash);
-    let old_marker_path = destination.join(".pinget-publisher.json");
-    let marker_backup = temporary.join("prior-marker.json");
-    let has_old_marker = old_marker_path.exists();
-    if has_old_marker {
-        fs::copy(&old_marker_path, &marker_backup)?;
-        OpenOptions::new().write(true).open(&marker_backup)?.sync_all()?;
-    }
-    let marker_temp = destination.join(".pinget-publisher.json.new");
-    write_json(&marker_temp, &marker)?;
-    rollback.files.push(marker_temp.clone());
-    if let Err(error) = atomic_replace(&marker_temp, &destination.join(".pinget-publisher.json"))
-        .and_then(|()| atomic_replace(&staged_package, &target_msix))
-    {
-        if has_old_marker {
-            let _ = atomic_replace(&marker_backup, &old_marker_path);
-        } else {
-            let _ = fs::remove_file(destination.join(".pinget-publisher.json"));
-        }
-        let _ = fs::remove_file(marker_temp);
+    marker.pending_commit = None;
+    // Three-step commit: (1) the marker records the new publication plus the marker to restore,
+    // (2) the package is swapped, (3) the pending record is dropped. A run interrupted between
+    // the steps is completed or rolled back by the next publish (`finalize_pending_commit`).
+    let pending_marker = OwnerMarker {
+        pending_commit: Some(PendingCommit {
+            previous: previous_marker.clone().map(Box::new),
+        }),
+        ..marker.clone()
+    };
+    replace_owner_marker(destination, &pending_marker)?;
+    if let Err(error) = atomic_replace(&staged_package, &target_msix) {
+        let _ = match &previous_marker {
+            Some(previous) => replace_owner_marker(destination, previous),
+            None => fs::remove_file(destination.join(".pinget-publisher.json")).map_err(PublisherError::from),
+        };
         let _ = fs::remove_file(staged_package);
         return Err(error);
     }
     rollback.committed = true;
+    replace_owner_marker(destination, &marker)?;
 
     // The marker is the publication commit record. Persist a matching state row.
     let state = options.state.canonicalize()?;
     mark_published(&state, build_id)?;
     fs::remove_dir_all(temporary)?;
-    let verified = verify_destination_with_tool(destination, options.psign_tool.as_deref(), &options.trusted_ca)?;
+    let verified = verify_destination_with_tool(
+        destination,
+        options.psign_tool.as_deref(),
+        &options.trusted_ca,
+        psign::SignaturePolicy::Published,
+        &BTreeMap::new(),
+    )?;
     Ok(PublishReport {
         valid: true,
         subject: verified.subject,
@@ -2459,18 +2902,34 @@ fn xml_attributes<R: std::io::BufRead>(
 }
 
 fn verify_destination(destination: &Path) -> Result<VerifyReport> {
-    verify_destination_with_tool(destination, None, &[])
+    verify_destination_with_tool(
+        destination,
+        None,
+        &[],
+        psign::SignaturePolicy::Published,
+        &BTreeMap::new(),
+    )
 }
 
+/// Verifies an owned destination. Files missing from the marker are accepted only when
+/// `adoptable` lists them with the same hash (the snapshot being published).
 fn verify_destination_with_tool(
     destination: &Path,
     psign_tool: Option<&Path>,
     trusted_ca: &[PathBuf],
+    policy: psign::SignaturePolicy,
+    adoptable: &BTreeMap<String, String>,
 ) -> Result<VerifyReport> {
     reject_reparse_components(destination)?;
     let destination = fs::canonicalize(destination)?;
     let marker = read_owner_marker(&destination.join(".pinget-publisher.json"))?
         .ok_or_else(|| PublisherError::Invalid("destination has no Pinget ownership marker".to_owned()))?;
+    let marker = resolve_pending_commit(&destination, marker)?.ok_or_else(|| {
+        PublisherError::Invalid(
+            "the first publication to this destination was interrupted before it was committed; publish again"
+                .to_owned(),
+        )
+    })?;
     for (relative, expected) in &marker.artifacts {
         let path = safe_join(&destination, relative)?;
         let bytes = fs::read(&path)?;
@@ -2482,7 +2941,11 @@ fn verify_destination_with_tool(
         }
     }
     let current = published_inventory(&destination)?;
-    if current != marker.artifacts {
+    if current.iter().any(|(path, hash)| {
+        marker.artifacts.get(path) != Some(hash)
+            && (marker.artifacts.contains_key(path) || adoptable.get(path) != Some(hash))
+    }) || marker.artifacts.keys().any(|path| !current.contains_key(path))
+    {
         return Err(PublisherError::Invalid(
             "published directory has missing or untracked files".to_owned(),
         ));
@@ -2500,6 +2963,7 @@ fn verify_destination_with_tool(
             &destination.join("source2.msix"),
             &marker.publisher,
             trusted_ca,
+            policy,
         )?;
     }
     Ok(VerifyReport {
@@ -2510,16 +2974,89 @@ fn verify_destination_with_tool(
     })
 }
 
-fn ensure_owned_destination(destination: &Path) -> Result<()> {
-    let marker = destination.join(".pinget-publisher.json");
-    let entries: Vec<_> = fs::read_dir(destination)?.collect::<std::io::Result<Vec<_>>>()?;
-    if entries.is_empty() || marker.is_file() {
-        return Ok(());
+/// Resolves a marker left by an interrupted package swap. When `source2.msix` is the package the
+/// marker records, the swap happened and the marker is committed; otherwise the previous marker
+/// is restored, keeping the interrupted publication's fully copied feed artifacts as owned files.
+/// Returns `None` when an interrupted first publication never swapped its package in.
+fn resolve_pending_commit(destination: &Path, marker: OwnerMarker) -> Result<Option<OwnerMarker>> {
+    let Some(pending) = marker.pending_commit.clone() else {
+        return Ok(Some(marker));
+    };
+    let package_hash = match fs::read(destination.join("source2.msix")) {
+        Ok(bytes) => Some(sha256_hex(&bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if package_hash.as_ref() == marker.artifacts.get("source2.msix") {
+        return Ok(Some(OwnerMarker {
+            pending_commit: None,
+            ..marker
+        }));
     }
-    Err(PublisherError::Invalid(format!(
-        "refusing to publish into non-empty unowned destination: {}",
-        destination.display()
-    )))
+    let Some(previous) = pending.previous else {
+        return Ok(None);
+    };
+    let mut previous = *previous;
+    for (relative, expected) in &marker.artifacts {
+        if relative == "source2.msix" || previous.artifacts.contains_key(relative) {
+            continue;
+        }
+        if fs::read(safe_join(destination, relative)?).is_ok_and(|bytes| sha256_hex(&bytes) == *expected) {
+            previous.artifacts.insert(relative.clone(), expected.clone());
+        }
+    }
+    Ok(Some(previous))
+}
+
+/// Persists the resolution of an interrupted package swap (see [`resolve_pending_commit`]).
+/// Must run under the destination writer lock.
+fn finalize_pending_commit(destination: &Path, marker: Option<OwnerMarker>) -> Result<Option<OwnerMarker>> {
+    let Some(marker) = marker else {
+        return Ok(None);
+    };
+    if marker.pending_commit.is_none() {
+        return Ok(Some(marker));
+    }
+    let resolved = resolve_pending_commit(destination, marker)?;
+    match &resolved {
+        Some(effective) => replace_owner_marker(destination, effective)?,
+        None => fs::remove_file(destination.join(".pinget-publisher.json"))?,
+    }
+    Ok(resolved)
+}
+
+/// Atomically replaces the ownership marker.
+fn replace_owner_marker(destination: &Path, marker: &OwnerMarker) -> Result<()> {
+    let temporary = destination.join(".pinget-publisher.json.new");
+    match fs::symlink_metadata(&temporary) {
+        Ok(_) => {
+            require_regular_file(&temporary)?;
+            fs::remove_file(&temporary)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    write_json(&temporary, marker)?;
+    let result = atomic_replace(&temporary, &destination.join(".pinget-publisher.json"));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// 32 lowercase hex characters, unique per call, for `<file>.<suffix>.tmp` copy temporaries.
+fn unique_temporary_suffix() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "{:08x}{:024x}",
+        std::process::id(),
+        nanos.wrapping_add(u128::from(sequence)) & ((1u128 << 96) - 1)
+    )
 }
 
 fn read_owner_marker(path: &Path) -> Result<Option<OwnerMarker>> {
@@ -2535,6 +3072,23 @@ fn read_owner_marker(path: &Path) -> Result<Option<OwnerMarker>> {
         ));
     }
     let marker: OwnerMarker = serde_json::from_slice(&bytes)?;
+    validate_owner_marker(&marker)?;
+    if let Some(previous) = marker
+        .pending_commit
+        .as_ref()
+        .and_then(|pending| pending.previous.as_deref())
+    {
+        validate_owner_marker(previous)?;
+        if previous.pending_commit.is_some() {
+            return Err(PublisherError::Invalid(
+                "publisher ownership marker has a nested pending commit".to_owned(),
+            ));
+        }
+    }
+    Ok(Some(marker))
+}
+
+fn validate_owner_marker(marker: &OwnerMarker) -> Result<()> {
     if marker.schema_version != 1 {
         return Err(PublisherError::Invalid(format!(
             "unsupported publication inventory schema version {}",
@@ -2565,7 +3119,7 @@ fn read_owner_marker(path: &Path) -> Result<Option<OwnerMarker>> {
             "publisher ownership marker does not list source2.msix".to_owned(),
         ));
     }
-    Ok(Some(marker))
+    Ok(())
 }
 
 fn published_inventory(root: &Path) -> Result<BTreeMap<String, String>> {
@@ -2695,6 +3249,14 @@ fn write_relative(root: &Path, relative: &str, bytes: &[u8]) -> Result<()> {
 fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
     let path = Path::new(relative);
     validate_relative_path(path)?;
+    if path
+        .components()
+        .any(|component| !is_windows_safe_name(&component.as_os_str().to_string_lossy()))
+    {
+        return Err(PublisherError::Invalid(format!(
+            "unsafe publisher relative path: {relative}"
+        )));
+    }
     let target = root.join(path);
     if target.starts_with(root) {
         reject_reparse_components(&target)?;
@@ -2725,19 +3287,53 @@ fn safe_component(value: &str) -> Result<String> {
         || value
             .chars()
             .any(|character| character == '/' || character == '\\' || character == ':' || character.is_control())
+        || !is_windows_safe_name(value)
     {
         return Err(PublisherError::Invalid(format!("unsafe path component: {value:?}")));
     }
     Ok(value.to_owned())
 }
 
+/// Rejects names Windows silently rewrites or maps to devices: a trailing `.` or space,
+/// and reserved device names (also when followed by an extension, e.g. `NUL.txt`).
+fn is_windows_safe_name(value: &str) -> bool {
+    if value.ends_with('.') || value.ends_with(' ') {
+        return false;
+    }
+    let stem = value.split('.').next().unwrap_or_default().trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            upper.strip_prefix(prefix).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}"
+                )
+            })
+        });
+    !reserved
+}
+
+/// Characters WinGet's manifest schema forbids in PackageIdentifier segments.
+fn is_identifier_forbidden_char(character: char) -> bool {
+    character.is_whitespace()
+        || character == '\u{feff}'
+        || character.is_control()
+        || matches!(character, '.' | '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+}
+
+/// Validates a PackageIdentifier with WinGet's schema rule: 2-8 dot-separated segments
+/// of 1-32 characters, at most 128 characters, no whitespace, control or path/URL
+/// metacharacters; plus Windows path-safety rejections for the output directory name.
 fn validate_package_identifier(id: &str) -> Result<()> {
     safe_component(id)?;
-    let mut chars = id.chars();
-    if id.len() > 128
-        || !chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
-        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
-        || id.trim() != id
+    let segments: Vec<_> = id.split('.').collect();
+    if id.chars().count() > 128
+        || !(2..=8).contains(&segments.len())
+        || segments.iter().any(|segment| {
+            !(1..=32).contains(&segment.chars().count()) || segment.chars().any(is_identifier_forbidden_char)
+        })
+        || !is_windows_safe_name(id)
     {
         return Err(PublisherError::Invalid(format!("PackageIdentifier is invalid: {id:?}")));
     }
@@ -2749,6 +3345,7 @@ fn validate_package_version(version: &str) -> Result<()> {
     if version.len() > 128
         || !chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
         || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-'))
+        || !is_windows_safe_name(version)
     {
         return Err(PublisherError::Invalid(format!(
             "PackageVersion is invalid: {version:?}"
@@ -2798,15 +3395,19 @@ fn validate_yaml_value(value: &Value, depth: usize) -> Result<()> {
     Ok(())
 }
 
+/// Validates the AppX `ST_PackageName` rule (3-50 characters of `[-.A-Za-z0-9]`), additionally
+/// rejecting empty dot-separated segments.
 fn validate_package_identity(name: &str, publisher: &str) -> Result<()> {
-    let segments: Vec<_> = name.split('.').collect();
-    if name.len() > 50
-        || segments.is_empty()
-        || segments
-            .iter()
-            .any(|segment| segment.is_empty() || !segment.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    if !(3..=50).contains(&name.len())
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+        || name.split('.').any(str::is_empty)
     {
-        return Err(PublisherError::Invalid("invalid MSIX package identity name".to_owned()));
+        return Err(PublisherError::Invalid(
+            "invalid MSIX package identity name: use 3-50 letters, digits, periods or hyphens without empty dot-separated segments"
+                .to_owned(),
+        ));
     }
     if publisher.trim().is_empty()
         || publisher.trim() != publisher
@@ -2830,6 +3431,17 @@ fn validate_msix_version(version: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Returns the canonical four-part form (`01.0.0.0` -> `1.0.0.0`), matching .NET `Version.ToString()`.
+fn normalize_msix_version(version: &str) -> Result<String> {
+    validate_msix_version(version)?;
+    let parts = version
+        .split('.')
+        .map(|part| part.parse::<u16>().map(|value| value.to_string()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| PublisherError::Invalid(format!("invalid package version: {version}")))?;
+    Ok(parts.join("."))
 }
 
 fn compare_winget_versions(left: &str, right: &str) -> std::cmp::Ordering {
