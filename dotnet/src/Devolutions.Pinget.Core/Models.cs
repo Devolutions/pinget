@@ -28,7 +28,7 @@ public record SourceRecord
     public required string Name { get; init; }
     public required SourceKind Kind { get; init; }
     public required string Arg { get; init; }
-    public required string Identifier { get; init; }
+    public required string Identifier { get; set; }
     public string TrustLevel { get; set; } = "None";
     public bool Explicit { get; set; }
     public int Priority { get; set; }

@@ -485,14 +485,6 @@ fn standalone_portable_link_uses_rename_then_command_then_file_name() {
     assert_eq!(alias(&with_command, Some("t2")), vec![("t2".to_owned(), None)]);
 }
 
-#[test]
-fn portable_install_downloads_keep_their_original_name() {
-    let mut request = InstallRequest::new(PackageQuery::default());
-    request.rename = Some("t2".to_owned());
-    assert_eq!(install_download_rename(&request, "portable"), None);
-    assert_eq!(install_download_rename(&request, "exe"), Some("t2"));
-}
-
 // ── R7-12: machine-scope x86 portables use the x86 root and registry view ──
 
 #[test]

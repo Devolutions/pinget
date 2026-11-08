@@ -4,6 +4,8 @@ mod portable_payload_tests;
 #[cfg(test)]
 mod portable_regression_tests;
 #[cfg(test)]
+mod review_a_tests;
+#[cfg(test)]
 mod review_c_tests;
 #[cfg(test)]
 mod wave10_tests;
@@ -2680,13 +2682,9 @@ impl Repository {
             (PathBuf::new(), PathBuf::from(store_target))
         } else {
             let temp_dir = std::env::temp_dir().join("pinget-install");
-            let fetched_path = self.fetch_installer_for_request(
-                request,
-                &manifest,
-                &installer,
-                install_download_rename(request, &installer_type),
-                &temp_dir,
-            )?;
+            // Like WinGet, `--rename` never names the installer an install downloads: it only
+            // names a portable's command alias (see `determine_portable_links`).
+            let fetched_path = self.fetch_installer_for_request(request, &manifest, &installer, None, &temp_dir)?;
             let prepared_path = prepare_installer_for_execution(&fetched_path, &installer_type)?;
             (prepared_path.clone(), prepared_path)
         };
@@ -8563,7 +8561,8 @@ fn parse_yaml_manifest_bundle_parts<B: AsRef<[u8]>>(parts: &[B]) -> Result<(Mani
     let mut mappings = Vec::new();
     let mut documents = Vec::new();
     for bytes in parts {
-        let bytes = bytes.as_ref();
+        // A UTF-8 BOM would make serde_yaml split the stream into a spurious extra document.
+        let bytes = strip_utf8_bom(bytes.as_ref());
         let raw_versions = raw_package_versions(bytes);
         let raw_documents = serde_yaml::Deserializer::from_slice(bytes);
         for ((index, document), raw_document) in serde_yaml::Deserializer::from_slice(bytes)
@@ -8571,20 +8570,26 @@ fn parse_yaml_manifest_bundle_parts<B: AsRef<[u8]>>(parts: &[B]) -> Result<(Mani
             .zip(raw_documents)
         {
             let mut value = YamlValue::deserialize(document).context("failed to deserialize YAML document")?;
-            // The model reads every scalar as text, like WinGet: re-read the document so numbers
-            // keep their source text (`Tags: [1.10]`, `MinimumVersion: 14.30`). The structured
-            // document below keeps the typed values.
-            let model_value = serde::de::DeserializeSeed::deserialize(RawScalarSeed(&value), raw_document).ok();
-            // `YamlValue` resolves plain scalars by YAML type, so `PackageVersion: 1.10` would
-            // become the float 1.1. WinGet treats manifest scalars as strings; restore the text.
-            if let (Some(Some(raw_version)), Some(mapping)) = (raw_versions.get(index), value.as_mapping_mut()) {
-                let key = YamlValue::from("PackageVersion");
-                if mapping.contains_key(&key) {
-                    mapping.insert(key, YamlValue::String(raw_version.clone()));
+            // WinGet reads every scalar as text: re-read the document so numbers keep their source
+            // text (`Tags: [1.10]`, `MinimumVersion: 14.30`) in both the model and the structured
+            // document (`download` manifests, `show -o json|yaml`), like the C# reader.
+            let model_value = match serde::de::DeserializeSeed::deserialize(RawScalarSeed(&value), raw_document) {
+                Ok(model_value) => model_value,
+                Err(_) => {
+                    // `YamlValue` resolves plain scalars by YAML type, so `PackageVersion: 1.10`
+                    // would become the float 1.1; at least restore the version text.
+                    if let (Some(Some(raw_version)), Some(mapping)) = (raw_versions.get(index), value.as_mapping_mut())
+                    {
+                        let key = YamlValue::from("PackageVersion");
+                        if mapping.contains_key(&key) {
+                            mapping.insert(key, YamlValue::String(raw_version.clone()));
+                        }
+                    }
+                    value
                 }
-            }
-            documents.push(serde_json::to_value(&value).context("failed to convert YAML manifest document")?);
-            if let YamlValue::Mapping(mapping) = model_value.unwrap_or(value) {
+            };
+            documents.push(serde_json::to_value(&model_value).context("failed to convert YAML manifest document")?);
+            if let YamlValue::Mapping(mapping) = model_value {
                 mappings.push(mapping);
             }
         }
@@ -10126,6 +10131,10 @@ impl<'de> serde::de::Visitor<'de> for RawScalarMappingVisitor<'_> {
     }
 }
 
+fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
+}
+
 /// Reads each document's `PackageVersion` as its original scalar text. Deserializing into a
 /// `String` makes serde_yaml keep the source representation (`1.10`, not `1.1`).
 fn raw_package_versions(bytes: &[u8]) -> Vec<Option<String>> {
@@ -11041,9 +11050,9 @@ fn verify_hash(expected_hash: &str, bytes: &[u8]) -> Result<()> {
 /// Chooses the on-disk name of a downloaded installer. A `--rename` value must
 /// already be a plain file name. A name taken from the URL is percent-decoded
 /// and used only when it is a safe single path segment (otherwise the
-/// `<id>.<version>` fallback WinGet uses applies), and it always receives an
-/// extension that matches the installer type so it cannot be launched as
-/// something else.
+/// `<id>.<version>` fallback WinGet uses applies). Either name always receives
+/// an extension that matches the installer type so it cannot be launched as
+/// something else (or, without one, fail to launch).
 fn installer_download_file_name(
     url: &str,
     rename: Option<&str>,
@@ -11054,7 +11063,7 @@ fn installer_download_file_name(
         if !is_safe_file_name(rename) {
             bail!("Invalid --rename value '{rename}': it must be a plain file name without path separators.");
         }
-        return Ok(rename.to_owned());
+        return Ok(with_installer_extension(rename.to_owned(), installer_type));
     }
 
     let path = url.split(['?', '#']).next().unwrap_or_default();
@@ -11649,17 +11658,6 @@ fn ensure_dependency_installed(dependency_id: &str, result: &InstallResult) -> R
         "dependency {dependency_id} failed to install (exit code: {})",
         result.exit_code
     )
-}
-
-/// File name override for the installer the install flow downloads. Like WinGet, `--rename`
-/// on a portable names the command alias, never the binary, which keeps the name from its
-/// URL; other installer types keep honoring it.
-fn install_download_rename<'a>(request: &'a InstallRequest, installer_type: &str) -> Option<&'a str> {
-    if installer_type.eq_ignore_ascii_case("portable") {
-        None
-    } else {
-        request.rename.as_deref()
-    }
 }
 
 /// The installer type that actually runs: a `zip` whose `NestedInstallerType` is an installer

@@ -24,7 +24,8 @@ internal static class ManifestValidator
 
         var files = Directory.Exists(manifestPath)
             ? Directory.EnumerateFiles(manifestPath)
-                .Where(path => Path.GetExtension(path) is ".yaml" or ".yml")
+                .Where(path => Path.GetExtension(path).Equals(".yaml", StringComparison.OrdinalIgnoreCase) ||
+                    Path.GetExtension(path).Equals(".yml", StringComparison.OrdinalIgnoreCase))
                 .ToList()
             : [manifestPath];
 
@@ -62,14 +63,14 @@ internal static class ManifestValidator
                 warnings.Add($"  {file}: schema directory not found, performing YAML-only validation");
             }
 
-            if ((manifestType == "singleton" || manifestType == "installer") && !HasField(root, "Installers"))
+            if ((manifestType == "singleton" || manifestType == "installer") && !HasValue(root, "Installers"))
                 errors.Add($"  {file}: required field 'Installers' is missing");
 
             if (manifestType == "singleton" || manifestType == "defaultlocale")
             {
                 foreach (var field in new[] { "PackageIdentifier", "PackageVersion" })
                 {
-                    if (!HasField(root, field) && manifestVersion != "0.1.0")
+                    if (!HasValue(root, field) && manifestVersion != "0.1.0")
                         errors.Add($"  {file}: required field '{field}' is missing");
                 }
             }
@@ -117,11 +118,32 @@ internal static class ManifestValidator
         return stream.Documents.Count == 0 ? null : stream.Documents[0].RootNode as YamlMappingNode;
     }
 
-    private static bool HasField(YamlMappingNode? root, string name) =>
-        root is not null && root.Children.ContainsKey(new YamlScalarNode(name));
+    /// <summary>
+    /// True when a required field is present with a value: a YAML null (<c>~</c>, <c>null</c>, nothing), a blank
+    /// string, or an empty sequence or mapping does not count, like the Rust CLI.
+    /// </summary>
+    private static bool HasValue(YamlMappingNode? root, string name)
+    {
+        if (root is null || !root.Children.TryGetValue(new YamlScalarNode(name), out var value))
+            return false;
+        return value switch
+        {
+            YamlScalarNode scalar => !IsNullScalar(scalar) && !string.IsNullOrWhiteSpace(scalar.Value),
+            YamlSequenceNode sequence => sequence.Children.Count > 0,
+            YamlMappingNode mapping => mapping.Children.Count > 0,
+            _ => true,
+        };
+    }
 
+    /// <summary>A plain, untagged YAML core-schema null: empty, <c>~</c>, <c>null</c>, <c>Null</c> or <c>NULL</c>.</summary>
+    private static bool IsNullScalar(YamlScalarNode scalar) =>
+        scalar.Style == ScalarStyle.Plain && scalar.Tag.IsEmpty &&
+        scalar.Value is null or "" or "~" or "null" or "Null" or "NULL";
+
+    /// <summary>A scalar field's text; a YAML null or blank value reads as absent.</summary>
     private static string? GetString(YamlMappingNode? root, string name) =>
-        root is not null && root.Children.TryGetValue(new YamlScalarNode(name), out var value) && value is YamlScalarNode scalar
+        root is not null && root.Children.TryGetValue(new YamlScalarNode(name), out var value) &&
+        value is YamlScalarNode scalar && !IsNullScalar(scalar) && !string.IsNullOrWhiteSpace(scalar.Value)
             ? scalar.Value
             : null;
 

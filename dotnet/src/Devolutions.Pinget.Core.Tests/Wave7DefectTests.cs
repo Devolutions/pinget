@@ -367,14 +367,6 @@ public class Wave7DefectTests
         Assert.Equal("t2", Alias(withCommand, "t2"));
     }
 
-    [Fact]
-    public void PortableInstallDownloads_KeepTheirOriginalName()
-    {
-        var request = new InstallRequest { Query = new PackageQuery(), Rename = "t2" };
-        Assert.Null(Repository.InstallDownloadRename(request, "portable"));
-        Assert.Equal("t2", Repository.InstallDownloadRename(request, "exe"));
-    }
-
     // ── R7-12: machine-scope x86 portables use the x86 root and registry view ──
 
     [Fact]

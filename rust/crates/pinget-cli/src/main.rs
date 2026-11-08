@@ -2473,13 +2473,206 @@ struct ManifestValidationReport {
     warnings: Vec<String>,
 }
 
-/// Parses a manifest file the way WinGet reads it: string-typed fields keep their original
-/// scalar text (`PackageVersion: 1.10` stays "1.10", not the number 1.1).
+/// Converts a manifest file to JSON for schema validation the way WinGet does
+/// (`ManifestYamlNodeToJson`): every scalar keeps its source text as a string
+/// (`PackageVersion: 1.10` stays "1.10", not the number 1.1) except the integer and boolean
+/// fields WinGet types, and YAML nulls stay `null`. A value of the wrong shape (`Tags: 123`,
+/// `Tags:`) is kept as is so the schema reports it instead of failing the parse.
 fn parse_manifest_for_validation(content: &[u8]) -> Result<serde_json::Value> {
     let content = content.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(content);
-    let content = std::str::from_utf8(content)?;
-    let value = pinget_publisher::parse_manifest_yaml(content)?;
-    Ok(serde_json::to_value(value)?)
+    std::str::from_utf8(content)?;
+    let mut documents = serde_yaml::Deserializer::from_slice(content);
+    let Some(document) = documents.next() else {
+        return Ok(serde_json::Value::Null);
+    };
+    if documents.next().is_some() {
+        bail!("deserializing from YAML containing more than one document is not supported");
+    }
+    let shape = <serde_yaml::Value as serde::Deserialize>::deserialize(document)?;
+    let raw_document = serde_yaml::Deserializer::from_slice(content)
+        .next()
+        .ok_or_else(|| anyhow!("the YAML document disappeared while re-reading it"))?;
+    Ok(serde::de::DeserializeSeed::deserialize(
+        ValidationSeed {
+            shape: &shape,
+            kind: ValidationScalarKind::String,
+        },
+        raw_document,
+    )?)
+}
+
+/// The JSON type WinGet gives a manifest scalar during schema validation.
+#[derive(Clone, Copy)]
+enum ValidationScalarKind {
+    String,
+    Int,
+    Bool,
+}
+
+/// WinGet's `ManifestFieldTypes`: the only manifest fields whose scalars are not strings.
+fn validation_scalar_kind(key: &str) -> ValidationScalarKind {
+    match key {
+        "InstallerSuccessCodes" | "InstallerReturnCode" => ValidationScalarKind::Int,
+        "InstallerAbortsTerminal"
+        | "InstallLocationRequired"
+        | "RequireExplicitUpgrade"
+        | "DisplayInstallWarnings"
+        | "DownloadCommandProhibited"
+        | "ArchiveBinariesDependOnPath" => ValidationScalarKind::Bool,
+        _ => ValidationScalarKind::String,
+    }
+}
+
+/// A typed scalar that does not convert stays a string, so the schema reports the bad type.
+fn validation_scalar(text: String, kind: ValidationScalarKind) -> serde_json::Value {
+    match kind {
+        ValidationScalarKind::String => serde_json::Value::String(text),
+        ValidationScalarKind::Int => {
+            let trimmed = text.trim();
+            let parsed = if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+                i64::from_str_radix(hex, 16).ok()
+            } else if let Some(octal) = trimmed.strip_prefix("0o") {
+                i64::from_str_radix(octal, 8).ok()
+            } else {
+                trimmed.parse::<i64>().ok()
+            };
+            parsed.map_or(serde_json::Value::String(text), serde_json::Value::from)
+        }
+        ValidationScalarKind::Bool => {
+            // yaml-cpp's boolean spellings, each in lower, Capitalized or UPPER case.
+            let spelled = |words: &[&str]| {
+                words.iter().any(|word| {
+                    let capitalized = format!("{}{}", word[..1].to_ascii_uppercase(), &word[1..]);
+                    text == *word || text == capitalized || text == word.to_ascii_uppercase()
+                })
+            };
+            if spelled(&["y", "yes", "true", "on"]) {
+                serde_json::Value::Bool(true)
+            } else if spelled(&["n", "no", "false", "off"]) {
+                serde_json::Value::Bool(false)
+            } else {
+                serde_json::Value::String(text)
+            }
+        }
+    }
+}
+
+/// Re-reads a YAML document guided by `shape`, the same document already parsed as a
+/// `serde_yaml::Value`. serde_yaml keeps a scalar's source text only when it is deserialized as
+/// a string, so the shape decides where to ask for one.
+struct ValidationSeed<'a> {
+    shape: &'a serde_yaml::Value,
+    kind: ValidationScalarKind,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ValidationSeed<'_> {
+    type Value = serde_json::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::Deserialize;
+        use serde::de::Error;
+
+        match self.shape {
+            serde_yaml::Value::Null => {
+                serde::de::IgnoredAny::deserialize(deserializer)?;
+                Ok(serde_json::Value::Null)
+            }
+            serde_yaml::Value::Sequence(items) => {
+                deserializer.deserialize_seq(ValidationSequenceVisitor { items, kind: self.kind })
+            }
+            serde_yaml::Value::Mapping(mapping) => deserializer.deserialize_map(ValidationMappingVisitor(mapping)),
+            serde_yaml::Value::Tagged(_) => {
+                serde::de::IgnoredAny::deserialize(deserializer)?;
+                serde_json::to_value(self.shape).map_err(D::Error::custom)
+            }
+            serde_yaml::Value::Bool(_) | serde_yaml::Value::Number(_) | serde_yaml::Value::String(_) => {
+                String::deserialize(deserializer).map(|text| validation_scalar(text, self.kind))
+            }
+        }
+    }
+}
+
+struct ValidationSequenceVisitor<'a> {
+    items: &'a [serde_yaml::Value],
+    kind: ValidationScalarKind,
+}
+
+impl<'de> serde::de::Visitor<'de> for ValidationSequenceVisitor<'_> {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a YAML sequence")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut items = Vec::with_capacity(self.items.len());
+        for shape in self.items {
+            let item = sequence
+                .next_element_seed(ValidationSeed { shape, kind: self.kind })?
+                .ok_or_else(|| serde::de::Error::custom("YAML sequence shape mismatch"))?;
+            items.push(item);
+        }
+        if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom("YAML sequence shape mismatch"));
+        }
+        Ok(serde_json::Value::Array(items))
+    }
+}
+
+struct ValidationMappingVisitor<'a>(&'a serde_yaml::Mapping);
+
+impl<'de> serde::de::Visitor<'de> for ValidationMappingVisitor<'_> {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a YAML mapping")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        // serde_yaml keeps mapping entries in document order, so the shapes line up with the keys.
+        let mut result = serde_json::Map::new();
+        for shape in self.0.values() {
+            let key = map
+                .next_key::<String>()?
+                .ok_or_else(|| serde::de::Error::custom("YAML mapping shape mismatch"))?;
+            let kind = validation_scalar_kind(&key);
+            let value = map.next_value_seed(ValidationSeed { shape, kind })?;
+            result.insert(key, value);
+        }
+        if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(serde::de::Error::custom("YAML mapping shape mismatch"));
+        }
+        Ok(serde_json::Value::Object(result))
+    }
+}
+
+/// A required field counts only with a value: a YAML null, a blank string, or an empty
+/// sequence or mapping does not.
+fn manifest_field_has_value(manifest: &serde_json::Value, field: &str) -> bool {
+    match manifest.get(field) {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(text)) => !text.trim().is_empty(),
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(serde_json::Value::Object(entries)) => !entries.is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// A scalar manifest field's text; a YAML null or blank value reads as absent.
+fn manifest_field_text<'a>(manifest: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    manifest
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
 }
 
 fn validate_manifest_path(manifest_path: &str) -> Result<ManifestValidationReport> {
@@ -2492,7 +2685,12 @@ fn validate_manifest_path(manifest_path: &str) -> Result<ManifestValidationRepor
         std::fs::read_dir(path)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "yaml" || ext == "yml"))
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
+            })
             .collect()
     } else {
         vec![path.to_path_buf()]
@@ -2513,15 +2711,10 @@ fn validate_manifest_path(manifest_path: &str) -> Result<ManifestValidationRepor
         let yaml_value = parse_manifest_for_validation(&content)
             .map_err(|e| anyhow::anyhow!("YAML parse error in {}: {e}", file.display()))?;
 
-        let manifest_type = yaml_value
-            .get("ManifestType")
-            .and_then(|v| v.as_str())
+        let manifest_type = manifest_field_text(&yaml_value, "ManifestType")
             .unwrap_or("singleton")
             .to_lowercase();
-        let manifest_version = yaml_value
-            .get("ManifestVersion")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0.1.0");
+        let manifest_version = manifest_field_text(&yaml_value, "ManifestVersion").unwrap_or("0.1.0");
 
         let schema_version = map_manifest_version(manifest_version);
         let schema_file_name = format!("manifest.{manifest_type}.{manifest_version}.json");
@@ -2565,12 +2758,14 @@ fn validate_manifest_path(manifest_path: &str) -> Result<ManifestValidationRepor
         }
 
         // Basic field checks
-        if (manifest_type == "singleton" || manifest_type == "installer") && yaml_value.get("Installers").is_none() {
+        if (manifest_type == "singleton" || manifest_type == "installer")
+            && !manifest_field_has_value(&yaml_value, "Installers")
+        {
             all_errors.push(format!("  {}: required field 'Installers' is missing", file.display()));
         }
         if manifest_type == "singleton" || manifest_type == "defaultlocale" {
             for field in ["PackageIdentifier", "PackageVersion"] {
-                if yaml_value.get(field).is_none() && manifest_version != "0.1.0" {
+                if !manifest_field_has_value(&yaml_value, field) && manifest_version != "0.1.0" {
                     all_errors.push(format!("  {}: required field '{field}' is missing", file.display()));
                 }
             }
@@ -3237,6 +3432,8 @@ fn can_ignore_unavailable_import_failure(error: &anyhow::Error) -> bool {
     message.contains("no package matched") || message.contains("no applicable installer found")
 }
 
+#[cfg(test)]
+mod review_a_cli_tests;
 #[cfg(test)]
 mod wave10_cli_tests;
 #[cfg(test)]

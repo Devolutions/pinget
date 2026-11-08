@@ -863,14 +863,6 @@ public class Repository : IDisposable
         return dest;
     }
 
-    /// <summary>
-    /// File name override for the installer the install flow downloads. Like WinGet, <c>--rename</c> on a
-    /// portable names the command alias, never the binary, which keeps the name from its URL; other installer
-    /// types keep honoring it.
-    /// </summary>
-    internal static string? InstallDownloadRename(InstallRequest request, string installerType) =>
-        installerType.Equals("portable", StringComparison.OrdinalIgnoreCase) ? null : request.Rename;
-
     internal const string MissingInstallerHashError =
         "The manifest does not provide an InstallerSha256 for this installer; use --ignore-security-hash to install it anyway.";
 
@@ -895,8 +887,9 @@ public class Repository : IDisposable
     /// <summary>
     /// Chooses the on-disk name of a downloaded installer. A --rename value must already be a plain file
     /// name. A name taken from the URL is percent-decoded and used only when it is a safe single path
-    /// segment (otherwise the &lt;id&gt;.&lt;version&gt; fallback WinGet uses applies), and it always receives an
-    /// extension that matches the installer type so it cannot be launched as something else.
+    /// segment (otherwise the &lt;id&gt;.&lt;version&gt; fallback WinGet uses applies). Either name always receives an
+    /// extension that matches the installer type so it cannot be launched as something else (or, without one,
+    /// fail to launch).
     /// </summary>
     internal static string InstallerDownloadFileName(string url, string? rename, string installerType, Manifest manifest)
     {
@@ -904,7 +897,7 @@ public class Repository : IDisposable
         {
             if (!IsSafeFileName(rename))
                 throw new InvalidOperationException($"Invalid --rename value '{rename}': it must be a plain file name without path separators.");
-            return rename;
+            return WithInstallerExtension(rename, installerType);
         }
 
         var path = url.Split('?', '#')[0];
@@ -1273,8 +1266,9 @@ public class Repository : IDisposable
         else
         {
             var tempDir = Path.Combine(Path.GetTempPath(), "pinget-install");
-            installerPath = FetchInstaller(request, manifest, selectedInstaller,
-                InstallDownloadRename(request, installerType), tempDir);
+            // Like WinGet, --rename never names the installer an install downloads: it only names a
+            // portable's command alias (see InstallerDispatch.DeterminePortableLinks).
+            installerPath = FetchInstaller(request, manifest, selectedInstaller, rename: null, tempDir);
             installerPath = PrepareInstallerForExecution(installerPath, installerType);
         }
         var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
@@ -2887,7 +2881,7 @@ public class Repository : IDisposable
         return entries;
     }
 
-    private static bool TryParseReturnCode(object? value, out long code)
+    internal static bool TryParseReturnCode(object? value, out long code)
     {
         var text = value?.ToString()?.Trim();
         // YAML hex integers (`0x8A150001`) arrive as their source text.
@@ -2905,9 +2899,13 @@ public class Repository : IDisposable
     private static List<object?> ReadYamlManifestDocuments(IReadOnlyList<byte[]> parts)
     {
         var documents = new List<object?>();
+        ReadOnlySpan<byte> utf8Bom = [0xEF, 0xBB, 0xBF];
         foreach (var bytes in parts)
         {
-            var yaml = System.Text.Encoding.UTF8.GetString(bytes);
+            var content = bytes.AsSpan();
+            if (content.StartsWith(utf8Bom))
+                content = content[utf8Bom.Length..];
+            var yaml = System.Text.Encoding.UTF8.GetString(content);
             var parser = new YamlDotNet.Core.Parser(new StringReader(yaml));
             parser.Consume<YamlDotNet.Core.Events.StreamStart>();
             while (parser.Accept<YamlDotNet.Core.Events.DocumentStart>(out _))
@@ -3087,7 +3085,7 @@ public class Repository : IDisposable
                         Architecture = InstStr("Architecture"),
                         InstallerType = InstStr("InstallerType") ?? topInstallerType,
                         NestedInstallerType = InstStr("NestedInstallerType") ?? topNestedInstallerType,
-                        NestedInstallerFiles = nestedFiles.Count > 0 ? nestedFiles : [.. topNestedInstallerFiles],
+                        NestedInstallerFiles = instDict.ContainsKey("NestedInstallerFiles") ? nestedFiles : [.. topNestedInstallerFiles],
                         Url = InstStr("InstallerUrl"),
                         Sha256 = InstStr("InstallerSha256"),
                         ProductCode = InstStr("ProductCode") ?? topProductCode,
@@ -3097,7 +3095,7 @@ public class Repository : IDisposable
                         ReleaseDate = InstStr("ReleaseDate") ?? topReleaseDate,
                         PackageFamilyName = InstStr("PackageFamilyName") ?? topPackageFamilyName,
                         UpgradeCode = InstStr("UpgradeCode") ?? topUpgradeCode,
-                        Platforms = platforms.Count > 0 ? platforms : [.. topPlatforms],
+                        Platforms = instDict.ContainsKey("Platform") ? platforms : [.. topPlatforms],
                         MinimumOsVersion = InstStr("MinimumOSVersion") ?? topMinimumOsVersion,
                         Switches = switches,
                         Commands = instDict.ContainsKey("Commands") ? InstArr("Commands") : [.. topCommands],
@@ -3113,7 +3111,7 @@ public class Repository : IDisposable
                             ? ReadStringList(unsupportedValue)
                             : [.. topUnsupportedArchitectures],
                         UpgradeBehavior = InstStr("UpgradeBehavior") ?? topUpgradeBehavior,
-                        AppsAndFeaturesEntries = appsAndFeaturesEntries.Count > 0 ? appsAndFeaturesEntries : [.. topAppsAndFeaturesEntries],
+                        AppsAndFeaturesEntries = instDict.ContainsKey("AppsAndFeaturesEntries") ? appsAndFeaturesEntries : [.. topAppsAndFeaturesEntries],
                         InstallerSuccessCodes = instDict.TryGetValue("InstallerSuccessCodes", out var successValue)
                             ? ReadInstallerReturnCodes(successValue)
                             : [.. topSuccessCodes],

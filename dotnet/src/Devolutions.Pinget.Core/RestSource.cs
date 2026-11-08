@@ -230,6 +230,8 @@ internal static class RestSource
     {
         var info = LoadInformation(client, source, appRoot, identifierKeyed, forceRefresh: true);
         source.SourceVersion = ChooseContract(info.ServerSupportedVersions);
+        if (!string.IsNullOrEmpty(info.SourceIdentifier))
+            source.Identifier = info.SourceIdentifier;
         return $"REST source up to date (contract: {source.SourceVersion})";
     }
 
@@ -645,8 +647,8 @@ internal static class RestSource
             return value.ValueKind switch
             {
                 JsonValueKind.Number => value.TryGetInt64(out code),
-                JsonValueKind.String => long.TryParse(value.GetString()?.Trim(), System.Globalization.NumberStyles.Integer,
-                    System.Globalization.CultureInfo.InvariantCulture, out code),
+                // Like the YAML reader and the Rust json_return_code, a string code may be `0x` hex.
+                JsonValueKind.String => Repository.TryParseReturnCode(value.GetString(), out code),
                 _ => false,
             };
         }
