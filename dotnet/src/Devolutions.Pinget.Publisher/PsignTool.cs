@@ -7,6 +7,25 @@ using System.Text.Json.Nodes;
 
 namespace Pinget.Publisher;
 
+/// <summary>How much of a signature <see cref="PsignTool.Verify"/> checks.</summary>
+internal enum SignaturePolicy
+{
+    /// <summary>A package signed by this publication: the signer certificate must be currently valid and trusted.</summary>
+    NewlySigned,
+
+    /// <summary>
+    /// An already published package: the chain must be trusted, but a certificate that has expired since
+    /// signing is left to psign's trust verification, which honours timestamps.
+    /// </summary>
+    Published,
+
+    /// <summary>
+    /// The previously published package about to be replaced: digests and signer only, so an expired or
+    /// rotated signing certificate never blocks the next publication.
+    /// </summary>
+    Superseded,
+}
+
 /// <summary>
 /// Signs and verifies MSIX packages with the cross-platform <c>psign-tool</c> from
 /// https://github.com/Devolutions/psign (dotnet tool <c>Devolutions.Psign.Tool</c>).
@@ -81,17 +100,25 @@ internal static class PsignTool
     }
 
     /// <summary>
-    /// Verifies the package digests, its signer against <paramref name="publisher"/>, and its certificate chain.
+    /// Verifies the package digests, its signer against <paramref name="publisher"/>, and (unless
+    /// <paramref name="policy"/> is <see cref="SignaturePolicy.Superseded"/>) its certificate chain.
     /// </summary>
     /// <remarks>
     /// Without trusted CAs, Windows uses the operating-system trust store (<c>signtool verify /pa</c>
     /// semantics) and other platforms use psign's Microsoft AuthRoot anchors.
     /// </remarks>
-    public static void Verify(string tool, string package, string publisher, IReadOnlyList<string> trustedCertificateAuthorities)
+    public static void Verify(
+        string tool,
+        string package,
+        string publisher,
+        IReadOnlyList<string> trustedCertificateAuthorities,
+        SignaturePolicy policy)
     {
         var packageArgument = PathArgument(package);
         _ = Run(tool, "MSIX digest verification", ["portable", "verify-msix", packageArgument]);
-        VerifySigner(tool, package, publisher);
+        VerifySigner(tool, package, publisher, policy == SignaturePolicy.NewlySigned);
+        if (policy == SignaturePolicy.Superseded)
+            return;
         var hint = trustedCertificateAuthorities.Count == 0 ? TrustedCaHint : null;
         if (trustedCertificateAuthorities.Count == 0 && OperatingSystem.IsWindows())
         {
@@ -113,7 +140,7 @@ internal static class PsignTool
         }
     }
 
-    private static void VerifySigner(string tool, string package, string publisher)
+    private static void VerifySigner(string tool, string package, string publisher, bool requireCurrentValidity)
     {
         byte[] signature;
         try
@@ -148,11 +175,14 @@ internal static class PsignTool
         byte[] certificate;
         try { certificate = Convert.FromBase64String(encoded); }
         catch (FormatException) { throw new PublisherException("source MSIX signer certificate is not valid base64"); }
-        CheckSigningCertificate(certificate, publisher);
+        CheckSigningCertificate(certificate, publisher, requireCurrentValidity);
     }
 
-    /// <summary>Requires the signer subject to match the package publisher, the Code Signing EKU and current validity.</summary>
-    public static void CheckSigningCertificate(byte[] der, string publisher)
+    /// <summary>
+    /// Requires the signer subject to match the package publisher, the Code Signing EKU and, when
+    /// <paramref name="requireCurrentValidity"/> is set, current validity.
+    /// </summary>
+    public static void CheckSigningCertificate(byte[] der, string publisher, bool requireCurrentValidity = true)
     {
         X509Certificate2 certificate;
         try
@@ -173,7 +203,8 @@ internal static class PsignTool
                 throw new PublisherException(
                     $"signing certificate subject does not match --publisher (expected \"{publisher}\", found \"{subject}\")");
             var now = DateTime.UtcNow;
-            if (now < certificate.NotBefore.ToUniversalTime() || now > certificate.NotAfter.ToUniversalTime())
+            if (requireCurrentValidity
+                && (now < certificate.NotBefore.ToUniversalTime() || now > certificate.NotAfter.ToUniversalTime()))
                 throw new PublisherException("signing certificate is not currently valid");
             var codeSigning = certificate.Extensions.OfType<X509EnhancedKeyUsageExtension>()
                 .Any(extension => extension.EnhancedKeyUsages.Cast<Oid>().Any(oid => oid.Value == CodeSigningOid));

@@ -44,6 +44,25 @@ internal static class UpgradeTargetSelector
         throw new InvalidOperationException($"{AmbiguousMessage}{Environment.NewLine}{candidates}");
     }
 
+    internal const string NoApplicableUpgradeMessage = "No applicable upgrade found.";
+
+    /// <summary>
+    /// Reports that nothing was selected for upgrade and returns the exit code. A named upgrade that
+    /// selected nothing is an error (WinGet reports <c>APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE</c>);
+    /// <c>upgrade --all</c> with nothing to do is not. Matches the Rust CLI.
+    /// </summary>
+    internal static int ReportNoApplicableUpgrade(bool all)
+    {
+        if (all)
+        {
+            Console.WriteLine(NoApplicableUpgradeMessage);
+            return 0;
+        }
+
+        Console.Error.WriteLine($"error: {NoApplicableUpgradeMessage}");
+        return 1;
+    }
+
     private static int DistinctIdCount(IEnumerable<ListMatch> rows)
         => rows.Select(match => match.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count();
 }

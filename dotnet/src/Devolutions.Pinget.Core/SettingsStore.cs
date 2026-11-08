@@ -27,7 +27,19 @@ internal static class SettingsStoreManager
         if (!File.Exists(path))
             return new JsonObject();
 
-        var node = JsonNode.Parse(File.ReadAllText(path));
+        return ParseJsonObject(File.ReadAllText(path));
+    }
+
+    // WinGet's settings.json ships with // comments and tolerates trailing commas.
+    private static readonly JsonDocumentOptions LenientDocumentOptions = new()
+    {
+        CommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
+    };
+
+    internal static JsonObject ParseJsonObject(string text)
+    {
+        var node = JsonNode.Parse(text.TrimStart('\uFEFF'), documentOptions: LenientDocumentOptions);
         return node as JsonObject ?? new JsonObject();
     }
 

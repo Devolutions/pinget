@@ -901,9 +901,10 @@ fn source_kind_name(kind: SourceKind) -> &'static str {
     }
 }
 
+/// Parses a source type; like WinGet, an omitted type means `Microsoft.PreIndexed.Package`.
 fn parse_source_kind(value: Option<&str>) -> Option<SourceKind> {
     match value {
-        None => Some(SourceKind::Rest),
+        None => Some(SourceKind::PreIndexed),
         Some(value) if value.eq_ignore_ascii_case("rest") || value.eq_ignore_ascii_case("Microsoft.Rest") => {
             Some(SourceKind::Rest)
         }
@@ -1240,3 +1241,6 @@ pub extern "system" fn PingetPackageManagerClsid() -> GUID {
 pub extern "system" fn PingetPackageManagerIid() -> GUID {
     IID_IPACKAGE_MANAGER
 }
+
+#[cfg(test)]
+mod wave11_com_tests;

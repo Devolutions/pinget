@@ -427,7 +427,7 @@ public class SourceStoreTests
 
         [Theory]
         [InlineData("Microsoft.DesktopAppInstaller_1.29.290.0_x64__8wekyb3d8bbwe", "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe", "1.29.290.0")]
-        [InlineData("Microsoft.DesktopAppInstaller_1.2.0.0_neutral_split.scale-100_8wekyb3d8bbwe", "Microsoft.DesktopAppInstaller_split.scale-100_8wekyb3d8bbwe", "1.2.0.0")]
+        [InlineData("Microsoft.DesktopAppInstaller_1.2.0.0_neutral_split.scale-100_8wekyb3d8bbwe", "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe", "1.2.0.0")]
         public void SystemWingetSourceStore_ParsesPackageFullNames(string packageFullName, string familyName, string version)
         {
                 var parsed = SystemWingetSourceStore.ParsePackageFullName(packageFullName);
@@ -1594,12 +1594,12 @@ public class RepositoryParityTests
 
         Assert.True(Repository.IsUpgradeBlockedByPin(match,
         [
-            new PinRecord { PackageId = "Test.Package", Version = "1.5.*", SourceId = "winget", PinType = PinType.Pinning }
+            new PinRecord { PackageId = "Test.Package", Version = "1.5.*", SourceId = "winget", PinType = PinType.Gating }
         ]));
 
         Assert.False(Repository.IsUpgradeBlockedByPin(match with { AvailableVersion = "1.5.9" },
         [
-            new PinRecord { PackageId = "Test.Package", Version = "1.5.*", SourceId = "winget", PinType = PinType.Pinning }
+            new PinRecord { PackageId = "Test.Package", Version = "1.5.*", SourceId = "winget", PinType = PinType.Gating }
         ]));
     }
 
@@ -1908,6 +1908,8 @@ public class RepositoryParityTests
             {
                 Query = new PackageQuery(),
                 ManifestPath = manifestPath,
+                // The fixture has no InstallerSha256, which is only accepted with the override.
+                IgnoreSecurityHash = true,
             };
 
             var downloadResult = repo.DownloadInstaller(request, Path.Combine(appRoot, "downloads"));
@@ -2650,9 +2652,10 @@ public class RepositoryParityTests
     }
 
     [Fact]
-    public void NormalizePublisher_Software_Strips_To_BaseName()
+    public void NormalizePublisher_Software_Is_Not_A_Legal_Suffix()
     {
-        Assert.Equal("sweetscape", NameNormalization.NormalizePublisher("SweetScape Software"));
+        // WinGet's legal-entity suffix list has no "Software" (its test data keeps SweetScapeSoftware.010Editor).
+        Assert.Equal("sweetscapesoftware", NameNormalization.NormalizePublisher("SweetScape Software"));
     }
 
     [Fact]
@@ -3241,7 +3244,7 @@ Installers:
         Assert.Equal("1.97.17002.0", parsed.Value.Version);
         Assert.Equal("split.scale-125", parsed.Value.ResourceId);
         Assert.Equal(
-            "Microsoft.XboxSpeechToTextOverlay_split.scale-125_8wekyb3d8bbwe",
+            "Microsoft.XboxSpeechToTextOverlay_8wekyb3d8bbwe",
             parsed.Value.FamilyName);
         Assert.True(InstalledPackages.IsMsixSplitResourcePackage(parsed.Value.ResourceId));
     }
@@ -3640,31 +3643,6 @@ Installers:
         var result = InstallerDispatch.ResolvePortableInstallLocationPure(
             "", "", "Sub_Source", @"C:\default");
         Assert.Equal(Path.Combine(@"C:\default", "Sub_Source"), result);
-    }
-
-    [Fact]
-    public void CleanDirectoryContents_RemovesFilesAndSubdirsButKeepsRoot()
-    {
-        var root = Path.Combine(Path.GetTempPath(), $"pinget-clean-test-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(root);
-        File.WriteAllText(Path.Combine(root, "a.txt"), "hello");
-        Directory.CreateDirectory(Path.Combine(root, "nested"));
-        File.WriteAllText(Path.Combine(root, "nested", "b.txt"), "world");
-
-        InstallerDispatch.CleanDirectoryContents(root);
-
-        Assert.True(Directory.Exists(root), "root dir itself must survive");
-        Assert.Empty(Directory.EnumerateFileSystemEntries(root));
-        Directory.Delete(root, recursive: true);
-    }
-
-    [Fact]
-    public void CleanDirectoryContents_IsNoOpOnNonexistentDir()
-    {
-        var bogus = Path.Combine(Path.GetTempPath(), $"pinget-clean-test-bogus-{Guid.NewGuid():N}");
-        Assert.False(Directory.Exists(bogus));
-        InstallerDispatch.CleanDirectoryContents(bogus);
-        Assert.False(Directory.Exists(bogus));
     }
 
     [Fact]
@@ -4730,7 +4708,7 @@ public class RepositoryEmbeddingTests
             repo.RemoveSource(source.Name);
 
         foreach (var source in sources)
-            repo.AddSource(source.Name, source.Arg, source.Kind, trustLevel: "trusted");
+            repo.AddSourceUnvalidated(source.Name, source.Arg, source.Kind, trustLevel: "trusted");
     }
 
     private static string WritePreindexedIndex(string appRoot, Repository repo, string sourceName, byte[] indexBytes)

@@ -93,11 +93,31 @@ pub(crate) fn sign(tool: &Path, package: &Path, pfx: &Path, password: &str, time
     run(tool, "MSIX signing", &arguments, Some(password)).map(|_| ())
 }
 
-/// Verifies the package digests, its signer against `publisher`, and its certificate chain.
+/// How much of a signature [`verify`] checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignaturePolicy {
+    /// A package signed by this publication: the signer certificate must be currently valid and trusted.
+    NewlySigned,
+    /// An already published package: the chain must be trusted, but a certificate that has expired
+    /// since signing is left to psign's trust verification, which honours timestamps.
+    Published,
+    /// The previously published package about to be replaced: digests and signer only, so an
+    /// expired or rotated signing certificate never blocks the next publication.
+    Superseded,
+}
+
+/// Verifies the package digests, its signer against `publisher`, and (unless `policy` is
+/// [`SignaturePolicy::Superseded`]) its certificate chain.
 ///
 /// Without `trusted_ca`, Windows uses the operating-system trust store (`signtool verify /pa`
 /// semantics) and other platforms use psign's Microsoft AuthRoot anchors.
-pub(crate) fn verify(tool: &Path, package: &Path, publisher: &str, trusted_ca: &[PathBuf]) -> Result<()> {
+pub(crate) fn verify(
+    tool: &Path,
+    package: &Path,
+    publisher: &str,
+    trusted_ca: &[PathBuf],
+    policy: SignaturePolicy,
+) -> Result<()> {
     let package_argument = path_argument(package)?;
     run(
         tool,
@@ -109,7 +129,10 @@ pub(crate) fn verify(tool: &Path, package: &Path, publisher: &str, trusted_ca: &
         ],
         None,
     )?;
-    verify_signer(tool, package, publisher)?;
+    verify_signer(tool, package, publisher, policy == SignaturePolicy::NewlySigned)?;
+    if policy == SignaturePolicy::Superseded {
+        return Ok(());
+    }
     let untrusted = |error: PublisherError| match error {
         PublisherError::Tool(message) if trusted_ca.is_empty() => PublisherError::Tool(format!(
             "{message}
@@ -143,7 +166,7 @@ Pass --trusted-ca with the signing root certificate when it is not trusted by de
     Ok(())
 }
 
-fn verify_signer(tool: &Path, package: &Path, publisher: &str) -> Result<()> {
+fn verify_signer(tool: &Path, package: &Path, publisher: &str, require_current_validity: bool) -> Result<()> {
     let mut archive = ZipArchive::new(File::open(package)?)
         .map_err(|error| PublisherError::Invalid(format!("could not read source MSIX: {error}")))?;
     let mut signature = Vec::new();
@@ -171,11 +194,12 @@ fn verify_signer(tool: &Path, package: &Path, publisher: &str) -> Result<()> {
     let certificate = BASE64
         .decode(encoded)
         .map_err(|_| PublisherError::Invalid("source MSIX signer certificate is not valid base64".to_owned()))?;
-    check_signing_certificate(&certificate, publisher)
+    check_signing_certificate(&certificate, publisher, require_current_validity)
 }
 
-/// Requires the signer subject to match the package publisher, the Code Signing EKU and current validity.
-pub(crate) fn check_signing_certificate(der: &[u8], publisher: &str) -> Result<()> {
+/// Requires the signer subject to match the package publisher, the Code Signing EKU and, when
+/// `require_current_validity` is set, current validity.
+pub(crate) fn check_signing_certificate(der: &[u8], publisher: &str, require_current_validity: bool) -> Result<()> {
     let certificate = Certificate::from_der(der)
         .map_err(|_| PublisherError::Invalid("signing certificate could not be parsed".to_owned()))?;
     let tbs = &certificate.tbs_certificate;
@@ -186,7 +210,9 @@ pub(crate) fn check_signing_certificate(der: &[u8], publisher: &str) -> Result<(
         )));
     }
     let now = SystemTime::now();
-    if now < tbs.validity.not_before.to_system_time() || now > tbs.validity.not_after.to_system_time() {
+    if require_current_validity
+        && (now < tbs.validity.not_before.to_system_time() || now > tbs.validity.not_after.to_system_time())
+    {
         return Err(PublisherError::Invalid(
             "signing certificate is not currently valid".to_owned(),
         ));
@@ -436,25 +462,27 @@ mod tests {
     #[test]
     fn signing_certificate_requires_matching_subject_code_signing_and_validity() {
         let valid = der(CODE_SIGNING_CERTIFICATE);
-        check_signing_certificate(&valid, SUBJECT).expect("matching code-signing certificate");
-        check_signing_certificate(&valid, "cn=pinget signer, o=\"example, inc.\"").expect("case-insensitive match");
+        check_signing_certificate(&valid, SUBJECT, true).expect("matching code-signing certificate");
+        check_signing_certificate(&valid, "cn=pinget signer, o=\"example, inc.\"", true)
+            .expect("case-insensitive match");
 
         assert!(
-            invalid_message(check_signing_certificate(&valid, "CN=Someone Else"))
+            invalid_message(check_signing_certificate(&valid, "CN=Someone Else", true))
                 .contains("does not match --publisher")
         );
         assert!(
-            invalid_message(check_signing_certificate(&valid, &format!("{SUBJECT} ")))
+            invalid_message(check_signing_certificate(&valid, &format!("{SUBJECT} "), true))
                 .contains("does not match --publisher")
         );
         assert!(
-            invalid_message(check_signing_certificate(&der(SERVER_AUTH_CERTIFICATE), SUBJECT)).contains("Code Signing")
+            invalid_message(check_signing_certificate(&der(SERVER_AUTH_CERTIFICATE), SUBJECT, true))
+                .contains("Code Signing")
         );
         assert!(
-            invalid_message(check_signing_certificate(&der(EXPIRED_CERTIFICATE), SUBJECT))
+            invalid_message(check_signing_certificate(&der(EXPIRED_CERTIFICATE), SUBJECT, true))
                 .contains("not currently valid")
         );
-        assert!(invalid_message(check_signing_certificate(&[1, 2, 3], SUBJECT)).contains("could not be parsed"));
+        assert!(invalid_message(check_signing_certificate(&[1, 2, 3], SUBJECT, true)).contains("could not be parsed"));
     }
 
     #[test]

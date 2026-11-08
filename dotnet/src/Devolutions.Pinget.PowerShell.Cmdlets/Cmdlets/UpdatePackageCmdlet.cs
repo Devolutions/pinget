@@ -40,7 +40,8 @@ public sealed class UpdatePackageCmdlet : InstallCmdlet
             Architecture,
             Mode,
             InstallerType,
-            IncludeUnknown);
+            IncludeUnknown,
+            MatchOption);
 
         foreach (var warning in result.Warnings)
             WriteWarning(warning);

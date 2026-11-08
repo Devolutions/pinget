@@ -141,7 +141,8 @@ foreach ($package in $packages) {
             '1.10.0' = @('1.10.0', '1.10.0')
         }
         Assert-Equal $actualArp $expectedArp 'Per-version ARP metadata is incorrect for Pinget.Test.Matrix.'
-        if ($package.arp_min_version -cne '1.9.0' -or $package.arp_max_version -cne '1.10.0') {
+        # WinGet stores the latest version's ARP range on the package row.
+        if ($package.arp_min_version -cne '1.10.0' -or $package.arp_max_version -cne '1.10.0') {
             throw 'Package-level ARP bounds are incorrect for Pinget.Test.Matrix.'
         }
     }

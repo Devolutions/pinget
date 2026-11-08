@@ -25,14 +25,14 @@ internal static class RestSource
         public RestInformation Value { get; init; } = new();
     }
 
-    public static RestInformation LoadInformation(HttpClient client, SourceRecord source, string? appRoot = null, bool identifierKeyed = false)
+    public static RestInformation LoadInformation(HttpClient client, SourceRecord source, string? appRoot = null, bool identifierKeyed = false, bool forceRefresh = false)
     {
         var stateDir = SourceStoreManager.SourceStateDir(source, appRoot, identifierKeyed);
         Directory.CreateDirectory(stateDir);
         var cachePath = Path.Combine(stateDir, "rest_info.json");
 
         // Try cache first
-        if (File.Exists(cachePath))
+        if (!forceRefresh && File.Exists(cachePath))
         {
             try
             {
@@ -74,17 +74,46 @@ internal static class RestSource
                 : [],
         };
 
-        // Cache for 1 hour
-        var cacheEntry = new RestInfoCache { ExpiresAt = DateTime.UtcNow.AddHours(1), Value = info };
+        var cacheEntry = new RestInfoCache
+        {
+            ExpiresAt = DateTime.UtcNow + InformationCacheLifetime(response.Headers.CacheControl?.MaxAge),
+            Value = info
+        };
         File.WriteAllText(cachePath, JsonSerializer.Serialize(cacheEntry, RestSourceJsonContext.Default.RestInfoCache));
 
         return info;
     }
 
+    // Cache lifetime for /information without a usable Cache-Control max-age.
+    internal static readonly TimeSpan DefaultInformationCacheLifetime = TimeSpan.FromSeconds(60);
+    // Upper bound on the server-supplied Cache-Control max-age for /information (one day).
+    internal static readonly TimeSpan MaxInformationCacheLifetime = TimeSpan.FromDays(1);
+
+    /// <summary>
+    /// How long to cache a REST /information response: the Cache-Control max-age clamped
+    /// to one day, or 60 seconds when the server sent none.
+    /// </summary>
+    internal static TimeSpan InformationCacheLifetime(TimeSpan? maxAge)
+    {
+        if (maxAge is not { } value || value < TimeSpan.Zero)
+            return DefaultInformationCacheLifetime;
+        return value > MaxInformationCacheLifetime ? MaxInformationCacheLifetime : value;
+    }
+
+    /// <summary>
+    /// Picks the newest supported contract whose major.minor the server lists, like WinGet's
+    /// GetLatestCommonVersion: a server advertising "1.12" or "1.12.1" speaks contract 1.12.0.
+    /// </summary>
     public static string? ChooseContract(IEnumerable<string> serverVersions)
     {
-        var serverSet = new HashSet<string>(serverVersions);
-        return SupportedContracts.FirstOrDefault(serverSet.Contains);
+        var serverMajorMinor = serverVersions.Select(MajorMinor).ToList();
+        return SupportedContracts.FirstOrDefault(candidate => serverMajorMinor.Contains(MajorMinor(candidate)));
+    }
+
+    private static (string Major, string Minor) MajorMinor(string version)
+    {
+        var parts = version.Split('.');
+        return (parts[0], parts.Length > 1 ? parts[1] : "");
     }
 
     public static (List<RestMatchResult> Results, bool Truncated) Search(
@@ -102,9 +131,10 @@ internal static class RestSource
         request.Headers.Add("Version", contract);
 
         using var response = client.SendAsync(request).GetAwaiter().GetResult();
-        response.EnsureSuccessStatusCode();
+        var responseBody = ReadResponseBody(response);
+        if (responseBody is null)
+            return ([], false);
 
-        var responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         using var document = JsonDocument.Parse(responseBody);
         var json = document.RootElement;
 
@@ -151,52 +181,98 @@ internal static class RestSource
         request.Headers.Add("Version", contract);
 
         using var response = client.SendAsync(request).GetAwaiter().GetResult();
-        response.EnsureSuccessStatusCode();
+        var body = ReadResponseBody(response)
+            ?? throw new InvalidOperationException(
+                $"No manifest found for package '{packageId}' version '{version}' in source '{source.Name}'");
 
-        var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         using var document = JsonDocument.Parse(body);
         var json = document.RootElement;
 
         return ParseRestManifest(json, packageId, version, channel);
     }
 
+    /// <summary>
+    /// Reads a REST response body, or null for the responses WinGet treats as an empty result:
+    /// 204 No Content (HttpClientHelper), and 404 with a JSON body that carries both
+    /// <c>code</c> and <c>message</c> (RestInterface_1_0 CustomRestCallResponseHandler). Any
+    /// other non-success status stays an error.
+    /// </summary>
+    internal static string? ReadResponseBody(HttpResponseMessage response)
+    {
+        if (response.StatusCode == System.Net.HttpStatusCode.NoContent)
+            return null;
+
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound &&
+            response.Content.Headers.ContentType?.MediaType is { } mediaType &&
+            mediaType.StartsWith("application/json", StringComparison.OrdinalIgnoreCase))
+        {
+            var errorBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            try
+            {
+                using var error = JsonDocument.Parse(errorBody);
+                if (error.RootElement.ValueKind == JsonValueKind.Object &&
+                    error.RootElement.TryGetProperty("code", out _) &&
+                    error.RootElement.TryGetProperty("message", out _))
+                {
+                    return null;
+                }
+            }
+            catch (JsonException)
+            {
+            }
+        }
+
+        response.EnsureSuccessStatusCode();
+        return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+    }
+
     public static string UpdateRest(HttpClient client, SourceRecord source, string? appRoot = null, bool identifierKeyed = false)
     {
-        var info = LoadInformation(client, source, appRoot, identifierKeyed);
-        source.SourceVersion = info.ServerSupportedVersions.FirstOrDefault();
+        var info = LoadInformation(client, source, appRoot, identifierKeyed, forceRefresh: true);
+        source.SourceVersion = ChooseContract(info.ServerSupportedVersions);
+        if (!string.IsNullOrEmpty(info.SourceIdentifier))
+            source.Identifier = info.SourceIdentifier;
         return $"REST source up to date (contract: {source.SourceVersion})";
     }
 
-    private static string BuildSearchBody(PackageQuery query, RestInformation info, SearchSemantics semantics)
+    internal static string BuildSearchBody(PackageQuery query, RestInformation info, SearchSemantics semantics)
     {
         var obj = new JsonObject();
         int maxResults = SourceFetchResults(query, semantics);
         obj["MaximumResults"] = maxResults;
 
         var filters = new JsonArray();
-        void AddFilter(string field, string value, string matchType)
+        static JsonObject PackageMatchFilter(string field, string value, string matchType) => new()
         {
-            filters.Add((JsonNode?)new JsonObject
+            ["PackageMatchField"] = field,
+            ["RequestMatch"] = new JsonObject
             {
-                ["PackageMatchField"] = field,
-                ["RequestMatch"] = new JsonObject
-                {
-                    ["KeyWord"] = value,
-                    ["MatchType"] = matchType
-                }
-            });
-        }
+                ["KeyWord"] = value,
+                ["MatchType"] = matchType
+            }
+        };
+        void AddFilter(string field, string value, string matchType) =>
+            filters.Add((JsonNode?)PackageMatchFilter(field, value, matchType));
 
-        string matchType = query.Exact ? "Exact" : "Substring";
+        // WinGet's GetSearchRequestForSingle uses CaseInsensitive unless --exact is given; in
+        // the REST contract `Exact` is case-sensitive. Many-search uses Substring.
+        string matchType = query.Exact
+            ? "Exact"
+            : semantics == SearchSemantics.Single ? "CaseInsensitive" : "Substring";
 
         if (query.Query is not null && semantics == SearchSemantics.Single)
         {
-            // For single-match semantics, use filters only (no Query field)
-            AddFilter("PackageIdentifier", query.Query, "Exact");
-            AddFilter("PackageName", query.Query, "Exact");
-            AddFilter("Moniker", query.Query, "Exact");
+            // The REST contract evaluates `(Query || Inclusions...) && Filters...`, so the
+            // alternative identity fields must be Inclusions (ORed). As Filters they would be
+            // ANDed and only match a package whose id, name and moniker are all equal.
+            var inclusions = new JsonArray();
+            inclusions.Add((JsonNode?)PackageMatchFilter("PackageIdentifier", query.Query, matchType));
+            inclusions.Add((JsonNode?)PackageMatchFilter("PackageName", query.Query, matchType));
+            inclusions.Add((JsonNode?)PackageMatchFilter("Moniker", query.Query, matchType));
+            obj["Inclusions"] = inclusions;
             AppendRequiredFilters(filters, info);
-            obj["Filters"] = filters;
+            if (filters.Count > 0)
+                obj["Filters"] = filters;
             return obj.ToJsonString();
         }
 
@@ -206,8 +282,11 @@ internal static class RestSource
         if (query.Id is not null) AddFilter("PackageIdentifier", query.Id, matchType);
         if (query.Name is not null) AddFilter("PackageName", query.Name, matchType);
         if (query.Moniker is not null) AddFilter("Moniker", query.Moniker, matchType);
-        if (query.Tag is not null) AddFilter("Tag", query.Tag, "Exact");
-        if (query.Command is not null) AddFilter("Command", query.Command, "Exact");
+        // Tag and command filters stay exact for many-search; a single lookup uses the
+        // single-lookup match type like WinGet's SearchSourceApplyFilters.
+        string tagMatchType = semantics == SearchSemantics.Single ? matchType : "Exact";
+        if (query.Tag is not null) AddFilter("Tag", query.Tag, tagMatchType);
+        if (query.Command is not null) AddFilter("Command", query.Command, tagMatchType);
 
         AppendRequiredFilters(filters, info);
 
@@ -502,7 +581,109 @@ internal static class RestSource
                 Custom = GetSwitch("Custom"),
                 Log = GetSwitch("Log"),
                 InstallLocation = GetSwitch("InstallLocation"),
+                Upgrade = GetSwitch("Upgrade"),
             };
+        }
+
+        InstallerDependencies GetDependencies(JsonElement el)
+        {
+            if (!el.TryGetProperty("Dependencies", out var dependencies) || dependencies.ValueKind != JsonValueKind.Object)
+                return new InstallerDependencies();
+
+            var packages = new List<PackageDependency>();
+            if (dependencies.TryGetProperty("PackageDependencies", out var packageDependencies) &&
+                packageDependencies.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var dependency in packageDependencies.EnumerateArray())
+                {
+                    if (dependency.ValueKind == JsonValueKind.Object &&
+                        GetOptStr(dependency, "PackageIdentifier") is { } packageIdentifier)
+                    {
+                        var minimumVersion = GetOptStr(dependency, "MinimumVersion")?.Trim();
+                        packages.Add(new PackageDependency
+                        {
+                            PackageIdentifier = packageIdentifier,
+                            MinimumVersion = string.IsNullOrEmpty(minimumVersion) ? null : minimumVersion,
+                        });
+                    }
+                }
+            }
+
+            return new InstallerDependencies
+            {
+                WindowsFeatures = GetStrArray(dependencies, "WindowsFeatures"),
+                WindowsLibraries = GetStrArray(dependencies, "WindowsLibraries"),
+                PackageDependencies = packages,
+                ExternalDependencies = GetStrArray(dependencies, "ExternalDependencies"),
+            };
+        }
+
+        List<string> GetMarkets(JsonElement el, string key) =>
+            el.TryGetProperty("Markets", out var markets) && markets.ValueKind == JsonValueKind.Object
+                ? GetStrArray(markets, key)
+                : [];
+
+        List<AppsAndFeaturesEntry> GetAppsAndFeaturesEntries(JsonElement el)
+        {
+            if (!el.TryGetProperty("AppsAndFeaturesEntries", out var entries) || entries.ValueKind != JsonValueKind.Array)
+                return [];
+            return entries.EnumerateArray()
+                .Where(entry => entry.ValueKind == JsonValueKind.Object)
+                .Select(entry => new AppsAndFeaturesEntry
+                {
+                    DisplayName = GetOptStr(entry, "DisplayName"),
+                    Publisher = GetOptStr(entry, "Publisher"),
+                    DisplayVersion = GetOptStr(entry, "DisplayVersion"),
+                    ProductCode = GetOptStr(entry, "ProductCode"),
+                    UpgradeCode = GetOptStr(entry, "UpgradeCode"),
+                    InstallerType = GetOptStr(entry, "InstallerType"),
+                })
+                .ToList();
+        }
+
+        static bool TryGetReturnCode(JsonElement value, out long code)
+        {
+            code = 0;
+            return value.ValueKind switch
+            {
+                JsonValueKind.Number => value.TryGetInt64(out code),
+                // Like the YAML reader and the Rust json_return_code, a string code may be `0x` hex.
+                JsonValueKind.String => Repository.TryParseReturnCode(value.GetString(), out code),
+                _ => false,
+            };
+        }
+
+        List<long> GetReturnCodes(JsonElement el, string prop)
+        {
+            var codes = new List<long>();
+            if (el.TryGetProperty(prop, out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in arr.EnumerateArray())
+                {
+                    if (TryGetReturnCode(item, out var code))
+                        codes.Add(code);
+                }
+            }
+            return codes;
+        }
+
+        List<ExpectedReturnCode> GetExpectedReturnCodes(JsonElement el)
+        {
+            var entries = new List<ExpectedReturnCode>();
+            if (el.TryGetProperty("ExpectedReturnCodes", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in arr.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Object &&
+                        item.TryGetProperty("InstallerReturnCode", out var codeValue) &&
+                        TryGetReturnCode(codeValue, out var code) &&
+                        GetOptStr(item, "ReturnResponse") is { Length: > 0 } response)
+                    {
+                        entries.Add(new ExpectedReturnCode { InstallerReturnCode = code, ReturnResponse = response });
+                    }
+                }
+            }
+            return entries;
         }
 
         bool GetBool(JsonElement el, string prop) =>
@@ -518,10 +699,21 @@ internal static class RestSource
         var topInstallerType = GetOptStr(installersSource, "InstallerType");
         var topNestedInstallerType = GetOptStr(installersSource, "NestedInstallerType") ?? GetOptStr(data, "NestedInstallerType");
         var topMsStoreProductIdentifier = GetOptStr(installersSource, "MSStoreProductIdentifier");
+        var topSuccessCodes = GetReturnCodes(installersSource, "InstallerSuccessCodes");
+        var topExpectedReturnCodes = GetExpectedReturnCodes(installersSource);
+        var topDependencies = GetDependencies(installersSource);
         if (installersSource.TryGetProperty("Installers", out var instArr) && instArr.ValueKind == JsonValueKind.Array)
         {
             foreach (var inst in instArr.EnumerateArray())
             {
+                // Installer-level values win; the version-level object supplies defaults.
+                JsonElement Inherited(string key) => inst.TryGetProperty(key, out _) ? inst : installersSource;
+                var dependencies = GetDependencies(inst);
+                if (dependencies.IsEmpty)
+                    dependencies = topDependencies;
+                var appsAndFeaturesEntries = GetAppsAndFeaturesEntries(inst);
+                if (appsAndFeaturesEntries.Count == 0)
+                    appsAndFeaturesEntries = GetAppsAndFeaturesEntries(installersSource);
                 var nestedFiles = ReadNestedInstallerFilesJson(inst);
                 if (nestedFiles.Count == 0)
                     nestedFiles = ReadNestedInstallerFilesJson(installersSource);
@@ -547,8 +739,23 @@ internal static class RestSource
                     UpgradeCode = GetOptStr(inst, "UpgradeCode"),
                     Switches = GetSwitches(inst).MergeWith(defaultSwitches),
                     Commands = GetStrArray(inst, "Commands"),
-                    PackageDependencies = GetPackageDependencies(inst),
+                    PackageDependencies = dependencies.IsEmpty
+                        ? GetPackageDependencies(inst)
+                        : dependencies.PackageDependencies.Select(dependency => dependency.PackageIdentifier).ToList(),
+                    Dependencies = dependencies,
                     RequireExplicitUpgrade = GetBool(inst, "RequireExplicitUpgrade"),
+                    DownloadCommandProhibited = GetBool(Inherited("DownloadCommandProhibited"), "DownloadCommandProhibited"),
+                    AllowedMarkets = GetMarkets(Inherited("Markets"), "AllowedMarkets"),
+                    ExcludedMarkets = GetMarkets(Inherited("Markets"), "ExcludedMarkets"),
+                    UnsupportedOSArchitectures = GetStrArray(Inherited("UnsupportedOSArchitectures"), "UnsupportedOSArchitectures"),
+                    UpgradeBehavior = GetOptStr(inst, "UpgradeBehavior") ?? GetOptStr(installersSource, "UpgradeBehavior"),
+                    AppsAndFeaturesEntries = appsAndFeaturesEntries,
+                    InstallerSuccessCodes = inst.TryGetProperty("InstallerSuccessCodes", out _)
+                        ? GetReturnCodes(inst, "InstallerSuccessCodes")
+                        : [.. topSuccessCodes],
+                    ExpectedReturnCodes = inst.TryGetProperty("ExpectedReturnCodes", out _)
+                        ? GetExpectedReturnCodes(inst)
+                        : [.. topExpectedReturnCodes],
                 });
             }
         }
@@ -834,7 +1041,7 @@ internal static class RestSource
         var parts = new List<string>();
         var current = new System.Text.StringBuilder();
         bool? currentIsDigit = null;
-        foreach (var ch in value)
+        foreach (var ch in TrimVersionPrefix(value))
         {
             if (ch is '.' or '-' or '_' or '+')
             {
@@ -860,6 +1067,19 @@ internal static class RestSource
         if (current.Length > 0)
             parts.Add(current.ToString());
         return parts;
+    }
+
+    /// <summary>
+    /// Drops a leading non-digit prefix such as the <c>v</c> in <c>v1.2</c>, as WinGet's
+    /// <c>Version::Assign</c> does: when the first digit comes before the first '.' (or there is no
+    /// '.'), everything before that digit is trimmed. Mirrors the Rust trim_version_prefix.
+    /// </summary>
+    internal static string TrimVersionPrefix(string value)
+    {
+        var trimmed = value.Trim();
+        var digit = trimmed.AsSpan().IndexOfAnyInRange('0', '9');
+        var split = trimmed.IndexOf('.');
+        return digit >= 0 && (split < 0 || digit < split) ? trimmed[digit..] : trimmed;
     }
 
     private static string? StripLessThanPrefix(string value)

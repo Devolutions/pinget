@@ -16,5 +16,6 @@
   <ItemGroup>
     <ProjectReference Include="..\Devolutions.Pinget.Cli\Devolutions.Pinget.Cli.csproj" />
     <ProjectReference Include="..\Devolutions.Pinget.Core\Devolutions.Pinget.Core.csproj" />
+    <ProjectReference Include="..\Devolutions.Pinget.PowerShell.Engine\Devolutions.Pinget.PowerShell.Engine.csproj" />
   </ItemGroup>
 </Project>

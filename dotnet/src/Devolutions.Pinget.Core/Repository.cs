@@ -231,6 +231,39 @@ public class Repository : IDisposable
 
     public void AddSource(string name, string arg, SourceKind kind, string trustLevel = "None", bool explicitSource = false, int priority = 0)
     {
+        ValidateSourceArgument(arg);
+        AddSourceUnvalidated(name, arg, kind, trustLevel, explicitSource, priority);
+    }
+
+    /// <summary>
+    /// <c>source add</c> accepts only secure remote URLs, like WinGet's RestSourceFactory::Add
+    /// (SOURCE_NOT_REMOTE / SOURCE_NOT_SECURE) and the pre-indexed forms (SOURCE_NOT_SECURE).
+    /// Manifests carry installer URLs and hashes, so a plain-HTTP source can be tampered with
+    /// in transit. Pinget fetches pre-indexed sources over HTTP(S) only, so a local path is
+    /// "not remote" for both kinds.
+    /// </summary>
+    internal static void ValidateSourceArgument(string arg)
+    {
+        var trimmed = arg.Trim();
+        if (!trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+            !trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"The source argument '{arg}' is not remote; only https:// sources are supported.");
+        }
+
+        if (!trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"The source argument '{arg}' is not secure; only https:// sources are supported.");
+
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host))
+            throw new InvalidOperationException($"The source argument '{arg}' is not a valid https:// URL.");
+    }
+
+    /// <summary>
+    /// Test seam: Core.Tests register loopback <c>http://</c> stub servers, which
+    /// <see cref="AddSource"/> refuses.
+    /// </summary>
+    internal void AddSourceUnvalidated(string name, string arg, SourceKind kind, string trustLevel = "None", bool explicitSource = false, int priority = 0)
+    {
         if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.AddSource(name, arg, kind, NormalizeSourceTrustLevel(trustLevel), explicitSource);
@@ -282,13 +315,22 @@ public class Repository : IDisposable
             return;
         }
 
-        var source = _store.Sources.FirstOrDefault(s => s.Name == name)
+        var source = _store.Sources.FirstOrDefault(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidOperationException($"Source '{name}' not found.");
 
         _store.Sources.Remove(source);
+        // Clean up cached state for this source. Best effort: a locked or partially
+        // deleted cache must not keep the source configured.
         var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources);
-        if (Directory.Exists(stateDir))
-            Directory.Delete(stateDir, recursive: true);
+        try
+        {
+            if (Directory.Exists(stateDir))
+                Directory.Delete(stateDir, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+        PreIndexedSource.RemoveSourceFileCaches(_appRoot, source.Identifier);
         SourceStoreManager.Save(_store, _appRoot);
     }
 
@@ -309,6 +351,7 @@ public class Repository : IDisposable
         var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources);
         if (Directory.Exists(stateDir))
             Directory.Delete(stateDir, recursive: true);
+        PreIndexedSource.RemoveSourceFileCaches(_appRoot, source.Identifier);
 
         var defaultSource = SourceStore.Default().Sources
             .FirstOrDefault(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase));
@@ -342,6 +385,7 @@ public class Repository : IDisposable
             var stateDir = SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources);
             if (Directory.Exists(stateDir))
                 Directory.Delete(stateDir, recursive: true);
+            PreIndexedSource.RemoveSourceFileCaches(_appRoot, source.Identifier);
         }
         _store = SourceStore.Default();
         SourceStoreManager.Save(_store, _appRoot);
@@ -448,17 +492,26 @@ public class Repository : IDisposable
         var indexes = ResolveSourceIndexes(sourceName);
         var results = new List<SourceUpdateResult>();
 
+        // One failing source must not stop the others or discard their refreshed metadata:
+        // record the failure in its result, keep going, and save what succeeded.
         foreach (var index in indexes)
         {
             var source = _store.Sources[index];
-            var detail = source.Kind switch
+            try
             {
-                SourceKind.PreIndexed => PreIndexedSource.Update(_client, source, _appRoot, MirrorsSystemWingetSources),
-                SourceKind.Rest => RestSource.UpdateRest(_client, source, _appRoot, MirrorsSystemWingetSources),
-                _ => "Unknown source kind"
-            };
-            source.LastUpdate = DateTime.UtcNow;
-            results.Add(new SourceUpdateResult { Name = source.Name, Kind = source.Kind, Detail = detail });
+                var detail = source.Kind switch
+                {
+                    SourceKind.PreIndexed => PreIndexedSource.Update(_client, source, _appRoot, MirrorsSystemWingetSources),
+                    SourceKind.Rest => RestSource.UpdateRest(_client, source, _appRoot, MirrorsSystemWingetSources),
+                    _ => "Unknown source kind"
+                };
+                source.LastUpdate = DateTime.UtcNow;
+                results.Add(new SourceUpdateResult { Name = source.Name, Kind = source.Kind, Detail = detail });
+            }
+            catch (Exception ex)
+            {
+                results.Add(new SourceUpdateResult { Name = source.Name, Kind = source.Kind, Detail = ex.Message, Success = false });
+            }
         }
 
         SaveStore();
@@ -582,7 +635,16 @@ public class Repository : IDisposable
 
     // ── List ──
 
-    public ListResponse List(ListQuery query)
+    public ListResponse List(ListQuery query) => List(query, applyPins: true);
+
+    /// <summary>
+    /// Like <see cref="List(ListQuery)"/>, but never hides upgrade rows because of a pin. Explicit
+    /// (named) upgrades use this: the caller evaluates the pin against the requested target version and
+    /// reports a pinned package instead of silently finding nothing to upgrade.
+    /// </summary>
+    public ListResponse ListIgnoringPins(ListQuery query) => List(query, applyPins: false);
+
+    private ListResponse List(ListQuery query, bool applyPins)
     {
         var sourceRefreshWarning = RefreshSystemWingetSourcesForQuery();
 
@@ -653,6 +715,7 @@ public class Repository : IDisposable
             // catalog name is the parity-faithful substitute pinget has
             // available without taking a WinRT dependency.
             warnings.AddRange(EnrichCorrelatedViaIndex(installed, query.Source));
+            warnings.AddRange(ResolveRestCorrelatedVersions(installed));
         }
 
         // For `upgrade`, collapse multiple installed entries that map to the
@@ -672,10 +735,11 @@ public class Repository : IDisposable
             .ThenBy(p => p.LocalId)
             .ToList();
 
-        var pins = query.UpgradeOnly ? ListPins() : [];
+        // --include-pinned relaxes only Pinning pins; Blocking and Gating pins still apply.
+        var pins = query.UpgradeOnly && applyPins ? ListPins() : [];
         var listMatches = filtered
             .Select(ListMatchFromInstalled)
-            .Where(match => !query.UpgradeOnly || query.IncludePinned || !IsUpgradeBlockedByPin(match, pins))
+            .Where(match => !query.UpgradeOnly || !IsUpgradeBlockedByPin(match, pins, query.IncludePinned))
             .ToList();
         if (!query.UpgradeOnly)
             listMatches = SuppressDuplicateAvailableVersions(listMatches);
@@ -710,57 +774,188 @@ public class Repository : IDisposable
 
     public DownloadResult DownloadInstaller(InstallRequest request, string downloadDir)
     {
-        var fetched = FetchInstaller(request, downloadDir);
-        var manifestYaml = BuildDownloadManifestYaml(fetched.Manifest, fetched.ManifestDocuments, fetched.Installer);
-        var manifestFileName = DeriveDownloadManifestFilename(fetched.Manifest, fetched.Installer);
+        EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
+        var (manifest, manifestDocuments) = ResolveManifestAndDocumentsForInstall(request);
+        var installer = SelectInstaller(manifest.Installers, request.Query)
+            ?? throw new InvalidOperationException("No applicable installer found for the current system");
+        // winget download gates: the package agreements must be accepted (DownloadCommand's
+        // ShowPromptsForSinglePackage), then an installer marked DownloadCommandProhibited is refused
+        // (EnsureSupportForDownload). Install does not apply these download-only checks.
+        EnsurePackageAgreementsAccepted(manifest, request);
+        EnsureInstallerDownloadSupported(installer);
+        var installerPath = FetchInstaller(request, manifest, installer, request.Rename, downloadDir);
+        var manifestYaml = BuildDownloadManifestYaml(manifest, manifestDocuments, installer);
+        var manifestFileName = DeriveDownloadManifestFilename(manifest, installer);
         var manifestPath = Path.Combine(downloadDir, manifestFileName);
         File.WriteAllText(manifestPath, manifestYaml);
 
         return new DownloadResult
         {
-            Manifest = fetched.Manifest,
-            InstallerPath = fetched.InstallerPath,
+            Manifest = manifest,
+            InstallerPath = installerPath,
             ManifestPath = manifestPath,
         };
     }
 
+    internal const string DownloadCommandProhibitedError =
+        "Installer is prohibited from being downloaded for later offline installation.";
+
+    internal const string UpgradeBlockedByManifestError =
+        "The package cannot be upgraded using WinGet. Please use the method provided by the publisher for upgrading this package.";
+
+    /// <summary>WinGet <c>APPINSTALLER_CLI_ERROR_DOWNLOAD_COMMAND_PROHIBITED</c>.</summary>
+    internal static void EnsureInstallerDownloadSupported(Installer installer)
+    {
+        if (installer.DownloadCommandProhibited)
+            throw new InvalidOperationException(DownloadCommandProhibitedError);
+    }
+
+    /// <summary>True when installing <paramref name="targetVersion"/> over <paramref name="installedVersion"/> changes the installed version.</summary>
+    internal static bool InstallIsUpdate(string installedVersion, string targetVersion)
+        => RestSource.CompareVersionStrings(installedVersion, targetVersion) != 0;
+
+    internal static bool UpgradeBehaviorIs(Installer installer, string behavior)
+        => string.Equals(installer.UpgradeBehavior?.Trim(), behavior, StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
-    /// Fetches the installer file without emitting the YAML manifest. Used by
-    /// the install flow, which downloads into a temp dir and only needs the
-    /// installer path — emitting a manifest there would litter the temp dir
-    /// and turn a benign YAML-write failure into an installation failure.
+    /// WinGet <c>APPINSTALLER_CLI_ERROR_INSTALL_UPGRADE_NOT_SUPPORTED</c>: <c>UpgradeBehavior: deny</c> blocks
+    /// updating an existing installation with this installer.
     /// </summary>
-    private FetchedInstaller FetchInstaller(InstallRequest request, string downloadDir)
+    internal static void EnsureUpgradeAllowed(Installer installer, bool isUpdate)
+    {
+        if (isUpdate && UpgradeBehaviorIs(installer, "deny"))
+            throw new InvalidOperationException(UpgradeBlockedByManifestError);
+    }
+
+    /// <summary>
+    /// Fetches the file of an installer the caller already selected, without emitting the YAML manifest.
+    /// The install flow passes the manifest and installer it resolved, so the downloaded (and hash-verified)
+    /// file always belongs to the installer that is then dispatched; resolving again here could return a
+    /// different manifest (a newly published version, a source refresh) whose file would run with the first
+    /// one's type and switches.
+    /// </summary>
+    internal string FetchInstaller(InstallRequest request, Manifest manifest, Installer installer, string? rename, string downloadDir)
     {
         EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
-        var (manifest, manifestDocuments) = ResolveManifestAndDocumentsForInstall(request);
-        var installer = SelectInstaller(manifest.Installers, request.Query)
-            ?? throw new InvalidOperationException("No applicable installer found for the current system");
         if (string.Equals(installer.InstallerType, "msstore", StringComparison.OrdinalIgnoreCase) &&
             installer.Url is null)
         {
             throw new InvalidOperationException("Downloading Microsoft Store (msstore) installers is not supported; use 'install' instead.");
         }
         var url = installer.Url ?? throw new InvalidOperationException("Installer has no URL");
+        var installerType = (installer.InstallerType ?? "exe").ToLowerInvariant();
+        var expectedHash = GetInstallerExpectedHash(installer, request.IgnoreSecurityHash);
 
+        var filename = InstallerDownloadFileName(url, rename, installerType, manifest);
         Directory.CreateDirectory(downloadDir);
-        var filename = request.Rename ?? url.Split('/').Last().Split('?').First();
-        if (string.IsNullOrEmpty(filename)) filename = "installer";
         var dest = Path.Combine(downloadDir, filename);
 
         var actualHash = DownloadInstallerToFile(url, dest);
 
-        if (installer.Sha256 is not null)
+        if (expectedHash is not null &&
+            !actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase) &&
+            !request.IgnoreSecurityHash)
         {
-            if (!actualHash.Equals(installer.Sha256, StringComparison.OrdinalIgnoreCase) &&
-                !request.IgnoreSecurityHash)
-            {
-                File.Delete(dest);
-                throw new InvalidOperationException($"Installer hash mismatch. Expected: {installer.Sha256}, Got: {actualHash}");
-            }
+            File.Delete(dest);
+            throw new InvalidOperationException($"Installer hash mismatch. Expected: {expectedHash}, Got: {actualHash}");
         }
 
-        return new FetchedInstaller(manifest, manifestDocuments, installer, dest);
+        return dest;
+    }
+
+    internal const string MissingInstallerHashError =
+        "The manifest does not provide an InstallerSha256 for this installer; use --ignore-security-hash to install it anyway.";
+
+    /// <summary>
+    /// Returns the hash the downloaded installer must match, or null when no verification applies (the user
+    /// overrode it, or an msstore installer has no hash). Like WinGet, every other installer type requires
+    /// InstallerSha256.
+    /// </summary>
+    internal static string? GetInstallerExpectedHash(Installer installer, bool ignoreSecurityHash)
+    {
+        var expectedHash = string.IsNullOrWhiteSpace(installer.Sha256) ? null : installer.Sha256;
+        if (expectedHash is not null || ignoreSecurityHash)
+            return expectedHash;
+        if (string.Equals(installer.InstallerType, "msstore", StringComparison.OrdinalIgnoreCase))
+            return null;
+        throw new InvalidOperationException(MissingInstallerHashError);
+    }
+
+    private const int MaxInstallerFileNameLength = 200;
+    private static readonly char[] InvalidInstallerFileNameChars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+    /// <summary>
+    /// Chooses the on-disk name of a downloaded installer. A --rename value must already be a plain file
+    /// name. A name taken from the URL is percent-decoded and used only when it is a safe single path
+    /// segment (otherwise the &lt;id&gt;.&lt;version&gt; fallback WinGet uses applies). Either name always receives an
+    /// extension that matches the installer type so it cannot be launched as something else (or, without one,
+    /// fail to launch).
+    /// </summary>
+    internal static string InstallerDownloadFileName(string url, string? rename, string installerType, Manifest manifest)
+    {
+        if (rename is not null)
+        {
+            if (!IsSafeFileName(rename))
+                throw new InvalidOperationException($"Invalid --rename value '{rename}': it must be a plain file name without path separators.");
+            return WithInstallerExtension(rename, installerType);
+        }
+
+        var path = url.Split('?', '#')[0];
+        var segment = path[(path.LastIndexOf('/') + 1)..];
+        var decoded = Uri.UnescapeDataString(segment);
+        var name = IsSafeFileName(decoded) ? decoded : MakeSafeFileName($"{manifest.Id}.{manifest.Version}");
+        return WithInstallerExtension(name, installerType);
+    }
+
+    internal static bool IsSafeFileName(string name)
+    {
+        if (name.Length == 0 ||
+            name.Length > MaxInstallerFileNameLength ||
+            name is "." or ".." ||
+            name.EndsWith('.') || name.EndsWith(' ') || name.StartsWith(' ') ||
+            name.Any(ch => char.IsControl(ch) || InvalidInstallerFileNameChars.Contains(ch)))
+            return false;
+
+        var stem = name.Split('.')[0].TrimEnd();
+        return !IsReservedWindowsDeviceName(stem);
+    }
+
+    private static bool IsReservedWindowsDeviceName(string stem)
+    {
+        var upper = stem.ToUpperInvariant();
+        return upper is "CON" or "PRN" or "AUX" or "NUL" ||
+            ((upper.StartsWith("COM", StringComparison.Ordinal) || upper.StartsWith("LPT", StringComparison.Ordinal)) &&
+             upper.Length == 4 && upper[3] is >= '1' and <= '9');
+    }
+
+    private static string MakeSafeFileName(string value)
+    {
+        var replaced = new string(value.Select(ch => char.IsControl(ch) || InvalidInstallerFileNameChars.Contains(ch) ? '_' : ch).ToArray());
+        var trimmed = replaced.Trim().TrimEnd('.').TrimEnd();
+        if (trimmed.Length > MaxInstallerFileNameLength)
+            trimmed = trimmed[..MaxInstallerFileNameLength];
+        return IsSafeFileName(trimmed) ? trimmed : "installer";
+    }
+
+    /// <summary>
+    /// Extensions accepted for each installer type; the first one is appended when the name does not already
+    /// end with an accepted extension.
+    /// </summary>
+    private static string[] InstallerTypeExtensions(string installerType) => installerType switch
+    {
+        "exe" or "burn" or "inno" or "nullsoft" or "nsis" or "portable" => [".exe"],
+        "msi" or "wix" => [".msi"],
+        "msix" or "appx" => [".msix", ".msixbundle", ".appx", ".appxbundle"],
+        "zip" => [".zip"],
+        _ => [],
+    };
+
+    private static string WithInstallerExtension(string name, string installerType)
+    {
+        var extensions = InstallerTypeExtensions(installerType);
+        if (extensions.Length == 0 || extensions.Any(extension => name.EndsWith(extension, StringComparison.OrdinalIgnoreCase)))
+            return name;
+        return name + extensions[0];
     }
 
     private string DownloadInstallerToFile(string url, string dest)
@@ -971,8 +1166,6 @@ public class Repository : IDisposable
 
     private sealed class InstallerDownloadRetryException(string message) : Exception(message);
 
-    private sealed record FetchedInstaller(Manifest Manifest, object ManifestDocuments, Installer Installer, string InstallerPath);
-
     public InstallResult Install(PackageQuery query, bool silent)
     {
         return Install(new InstallRequest
@@ -986,6 +1179,14 @@ public class Repository : IDisposable
         => Install(new InstallRequest { Query = query, Mode = mode });
 
     public InstallResult Install(InstallRequest request)
+        => InstallCore(request, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// <paramref name="visited"/> holds the ids of every package already on the current dependency
+    /// chain or already handled, shared across the whole recursion so a dependency cycle (or a
+    /// self-dependency) is skipped instead of recursing forever, as WinGet's dependency graph does.
+    /// </summary>
+    private InstallResult InstallCore(InstallRequest request, HashSet<string> visited)
     {
         // Refuse a disabled override before any side effect (agreement prompt, dependency
         // installs) and on paths that never fetch an installer (no-op, msstore, dependencies-only).
@@ -1005,8 +1206,25 @@ public class Repository : IDisposable
             return noOpResult;
 
         request = ApplyInstallScope(request, existingMatch?.Scope);
+
+        // Select the installer first: it decides which dependencies apply, and a manifest with no
+        // applicable installer must fail before any dependency is installed.
+        var selectedInstaller = SelectInstaller(manifest.Installers, request.Query)
+            ?? throw new InvalidOperationException("No applicable installer found");
+
+        // Installing a different version over an existing installation is an update (WinGet converts such an
+        // install to the upgrade flow). A same-version reinstall (repair, --force) is not.
+        var isUpdate = existingMatch is not null && InstallIsUpdate(existingMatch.InstalledVersion, manifest.Version);
+        EnsureUpgradeAllowed(selectedInstaller, isUpdate);
+        if (!isUpdate && selectedInstaller.Switches.Upgrade is not null)
+        {
+            // The `Upgrade` switch only applies when updating an existing installation.
+            selectedInstaller = selectedInstaller with { Switches = selectedInstaller.Switches with { Upgrade = null } };
+        }
+
         EnsurePackageAgreementsAccepted(manifest, request);
-        InstallDependencies(manifest, request);
+        visited.Add(manifest.Id);
+        InstallDependencies(manifest, selectedInstaller, request, visited);
 
         if (request.DependenciesOnly)
         {
@@ -1022,30 +1240,21 @@ public class Repository : IDisposable
             };
         }
 
-        var selectedInstaller = SelectInstaller(manifest.Installers, request.Query)
-            ?? throw new InvalidOperationException("No applicable installer found");
-
-        if (request.UninstallPrevious)
+        var warnings = new List<string>();
+        if ((request.UninstallPrevious || (isUpdate && UpgradeBehaviorIs(selectedInstaller, "uninstallPrevious"))) && existingMatch is not null)
         {
-            var uninstallQuery = request.Query with
-            {
-                Id = request.Query.Id ?? manifest.Id,
-                Query = request.Query.Query ?? manifest.Id,
-            };
+            // Remove the installed version that was found above, not whatever the
+            // install query (which may pin the *new* version) happens to match.
+            int previousExitCode;
             try
             {
-                Uninstall(new UninstallRequest
-                {
-                    Query = uninstallQuery,
-                    ProductCode = selectedInstaller.ProductCode,
-                    Mode = InstallerMode.Silent,
-                    AllVersions = true,
-                    Force = true,
-                });
+                previousExitCode = InstallerDispatch.Uninstall(existingMatch, CreateUninstallPreviousRequest(existingMatch), warnings);
             }
-            catch (InvalidOperationException)
+            catch (InvalidOperationException ex)
             {
+                throw new InvalidOperationException($"Failed to uninstall the previous version of {manifest.Id}: {ex.Message}", ex);
             }
+            EnsurePreviousVersionUninstalled(manifest.Id, previousExitCode);
         }
 
         var installerType = (selectedInstaller.InstallerType ?? "exe").ToLowerInvariant();
@@ -1057,11 +1266,32 @@ public class Repository : IDisposable
         else
         {
             var tempDir = Path.Combine(Path.GetTempPath(), "pinget-install");
-            installerPath = FetchInstaller(request, tempDir).InstallerPath;
+            // Like WinGet, --rename never names the installer an install downloads: it only names a
+            // portable's command alias (see InstallerDispatch.DeterminePortableLinks).
+            installerPath = FetchInstaller(request, manifest, selectedInstaller, rename: null, tempDir);
             installerPath = PrepareInstallerForExecution(installerPath, installerType);
         }
-        var warnings = new List<string>();
         var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
+        return CompletedInstallResult(manifest, selectedInstaller, installerPath, installerType, exitCode, warnings);
+    }
+
+    /// <summary>
+    /// Builds the result of a finished installer run from its classified exit code. A reboot-required
+    /// success is surfaced both as <see cref="InstallResult.RebootRequired"/> and as a warning.
+    /// </summary>
+    internal static InstallResult CompletedInstallResult(
+        Manifest manifest,
+        Installer installer,
+        string installerPath,
+        string installerType,
+        int exitCode,
+        List<string> warnings)
+    {
+        // A zip's exit code comes from its nested installer, so classify it with the nested type.
+        var (success, rebootRequired) = InstallerDispatch.ClassifyExitCode(installer,
+            InstallerDispatch.EffectiveInstallerType(installer, installerType), exitCode);
+        if (rebootRequired)
+            warnings.Add(InstallerDispatch.InstallRebootRequiredWarning);
 
         return new InstallResult
         {
@@ -1070,10 +1300,28 @@ public class Repository : IDisposable
             InstallerPath = installerPath,
             InstallerType = installerType,
             ExitCode = exitCode,
-            Success = exitCode == 0,
+            Success = success,
             NoOp = false,
+            RebootRequired = rebootRequired,
             Warnings = warnings,
         };
+    }
+
+    /// <summary>
+    /// Builds the request used by --uninstall-previous to remove the installed version that the install flow
+    /// already located.
+    /// </summary>
+    internal static UninstallRequest CreateUninstallPreviousRequest(ListMatch previous) => new()
+    {
+        Query = new PackageQuery { Id = previous.Id, Exact = true },
+        Mode = InstallerMode.Silent,
+        Force = true,
+    };
+
+    internal static void EnsurePreviousVersionUninstalled(string packageId, int exitCode)
+    {
+        if (exitCode != 0)
+            throw new InvalidOperationException($"Failed to uninstall the previous version of {packageId} (exit code: {exitCode})");
     }
 
     internal static InstallRequest ApplyInstallScope(InstallRequest request, string? installedScope = null)
@@ -1130,7 +1378,7 @@ public class Repository : IDisposable
             return CreateUnsupportedActionResult(packageId, request.Query.Version ?? "", "repair", RepairUnsupportedWarning);
         }
 
-        var warnings = new List<string> { RepairReinstallWarning };
+        var warnings = new List<string>();
         ListMatch? installedMatch = null;
 
         if (string.IsNullOrWhiteSpace(request.ManifestPath))
@@ -1145,6 +1393,31 @@ public class Repository : IDisposable
             installedMatch = installed.Matches[0];
         }
 
+        // An installed MSI is repaired in place with `msiexec /f <ProductCode>`, as WinGet does. Re-running
+        // `msiexec /i` on the same package is a maintenance run without REINSTALL that changes nothing yet
+        // reports success.
+        var msiProductCode = installedMatch is null ? null : MsiRepairProductCode(installedMatch);
+        if (installedMatch is not null && msiProductCode is not null && OperatingSystem.IsWindows())
+        {
+            var repairExitCode = InstallerDispatch.RunMsiRepair(msiProductCode, request.Mode, request.LogPath);
+            var (repairSuccess, repairRebootRequired) = InstallerDispatch.ClassifyExitCode(new Installer(), "msi", repairExitCode);
+            if (repairRebootRequired)
+                warnings.Add(InstallerDispatch.InstallRebootRequiredWarning);
+            return new InstallResult
+            {
+                PackageId = installedMatch.Id,
+                Version = installedMatch.InstalledVersion,
+                InstallerPath = "",
+                InstallerType = "msi",
+                ExitCode = repairExitCode,
+                Success = repairSuccess,
+                NoOp = false,
+                RebootRequired = repairRebootRequired,
+                Warnings = warnings,
+            };
+        }
+
+        warnings.Insert(0, RepairReinstallWarning);
         var installResult = Install(CreateRepairInstallRequest(request, installedMatch));
         return installResult with { Warnings = [.. warnings, .. installResult.Warnings] };
     }
@@ -1167,15 +1440,11 @@ public class Repository : IDisposable
         }
 
         var matches = ResolveUninstallMatches(request);
-        var exitCode = 0;
         var warnings = new List<string>();
-
-        foreach (var installed in matches)
-        {
-            exitCode = InstallerDispatch.Uninstall(installed, request, warnings);
-            if (exitCode != 0 && !request.AllVersions)
-                break;
-        }
+        var exitCode = InstallerDispatch.UninstallEachMatch(matches, request.AllVersions,
+            installed => OperatingSystem.IsWindows()
+                ? InstallerDispatch.Uninstall(installed, request, warnings)
+                : throw new PlatformNotSupportedException("Uninstalling packages is only supported on Windows"));
 
         var primary = matches[0];
         return new InstallResult
@@ -1218,23 +1487,63 @@ public class Repository : IDisposable
             Count = 100,
         }).Matches;
 
+        var correlationCodes = ManifestCorrelationCodes.FromManifest(manifest);
         var found = installedMatches.FirstOrDefault(match =>
             match.Id.Equals(manifest.Id, StringComparison.OrdinalIgnoreCase) ||
             match.LocalId.Equals(manifest.Id, StringComparison.OrdinalIgnoreCase) ||
-            ManifestMatchesInstalledPackageFamilyName(manifest, match.PackageFamilyNames));
+            ManifestMatchesInstalledPackageFamilyName(manifest, match.PackageFamilyNames) ||
+            correlationCodes.Matches(match.ProductCodes, match.UpgradeCodes));
         if (found is not null)
             return found;
 
-        if (manifest.Installers.Any(i => !string.IsNullOrWhiteSpace(i.PackageFamilyName)))
+        if (!correlationCodes.IsEmpty || manifest.Installers.Any(i => !string.IsNullOrWhiteSpace(i.PackageFamilyName)))
         {
             var allInstalled = InstalledPackages.Collect(request.Query.InstallScope);
             var pfnMatch = allInstalled.FirstOrDefault(candidate =>
-                ManifestMatchesInstalledPackageFamilyName(manifest, candidate.PackageFamilyNames));
+                ManifestMatchesInstalledPackageFamilyName(manifest, candidate.PackageFamilyNames) ||
+                correlationCodes.Matches(candidate.ProductCodes, candidate.UpgradeCodes));
             if (pfnMatch is not null)
                 return ListMatchFromInstalled(pfnMatch, _store.Sources);
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// The product and upgrade codes a manifest declares (installer <c>ProductCode</c>/<c>UpgradeCode</c> and every
+    /// <c>AppsAndFeaturesEntries</c> entry), used to find its installed package.
+    /// </summary>
+    internal sealed record ManifestCorrelationCodes(List<string> ProductCodes, List<string> UpgradeCodes)
+    {
+        public static ManifestCorrelationCodes FromManifest(Manifest manifest)
+        {
+            var codes = new ManifestCorrelationCodes([], []);
+            static void Push(List<string> list, string? value)
+            {
+                var trimmed = value?.Trim();
+                if (!string.IsNullOrEmpty(trimmed) && !list.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
+                    list.Add(trimmed);
+            }
+
+            foreach (var installer in manifest.Installers)
+            {
+                Push(codes.ProductCodes, installer.ProductCode);
+                Push(codes.UpgradeCodes, installer.UpgradeCode);
+                foreach (var entry in installer.AppsAndFeaturesEntries)
+                {
+                    Push(codes.ProductCodes, entry.ProductCode);
+                    Push(codes.UpgradeCodes, entry.UpgradeCode);
+                }
+            }
+
+            return codes;
+        }
+
+        public bool IsEmpty => ProductCodes.Count == 0 && UpgradeCodes.Count == 0;
+
+        public bool Matches(IReadOnlyList<string> installedProductCodes, IReadOnlyList<string> installedUpgradeCodes) =>
+            installedProductCodes.Any(code => ProductCodes.Contains(code, StringComparer.OrdinalIgnoreCase)) ||
+            installedUpgradeCodes.Any(code => UpgradeCodes.Contains(code, StringComparer.OrdinalIgnoreCase));
     }
 
     private static bool ManifestMatchesInstalledPackageFamilyName(Manifest manifest, IReadOnlyList<string> installedPfns)
@@ -1263,22 +1572,117 @@ public class Repository : IDisposable
         throw new InvalidOperationException("Package agreements are present; rerun with --accept-package-agreements to continue.");
     }
 
-    private void InstallDependencies(Manifest manifest, InstallRequest request)
+    private void InstallDependencies(Manifest manifest, Installer installer, InstallRequest request, HashSet<string> visited)
     {
         if (request.SkipDependencies)
             return;
 
-        var dependencies = manifest.PackageDependencies
-            .Concat(manifest.Installers.SelectMany(installer => installer.PackageDependencies))
-            .Where(id => !string.IsNullOrWhiteSpace(id))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        foreach (var dependencyId in dependencies)
+        foreach (var dependency in SelectedInstallerDependencies(manifest, installer))
         {
-            var result = Install(CreateDependencyInstallRequest(dependencyId, request));
+            var dependencyId = dependency.PackageIdentifier;
+            // Already installed in this run, or a dependency loop back to a package on the chain.
+            if (!visited.Add(dependencyId))
+                continue;
+
+            var dependencyRequest = CreateDependencyInstallRequest(dependencyId, request);
+            if (dependency.MinimumVersion is { } minimumVersion)
+            {
+                // WinGet's DependencyNodeProcessor: an installed version that satisfies `MinimumVersion` is skipped;
+                // otherwise the latest available version is installed (upgrading an older one), and it must itself
+                // satisfy the minimum.
+                var installedVersion = InstalledDependencyVersion(dependencyRequest);
+                if (installedVersion is not null && DependencyVersionSatisfies(installedVersion, minimumVersion))
+                    continue;
+                var available = ResolveManifestForInstall(dependencyRequest);
+                EnsureDependencyMinimumVersion(dependencyId, available.Version, minimumVersion);
+                dependencyRequest = dependencyRequest with
+                {
+                    NoUpgrade = false,
+                    Query = dependencyRequest.Query with { Version = available.Version },
+                };
+            }
+
+            var result = InstallCore(dependencyRequest, visited);
             EnsureDependencyInstalled(dependencyId, result);
         }
+    }
+
+    /// <summary>Installed version of a dependency (by exact id), if it is installed.</summary>
+    private string? InstalledDependencyVersion(InstallRequest dependencyRequest)
+    {
+        var id = dependencyRequest.Query.Id;
+        if (string.IsNullOrWhiteSpace(id))
+            return null;
+        return List(new ListQuery
+        {
+            Id = id,
+            Source = dependencyRequest.Query.Source,
+            Exact = true,
+            Count = 100,
+        }).Matches
+            .FirstOrDefault(match =>
+                match.Id.Equals(id, StringComparison.OrdinalIgnoreCase) ||
+                match.LocalId.Equals(id, StringComparison.OrdinalIgnoreCase))
+            ?.InstalledVersion;
+    }
+
+    /// <summary>True when <paramref name="version"/> satisfies a dependency's <c>MinimumVersion</c>.</summary>
+    internal static bool DependencyVersionSatisfies(string version, string minimumVersion)
+        => !RestSource.IsUnknownVersion(version) && RestSource.CompareVersionStrings(version, minimumVersion) >= 0;
+
+    /// <summary>
+    /// WinGet <c>DependenciesFlowNoMinVersion</c>: the version that would be installed must satisfy the dependency's
+    /// <c>MinimumVersion</c>.
+    /// </summary>
+    internal static void EnsureDependencyMinimumVersion(string dependencyId, string availableVersion, string minimumVersion)
+    {
+        if (!DependencyVersionSatisfies(availableVersion, minimumVersion))
+            throw new InvalidOperationException(
+                $"No suitable version of dependency {dependencyId} was found: {availableVersion} is older than the required minimum version {minimumVersion}");
+    }
+
+    /// <summary>
+    /// Package dependencies of the selected installer, falling back to the manifest-level
+    /// <c>Dependencies</c> (WinGet inherits root <c>Dependencies</c> into installers that declare none).
+    /// Blank ids are dropped and duplicates removed case-insensitively, keeping manifest order.
+    /// </summary>
+    internal static List<string> SelectedInstallerPackageDependencies(Manifest manifest, Installer installer)
+        => SelectedInstallerDependencies(manifest, installer).Select(dependency => dependency.PackageIdentifier).ToList();
+
+    /// <summary>
+    /// Package dependencies (with <c>MinimumVersion</c>) of the selected installer. An installer that declares
+    /// dependencies of any kind uses only its own; otherwise the root ones apply. A duplicated id keeps its first
+    /// position and the highest minimum version, like WinGet.
+    /// </summary>
+    internal static List<PackageDependency> SelectedInstallerDependencies(Manifest manifest, Installer installer)
+    {
+        IEnumerable<PackageDependency> declared = !installer.Dependencies.IsEmpty
+            ? installer.Dependencies.PackageDependencies
+            : (installer.PackageDependencies.Count > 0 ? installer.PackageDependencies : manifest.PackageDependencies)
+                .Select(id => new PackageDependency { PackageIdentifier = id });
+
+        var result = new List<PackageDependency>();
+        foreach (var dependency in declared)
+        {
+            var id = dependency.PackageIdentifier.Trim();
+            if (id.Length == 0)
+                continue;
+            var index = result.FindIndex(existing => existing.PackageIdentifier.Equals(id, StringComparison.OrdinalIgnoreCase));
+            if (index >= 0)
+            {
+                var existing = result[index];
+                if (dependency.MinimumVersion is { } minimum &&
+                    (existing.MinimumVersion is null || RestSource.CompareVersionStrings(minimum, existing.MinimumVersion) > 0))
+                {
+                    result[index] = existing with { MinimumVersion = minimum };
+                }
+                continue;
+            }
+
+            result.Add(new PackageDependency { PackageIdentifier = id, MinimumVersion = dependency.MinimumVersion });
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -1324,6 +1728,20 @@ public class Repository : IDisposable
         InstallScope = request.Query.InstallScope,
         Count = 100,
     };
+
+    /// <summary>
+    /// The product code to repair with msiexec when the installed package is a Windows Installer (MSI/WiX)
+    /// ARP entry, or null when repair has to fall back to reinstalling. The installed scan records the ARP
+    /// subkey name (the ProductCode for MSI entries) among the product codes.
+    /// </summary>
+    internal static string? MsiRepairProductCode(ListMatch installed)
+    {
+        if (!string.Equals(installed.InstallerCategory, "msi", StringComparison.OrdinalIgnoreCase))
+            return null;
+        return installed.ProductCodes
+            .Select(code => code.Trim())
+            .FirstOrDefault(code => code.Length > 2 && code.StartsWith('{') && code.EndsWith('}'));
+    }
 
     internal static InstallRequest CreateRepairInstallRequest(RepairRequest request, ListMatch? installedMatch) => new()
     {
@@ -1429,6 +1847,11 @@ public class Repository : IDisposable
         if (!string.IsNullOrWhiteSpace(request.ManifestPath))
         {
             var manifest = LoadManifestFromPath(request.ManifestPath!);
+            // Like WinGet's manifest correlation, the product and upgrade codes the manifest declares (including
+            // `AppsAndFeaturesEntries`) identify the installed package even when it is not correlated to the
+            // manifest's package id.
+            if (request.ProductCode is null && InstalledMatchesForManifestCodes(manifest, request) is { } codeMatches)
+                return codeMatches;
             var manifestQuery = new PackageQuery
             {
                 Query = manifest.Id,
@@ -1469,6 +1892,29 @@ public class Repository : IDisposable
         return request.AllVersions ? matches : [matches[0]];
     }
 
+    /// <summary>
+    /// Installed packages whose product or upgrade codes match the codes declared by <paramref name="manifest"/>;
+    /// null when the manifest declares no codes or nothing installed matches them.
+    /// </summary>
+    private List<ListMatch>? InstalledMatchesForManifestCodes(Manifest manifest, UninstallRequest request)
+    {
+        var codes = ManifestCorrelationCodes.FromManifest(manifest);
+        if (codes.IsEmpty)
+            return null;
+
+        var matches = InstalledPackages.Collect(request.Query.InstallScope)
+            .Where(candidate => codes.Matches(candidate.ProductCodes, candidate.UpgradeCodes))
+            .Where(candidate => request.Query.Version is null ||
+                candidate.InstalledVersion.Equals(request.Query.Version, StringComparison.OrdinalIgnoreCase))
+            .Select(candidate => ListMatchFromInstalled(candidate, _store.Sources))
+            .ToList();
+        if (matches.Count == 0)
+            return null;
+        if (!request.AllVersions && matches.Count > 1 && !request.Force)
+            throw new InvalidOperationException("Multiple installed packages matched the query; refine the query or use --all-versions.");
+        return request.AllVersions ? matches : [matches[0]];
+    }
+
     private Manifest LoadManifestFromPath(string manifestPath)
         => LoadManifestFromPathWithDocuments(manifestPath).Manifest;
 
@@ -1479,9 +1925,8 @@ public class Repository : IDisposable
     private (Manifest Manifest, object Documents) LoadManifestFromPathWithDocuments(string manifestPath)
     {
         EnsureAdminSettingEnabled("LocalManifestFiles", "--manifest");
-        var resolved = ResolveManifestPath(manifestPath);
-        var bytes = File.ReadAllBytes(resolved);
-        return (ParseYamlManifest(bytes), ParseYamlManifestDocuments(bytes));
+        var parts = ResolveManifestPaths(manifestPath).Select(File.ReadAllBytes).ToList();
+        return (ParseYamlManifest(parts), ParseYamlManifestDocuments(parts));
     }
 
     /// <summary>
@@ -1505,7 +1950,15 @@ public class Repository : IDisposable
         else
             document.Remove("Channel");
 
-        var singleInstaller = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        // Like WinGet's YamlWriter, keep every field of the selected installer's entry (switches, nested
+        // installers, dependencies, return codes, ...); the typed values below only fill in what the entry
+        // inherits from the root.
+        var matchedEntry = document.TryGetValue("Installers", out var entries) && entries is IEnumerable<object?> entryList
+            ? entryList.OfType<Dictionary<string, object?>>().FirstOrDefault(entry => DownloadManifestEntryMatches(entry, document, installer))
+            : null;
+        var singleInstaller = matchedEntry is not null
+            ? new Dictionary<string, object?>(matchedEntry, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrEmpty(installer.Architecture)) singleInstaller["Architecture"] = installer.Architecture;
         if (!string.IsNullOrEmpty(installer.InstallerType)) singleInstaller["InstallerType"] = installer.InstallerType;
         if (!string.IsNullOrEmpty(installer.Url)) singleInstaller["InstallerUrl"] = installer.Url;
@@ -1520,6 +1973,25 @@ public class Repository : IDisposable
         document["ManifestType"] = "merged";
 
         return YamlEmitter.EmitDocument(document);
+    }
+
+    /// <summary>True when a manifest <c>Installers</c> entry (with root-level fallbacks) is the selected installer.</summary>
+    private static bool DownloadManifestEntryMatches(Dictionary<string, object?> entry, Dictionary<string, object?> root, Installer installer)
+    {
+        string? Field(string key)
+        {
+            var value = (entry.TryGetValue(key, out var own) ? own : root.GetValueOrDefault(key))?.ToString()?.Trim();
+            return string.IsNullOrEmpty(value) ? null : value;
+        }
+
+        bool Same(string key, string? expected) =>
+            string.Equals(Field(key), string.IsNullOrWhiteSpace(expected) ? null : expected.Trim(), StringComparison.OrdinalIgnoreCase);
+
+        return Same("InstallerUrl", installer.Url) &&
+            Same("Architecture", installer.Architecture) &&
+            Same("InstallerType", installer.InstallerType) &&
+            Same("Scope", installer.Scope) &&
+            Same("InstallerLocale", installer.Locale);
     }
 
     /// <summary>
@@ -1591,19 +2063,27 @@ public class Repository : IDisposable
         return builder.ToString();
     }
 
-    private static string ResolveManifestPath(string manifestPath)
+    /// <summary>
+    /// Resolves <c>--manifest</c> to the files to load: the file itself, or every <c>*.yaml</c>/<c>*.yml</c>
+    /// file in a directory, since a WinGet multi-file manifest (version, defaultLocale, installer and
+    /// locale files) is passed as its directory.
+    /// </summary>
+    internal static List<string> ResolveManifestPaths(string manifestPath)
     {
         if (File.Exists(manifestPath))
-            return manifestPath;
+            return [manifestPath];
 
         if (!Directory.Exists(manifestPath))
             throw new InvalidOperationException($"Manifest path not found: {manifestPath}");
 
-        var manifestFile = Directory.EnumerateFiles(manifestPath, "*.yaml")
-            .Concat(Directory.EnumerateFiles(manifestPath, "*.yml"))
-            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-            .FirstOrDefault();
-        return manifestFile ?? throw new InvalidOperationException($"No manifest file found under: {manifestPath}");
+        var manifestFiles = Directory.EnumerateFiles(manifestPath)
+            .Where(path => Path.GetExtension(path).Equals(".yaml", StringComparison.OrdinalIgnoreCase) ||
+                           Path.GetExtension(path).Equals(".yml", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(path => path, StringComparer.Ordinal)
+            .ToList();
+        return manifestFiles.Count > 0
+            ? manifestFiles
+            : throw new InvalidOperationException($"No manifest file found under: {manifestPath}");
     }
 
     // ── Internal search machinery ──
@@ -2223,13 +2703,13 @@ public class Repository : IDisposable
             if (requestedChannel is null)
                 return versions[0]; // latest
 
-            var channelMatch = versions.FirstOrDefault(v => v.Channel == requestedChannel);
+            var channelMatch = versions.FirstOrDefault(v => string.Equals(v.Channel, requestedChannel, StringComparison.OrdinalIgnoreCase));
             return channelMatch ?? throw new InvalidOperationException(
                 $"Channel '{requestedChannel}' was not found for package '{packageId}' in source '{sourceName}'.");
         }
 
-        var match = versions.FirstOrDefault(v => v.Version == requestedVersion
-            && (requestedChannel is null || v.Channel == requestedChannel));
+        var match = versions.FirstOrDefault(v => string.Equals(v.Version, requestedVersion, StringComparison.OrdinalIgnoreCase)
+            && (requestedChannel is null || string.Equals(v.Channel, requestedChannel, StringComparison.OrdinalIgnoreCase)));
         if (match is not null)
             return match;
 
@@ -2252,7 +2732,7 @@ public class Repository : IDisposable
 
         if (requestedVersion is not null)
         {
-            var match = entries.FirstOrDefault(e => e.Version == requestedVersion);
+            var match = entries.FirstOrDefault(e => string.Equals(e.Version, requestedVersion, StringComparison.OrdinalIgnoreCase));
             if (match is not null)
                 return match;
 
@@ -2279,13 +2759,13 @@ public class Repository : IDisposable
             if (requestedChannel is null)
                 return sorted[0];
 
-            var channelMatch = sorted.FirstOrDefault(v => v.Channel == requestedChannel);
+            var channelMatch = sorted.FirstOrDefault(v => string.Equals(v.Channel, requestedChannel, StringComparison.OrdinalIgnoreCase));
             return channelMatch ?? throw new InvalidOperationException(
                 $"Channel '{requestedChannel}' was not found for package '{packageId}' in source '{sourceName}'.");
         }
 
-        var match = versions.FirstOrDefault(v => v.Version == requestedVersion
-            && (requestedChannel is null || v.Channel == requestedChannel));
+        var match = versions.FirstOrDefault(v => string.Equals(v.Version, requestedVersion, StringComparison.OrdinalIgnoreCase)
+            && (requestedChannel is null || string.Equals(v.Channel, requestedChannel, StringComparison.OrdinalIgnoreCase)));
         if (match is not null)
             return match;
 
@@ -2295,6 +2775,17 @@ public class Repository : IDisposable
     // ── Installer selection ──
 
     internal static Installer? SelectInstaller(List<Installer> installers, PackageQuery query)
+        => SelectInstaller(installers, query, RestSource.DefaultMarket(), PreferredInstallerLocales.Value);
+
+    /// <summary>
+    /// Installer selection with the host's market (<c>Markets</c> filter) and preferred UI languages (installer
+    /// locale preference when no <c>--locale</c> is requested) passed in explicitly.
+    /// </summary>
+    internal static Installer? SelectInstaller(
+        List<Installer> installers,
+        PackageQuery query,
+        string market,
+        IReadOnlyList<string> preferredLocales)
     {
         if (installers.Count == 0)
             return null;
@@ -2312,11 +2803,14 @@ public class Repository : IDisposable
         return installers
             .Where(installer => InstallerMatchesRequested(installer, requestedType, requestedScope, requestedPlatform, requestedOsVersion, systemPlatform, currentOsVersion))
             .Where(installer => InstallerMatchesArchitecture(installer, requestedArchitecture, systemArchitecture))
+            .Where(installer => !InstallerUnsupportedOnArchitecture(installer, systemArchitecture))
+            .Where(installer => InstallerMatchesMarket(installer, market))
+            .Where(installer => InstallerMatchesLocale(installer.Locale, requestedLocale))
             .Select((installer, index) => new
             {
                 Installer = installer,
                 Index = index,
-                Rank = InstallerRank(installer, requestedLocale, requestedArchitecture, systemArchitecture),
+                Rank = InstallerRank(installer, requestedLocale, preferredLocales, requestedArchitecture, systemArchitecture),
             })
             .OrderByDescending(item => item.Rank.Architecture)
             .ThenByDescending(item => item.Rank.Locale)
@@ -2329,15 +2823,13 @@ public class Repository : IDisposable
     // ── Manifest parsing ──
 
     internal static object ParseYamlManifestDocuments(byte[] bytes)
-    {
-        var yaml = System.Text.Encoding.UTF8.GetString(bytes);
+        => ParseYamlManifestDocuments([bytes]);
 
+    internal static object ParseYamlManifestDocuments(IReadOnlyList<byte[]> parts)
+    {
         var documents = new List<Dictionary<string, object?>>();
-        var parser = new YamlDotNet.Core.Parser(new StringReader(yaml));
-        parser.Consume<YamlDotNet.Core.Events.StreamStart>();
-        while (parser.Accept<YamlDotNet.Core.Events.DocumentStart>(out _))
+        foreach (var doc in ReadYamlManifestDocuments(parts))
         {
-            var doc = ReadYamlDocument(parser);
             if (NormalizeYamlValue(doc) is Dictionary<string, object?> normalized)
                 documents.Add(normalized);
         }
@@ -2355,23 +2847,110 @@ public class Repository : IDisposable
         return documents;
     }
 
-    internal static Manifest ParseYamlManifest(byte[] bytes)
+    private static List<long> ReadInstallerReturnCodes(object? value)
     {
-        var yaml = System.Text.Encoding.UTF8.GetString(bytes);
+        if (value is not IList<object> list)
+            return [];
 
-        // Merge all YAML documents into one dictionary (manifests can be multi-document)
-        var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-        var parser = new YamlDotNet.Core.Parser(new StringReader(yaml));
-        parser.Consume<YamlDotNet.Core.Events.StreamStart>();
-        while (parser.Accept<YamlDotNet.Core.Events.DocumentStart>(out _))
+        var codes = new List<long>();
+        foreach (var item in list)
         {
-            if (ReadYamlDocument(parser) is Dictionary<object, object> doc)
+            if (TryParseReturnCode(item, out var code))
+                codes.Add(code);
+        }
+        return codes;
+    }
+
+    private static List<ExpectedReturnCode> ReadExpectedReturnCodes(object? value)
+    {
+        if (value is not IList<object> list)
+            return [];
+
+        var entries = new List<ExpectedReturnCode>();
+        foreach (var item in list)
+        {
+            if (item is IDictionary<object, object> entry &&
+                entry.TryGetValue("InstallerReturnCode", out var codeValue) &&
+                TryParseReturnCode(codeValue, out var code) &&
+                entry.TryGetValue("ReturnResponse", out var response) &&
+                response?.ToString() is { Length: > 0 } responseText)
             {
-                foreach (var kvp in doc)
-                {
-                    var keyStr = kvp.Key.ToString();
-                    if (keyStr is not null) dict[keyStr] = kvp.Value;
-                }
+                entries.Add(new ExpectedReturnCode { InstallerReturnCode = code, ReturnResponse = responseText });
+            }
+        }
+        return entries;
+    }
+
+    internal static bool TryParseReturnCode(object? value, out long code)
+    {
+        var text = value?.ToString()?.Trim();
+        // YAML hex integers (`0x8A150001`) arrive as their source text.
+        if (text is not null && text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            return long.TryParse(text.AsSpan(2), System.Globalization.NumberStyles.AllowHexSpecifier,
+                System.Globalization.CultureInfo.InvariantCulture, out code);
+        return long.TryParse(text, System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out code);
+    }
+
+    /// <summary>
+    /// Reads every YAML document of one or more manifest files (a multi-file manifest directory),
+    /// in file order.
+    /// </summary>
+    private static List<object?> ReadYamlManifestDocuments(IReadOnlyList<byte[]> parts)
+    {
+        var documents = new List<object?>();
+        ReadOnlySpan<byte> utf8Bom = [0xEF, 0xBB, 0xBF];
+        foreach (var bytes in parts)
+        {
+            var content = bytes.AsSpan();
+            if (content.StartsWith(utf8Bom))
+                content = content[utf8Bom.Length..];
+            var yaml = System.Text.Encoding.UTF8.GetString(content);
+            var parser = new YamlDotNet.Core.Parser(new StringReader(yaml));
+            parser.Consume<YamlDotNet.Core.Events.StreamStart>();
+            while (parser.Accept<YamlDotNet.Core.Events.DocumentStart>(out _))
+                documents.Add(ReadYamlDocument(parser));
+        }
+        return documents;
+    }
+
+    /// <summary>
+    /// Merge order of a manifest document into the root manifest: version, then defaultLocale, then
+    /// installer, then anything else (singleton/merged). Null for a non-default <c>locale</c> document,
+    /// which must not override the default-locale root fields.
+    /// </summary>
+    private static int? YamlManifestMergeRank(Dictionary<object, object> document)
+    {
+        var manifestType = document.TryGetValue("ManifestType", out var value) ? value?.ToString() : null;
+        if (string.Equals(manifestType, "locale", StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (string.Equals(manifestType, "version", StringComparison.OrdinalIgnoreCase))
+            return 0;
+        if (string.Equals(manifestType, "defaultLocale", StringComparison.OrdinalIgnoreCase))
+            return 1;
+        if (string.Equals(manifestType, "installer", StringComparison.OrdinalIgnoreCase))
+            return 2;
+        return 3;
+    }
+
+    internal static Manifest ParseYamlManifest(byte[] bytes)
+        => ParseYamlManifest([bytes]);
+
+    internal static Manifest ParseYamlManifest(IReadOnlyList<byte[]> parts)
+    {
+        // Merge all YAML documents into one dictionary (manifests can be multi-document or multi-file)
+        var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        var ordered = ReadYamlManifestDocuments(parts)
+            .OfType<Dictionary<object, object>>()
+            .Select(doc => (Rank: YamlManifestMergeRank(doc), Document: doc))
+            .Where(item => item.Rank is not null)
+            .OrderBy(item => item.Rank);
+        foreach (var (_, doc) in ordered)
+        {
+            foreach (var kvp in doc)
+            {
+                var keyStr = kvp.Key.ToString();
+                if (keyStr is not null) dict[keyStr] = kvp.Value;
             }
         }
 
@@ -2461,6 +3040,15 @@ public class Repository : IDisposable
             : [];
         string? topMinimumOsVersion = GetOptStr("MinimumOSVersion");
         var topSwitches = ReadInstallerSwitches(dict);
+        var topSuccessCodes = ReadInstallerReturnCodes(dict.TryGetValue("InstallerSuccessCodes", out var topSuccessValue) ? topSuccessValue : null);
+        var topExpectedReturnCodes = ReadExpectedReturnCodes(dict.TryGetValue("ExpectedReturnCodes", out var topExpectedValue) ? topExpectedValue : null);
+        var topCommands = ReadStringList(dict.GetValueOrDefault("Commands"));
+        var topMarkets = dict.GetValueOrDefault("Markets");
+        var topUnsupportedArchitectures = ReadStringList(dict.GetValueOrDefault("UnsupportedOSArchitectures"));
+        var topUpgradeBehavior = GetOptStr("UpgradeBehavior");
+        var topDownloadCommandProhibited = ReadBool(dict, "DownloadCommandProhibited");
+        var topDependencies = ReadDependencies(dict.GetValueOrDefault("Dependencies"));
+        var topAppsAndFeaturesEntries = ReadAppsAndFeaturesEntries(dict.GetValueOrDefault("AppsAndFeaturesEntries"));
 
         var installers = new List<Installer>();
         if (dict.TryGetValue("Installers", out var instObj) && instObj is IList<object> instList)
@@ -2485,12 +3073,19 @@ public class Repository : IDisposable
                     var nestedFiles = instDict.TryGetValue("NestedInstallerFiles", out var nestedFilesValue)
                         ? ReadNestedInstallerFiles(nestedFilesValue)
                         : [];
+                    // WinGet: installer `Dependencies` of any kind override the root ones entirely; only an
+                    // installer that declares none inherits the root dependencies.
+                    var installerDependencies = ReadDependencies(instDict.TryGetValue("Dependencies", out var instDeps) ? instDeps : null);
+                    if (installerDependencies.IsEmpty)
+                        installerDependencies = topDependencies;
+                    var markets = instDict.TryGetValue("Markets", out var marketsValue) ? marketsValue : topMarkets;
+                    var appsAndFeaturesEntries = ReadAppsAndFeaturesEntries(instDict.TryGetValue("AppsAndFeaturesEntries", out var afeValue) ? afeValue : null);
                     installers.Add(new Installer
                     {
                         Architecture = InstStr("Architecture"),
                         InstallerType = InstStr("InstallerType") ?? topInstallerType,
                         NestedInstallerType = InstStr("NestedInstallerType") ?? topNestedInstallerType,
-                        NestedInstallerFiles = nestedFiles.Count > 0 ? nestedFiles : [.. topNestedInstallerFiles],
+                        NestedInstallerFiles = instDict.ContainsKey("NestedInstallerFiles") ? nestedFiles : [.. topNestedInstallerFiles],
                         Url = InstStr("InstallerUrl"),
                         Sha256 = InstStr("InstallerSha256"),
                         ProductCode = InstStr("ProductCode") ?? topProductCode,
@@ -2500,30 +3095,35 @@ public class Repository : IDisposable
                         ReleaseDate = InstStr("ReleaseDate") ?? topReleaseDate,
                         PackageFamilyName = InstStr("PackageFamilyName") ?? topPackageFamilyName,
                         UpgradeCode = InstStr("UpgradeCode") ?? topUpgradeCode,
-                        Platforms = platforms.Count > 0 ? platforms : [.. topPlatforms],
+                        Platforms = instDict.ContainsKey("Platform") ? platforms : [.. topPlatforms],
                         MinimumOsVersion = InstStr("MinimumOSVersion") ?? topMinimumOsVersion,
                         Switches = switches,
-                        Commands = InstArr("Commands"),
-                        PackageDependencies = InstArr("PackageDependencies"),
+                        Commands = instDict.ContainsKey("Commands") ? InstArr("Commands") : [.. topCommands],
+                        PackageDependencies = installerDependencies.PackageDependencies.Select(dependency => dependency.PackageIdentifier).ToList(),
+                        Dependencies = installerDependencies,
                         RequireExplicitUpgrade = ReadBool(instDict, "RequireExplicitUpgrade"),
+                        DownloadCommandProhibited = instDict.ContainsKey("DownloadCommandProhibited")
+                            ? ReadBool(instDict, "DownloadCommandProhibited")
+                            : topDownloadCommandProhibited,
+                        AllowedMarkets = ReadMarkets(markets, "AllowedMarkets"),
+                        ExcludedMarkets = ReadMarkets(markets, "ExcludedMarkets"),
+                        UnsupportedOSArchitectures = instDict.TryGetValue("UnsupportedOSArchitectures", out var unsupportedValue)
+                            ? ReadStringList(unsupportedValue)
+                            : [.. topUnsupportedArchitectures],
+                        UpgradeBehavior = InstStr("UpgradeBehavior") ?? topUpgradeBehavior,
+                        AppsAndFeaturesEntries = instDict.ContainsKey("AppsAndFeaturesEntries") ? appsAndFeaturesEntries : [.. topAppsAndFeaturesEntries],
+                        InstallerSuccessCodes = instDict.TryGetValue("InstallerSuccessCodes", out var successValue)
+                            ? ReadInstallerReturnCodes(successValue)
+                            : [.. topSuccessCodes],
+                        ExpectedReturnCodes = instDict.TryGetValue("ExpectedReturnCodes", out var expectedValue)
+                            ? ReadExpectedReturnCodes(expectedValue)
+                            : [.. topExpectedReturnCodes],
                     });
                 }
             }
         }
 
-        var dependencies = new List<string>();
-        if (dict.TryGetValue("Dependencies", out var depsObj) && depsObj is IDictionary<object, object> depsDict)
-        {
-            if (depsDict.TryGetValue("PackageDependencies", out var pkgDeps) && pkgDeps is IList<object> pkgDepList)
-            {
-                foreach (var dep in pkgDepList)
-                {
-                    if (dep is IDictionary<object, object> depDict &&
-                        depDict.TryGetValue("PackageIdentifier", out var pid))
-                        dependencies.Add(pid?.ToString() ?? "");
-                }
-            }
-        }
+        var dependencies = ReadPackageDependencies(dict.TryGetValue("Dependencies", out var depsObj) ? depsObj : null);
 
         var topLevelRequireExplicit = ReadBool(dict, "RequireExplicitUpgrade");
         var anyInstallerRequireExplicit = installers.Any(i => i.RequireExplicitUpgrade);
@@ -2533,6 +3133,7 @@ public class Repository : IDisposable
             Id = GetStr("PackageIdentifier"),
             Name = GetOptStr("PackageName") ?? GetStr("PackageIdentifier"),
             Version = GetStr("PackageVersion"),
+            Channel = GetOptStr("Channel") ?? "",
             Publisher = GetOptStr("Publisher"),
             Description = GetOptStr("Description") ?? GetOptStr("ShortDescription"),
             ShortDescription = GetOptStr("ShortDescription"),
@@ -2556,6 +3157,103 @@ public class Repository : IDisposable
             PackageDependencies = dependencies,
             RequireExplicitUpgrade = topLevelRequireExplicit || anyInstallerRequireExplicit,
         };
+    }
+
+    /// <summary>
+    /// Reads every dependency kind of a manifest root or installer <c>Dependencies</c> mapping, like the
+    /// Rust yaml_dependencies. <c>MinimumVersion</c> keeps its source text.
+    /// </summary>
+    internal static InstallerDependencies ReadDependencies(object? dependencies)
+    {
+        if (dependencies is not IDictionary<object, object> depsDict)
+            return new InstallerDependencies();
+
+        static List<string> List(IDictionary<object, object> source, string key)
+        {
+            if (!source.TryGetValue(key, out var value) || value is not IList<object> items)
+                return [];
+            return items.Select(item => item?.ToString() ?? "").Where(item => !string.IsNullOrWhiteSpace(item)).ToList();
+        }
+
+        var packages = new List<PackageDependency>();
+        if (depsDict.TryGetValue("PackageDependencies", out var pkgDeps) && pkgDeps is IList<object> pkgDepList)
+        {
+            foreach (var dep in pkgDepList)
+            {
+                if (dep is IDictionary<object, object> depDict &&
+                    depDict.TryGetValue("PackageIdentifier", out var pid) &&
+                    pid?.ToString() is { } packageIdentifier)
+                {
+                    var minimumVersion = depDict.TryGetValue("MinimumVersion", out var min) ? min?.ToString()?.Trim() : null;
+                    packages.Add(new PackageDependency
+                    {
+                        PackageIdentifier = packageIdentifier,
+                        MinimumVersion = string.IsNullOrEmpty(minimumVersion) ? null : minimumVersion,
+                    });
+                }
+            }
+        }
+
+        return new InstallerDependencies
+        {
+            WindowsFeatures = List(depsDict, "WindowsFeatures"),
+            WindowsLibraries = List(depsDict, "WindowsLibraries"),
+            PackageDependencies = packages,
+            ExternalDependencies = List(depsDict, "ExternalDependencies"),
+        };
+    }
+
+    private static List<string> ReadMarkets(object? markets, string key)
+    {
+        if (markets is not IDictionary<object, object> marketsDict ||
+            !marketsDict.TryGetValue(key, out var value) ||
+            value is not IList<object> items)
+            return [];
+        return items.Select(item => item?.ToString() ?? "").Where(item => !string.IsNullOrWhiteSpace(item)).ToList();
+    }
+
+    private static List<AppsAndFeaturesEntry> ReadAppsAndFeaturesEntries(object? value)
+    {
+        if (value is not IList<object> items)
+            return [];
+
+        return items
+            .OfType<IDictionary<object, object>>()
+            .Select(item =>
+            {
+                string? Get(string key) => item.TryGetValue(key, out var v) ? v?.ToString() : null;
+                return new AppsAndFeaturesEntry
+                {
+                    DisplayName = Get("DisplayName"),
+                    Publisher = Get("Publisher"),
+                    DisplayVersion = Get("DisplayVersion"),
+                    ProductCode = Get("ProductCode"),
+                    UpgradeCode = Get("UpgradeCode"),
+                    InstallerType = Get("InstallerType"),
+                };
+            })
+            .ToList();
+    }
+
+    /// <summary>
+    /// Reads <c>Dependencies.PackageDependencies[*].PackageIdentifier</c> from a manifest root or
+    /// installer entry, like the Rust yaml_package_dependencies.
+    /// </summary>
+    private static List<string> ReadPackageDependencies(object? dependencies)
+    {
+        var result = new List<string>();
+        if (dependencies is IDictionary<object, object> depsDict &&
+            depsDict.TryGetValue("PackageDependencies", out var pkgDeps) &&
+            pkgDeps is IList<object> pkgDepList)
+        {
+            foreach (var dep in pkgDepList)
+            {
+                if (dep is IDictionary<object, object> depDict &&
+                    depDict.TryGetValue("PackageIdentifier", out var pid))
+                    result.Add(pid?.ToString() ?? "");
+            }
+        }
+        return result;
     }
 
     private static bool ReadBool(IDictionary<string, object?> dict, string key)
@@ -2857,6 +3555,7 @@ public class Repository : IDisposable
             Custom = Get("Custom"),
             Log = Get("Log"),
             InstallLocation = Get("InstallLocation"),
+            Upgrade = Get("Upgrade"),
         };
     }
 
@@ -3268,6 +3967,53 @@ public class Repository : IDisposable
             }
         }
 
+        return warnings;
+    }
+
+    /// <summary>
+    /// Rows correlated to a REST source (such as msstore) through that source's installed.db carry no
+    /// available version, so they could never show as upgradeable. Resolve the latest version with an
+    /// exact-id single lookup against the source, the same request search makes.
+    /// </summary>
+    internal List<string> ResolveRestCorrelatedVersions(List<InstalledPackage> installed)
+    {
+        var warnings = new List<string>();
+        var failedSources = new HashSet<int>();
+        foreach (var pkg in installed)
+        {
+            var correlated = pkg.Correlated;
+            if (correlated is null || correlated.SourceKind != SourceKind.Rest || correlated.Version is not null)
+                continue;
+
+            var sourceIndex = _store.Sources.FindIndex(source =>
+                source.Name.Equals(correlated.SourceName, StringComparison.OrdinalIgnoreCase));
+            if (sourceIndex < 0 || failedSources.Contains(sourceIndex))
+                continue;
+
+            var query = new PackageQuery { Id = correlated.Id, Source = correlated.SourceName, Exact = true };
+            try
+            {
+                var (matches, _) = SearchSource(sourceIndex, query, SearchSemantics.Single);
+                var hit = matches.FirstOrDefault(match =>
+                    match.Display.Id.Equals(correlated.Id, StringComparison.OrdinalIgnoreCase));
+                if (hit is not null)
+                {
+                    pkg.Correlated = correlated with
+                    {
+                        Version = hit.Display.Version,
+                        Channel = hit.Display.Channel,
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                failedSources.Add(sourceIndex);
+                var operation = ex is SourceOperationException sourceOperation ? sourceOperation.Operation : "search";
+                var warning = CreateSourceWarning(sourceIndex, operation, UnwrapSourceOperationException(ex));
+                warnings.Add($"Failed when searching source '{warning.SourceName}'; results will not be included: {warning.Message}");
+                EmitDiagnostic(warning);
+            }
+        }
         return warnings;
     }
 
@@ -3699,12 +4445,13 @@ public class Repository : IDisposable
                     }
                 }
 
-                // RequireExplicitUpgrade is on the latest version's
-                // installer manifest. winget hides those from bulk
-                // `upgrade` (Edge, Steam, Discord). Peek at the first
-                // versionData entry (latest by sort order) and read its
-                // manifest to mirror that filtering.
-                var latest = entries.Count > 0 ? entries[0] : null;
+                // RequireExplicitUpgrade is on the installer manifest.
+                // winget hides those from bulk `upgrade` (Edge, Steam,
+                // Discord). Read the manifest of the version the row would
+                // upgrade to: versionData is not sorted, so take the entry
+                // matching the correlated available version, else the
+                // highest version.
+                var latest = UpgradeTargetVersionEntry(entries, installed[idx].Correlated?.Version);
                 if (latest is not null)
                 {
                     try
@@ -3720,6 +4467,32 @@ public class Repository : IDisposable
             }
         }
         return warnings;
+    }
+
+    /// <summary>
+    /// The versionData entry whose manifest describes the upgrade target: the entry equal to
+    /// <paramref name="targetVersion"/> when there is one, otherwise the highest version. versionData lists
+    /// versions in file order, not sorted.
+    /// </summary>
+    internal static PreIndexedSource.V2VersionDataEntry? UpgradeTargetVersionEntry(
+        IReadOnlyList<PreIndexedSource.V2VersionDataEntry> entries, string? targetVersion)
+    {
+        if (!string.IsNullOrWhiteSpace(targetVersion))
+        {
+            foreach (var entry in entries)
+            {
+                if (RestSource.CompareVersionStrings(entry.Version, targetVersion) == 0)
+                    return entry;
+            }
+        }
+
+        PreIndexedSource.V2VersionDataEntry? best = null;
+        foreach (var entry in entries)
+        {
+            if (best is null || RestSource.CompareVersionStrings(entry.Version, best.Version) > 0)
+                best = entry;
+        }
+        return best;
     }
 
     /// <summary>
@@ -3851,15 +4624,14 @@ public class Repository : IDisposable
             || (query.IncludeUnknown && InstalledPackageHasUnknownVersion(pkg) && pkg.Correlated is not null);
     }
 
+    /// <summary>
+    /// True when the host can use at least one installer, applying the same applicability rules as
+    /// install (architecture, platform, minimum OS version).
+    /// </summary>
     private static bool ManifestHasCompatibleInstaller(Manifest manifest)
     {
         if (manifest.Installers.Count == 0) return true;
-        var allowed = PreferredArchitectures(CurrentArchitecture());
-        return manifest.Installers.Any(installer =>
-        {
-            var arch = installer.Architecture ?? "neutral";
-            return allowed.Any(candidate => candidate.Equals(arch, StringComparison.OrdinalIgnoreCase));
-        });
+        return SelectInstaller(manifest.Installers, new PackageQuery()) is not null;
     }
 
     internal static PinRecord? FindApplicablePin(ListMatch match, IReadOnlyList<PinRecord> pins)
@@ -3893,7 +4665,27 @@ public class Repository : IDisposable
         return sourceSpecific ?? sourceAgnostic;
     }
 
-    internal static bool IsUpgradeBlockedByPin(ListMatch match, IReadOnlyList<PinRecord> pins)
+    /// <summary>
+    /// Whether <paramref name="pin"/> prevents upgrading to <paramref name="targetVersion"/>, following
+    /// WinGet's pin semantics: Blocking always blocks, Pinning blocks unless pinned packages are included
+    /// (--include-pinned or an explicit single-package upgrade), and Gating only allows versions inside the
+    /// gated range.
+    /// </summary>
+    public static bool PinBlocksUpgrade(PinRecord pin, string targetVersion, bool includePinned) => pin.PinType switch
+    {
+        PinType.Blocking => true,
+        PinType.Pinning => !includePinned,
+        PinType.Gating => !string.IsNullOrWhiteSpace(targetVersion) && !VersionMatchesPinPattern(targetVersion, pin.Version),
+        _ => false,
+    };
+
+    /// <summary>
+    /// Whether a pin hides <paramref name="match"/> from the upgrade list. <paramref name="includePinned"/>
+    /// relaxes only Pinning pins, as in WinGet's EvaluatePinnedStateForVersion: Blocking pins still block and
+    /// Gating pins still reject versions outside their range. The default is the implicit (upgrade /
+    /// upgrade --all) path.
+    /// </summary>
+    internal static bool IsUpgradeBlockedByPin(ListMatch match, IReadOnlyList<PinRecord> pins, bool includePinned = false)
     {
         if (string.IsNullOrWhiteSpace(match.AvailableVersion))
             return false;
@@ -3902,29 +4694,34 @@ public class Repository : IDisposable
         if (pin is null)
             return false;
 
-        return pin.PinType switch
-        {
-            PinType.Blocking => true,
-            PinType.Gating or PinType.Pinning => !VersionMatchesPinPattern(match.AvailableVersion!, pin.Version),
-            _ => false,
-        };
+        return PinBlocksUpgrade(pin, match.AvailableVersion!, includePinned);
     }
 
+    /// <summary>
+    /// Mirrors WinGet's GatedVersion::IsValidVersion: a pattern ending in ".*" matches versions whose leading
+    /// parts equal the pattern's parts (missing version parts count as 0); any other pattern must equal the
+    /// version. Parts are compared as versions, so "1.2.*" matches "1.2", "1.2.0" and "1.2.5" but not "1.20",
+    /// and "1.2" equals "1.2.0".
+    /// </summary>
     internal static bool VersionMatchesPinPattern(string version, string pattern)
     {
-        if (string.IsNullOrWhiteSpace(pattern) || pattern == "*")
+        pattern = pattern?.Trim() ?? "";
+        if (pattern.Length == 0 || pattern == "*")
             return true;
 
-        if (!pattern.Contains('*'))
-            return version.Equals(pattern, StringComparison.OrdinalIgnoreCase);
+        var gateParts = pattern.Split('.').Select(part => part.Trim()).ToArray();
+        if (gateParts[^1] != "*")
+            return RestSource.CompareVersionStrings(version, pattern) == 0;
 
-        if (pattern.Count(c => c == '*') == 1 && pattern.EndsWith("*", StringComparison.Ordinal))
+        var versionParts = version.Trim().Split('.').Select(part => part.Trim()).ToArray();
+        for (var i = 0; i < gateParts.Length - 1; i++)
         {
-            var prefix = pattern[..^1];
-            return version.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+            var versionPart = i < versionParts.Length ? versionParts[i] : "0";
+            if (RestSource.CompareVersionStrings(versionPart, gateParts[i]) != 0)
+                return false;
         }
 
-        return version.Equals(pattern, StringComparison.OrdinalIgnoreCase);
+        return true;
     }
 
     private static int ListSortWeight(InstalledPackage pkg)
@@ -4072,7 +4869,8 @@ public class Repository : IDisposable
         => query.Query is not null || query.Id is not null || query.Name is not null ||
            query.Moniker is not null || query.Tag is not null || query.Command is not null;
 
-    private static bool AllowLooseListCorrelation(ListQuery query) => !query.Exact;
+    internal static bool AllowLooseListCorrelation(ListQuery query) =>
+        !query.Exact && (query.Query is not null || query.Id is not null || query.Name is not null);
 
     private static bool MatchesText(string candidate, string query, bool exact) =>
         exact
@@ -4116,8 +4914,14 @@ public class Repository : IDisposable
         if (string.IsNullOrWhiteSpace(effectivePlatform))
             return true;
 
-        return installer.Platforms.Any(platform => platform.Equals(effectivePlatform, StringComparison.OrdinalIgnoreCase));
+        // WinGet does not filter on Platform for install, and Windows.Universal (UWP) packages run on
+        // desktop Windows: unless a platform was requested explicitly, Universal installers apply.
+        return installer.Platforms.Any(platform =>
+            platform.Equals(effectivePlatform, StringComparison.OrdinalIgnoreCase) ||
+            (requestedPlatform is null && platform.Equals(UniversalPlatform, StringComparison.OrdinalIgnoreCase)));
     }
+
+    private const string UniversalPlatform = "Windows.Universal";
 
     private static bool InstallerMatchesOsVersion(Installer installer, string? requestedOsVersion, string? currentOsVersion)
     {
@@ -4128,10 +4932,10 @@ public class Repository : IDisposable
         if (string.IsNullOrWhiteSpace(effectiveOsVersion))
             return true;
 
-        if (TryParseVersion(installer.MinimumOsVersion!, out var minimumVersion) &&
-            TryParseVersion(effectiveOsVersion, out var actualVersion))
+        if (TryParseDottedVersion(installer.MinimumOsVersion!, out var minimumVersion) &&
+            TryParseDottedVersion(effectiveOsVersion, out var actualVersion))
         {
-            return actualVersion.CompareTo(minimumVersion) >= 0;
+            return CompareDottedVersions(actualVersion, minimumVersion) >= 0;
         }
 
         return installer.MinimumOsVersion.Equals(effectiveOsVersion, StringComparison.OrdinalIgnoreCase);
@@ -4149,9 +4953,31 @@ public class Repository : IDisposable
             .Any(candidate => installer.Architecture.Equals(candidate, StringComparison.OrdinalIgnoreCase));
     }
 
+    /// <summary>
+    /// WinGet <c>MarketFilter</c>: a non-empty <c>AllowedMarkets</c> must contain the market; otherwise the
+    /// market must not be in <c>ExcludedMarkets</c>. Compared case-insensitively.
+    /// </summary>
+    internal static bool InstallerMatchesMarket(Installer installer, string market)
+    {
+        bool Contains(List<string> markets) =>
+            markets.Any(value => value.Trim().Equals(market, StringComparison.OrdinalIgnoreCase));
+        return installer.AllowedMarkets.Count > 0
+            ? Contains(installer.AllowedMarkets)
+            : !Contains(installer.ExcludedMarkets);
+    }
+
+    /// <summary>
+    /// WinGet <c>MachineArchitectureComparator</c>: an installer listing the system architecture in
+    /// <c>UnsupportedOSArchitectures</c> is not applicable (it would otherwise run under emulation).
+    /// </summary>
+    internal static bool InstallerUnsupportedOnArchitecture(Installer installer, string systemArchitecture)
+        => installer.UnsupportedOSArchitectures.Any(value =>
+            value.Trim().Equals(systemArchitecture, StringComparison.OrdinalIgnoreCase));
+
     private static (int Architecture, int Locale, int Commands) InstallerRank(
         Installer installer,
         string? requestedLocale,
+        IReadOnlyList<string> preferredLocales,
         string? requestedArchitecture,
         string systemArchitecture)
     {
@@ -4160,7 +4986,9 @@ public class Repository : IDisposable
             requestedArchitecture ?? systemArchitecture,
             requestedArchitecture is not null,
             systemArchitecture);
-        var locale = LocaleRank(installer.Locale, requestedLocale);
+        var locale = requestedLocale is not null
+            ? LocaleRank(installer.Locale, requestedLocale)
+            : PreferredLocaleRank(installer.Locale, preferredLocales);
         var commands = installer.Commands.Count == 0 ? 0 : 1;
         return (architecture, locale, commands);
     }
@@ -4189,6 +5017,71 @@ public class Repository : IDisposable
         return -1;
     }
 
+    /// <summary>
+    /// Locale preference without <c>--locale</c>, after WinGet's <c>LocaleComparator</c>: the first preferred
+    /// language that an installer matches decides (an exact tag beats the same language), an installer declaring
+    /// no locale beats one whose locale matches no preference, and with no preferences at all the locale does not
+    /// rank installers.
+    /// </summary>
+    internal static int PreferredLocaleRank(string? installerLocale, IReadOnlyList<string> preferredLocales)
+    {
+        if (preferredLocales.Count == 0)
+            return 0;
+        var locale = installerLocale?.Trim();
+        if (string.IsNullOrEmpty(locale))
+            return 1;
+
+        for (var index = 0; index < preferredLocales.Count; index++)
+        {
+            var preferred = preferredLocales[index].Trim();
+            var weight = 2 + (preferredLocales.Count - index) * 2;
+            if (locale.Equals(preferred, StringComparison.OrdinalIgnoreCase))
+                return weight + 1;
+            var language = locale.Split('-')[0];
+            if (language.Length > 0 && language.Equals(preferred.Split('-')[0], StringComparison.OrdinalIgnoreCase))
+                return weight;
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// The user's preferred UI languages (BCP-47 tags, most preferred first), which WinGet uses as the installer
+    /// locale preference when no locale is requested.
+    /// </summary>
+    private static readonly Lazy<IReadOnlyList<string>> PreferredInstallerLocales = new(ReadPreferredUiLanguages);
+
+    private const uint MuiLanguageName = 0x8;
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool GetUserPreferredUILanguages(uint flags, out uint numLanguages, char[]? languagesBuffer, ref uint languagesBufferLength);
+
+    private static IReadOnlyList<string> ReadPreferredUiLanguages()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                uint length = 0;
+                if (GetUserPreferredUILanguages(MuiLanguageName, out _, null, ref length) && length > 0)
+                {
+                    var buffer = new char[length];
+                    if (GetUserPreferredUILanguages(MuiLanguageName, out _, buffer, ref length))
+                        return new string(buffer).Split('\0', StringSplitOptions.RemoveEmptyEntries);
+                }
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+            {
+            }
+
+            return [];
+        }
+
+        var name = System.Globalization.CultureInfo.CurrentUICulture.Name;
+        return string.IsNullOrEmpty(name) ? [] : [name];
+    }
+
     private static int LocaleRank(string? installerLocale, string? requestedLocale)
     {
         if (installerLocale is not null && requestedLocale is not null &&
@@ -4213,16 +5106,42 @@ public class Repository : IDisposable
     private static bool MatchesOptionalCaseInsensitive(string? value, string? requested) =>
         requested is null || (value is not null && value.Equals(requested, StringComparison.OrdinalIgnoreCase));
 
-    private static bool TryParseVersion(string value, out System.Version version)
+    /// <summary>Parses a dotted numeric version of any length, like the Rust parse_dotted_version.</summary>
+    private static bool TryParseDottedVersion(string value, out ulong[] version)
     {
         var parts = value.Split('.', StringSplitOptions.RemoveEmptyEntries);
-        while (parts.Length > 4)
-            parts = parts.Take(parts.Length - 1).ToArray();
-
-        return System.Version.TryParse(string.Join('.', parts), out version!);
+        version = new ulong[parts.Length];
+        for (var i = 0; i < parts.Length; i++)
+        {
+            if (!ulong.TryParse(parts[i], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out version[i]))
+                return false;
+        }
+        return parts.Length > 0;
     }
 
-    private static string CurrentArchitecture() => RuntimeInformation.OSArchitecture switch
+    /// <summary>
+    /// Compares dotted numeric versions component by component, treating missing trailing components
+    /// as zero, so <c>10.0.19041</c> equals <c>10.0.19041.0</c>.
+    /// </summary>
+    internal static int CompareDottedVersions(IReadOnlyList<ulong> left, IReadOnlyList<ulong> right)
+    {
+        for (var i = 0; i < Math.Max(left.Count, right.Count); i++)
+        {
+            var cmp = (i < left.Count ? left[i] : 0UL).CompareTo(i < right.Count ? right[i] : 0UL);
+            if (cmp != 0)
+                return cmp;
+        }
+        return 0;
+    }
+
+    /// <summary>
+    /// A requested <c>--locale</c> is a requirement, not a preference: an installer that declares a
+    /// different language is not applicable. Installers that declare no locale stay applicable.
+    /// </summary>
+    private static bool InstallerMatchesLocale(string? installerLocale, string? requestedLocale)
+        => LocaleRank(installerLocale, requestedLocale) >= 0;
+
+    internal static string CurrentArchitecture() => RuntimeInformation.OSArchitecture switch
     {
         Architecture.X64 => "x64",
         Architecture.X86 => "x86",

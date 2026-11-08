@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.CommandLine.Parsing;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -8,6 +9,8 @@ using Devolutions.Pinget.Core;
 
 const string Version = "0.14.1";
 const string UpgradeUnsupportedWarning = "Upgrading packages is not supported on this platform; no changes were made.";
+
+using var utf8Output = CliConsole.UseUtf8Output();
 
 if (args.Length == 1 && (string.Equals(args[0], "--version", StringComparison.OrdinalIgnoreCase) || string.Equals(args[0], "-v", StringComparison.OrdinalIgnoreCase)))
 {
@@ -25,6 +28,9 @@ rootCommand.AddGlobalOption(outputOption);
 var infoOption = new Option<bool>("--info", "Display general info");
 rootCommand.AddGlobalOption(infoOption);
 
+var commonOptions = new CliCommonOptions();
+commonOptions.AddTo(rootCommand);
+
 // ── Common options ──
 Option<string?> QueryArg(string description = "Query")
 {
@@ -37,7 +43,21 @@ Option<string?> NameOpt() => new("--name", "Filter by name");
 Option<string?> MonikerOpt() => new("--moniker", "Filter by moniker");
 Option<string?> SourceOpt() { var o = new Option<string?>("--source", "Source name"); o.AddAlias("-s"); return o; }
 Option<bool> ExactOpt() { var o = new Option<bool>("--exact", "Exact match"); o.AddAlias("-e"); return o; }
-Option<int?> CountOpt() { var o = new Option<int?>("--count", "Max results"); o.AddAlias("-n"); return o; }
+Option<int?> CountOpt()
+{
+    var o = new Option<int?>("--count", "Max results"); o.AddAlias("-n");
+    o.AddValidator(result =>
+    {
+        // Non-numeric tokens are already reported by the int parser.
+        if (result.Tokens.Count > 0 &&
+            int.TryParse(result.Tokens[^1].Value, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var count) &&
+            !CliValidation.IsValidCount(count))
+        {
+            result.ErrorMessage = CliValidation.CountOutOfBoundsMessage;
+        }
+    });
+    return o;
+}
 Option<string?> VersionOpt() { var o = new Option<string?>("--version", "Version"); o.AddAlias("-v"); return o; }
 
 // ── Search command ──
@@ -279,7 +299,9 @@ upgradeCommand.SetHandler((ctx) =>
         return;
     }
 
-    var result = repo.List(query);
+    // A named upgrade checks pins below against the requested target version and reports a pinned
+    // package; the list itself only hides pinned rows for implicit upgrades.
+    var result = hasExplicitUpgradeSelector ? repo.ListIgnoringPins(query) : repo.List(query);
     var mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress;
     var baseInstallRequest = CreateInstallRequest(
         installQuery,
@@ -323,7 +345,7 @@ upgradeCommand.SetHandler((ctx) =>
         var failureCount = 0;
         if (upgradeable.Count == 0)
         {
-            Console.WriteLine("No applicable upgrade found.");
+            ctx.ExitCode = UpgradeTargetSelector.ReportNoApplicableUpgrade(upgradeAll);
         }
         else
         {
@@ -333,9 +355,10 @@ upgradeCommand.SetHandler((ctx) =>
                 try
                 {
                     var pin = FindMatchingPin(m, pins);
-                    if (pin?.PinType == PinType.Blocking)
+                    var targetVersion = installQuery.Version ?? m.AvailableVersion ?? "";
+                    if (pin is not null && PinPolicy.UpgradeBlockMessage(pin, targetVersion, query.IncludePinned) is { } pinMessage)
                     {
-                        Console.WriteLine($"  Package is blocked by pin {pin.Version}; remove the pin before upgrading.");
+                        Console.WriteLine($"  {pinMessage}");
                         failureCount++;
                         continue;
                     }
@@ -432,12 +455,21 @@ sourceListCmd.SetHandler(() =>
     PrintSources(repo.ListSources());
 });
 
-sourceUpdateCmd.SetHandler((source) =>
+sourceUpdateCmd.SetHandler((ctx) =>
 {
     using var repo = Repository.Open();
-    foreach (var r in repo.UpdateSources(source))
-        Console.WriteLine($"{r.Name} [{r.Kind}]: {r.Detail}");
-}, suSourceArg);
+    var results = repo.UpdateSources(ctx.ParseResult.GetValueForArgument(suSourceArg));
+    foreach (var r in results)
+        Console.WriteLine(r.Success ? $"{r.Name} [{r.Kind}]: {r.Detail}" : $"{r.Name} [{r.Kind}]: failed: {r.Detail}");
+
+    // Every source is attempted and reported, but the command still fails when any did.
+    var failed = results.Where(r => !r.Success).Select(r => r.Name).ToList();
+    if (failed.Count > 0)
+    {
+        Console.Error.WriteLine($"{failed.Count} source(s) failed to update: {string.Join(", ", failed)}");
+        ctx.ExitCode = 1;
+    }
+});
 
 sourceExportCmd.SetHandler(() =>
 {
@@ -492,18 +524,20 @@ sourceRemoveCmd.SetHandler((name) =>
     Console.WriteLine("Done");
 }, srNameArg);
 
-sourceResetCmd.SetHandler((name, force) =>
+sourceResetCmd.SetHandler((ctx) =>
 {
+    var name = ctx.ParseResult.GetValueForOption(srNameOpt);
+    var force = ctx.ParseResult.GetValueForOption(srForceOpt);
     using var repo = Repository.Open();
     if (!string.IsNullOrWhiteSpace(name))
         repo.ResetSource(name);
     else
     {
-        if (!force) { Console.Error.WriteLine("error: Resetting all sources requires --force"); return; }
+        if (!force) { Console.Error.WriteLine("error: Resetting all sources requires --force"); ctx.ExitCode = 1; return; }
         repo.ResetSources();
     }
     Console.WriteLine("Done");
-}, srNameOpt, srForceOpt);
+});
 
 // ── Cache warm ──
 var cacheCommand = new Command("cache", "Cache management");
@@ -540,29 +574,21 @@ var hashFileArg = new Argument<string>("file", "File path");
 var hashMsixOpt = new Option<bool>("--msix", "MSIX signature hash");
 hashCommand.AddArgument(hashFileArg); hashCommand.AddOption(hashMsixOpt);
 
-hashCommand.SetHandler((file, msix) =>
+hashCommand.SetHandler((ctx) =>
 {
-    var bytes = File.ReadAllBytes(file);
-    var hash = SHA256.HashData(bytes);
-    Console.WriteLine($"SHA256: {Convert.ToHexString(hash)}");
-    if (msix)
+    var file = ctx.ParseResult.GetValueForArgument(hashFileArg);
+    try
     {
-        try
-        {
-            using var archive = System.IO.Compression.ZipFile.OpenRead(file);
-            var sig = archive.GetEntry("AppxSignature.p7x");
-            if (sig is not null)
-            {
-                using var stream = sig.Open();
-                using var ms = new MemoryStream();
-                stream.CopyTo(ms);
-                var sigHash = SHA256.HashData(ms.ToArray());
-                Console.WriteLine($"SignatureSha256: {Convert.ToHexString(sigHash)}");
-            }
-        }
-        catch { Console.Error.WriteLine("Not a valid MSIX/Appx package"); }
+        Console.WriteLine($"SHA256: {FileHasher.Sha256FileHex(file)}");
+        if (ctx.ParseResult.GetValueForOption(hashMsixOpt))
+            Console.WriteLine($"SignatureSha256: {FileHasher.MsixSignatureSha256Hex(file)}");
     }
-}, hashFileArg, hashMsixOpt);
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException)
+    {
+        Console.Error.WriteLine($"error: {ex.Message}");
+        ctx.ExitCode = 1;
+    }
+});
 
 // ── Export ──
 var exportCommand = new Command("export", "Export installed packages");
@@ -587,7 +613,7 @@ var errorCommand = new Command("error", "Look up error codes");
 var errInputArg = new Argument<string>("input", "Error code");
 errorCommand.AddArgument(errInputArg);
 
-errorCommand.SetHandler(PrintErrorLookup, errInputArg);
+errorCommand.SetHandler(ctx => { ctx.ExitCode = PrintErrorLookup(ctx.ParseResult.GetValueForArgument(errInputArg)); });
 
 // ── Settings ──
 var settingsCommand = new Command("settings", "Settings");
@@ -695,11 +721,23 @@ featuresCommand.SetHandler(() =>
 var validateCommand = new Command("validate", "Validate manifest");
 var valManifestArg = new Argument<string>("manifest", "Manifest file");
 validateCommand.AddArgument(valManifestArg);
-validateCommand.SetHandler((manifest) =>
+validateCommand.SetHandler((ctx) =>
 {
-    if (!File.Exists(manifest)) { Console.Error.WriteLine($"error: File not found: {manifest}"); return; }
-    Console.WriteLine("Manifest validation succeeded.");
-}, valManifestArg);
+    var manifest = ctx.ParseResult.GetValueForArgument(valManifestArg);
+    ManifestValidationReport report;
+    try
+    {
+        report = ManifestValidator.Validate(manifest);
+    }
+    catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+    {
+        Console.Error.WriteLine($"error: {ex.Message}");
+        ctx.ExitCode = 1;
+        return;
+    }
+
+    ctx.ExitCode = ManifestValidator.Print(report, CliSession.IgnoreWarnings);
+});
 
 // ── Download ──
 var downloadCommand = new Command("download", "Download installer");
@@ -740,7 +778,8 @@ downloadCommand.SetHandler((ctx) =>
     };
     var dir = ctx.ParseResult.GetValueForOption(dlDirOpt)
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
-    using var repo = Repository.Open();
+    // Download shows the package agreements prompt like install (WinGet DownloadCommand).
+    using var repo = OpenRepositoryForPackageAction();
     var request = CreateInstallRequest(
         query,
         ctx.ParseResult.GetValueForOption(dlManifestOpt),
@@ -815,6 +854,12 @@ pinListCmd.SetHandler((ctx) =>
         ctx.ParseResult.GetValueForOption(plSourceOpt),
         ctx.ParseResult.GetValueForOption(plExactOpt));
     var pins = FilterPins(repo, query);
+    var output = GetOutputFormat(ctx.ParseResult.GetValueForOption(outputOption));
+    if (output != OutputFormat.Text)
+    {
+        WriteStructuredOutput(PinListEntry.FromPins(pins), output, CliJsonContext.Default.ListPinListEntry);
+        return;
+    }
     if (pins.Count == 0) { Console.WriteLine("No pins found."); return; }
     Console.WriteLine($"{"Package Id",-40} {"Version",-20} {"Source",-15} Pin Type");
     Console.WriteLine(new string('-', 85));
@@ -855,18 +900,14 @@ pinAddCmd.SetHandler((ctx) =>
         var target = ResolveSingleAvailablePinTarget(repo, query);
         packageId = target.Id;
         sourceId = target.SourceName;
-        resolvedVersion = target.Version;
+        resolvedVersion = PinPolicy.InstalledVersionForPin(repo, target.Id, target.SourceName);
     }
 
     if (repo.ListPins(sourceId).Any(pin => pin.PackageId.Equals(packageId, StringComparison.OrdinalIgnoreCase)) && !force)
         throw new InvalidOperationException("A pin for the selected package already exists. Rerun with --force to replace it.");
 
-    var pinVersion = !string.IsNullOrWhiteSpace(requestedVersion)
-        ? requestedVersion
-        : blocking
-            ? "*"
-            : resolvedVersion ?? "*";
-    repo.AddPin(packageId, pinVersion, sourceId, blocking ? PinType.Blocking : PinType.Pinning);
+    var pinVersion = PinPolicy.PinVersionForAdd(requestedVersion, blocking, resolvedVersion);
+    repo.AddPin(packageId, pinVersion, sourceId, PinPolicy.PinTypeForAdd(blocking, requestedVersion));
     Console.WriteLine($"Pin added for {packageId}");
 });
 
@@ -888,6 +929,8 @@ pinRemoveCmd.SetHandler((ctx) =>
     if (ctx.ParseResult.GetValueForOption(prInstalledOpt))
     {
         var target = ResolveSingleInstalledPinTarget(repo, query);
+        // Same key as `pin add --installed`: an installed package with no correlated source is
+        // pinned under the empty (source-less) source id.
         pin = repo.ListPins(target.SourceName ?? query.Source ?? "")
             .FirstOrDefault(candidate => candidate.PackageId.Equals(target.Id, StringComparison.OrdinalIgnoreCase));
     }
@@ -915,13 +958,15 @@ pinRemoveCmd.SetHandler((ctx) =>
     Console.WriteLine(repo.RemovePin(pin.PackageId, pin.SourceId) ? $"Pin removed for {pin.PackageId}" : $"No pin found for {pin.PackageId}");
 });
 
-pinResetCmd.SetHandler((force, source) =>
+pinResetCmd.SetHandler((ctx) =>
 {
-    if (!force) { Console.Error.WriteLine("error: Resetting all pins requires --force"); return; }
+    var force = ctx.ParseResult.GetValueForOption(prForceOpt);
+    var source = ctx.ParseResult.GetValueForOption(prResetSourceOpt);
+    if (!force) { Console.Error.WriteLine("error: Resetting all pins requires --force"); ctx.ExitCode = 1; return; }
     using var repo = Repository.Open();
     repo.ResetPins(source);
-    Console.WriteLine(string.IsNullOrWhiteSpace(source) ? "All pins have been reset." : $"All pins for source '{source}' have been reset.");
-}, prForceOpt, prResetSourceOpt);
+    Console.WriteLine(source is null ? "All pins have been reset." : $"All pins for source '{source}' have been reset.");
+});
 
 // ── Install ──
 var installCommand = new Command("install", "Install a package");
@@ -1126,24 +1171,20 @@ importCommand.SetHandler((ctx) =>
     var noUpgrade = ctx.ParseResult.GetValueForOption(imNoUpgradeOpt);
     var acceptPackageAgreements = ctx.ParseResult.GetValueForOption(imAcceptPkgAgreementsOpt);
 
-    if (!File.Exists(file)) { Console.Error.WriteLine($"error: File not found: {file}"); return; }
-    var jsonText = File.ReadAllText(file);
-    using var doc = JsonDocument.Parse(jsonText);
-    var sources = doc.RootElement.GetProperty("Sources").EnumerateArray().ToList();
+    if (!File.Exists(file)) { Console.Error.WriteLine($"error: File not found: {file}"); ctx.ExitCode = 1; return; }
+    List<ImportPackage> importPackages;
+    try
+    {
+        importPackages = ImportCommandHandler.ParseImportFile(File.ReadAllText(file), ignoreVersions);
+    }
+    catch (InvalidDataException ex)
+    {
+        Console.Error.WriteLine($"error: {ex.Message}");
+        ctx.ExitCode = 1;
+        return;
+    }
 
     using var repo = OpenRepositoryForPackageAction();
-    var importPackages = sources.SelectMany(source =>
-    {
-        var sourceName = source.TryGetProperty("SourceDetails", out var sourceDetails)
-            ? GetJsonString(sourceDetails, "Name")
-            : null;
-        return source.GetProperty("Packages").EnumerateArray().Select(pkg => new ImportPackage(
-            pkg.GetProperty("PackageIdentifier").GetString()!,
-            sourceName,
-            ignoreVersions ? null : GetJsonString(pkg, "Version"),
-            pkg));
-    }).ToList();
-
     ctx.ExitCode = ImportCommandHandler.Run(
         importPackages,
         dryRun,
@@ -1160,7 +1201,14 @@ importCommand.SetHandler((ctx) =>
             },
             pkg.Entry,
             acceptPackageAgreements,
-            noUpgrade)));
+            noUpgrade)),
+        pkg => repo.Search(new PackageQuery
+        {
+            Id = pkg.Id,
+            Source = pkg.SourceName,
+            Exact = true,
+            Version = pkg.Version,
+        }).Matches.Count > 0);
 });
 
 // ── Add all commands to root ──
@@ -1193,7 +1241,9 @@ rootCommand.SetHandler((ctx) =>
     }
 });
 
-return rootCommand.Invoke(args);
+var parseResult = rootCommand.Parse(args);
+commonOptions.Apply(parseResult);
+return parseResult.Invoke();
 
 // ═══════════════ Output helpers ═══════════════
 
@@ -1307,6 +1357,7 @@ static void PrintShow(ShowResult result)
     Console.WriteLine($"Found {result.Package.Name} [{result.Package.Id}]");
     var m = result.Manifest;
     Console.WriteLine($"Version: {m.Version}");
+    PrintOpt("Channel", m.Channel);
     PrintOpt("Publisher", m.Publisher);
     PrintOpt("Publisher Url", m.PublisherUrl);
     PrintOpt("Publisher Support Url", m.PublisherSupportUrl);
@@ -1324,12 +1375,18 @@ static void PrintShow(ShowResult result)
     PrintOpt("Privacy Url", m.PrivacyUrl);
     PrintOpt("Copyright", m.Copyright);
     PrintOpt("Copyright Url", m.CopyrightUrl);
+    if (!string.IsNullOrEmpty(m.ReleaseNotes))
+    {
+        Console.WriteLine("Release Notes:");
+        foreach (var line in m.ReleaseNotes.Split('\n'))
+            Console.WriteLine($"  {line.TrimEnd('\r')}");
+    }
     PrintOpt("Release Notes Url", m.ReleaseNotesUrl);
     if (m.Documentation.Count > 0)
     {
         Console.WriteLine("Documentation:");
         foreach (var doc in m.Documentation)
-            Console.WriteLine($"  {doc.Label ?? "Link"}: {doc.Url}");
+            Console.WriteLine(ShowFormatting.DocumentationLine(doc));
     }
 
     if (result.Manifest.PackageDependencies.Count > 0)
@@ -1348,11 +1405,20 @@ static void PrintShow(ShowResult result)
         PrintOpt("  Architecture", inst.Architecture);
         PrintOpt("  Locale", inst.Locale);
         PrintOpt("  Scope", inst.Scope);
+        if (inst.Platforms.Count > 0)
+            Console.WriteLine($"  Platform: {string.Join(", ", inst.Platforms)}");
+        PrintOpt("  MinimumOSVersion", inst.MinimumOsVersion);
         PrintOpt("  Url", inst.Url);
         PrintOpt("  Sha256", inst.Sha256);
         PrintOpt("  ProductCode", inst.ProductCode);
         PrintOpt("  Store Product Id", inst.MSStoreProductIdentifier);
+        PrintOpt("  PackageFamilyName", inst.PackageFamilyName);
+        PrintOpt("  UpgradeCode", inst.UpgradeCode);
         PrintOpt("  ReleaseDate", inst.ReleaseDate);
+        if (inst.Commands.Count > 0)
+            Console.WriteLine($"  Commands: {string.Join(", ", inst.Commands)}");
+        foreach (var line in ShowFormatting.InstallerDependencyLines(inst))
+            Console.WriteLine(line);
     }
     else if (m.Installers.Count > 0)
     {
@@ -1362,7 +1428,7 @@ static void PrintShow(ShowResult result)
 }
 
 static Repository OpenRepositoryForPackageAction() =>
-    Repository.Open(!Console.IsInputRedirected && !Console.IsErrorRedirected
+    Repository.Open(CliSession.AgreementsPromptAllowed(CliSession.DisableInteractivity, Console.IsInputRedirected, Console.IsErrorRedirected)
         ? new RepositoryOptions { PackageAgreementsPrompt = PromptPackageAgreements }
         : null);
 
@@ -1502,20 +1568,19 @@ static int PrintPackageActionResult(InstallResult result, string action, string 
     return result.ExitCode != 0 ? result.ExitCode : 1;
 }
 
-static void PrintErrorLookup(string input)
+static int PrintErrorLookup(string input)
 {
-    if (!long.TryParse(input.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
-        ? input[2..] : input, System.Globalization.NumberStyles.HexNumber, null, out var code))
+    if (!ErrorCodes.TryParse(input, out var code))
     {
         Console.Error.WriteLine($"error: Could not parse '{input}' as an error code");
-        return;
+        return 1;
     }
 
-    var lookup = LookupHresult(code);
+    var lookup = ErrorCodes.Lookup(code);
     if (lookup is not null)
     {
         // APPINSTALLER codes (0x8A15xxxx): show symbol on same line
-        if ((code & 0xFFFF0000L) == unchecked((long)0x8A150000))
+        if ((code & 0xFFFF0000u) == 0x8A150000u)
             Console.WriteLine($"0x{code:x8} : {lookup.Value.Symbol}");
         else
             Console.WriteLine($"0x{code:x8}");
@@ -1524,42 +1589,13 @@ static void PrintErrorLookup(string input)
     else
     {
         Console.WriteLine($"0x{code:x8}");
-        Console.WriteLine("  Unknown error code");
+        Console.WriteLine("Unknown error code");
     }
+
+    return 0;
 }
 
-static (string Symbol, string Description)? LookupHresult(long code)
-{
-    return (code & 0xFFFF0000L) switch
-    {
-        0x8A150000 => (code & 0xFFFF) switch
-        {
-            0x0001 => ("APPINSTALLER_CLI_ERROR_INTERNAL_ERROR", "An unexpected error occurred."),
-            0x0002 => ("APPINSTALLER_CLI_ERROR_INVALID_CL_ARGUMENTS", "Invalid command line arguments."),
-            0x0003 => ("APPINSTALLER_CLI_ERROR_COMMAND_FAILED", "The command failed."),
-            0x0004 => ("APPINSTALLER_CLI_ERROR_MANIFEST_FAILED", "Opening the manifest failed."),
-            0x0007 => ("APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER", "No applicable installer found."),
-            0x000E => ("APPINSTALLER_CLI_ERROR_PACKAGE_NOT_FOUND", "No package matched the query."),
-            0x0010 => ("APPINSTALLER_CLI_ERROR_SOURCE_NAME_ALREADY_EXISTS", "A source with the given name already exists."),
-            0x0012 => ("APPINSTALLER_CLI_ERROR_NO_SOURCES_DEFINED", "No sources are configured."),
-            0x0013 => ("APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND", "Multiple packages matched the query."),
-            0x0016 => ("APPINSTALLER_CLI_ERROR_NO_APPLICABLE_UPGRADE", "No applicable upgrade found."),
-            0x001B => ("APPINSTALLER_CLI_ERROR_MSSTORE_BLOCKED_BY_POLICY", "This feature is blocked by Group Policy."),
-            0x001C => ("APPINSTALLER_CLI_ERROR_MSSTORE_APP_BLOCKED_BY_POLICY", "This Microsoft Store app is blocked by Group Policy."),
-            _ => null,
-        },
-        _ => code switch
-        {
-            unchecked((long)0x80004005) => ("E_FAIL", "Unspecified error"),
-            unchecked((long)0x80070005) => ("E_ACCESSDENIED", "General access denied error"),
-            unchecked((long)0x80070057) => ("E_INVALIDARG", "One or more arguments are not valid"),
-            unchecked((long)0x8007000E) => ("E_OUTOFMEMORY", "Failed to allocate necessary memory"),
-            _ => null,
-        }
-    };
-}
-
-static void PrintWarnings(List<string> warnings) { foreach (var w in warnings) Console.Error.WriteLine($"warning: {w}"); }
+static void PrintWarnings(List<string> warnings) { foreach (var w in warnings) CliSession.WriteWarning(w); }
 static void PrintOpt(string label, string? value) { if (!string.IsNullOrEmpty(value)) Console.WriteLine($"{label}: {value}"); }
 static string Trunc(string s, int max) => s.Length <= max ? s : s[..(max - 1)] + ".";
 
@@ -1581,23 +1617,7 @@ static string ResolveSourceAddValue(string? positionalValue, string? optionValue
     throw new InvalidOperationException($"source add requires a {label}.");
 }
 
-static SourceKind ParseSourceKind(string? value)
-{
-    if (string.IsNullOrWhiteSpace(value) ||
-        string.Equals(value, "rest", StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(value, "Microsoft.Rest", StringComparison.OrdinalIgnoreCase))
-    {
-        return SourceKind.Rest;
-    }
-
-    if (string.Equals(value, "preindexed", StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(value, "Microsoft.PreIndexed.Package", StringComparison.OrdinalIgnoreCase))
-    {
-        return SourceKind.PreIndexed;
-    }
-
-    throw new InvalidOperationException($"Unsupported source type: {value}");
-}
+static SourceKind ParseSourceKind(string? value) => SourceTypes.Parse(value);
 
 static string FormatSourceType(SourceKind kind) => kind switch
 {
@@ -1802,11 +1822,6 @@ static RepairRequest CreateRepairRequest(
         IgnoreSecurityHash = ignoreSecurityHash,
     };
 
-static string? GetJsonString(JsonElement element, string propertyName) =>
-    element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
-        ? value.GetString()
-        : null;
-
 static bool IsInstalledPackagePresent(Repository repo, string packageId, string? sourceName) =>
     repo.List(new ListQuery
     {
@@ -1831,72 +1846,8 @@ void WriteJsonNode(JsonNode value, OutputFormat output)
 
 static void PrintTable(string[] headers, List<string[]> rows)
 {
-    if (headers.Length == 0) return;
-    int cols = headers.Length;
-    var widths = headers.Select(h => h.Length).ToArray();
-    var hasData = new bool[cols];
-
-    foreach (var row in rows)
-        for (int i = 0; i < Math.Min(cols, row.Length); i++)
-            if (!string.IsNullOrEmpty(row[i]))
-            {
-                hasData[i] = true;
-                widths[i] = Math.Max(widths[i], row[i].Length);
-            }
-
-    for (int i = 0; i < cols; i++)
-        if (!hasData[i]) widths[i] = 0;
-
-    var spaceAfter = Enumerable.Repeat(true, cols).ToArray();
-    spaceAfter[^1] = false;
-    for (int i = cols - 1; i >= 1; i--)
-    {
-        if (widths[i] == 0) spaceAfter[i - 1] = false;
-        else break;
-    }
-
-    int totalWidth = widths.Zip(spaceAfter, (w, s) => w + (s ? 1 : 0)).Sum();
-    int consoleWidth = 119;
-    try { consoleWidth = Math.Max(1, Console.WindowWidth - 2); } catch { }
-    if (totalWidth >= consoleWidth)
-    {
-        int extra = totalWidth - consoleWidth + 1;
-        while (extra > 0)
-        {
-            int target = 0;
-            for (int i = 1; i < cols; i++)
-                if (widths[i] > widths[target]) target = i;
-            if (widths[target] > 1) widths[target]--;
-            extra--;
-        }
-        totalWidth = Math.Max(0, consoleWidth - 1);
-    }
-
-    PrintTableLine(headers, widths, spaceAfter);
-    Console.WriteLine(new string('-', totalWidth));
-    foreach (var row in rows)
-        PrintTableLine(row, widths, spaceAfter);
-}
-
-static void PrintTableLine(string[] values, int[] widths, bool[] spaceAfter)
-{
-    var sb = new System.Text.StringBuilder();
-    for (int i = 0; i < Math.Min(values.Length, widths.Length); i++)
-    {
-        if (widths[i] == 0) continue;
-        var val = values[i] ?? "";
-        if (val.Length > widths[i])
-        {
-            sb.Append(Trunc(val, widths[i]));
-            if (spaceAfter[i]) sb.Append(' ');
-        }
-        else
-        {
-            sb.Append(val);
-            if (spaceAfter[i]) sb.Append(' ', widths[i] - val.Length + 1);
-        }
-    }
-    Console.WriteLine(sb.ToString().TrimEnd());
+    foreach (var line in TableRenderer.Render(headers, rows, TableRenderer.ConsoleWidth()))
+        Console.WriteLine(line);
 }
 
 enum OutputFormat

@@ -50,23 +50,23 @@ public static class YamlEmitter
                 return;
 
             case bool b:
-                EmitScalar(emitter, b ? "true" : "false");
+                EmitPlainScalar(emitter, b ? "true" : "false");
                 return;
 
             case sbyte or byte or short or ushort or int or uint or long or ulong:
-                EmitScalar(emitter, Convert.ToString(value, CultureInfo.InvariantCulture) ?? "");
+                EmitPlainScalar(emitter, Convert.ToString(value, CultureInfo.InvariantCulture) ?? "");
                 return;
 
             case float f:
-                EmitScalar(emitter, f.ToString("R", CultureInfo.InvariantCulture));
+                EmitPlainScalar(emitter, f.ToString("R", CultureInfo.InvariantCulture));
                 return;
 
             case double d:
-                EmitScalar(emitter, d.ToString("R", CultureInfo.InvariantCulture));
+                EmitPlainScalar(emitter, d.ToString("R", CultureInfo.InvariantCulture));
                 return;
 
             case decimal m:
-                EmitScalar(emitter, m.ToString(CultureInfo.InvariantCulture));
+                EmitPlainScalar(emitter, m.ToString(CultureInfo.InvariantCulture));
                 return;
 
             case DateTime dt:
@@ -148,16 +148,16 @@ public static class YamlEmitter
                 EmitScalar(emitter, jsonValue.GetValue<string>());
                 return;
             case JsonValueKind.True:
-                EmitScalar(emitter, "true");
+                EmitPlainScalar(emitter, "true");
                 return;
             case JsonValueKind.False:
-                EmitScalar(emitter, "false");
+                EmitPlainScalar(emitter, "false");
                 return;
             case JsonValueKind.Null:
                 EmitNull(emitter);
                 return;
             case JsonValueKind.Number:
-                EmitScalar(emitter, jsonValue.ToJsonString());
+                EmitPlainScalar(emitter, jsonValue.ToJsonString());
                 return;
             default:
                 EmitScalar(emitter, jsonValue.ToJsonString());
@@ -207,7 +207,8 @@ public static class YamlEmitter
         emitter.Emit(new SequenceEnd());
     }
 
-    private static void EmitScalar(IEmitter emitter, string value)
+    // Booleans and numbers: always plain, so they read back as their native type.
+    private static void EmitPlainScalar(IEmitter emitter, string value)
     {
         emitter.Emit(new Scalar(
             anchor: null,
@@ -217,6 +218,37 @@ public static class YamlEmitter
             isPlainImplicit: true,
             isQuotedImplicit: true));
     }
+
+    // Strings: plain unless a YAML reader would resolve the plain scalar to something
+    // other than a string ("1.10", "true", "null", "", ...). Clearing isPlainImplicit
+    // makes the emitter quote it, which is what serde_yaml does on the Rust side.
+    private static void EmitScalar(IEmitter emitter, string value)
+    {
+        emitter.Emit(new Scalar(
+            anchor: null,
+            tag: null,
+            value: value,
+            style: ScalarStyle.Any,
+            isPlainImplicit: !ResolvesToNonString(value),
+            isQuotedImplicit: true));
+    }
+
+    private static readonly HashSet<string> NonStringWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "~", "null", "true", "false", "yes", "no", "on", "off", "y", "n",
+        ".inf", "+.inf", "-.inf", ".nan",
+    };
+
+    // YAML 1.1 and 1.2 core-schema ints/floats: decimal, 0x hex, 0o / leading-0 octal,
+    // 0b binary, underscores, exponents, and 1.1 sexagesimal (1:30).
+    private static readonly System.Text.RegularExpressions.Regex NumberPattern = new(
+        @"^(?:[-+]?(?:0x[0-9a-f_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*(?::[0-5]?[0-9])+(?:\.[0-9_]*)?|(?:[0-9][0-9_]*)?\.?[0-9_]+(?:e[-+]?[0-9]+)?|[0-9][0-9_]*\.(?:e[-+]?[0-9]+)?))$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    internal static bool ResolvesToNonString(string value) =>
+        value.Length == 0 ||
+        NonStringWords.Contains(value) ||
+        NumberPattern.IsMatch(value);
 
     private static readonly TagName NullTag = new("tag:yaml.org,2002:null");
 

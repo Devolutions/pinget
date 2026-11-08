@@ -41,6 +41,8 @@ pub(crate) enum Architecture {
     Unknown,
     X86,
     X64,
+    Arm,
+    Arm64,
 }
 
 /// One pass over the input — captures both the regex and the replacement
@@ -176,6 +178,12 @@ fn remove_architecture(value: &mut String) -> Architecture {
     if apply(architecture_x32(), value) || apply(architecture_32_bit(), value) {
         return Architecture::X86;
     }
+    if apply(architecture_arm64(), value) {
+        return Architecture::Arm64;
+    }
+    if apply(architecture_arm(), value) {
+        return Architecture::Arm;
+    }
     Architecture::Unknown
 }
 
@@ -285,6 +293,14 @@ regex_cell!(
     r"(^|[^\p{L}\p{Nd}])(?:X64|AMD64|X86[\p{Pd}\p{Pc}]64)(?=\P{Nd}|$)(?:\sEDITION)?"
 );
 regex_cell!(
+    architecture_arm64_re,
+    r"(^|[^\p{L}\p{Nd}])(?:ARM64|AARCH64)(?=\P{Nd}|$)(?:\sEDITION)?"
+);
+regex_cell!(
+    architecture_arm_re,
+    r"(^|[^\p{L}\p{Nd}])(?:ARM32)(?=\P{Nd}|$)(?:\sEDITION)?"
+);
+regex_cell!(
     architecture_32_bit_re,
     r"(^|[^\p{L}\p{Nd}])(?:32[\p{Pd}\p{Pc}\p{Z}]?BIT)S?(?:\sEDITION)?"
 );
@@ -298,6 +314,8 @@ regex_cell!(
 );
 stripper_cell!(architecture_x32, architecture_x32_re, "$1");
 stripper_cell!(architecture_x64, architecture_x64_re, "$1");
+stripper_cell!(architecture_arm64, architecture_arm64_re, "$1");
+stripper_cell!(architecture_arm, architecture_arm_re, "$1");
 stripper_cell!(architecture_32_bit, architecture_32_bit_re, "$1");
 stripper_cell!(architecture_64_bit, architecture_64_bit_re, "$1");
 stripper_cell!(architecture_32_or_64_bit, architecture_32_or_64_bit_re, "$1");

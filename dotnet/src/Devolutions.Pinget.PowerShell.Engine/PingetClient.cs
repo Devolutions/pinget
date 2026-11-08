@@ -149,7 +149,8 @@ public sealed class PingetClient : IDisposable
         string? downloadDirectory,
         bool skipMicrosoftStoreLicense,
         PSWindowsPlatform platform,
-        string? targetOsVersion)
+        string? targetOsVersion,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var warnings = new List<string>();
         AddDownloadCompatibilityWarnings(warnings, skipDependencies, skipMicrosoftStoreLicense);
@@ -165,13 +166,13 @@ public sealed class PingetClient : IDisposable
                 null,
                 null,
                 0,
-                PSPackageFieldMatchOption.EqualsCaseInsensitive) with
+                matchOption) with
             {
                 Version = version ?? GetCatalogVersion(inputObject),
                 Locale = locale,
                 InstallerArchitecture = architecture == PSProcessorArchitecture.Default ? null : architecture.ToString(),
                 InstallerType = installerType == PSPackageInstallerType.Default ? null : installerType.ToString(),
-                InstallScope = scope == PSPackageInstallScope.Any ? null : scope.ToString(),
+                InstallScope = PSEnumMapping.ToInstallScope(scope),
                 Platform = ToInstallerPlatform(platform),
                 OsVersion = Normalize(targetOsVersion),
             },
@@ -288,7 +289,8 @@ public sealed class PingetClient : IDisposable
         PSPackageInstallScope scope,
         PSProcessorArchitecture architecture,
         PSPackageInstallMode mode,
-        PSPackageInstallerType installerType)
+        PSPackageInstallerType installerType,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var warnings = new List<string>();
         ApplyRequestHeaders(header);
@@ -304,13 +306,13 @@ public sealed class PingetClient : IDisposable
                 null,
                 null,
                 0,
-                PSPackageFieldMatchOption.EqualsCaseInsensitive) with
+                matchOption) with
             {
                 Version = version ?? GetCatalogVersion(inputObject),
                 Locale = locale,
                 InstallerArchitecture = architecture == PSProcessorArchitecture.Default ? null : architecture.ToString(),
                 InstallerType = installerType == PSPackageInstallerType.Default ? null : installerType.ToString(),
-                InstallScope = scope == PSPackageInstallScope.Any ? null : scope.ToString(),
+                InstallScope = PSEnumMapping.ToInstallScope(scope),
             },
             Override = Normalize(overrideArguments),
             Custom = Normalize(custom),
@@ -336,7 +338,8 @@ public sealed class PingetClient : IDisposable
         string[]? query,
         bool force,
         string? log,
-        PSPackageUninstallMode mode)
+        PSPackageUninstallMode mode,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var request = new UninstallRequest
         {
@@ -349,7 +352,7 @@ public sealed class PingetClient : IDisposable
                 null,
                 null,
                 0,
-                PSPackageFieldMatchOption.EqualsCaseInsensitive) with
+                matchOption) with
             {
                 Version = version ?? GetInstalledVersion(inputObject),
             },
@@ -383,7 +386,8 @@ public sealed class PingetClient : IDisposable
         PSProcessorArchitecture architecture,
         PSPackageInstallMode mode,
         PSPackageInstallerType installerType,
-        bool includeUnknown)
+        bool includeUnknown,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var warnings = new List<string>();
         ApplyRequestHeaders(header);
@@ -398,50 +402,53 @@ public sealed class PingetClient : IDisposable
             // -Version is the upgrade target; ListQuery.Version would filter on the installed version.
             UpgradeOnly = true,
             IncludeUnknown = includeUnknown,
-            Exact = true,
+            Exact = PSEnumMapping.UsesExactMatch(matchOption),
         };
 
         var matches = _repository.List(listQuery);
         warnings.AddRange(matches.Warnings);
 
-        var results = new List<PSInstallResult>();
-        foreach (var match in matches.Matches)
-        {
-            var request = new InstallRequest
+        var results = UpdateBatch.Run(
+            matches.Matches,
+            match => (match.Id, match.Name, match.SourceName),
+            match =>
             {
-                Query = new PackageQuery
+                var request = new InstallRequest
                 {
-                    Id = match.Id,
-                    Source = match.SourceName,
-                    Exact = true,
-                    Version = Normalize(version) ?? match.AvailableVersion,
-                    Locale = locale,
-                    InstallerArchitecture = architecture == PSProcessorArchitecture.Default ? null : architecture.ToString(),
-                    InstallerType = installerType == PSPackageInstallerType.Default ? null : installerType.ToString(),
-                    InstallScope = scope == PSPackageInstallScope.Any ? null : scope.ToString(),
-                },
-                Override = Normalize(overrideArguments),
-                Custom = Normalize(custom),
-                InstallLocation = Normalize(location),
-                LogPath = Normalize(log),
-                Force = force,
-                SkipDependencies = skipDependencies,
-                IgnoreSecurityHash = allowHashMismatch,
-                Mode = ToInstallerMode(mode),
-            };
+                    Query = new PackageQuery
+                    {
+                        Id = match.Id,
+                        Source = match.SourceName,
+                        Exact = true,
+                        Version = Normalize(version) ?? match.AvailableVersion,
+                        Locale = locale,
+                        InstallerArchitecture = architecture == PSProcessorArchitecture.Default ? null : architecture.ToString(),
+                        InstallerType = installerType == PSPackageInstallerType.Default ? null : installerType.ToString(),
+                        InstallScope = PSEnumMapping.ToInstallScope(scope),
+                    },
+                    Override = Normalize(overrideArguments),
+                    Custom = Normalize(custom),
+                    InstallLocation = Normalize(location),
+                    LogPath = Normalize(log),
+                    Force = force,
+                    SkipDependencies = skipDependencies,
+                    IgnoreSecurityHash = allowHashMismatch,
+                    Mode = ToInstallerMode(mode),
+                };
 
-            var result = _repository.Install(request);
-            warnings.AddRange(result.Warnings);
-            results.Add(ToPsInstallResult(result, request, new PSInstalledCatalogPackage(
-                match.Id,
-                match.Name,
-                match.SourceName ?? string.Empty,
-                null,
-                match.InstalledVersion,
-                string.IsNullOrWhiteSpace(match.AvailableVersion) ? [] : [match.AvailableVersion],
-                match.Publisher,
-                match.Scope)));
-        }
+                var result = _repository.Install(request);
+                warnings.AddRange(result.Warnings);
+                return ToPsInstallResult(result, request, new PSInstalledCatalogPackage(
+                    match.Id,
+                    match.Name,
+                    match.SourceName ?? string.Empty,
+                    null,
+                    match.InstalledVersion,
+                    string.IsNullOrWhiteSpace(match.AvailableVersion) ? [] : [match.AvailableVersion],
+                    match.Publisher,
+                    match.Scope));
+            },
+            warnings);
 
         return new CollectionResult<PSInstallResult>(results, warnings, matches.Truncated);
     }
@@ -457,7 +464,8 @@ public sealed class PingetClient : IDisposable
         bool allowHashMismatch,
         bool force,
         string? log,
-        PSPackageRepairMode mode)
+        PSPackageRepairMode mode,
+        PSPackageFieldMatchOption matchOption = PSPackageFieldMatchOption.EqualsCaseInsensitive)
     {
         var warnings = new List<string>();
         var request = new RepairRequest
@@ -470,7 +478,7 @@ public sealed class PingetClient : IDisposable
                 Source = Normalize(source ?? inputObject?.Source),
                 Query = JoinQuery(query),
                 Version = Normalize(version) ?? GetInstalledVersion(inputObject),
-                Exact = true,
+                Exact = PSEnumMapping.UsesExactMatch(matchOption),
             },
             IgnoreSecurityHash = allowHashMismatch,
             Force = force,
@@ -492,7 +500,7 @@ public sealed class PingetClient : IDisposable
             (inputObject as PSInstalledCatalogPackage)?.Scope)), warnings);
     }
 
-    private static PackageQuery BuildPackageQuery(
+    internal static PackageQuery BuildPackageQuery(
         string? id,
         string? name,
         string? moniker,
@@ -513,7 +521,7 @@ public sealed class PingetClient : IDisposable
             Tag = Normalize(tag),
             Command = Normalize(command),
             Count = count == 0 ? null : (int)count,
-            Exact = UsesExactMatch(matchOption),
+            Exact = PSEnumMapping.UsesExactMatch(matchOption),
         };
     }
 
@@ -538,7 +546,7 @@ public sealed class PingetClient : IDisposable
             Tag = Normalize(tag),
             Command = Normalize(command),
             Count = count == 0 ? null : (int)count,
-            Exact = UsesExactMatch(matchOption),
+            Exact = PSEnumMapping.UsesExactMatch(matchOption),
         };
     }
 
@@ -617,7 +625,7 @@ public sealed class PingetClient : IDisposable
         _ => InstallerMode.SilentWithProgress,
     };
 
-    private static PSInstallResult ToPsInstallResult(InstallResult result, InstallRequest request, PSCatalogPackage? inputObject)
+    internal static PSInstallResult ToPsInstallResult(InstallResult result, InstallRequest request, PSCatalogPackage? inputObject)
     {
         var identity = ResolveIdentity(result.PackageId, request.Query.Name ?? inputObject?.Name, request.Query.Source ?? inputObject?.Source);
         return new PSInstallResult
@@ -627,8 +635,8 @@ public sealed class PingetClient : IDisposable
             Source = identity.Source,
             CorrelationData = result.InstallerPath,
             InstallerErrorCode = unchecked((uint)result.ExitCode),
-            RebootRequired = false,
-            Status = result.Success ? "Ok" : result.NoOp ? "NoOp" : "Error",
+            RebootRequired = result.RebootRequired,
+            Status = InstallResultStatus.From(result.Success, result.NoOp),
         };
     }
 
@@ -642,8 +650,8 @@ public sealed class PingetClient : IDisposable
             Source = identity.Source,
             CorrelationData = result.InstallerPath,
             UninstallerErrorCode = unchecked((uint)result.ExitCode),
-            RebootRequired = false,
-            Status = result.Success ? "Ok" : result.NoOp ? "NoOp" : "Error",
+            RebootRequired = result.RebootRequired,
+            Status = InstallResultStatus.From(result.Success, result.NoOp),
         };
     }
 
@@ -657,16 +665,13 @@ public sealed class PingetClient : IDisposable
             Source = identity.Source,
             CorrelationData = result.InstallerPath,
             RepairErrorCode = unchecked((uint)result.ExitCode),
-            RebootRequired = false,
-            Status = result.Success ? "Ok" : result.NoOp ? "NoOp" : "Error",
+            RebootRequired = result.RebootRequired,
+            Status = InstallResultStatus.From(result.Success, result.NoOp),
         };
     }
 
     private static (string Name, string? Source) ResolveIdentity(string id, string? name, string? source) =>
         (string.IsNullOrWhiteSpace(name) ? id : name, Normalize(source));
-
-    private static bool UsesExactMatch(PSPackageFieldMatchOption matchOption) =>
-        matchOption is PSPackageFieldMatchOption.Equals or PSPackageFieldMatchOption.EqualsCaseInsensitive;
 
     private static string? JoinQuery(string[]? query)
     {
@@ -679,16 +684,17 @@ public sealed class PingetClient : IDisposable
 
     private static string? Normalize(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
-    private static SourceKind ParseSourceKind(string? value)
+    // Like WinGet, an omitted source type means Microsoft.PreIndexed.Package.
+    internal static SourceKind ParseSourceKind(string? value)
     {
-        if (string.IsNullOrWhiteSpace(value) ||
-            string.Equals(value, "rest", StringComparison.OrdinalIgnoreCase) ||
+        if (string.Equals(value, "rest", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(value, "Microsoft.Rest", StringComparison.OrdinalIgnoreCase))
         {
             return SourceKind.Rest;
         }
 
-        if (string.Equals(value, "preindexed", StringComparison.OrdinalIgnoreCase) ||
+        if (string.IsNullOrWhiteSpace(value) ||
+            string.Equals(value, "preindexed", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(value, "Microsoft.PreIndexed.Package", StringComparison.OrdinalIgnoreCase))
         {
             return SourceKind.PreIndexed;
