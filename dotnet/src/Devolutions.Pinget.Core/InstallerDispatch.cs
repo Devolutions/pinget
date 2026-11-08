@@ -763,6 +763,7 @@ internal static class InstallerDispatch
 
         if (sameExistingLocation)
             RemoveObsoletePortableFiles(targetDir, payload, previousFiles, previousDirectories);
+        createdDirectories = RetainedPortableDirectories(targetDir, payload, createdDirectories);
 
         // Create a Links\<alias>.exe shim for every command so users can invoke
         // the portable from any shell, matching winget's portable workflow.
@@ -996,6 +997,35 @@ internal static class InstallerDispatch
         RemoveTrackedPortableFiles(targetDir,
             previousFiles.Where(file => !currentFiles.Contains(file)).ToArray(),
             previousDirectories.Where(directory => !currentDirectories.Contains(directory)).ToArray());
+    }
+
+    /// <summary>
+    /// The created directories to record in <c>PingetPortableDirectories</c> after an install or upgrade:
+    /// the planned list minus obsolete directories that are no longer on disk (removed by
+    /// <see cref="RemoveObsoletePortableFiles"/>). Tracking a removed directory would let a later upgrade or
+    /// uninstall claim, and delete, a directory the user creates with the same name. An obsolete directory
+    /// kept because it still holds files stays tracked.
+    /// </summary>
+    internal static IReadOnlyList<string> RetainedPortableDirectories(string targetDir, PortablePayload payload,
+        IReadOnlyList<string> createdDirectories)
+    {
+        var currentDirectories = new HashSet<string>(payload.Directories, StringComparer.OrdinalIgnoreCase);
+        return createdDirectories
+            .Where(directory => currentDirectories.Contains(directory) || PortableDirectoryExists(targetDir, directory))
+            .ToArray();
+    }
+
+    private static bool PortableDirectoryExists(string targetDir, string relativePath)
+    {
+        try
+        {
+            return Directory.Exists(SafePortablePath(targetDir, relativePath));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or
+                                   InvalidOperationException or System.Security.SecurityException)
+        {
+            return false;
+        }
     }
 
     internal static void RemoveTrackedPortableFiles(string root, IReadOnlyList<string> files, IReadOnlyList<string> directories)
@@ -2140,26 +2170,28 @@ internal static class InstallerDispatch
     [SupportedOSPlatform("windows")]
     private static ExistingPortableEntry? ReadPortableEntryForInstalled(ListMatch installed)
     {
-        const string ArpPrefix = @"ARP\";
-        if (!installed.LocalId.StartsWith(ArpPrefix, StringComparison.OrdinalIgnoreCase))
+        // Same exact keys as ARP uninstall (including ARP\User\X86's WOW6432Node lookup).
+        var candidates = GetArpUninstallKeyCandidates(installed.LocalId);
+        if (candidates is null)
             return null;
-        var rest = installed.LocalId[ArpPrefix.Length..];
-        var parts = rest.Split('\\', 3);
-        if (parts.Length != 3 || string.IsNullOrWhiteSpace(parts[2]) || parts[2].Contains('\\') ||
-            !(parts[0].Equals("User", StringComparison.OrdinalIgnoreCase) || parts[0].Equals("Machine", StringComparison.OrdinalIgnoreCase)))
-            return null;
-        var hive = parts[0].Equals("User", StringComparison.OrdinalIgnoreCase)
-            ? Microsoft.Win32.RegistryHive.CurrentUser
-            : Microsoft.Win32.RegistryHive.LocalMachine;
-        var view = parts[1].Equals("X86", StringComparison.OrdinalIgnoreCase)
-            ? Microsoft.Win32.RegistryView.Registry32
-            : Microsoft.Win32.RegistryView.Registry64;
-        using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
-        using var subkey = baseKey.OpenSubKey($@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{parts[2]}");
-        return subkey is null
-            ? null
-            : ReadPortableEntry(subkey, parts[2], hive == Microsoft.Win32.RegistryHive.LocalMachine && view == Microsoft.Win32.RegistryView.Registry32);
+        foreach (var candidate in candidates)
+        {
+            using var baseKey = OpenArpCandidateBaseKey(candidate);
+            using var subkey = baseKey.OpenSubKey(candidate.KeyPath);
+            if (subkey is null)
+                continue;
+            var subkeyName = candidate.KeyPath[(candidate.KeyPath.LastIndexOf('\\') + 1)..];
+            return ReadPortableEntry(subkey, subkeyName, candidate.Machine && candidate.Wow64Bit32);
+        }
+
+        return null;
     }
+
+    [SupportedOSPlatform("windows")]
+    private static Microsoft.Win32.RegistryKey OpenArpCandidateBaseKey(ArpUninstallKeyCandidate candidate) =>
+        Microsoft.Win32.RegistryKey.OpenBaseKey(
+            candidate.Machine ? Microsoft.Win32.RegistryHive.LocalMachine : Microsoft.Win32.RegistryHive.CurrentUser,
+            candidate.Wow64Bit32 ? Microsoft.Win32.RegistryView.Registry32 : Microsoft.Win32.RegistryView.Registry64);
 
     internal static PortableScope InstalledPortableScope(ListMatch installed)
     {
@@ -2233,26 +2265,23 @@ internal static class InstallerDispatch
     {
         try
         {
-            const string ArpPrefix = @"ARP\";
-            if (installed.LocalId.StartsWith(ArpPrefix, StringComparison.OrdinalIgnoreCase))
+            // Same exact keys as ARP uninstall (including ARP\User\X86's WOW6432Node lookup).
+            var candidates = GetArpUninstallKeyCandidates(installed.LocalId);
+            if (candidates is not null)
             {
-                var rest = installed.LocalId[ArpPrefix.Length..];
-                var parts = rest.Split('\\', 3);
-                if (parts.Length == 3 && !string.IsNullOrWhiteSpace(parts[2]) && !parts[2].Contains('\\') &&
-                    (parts[0].Equals("User", StringComparison.OrdinalIgnoreCase) || parts[0].Equals("Machine", StringComparison.OrdinalIgnoreCase)))
+                // Remove the entry that was read: the first candidate that exists.
+                foreach (var candidate in candidates)
                 {
-                    var hive = parts[0].Equals("User", StringComparison.OrdinalIgnoreCase)
-                        ? Microsoft.Win32.RegistryHive.CurrentUser
-                        : Microsoft.Win32.RegistryHive.LocalMachine;
-                    var view = parts[1].Equals("X86", StringComparison.OrdinalIgnoreCase)
-                        ? Microsoft.Win32.RegistryView.Registry32
-                        : Microsoft.Win32.RegistryView.Registry64;
-                    using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
-                    baseKey.DeleteSubKeyTree(
-                        $@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{parts[2]}",
-                        throwOnMissingSubKey: false);
+                    using var baseKey = OpenArpCandidateBaseKey(candidate);
+                    using (var existing = baseKey.OpenSubKey(candidate.KeyPath))
+                    {
+                        if (existing is null)
+                            continue;
+                    }
+                    baseKey.DeleteSubKeyTree(candidate.KeyPath, throwOnMissingSubKey: false);
                     return;
                 }
+                return;
             }
 
             warnings.Add("Could not remove the portable registry entry because its exact registry key is unavailable.");

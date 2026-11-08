@@ -146,128 +146,123 @@ internal static class InstalledPackages
         Microsoft.Win32.RegistryHive hive, string scopeLabel, string archLabel,
         Microsoft.Win32.RegistryView view)
     {
-        var arpPaths = new[]
-        {
-            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-            @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-        };
+        // Like WinGet's ARPHelper (and the Rust core), each hive/view is read through the standard
+        // Uninstall path only: HKLM's 32-bit view already maps it to WOW6432Node, and HKCU is shared
+        // between views (WinGet never reads HKCU\Software\WOW6432Node), so user entries are X64.
+        const string arpPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 
-        foreach (var arpPath in arpPaths)
+        try
         {
-            var effectiveArch = arpPath.Contains("WOW6432Node") ? "X86" : archLabel;
-            try
+            using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
+            using var uninstallKey = baseKey.OpenSubKey(arpPath);
+            if (uninstallKey is null) return;
+
+            foreach (var subkeyName in uninstallKey.GetSubKeyNames())
             {
-                using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
-                using var uninstallKey = baseKey.OpenSubKey(arpPath);
-                if (uninstallKey is null) continue;
-
-                foreach (var subkeyName in uninstallKey.GetSubKeyNames())
+                try
                 {
-                    try
+                    using var subkey = uninstallKey.OpenSubKey(subkeyName);
+                    if (subkey is null) continue;
+
+                    var displayName = ReadString(subkey, "DisplayName");
+                    if (displayName is null) continue;
+
+                    var systemComponent = subkey.GetValue("SystemComponent");
+                    if (systemComponent is int sc && sc != 0) continue;
+
+                    // WinGet's ARPHelper has no install-location filter: entries under the Windows
+                    // directory (printer drivers and the like) are listed too. Only inbox MSIX
+                    // packages are filtered by location.
+                    var installLocation = ReadString(subkey, "InstallLocation");
+
+                    if (ReadString(subkey, "ParentKeyName") is not null)
+                        continue;
+
+                    var version = DetermineArpVersion(
+                        ReadString(subkey, "DisplayVersion"),
+                        ReadDword(subkey, "VersionMajor"),
+                        ReadDword(subkey, "VersionMinor"),
+                        ReadDword(subkey, "MajorVersion"),
+                        ReadDword(subkey, "MinorVersion"),
+                        ReadDword(subkey, "Version"));
+                    var publisher = ReadString(subkey, "Publisher");
+                    var packageFamilyName = ReadString(subkey, "PackageFamilyName");
+                    var productCode = ReadString(subkey, "ProductCode");
+                    var upgradeCode = ReadString(subkey, "UpgradeCode");
+                    var wingetPackageIdentifier = ReadString(subkey, "WinGetPackageIdentifier");
+                    var wingetSourceIdentifier = ReadString(subkey, "WinGetSourceIdentifier");
+
+                    var localId = $@"ARP\{scopeLabel}\{archLabel}\{subkeyName}";
+                    // Honor the WinGet ARP signal so uninstall flows through the
+                    // portable uninstall path (clean dir + registry removal) instead
+                    // of delegating the UninstallString to a winget subprocess that
+                    // only fully cleans up entries winget itself installed.
+                    var wingetInstallerType = ReadString(subkey, "WinGetInstallerType");
+                    var installerCategory =
+                        wingetInstallerType is { } wit && wit.Equals("portable", StringComparison.OrdinalIgnoreCase)
+                            ? "portable"
+                            : localId.StartsWith(@"ARP\", StringComparison.OrdinalIgnoreCase) &&
+                                subkey.GetValue("WindowsInstaller") is int windowsInstaller && windowsInstaller == 1
+                                ? "msi"
+                                : subkeyName.StartsWith("MSIX\\", StringComparison.OrdinalIgnoreCase)
+                                    ? "msix"
+                                    : "exe";
+
+                    var dedupKey =
+                        $"{localId}|{displayName.ToLowerInvariant()}|{version.ToLowerInvariant()}|{(publisher ?? "").ToLowerInvariant()}";
+                    if (!seen.Add(dedupKey)) continue;
+
+                    var packageFamilyNames = new List<string>();
+                    if (!string.IsNullOrWhiteSpace(packageFamilyName))
+                        packageFamilyNames.Add(packageFamilyName);
+
+                    var productCodes = new List<string>();
+                    if (!string.IsNullOrWhiteSpace(productCode))
+                        productCodes.Add(productCode);
+                    if (!productCodes.Any(code => code.Equals(subkeyName, StringComparison.OrdinalIgnoreCase)))
+                        productCodes.Add(subkeyName.ToLowerInvariant());
+
+                    var upgradeCodes = new List<string>();
+                    if (!string.IsNullOrWhiteSpace(upgradeCode))
+                        upgradeCodes.Add(upgradeCode);
+                    if (upgradeCodes.Count == 0)
                     {
-                        using var subkey = uninstallKey.OpenSubKey(subkeyName);
-                        if (subkey is null) continue;
-
-                        var displayName = ReadString(subkey, "DisplayName");
-                        if (displayName is null) continue;
-
-                        var systemComponent = subkey.GetValue("SystemComponent");
-                        if (systemComponent is int sc && sc != 0) continue;
-
-                        // WinGet's ARPHelper has no install-location filter: entries under the Windows
-                        // directory (printer drivers and the like) are listed too. Only inbox MSIX
-                        // packages are filtered by location.
-                        var installLocation = ReadString(subkey, "InstallLocation");
-
-                        if (ReadString(subkey, "ParentKeyName") is not null)
-                            continue;
-
-                        var version = DetermineArpVersion(
-                            ReadString(subkey, "DisplayVersion"),
-                            ReadDword(subkey, "VersionMajor"),
-                            ReadDword(subkey, "VersionMinor"),
-                            ReadDword(subkey, "MajorVersion"),
-                            ReadDword(subkey, "MinorVersion"),
-                            ReadDword(subkey, "Version"));
-                        var publisher = ReadString(subkey, "Publisher");
-                        var packageFamilyName = ReadString(subkey, "PackageFamilyName");
-                        var productCode = ReadString(subkey, "ProductCode");
-                        var upgradeCode = ReadString(subkey, "UpgradeCode");
-                        var wingetPackageIdentifier = ReadString(subkey, "WinGetPackageIdentifier");
-                        var wingetSourceIdentifier = ReadString(subkey, "WinGetSourceIdentifier");
-
-                        var localId = $@"ARP\{scopeLabel}\{effectiveArch}\{subkeyName}";
-                        // Honor the WinGet ARP signal so uninstall flows through the
-                        // portable uninstall path (clean dir + registry removal) instead
-                        // of delegating the UninstallString to a winget subprocess that
-                        // only fully cleans up entries winget itself installed.
-                        var wingetInstallerType = ReadString(subkey, "WinGetInstallerType");
-                        var installerCategory =
-                            wingetInstallerType is { } wit && wit.Equals("portable", StringComparison.OrdinalIgnoreCase)
-                                ? "portable"
-                                : localId.StartsWith(@"ARP\", StringComparison.OrdinalIgnoreCase) &&
-                                    subkey.GetValue("WindowsInstaller") is int windowsInstaller && windowsInstaller == 1
-                                    ? "msi"
-                                    : subkeyName.StartsWith("MSIX\\", StringComparison.OrdinalIgnoreCase)
-                                        ? "msix"
-                                        : "exe";
-
-                        var dedupKey =
-                            $"{localId}|{displayName.ToLowerInvariant()}|{version.ToLowerInvariant()}|{(publisher ?? "").ToLowerInvariant()}";
-                        if (!seen.Add(dedupKey)) continue;
-
-                        var packageFamilyNames = new List<string>();
-                        if (!string.IsNullOrWhiteSpace(packageFamilyName))
-                            packageFamilyNames.Add(packageFamilyName);
-
-                        var productCodes = new List<string>();
-                        if (!string.IsNullOrWhiteSpace(productCode))
-                            productCodes.Add(productCode);
-                        if (!productCodes.Any(code => code.Equals(subkeyName, StringComparison.OrdinalIgnoreCase)))
-                            productCodes.Add(subkeyName.ToLowerInvariant());
-
-                        var upgradeCodes = new List<string>();
-                        if (!string.IsNullOrWhiteSpace(upgradeCode))
-                            upgradeCodes.Add(upgradeCode);
-                        if (upgradeCodes.Count == 0)
+                        // ARP rarely exposes UpgradeCode directly. Recover
+                        // it from the MSI Installer registry hive so
+                        // identity correlation can fall back to
+                        // upgradecodes2 when productcodes2 picks the wrong
+                        // sibling (Node.js 24.x being attributed to
+                        // OpenJS.NodeJS.LTS rather than OpenJS.NodeJS.22).
+                        foreach (var code in productCodes)
                         {
-                            // ARP rarely exposes UpgradeCode directly. Recover
-                            // it from the MSI Installer registry hive so
-                            // identity correlation can fall back to
-                            // upgradecodes2 when productcodes2 picks the wrong
-                            // sibling (Node.js 24.x being attributed to
-                            // OpenJS.NodeJS.LTS rather than OpenJS.NodeJS.22).
-                            foreach (var code in productCodes)
+                            if (upgradeCodeMap.TryGetValue(code, out var uc))
                             {
-                                if (upgradeCodeMap.TryGetValue(code, out var uc))
-                                {
-                                    upgradeCodes.Add(uc);
-                                    break;
-                                }
+                                upgradeCodes.Add(uc);
+                                break;
                             }
                         }
-
-                        packages.Add(new InstalledPackage
-                        {
-                            Name = displayName,
-                            LocalId = localId,
-                            InstalledVersion = version,
-                            Publisher = publisher,
-                            Scope = scopeLabel,
-                            InstallerCategory = installerCategory,
-                            InstallLocation = installLocation,
-                            WinGetPackageIdentifier = wingetPackageIdentifier,
-                            WinGetSourceIdentifier = wingetSourceIdentifier,
-                            PackageFamilyNames = packageFamilyNames,
-                            ProductCodes = productCodes,
-                            UpgradeCodes = upgradeCodes,
-                        });
                     }
-                    catch { /* skip unreadable subkey */ }
+
+                    packages.Add(new InstalledPackage
+                    {
+                        Name = displayName,
+                        LocalId = localId,
+                        InstalledVersion = version,
+                        Publisher = publisher,
+                        Scope = scopeLabel,
+                        InstallerCategory = installerCategory,
+                        InstallLocation = installLocation,
+                        WinGetPackageIdentifier = wingetPackageIdentifier,
+                        WinGetSourceIdentifier = wingetSourceIdentifier,
+                        PackageFamilyNames = packageFamilyNames,
+                        ProductCodes = productCodes,
+                        UpgradeCodes = upgradeCodes,
+                    });
                 }
+                catch { /* skip unreadable subkey */ }
             }
-            catch { /* skip unreadable hive path */ }
         }
+        catch { /* skip unreadable hive path */ }
     }
 
     [SupportedOSPlatform("windows")]

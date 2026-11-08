@@ -929,6 +929,8 @@ pinRemoveCmd.SetHandler((ctx) =>
     if (ctx.ParseResult.GetValueForOption(prInstalledOpt))
     {
         var target = ResolveSingleInstalledPinTarget(repo, query);
+        // Same key as `pin add --installed`: an installed package with no correlated source is
+        // pinned under the empty (source-less) source id.
         pin = repo.ListPins(target.SourceName ?? query.Source ?? "")
             .FirstOrDefault(candidate => candidate.PackageId.Equals(target.Id, StringComparison.OrdinalIgnoreCase));
     }
@@ -963,7 +965,7 @@ pinResetCmd.SetHandler((ctx) =>
     if (!force) { Console.Error.WriteLine("error: Resetting all pins requires --force"); ctx.ExitCode = 1; return; }
     using var repo = Repository.Open();
     repo.ResetPins(source);
-    Console.WriteLine(string.IsNullOrWhiteSpace(source) ? "All pins have been reset." : $"All pins for source '{source}' have been reset.");
+    Console.WriteLine(source is null ? "All pins have been reset." : $"All pins for source '{source}' have been reset.");
 });
 
 // ── Install ──

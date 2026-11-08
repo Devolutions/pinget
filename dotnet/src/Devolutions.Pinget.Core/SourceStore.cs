@@ -734,9 +734,20 @@ internal static class SourceStoreManager
         return result.ToString();
     }
 
-    // An empty or dot-only identifier (a REST server picks its SourceIdentifier) would
-    // otherwise name the parent directory itself.
-    internal static string SanitizePathSegment(string value) => value.TrimEnd('.', ' ').Length == 0
-        ? "_"
-        : string.Concat(value.Select(c => @"\/:*?""<>|".Contains(c) ? '_' : c));
+    /// <summary>
+    /// Turns a source name or identifier (a REST server picks its SourceIdentifier) into a single
+    /// Windows-safe directory name: path and wildcard characters and control characters become
+    /// <c>_</c>, and trailing dots and spaces (which Windows drops) are trimmed. A name that is still
+    /// unsafe — empty or dot-only (it would name the parent directory), a reserved device name, a
+    /// leading space, or too long — is prefixed with <c>_</c>, falling back to <c>_</c> alone.
+    /// </summary>
+    internal static string SanitizePathSegment(string value)
+    {
+        var replaced = string.Concat(value.Select(c => char.IsControl(c) || @"\/:*?""<>|".Contains(c) ? '_' : c));
+        var trimmed = replaced.TrimEnd('.', ' ');
+        if (Repository.IsSafeFileName(trimmed))
+            return trimmed;
+        var prefixed = "_" + trimmed;
+        return Repository.IsSafeFileName(prefixed) ? prefixed : "_";
+    }
 }

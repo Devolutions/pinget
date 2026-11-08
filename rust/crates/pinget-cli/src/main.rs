@@ -1092,8 +1092,15 @@ fn run() -> Result<()> {
 
                     let pin = if args.installed {
                         let target = resolve_single_installed_pin_target(&mut repository, &query)?;
+                        // Same key as `pin add --installed`: an installed package with no
+                        // correlated source is pinned under the empty (source-less) source id.
+                        let source_id = target
+                            .source_name
+                            .as_deref()
+                            .or(query.source.as_deref())
+                            .unwrap_or_default();
                         repository
-                            .list_pins(target.source_name.as_deref().or(query.source.as_deref()))?
+                            .list_pins(Some(source_id))?
                             .into_iter()
                             .find(|candidate| candidate.package_id.eq_ignore_ascii_case(&target.id))
                     } else {

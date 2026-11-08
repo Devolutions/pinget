@@ -4,6 +4,8 @@ mod portable_payload_tests;
 #[cfg(test)]
 mod portable_regression_tests;
 #[cfg(test)]
+mod review_c_tests;
+#[cfg(test)]
 mod wave10_tests;
 #[cfg(test)]
 mod wave11_tests;
@@ -2342,18 +2344,38 @@ impl Repository {
             PinType::Blocking => 4,
             PinType::Gating => 3,
         };
-        execute_sql(
+        // Pins are matched case-insensitively, but WinGet's `pin_index` is a
+        // BINARY unique index, so `INSERT OR REPLACE` alone would add a second
+        // row for an id/source that differs only by case. Replace such a row
+        // in the same transaction.
+        execute_batch_sql(&conn, "BEGIN")?;
+        let replaced = execute_sql(
             &conn,
-            &format!(
-                "INSERT OR REPLACE INTO pin (package_id, version, source_id, {pin_type_column}) VALUES (?1, ?2, ?3, ?4)"
-            ),
+            "DELETE FROM pin WHERE package_id = ?1 COLLATE NOCASE AND source_id = ?2 COLLATE NOCASE",
             vec![
                 SqlValue::Text(package_id.to_owned()),
-                SqlValue::Text(version.to_owned()),
                 SqlValue::Text(source_id.to_owned()),
-                SqlValue::Integer(type_int),
             ],
-        )?;
+        )
+        .and_then(|_| {
+            execute_sql(
+                &conn,
+                &format!(
+                    "INSERT OR REPLACE INTO pin (package_id, version, source_id, {pin_type_column}) VALUES (?1, ?2, ?3, ?4)"
+                ),
+                vec![
+                    SqlValue::Text(package_id.to_owned()),
+                    SqlValue::Text(version.to_owned()),
+                    SqlValue::Text(source_id.to_owned()),
+                    SqlValue::Integer(type_int),
+                ],
+            )
+        });
+        if let Err(error) = replaced {
+            let _ = execute_batch_sql(&conn, "ROLLBACK");
+            return Err(error);
+        }
+        execute_batch_sql(&conn, "COMMIT")?;
         conn.cacheflush().context("failed to flush pin database")?;
         Ok(())
     }
@@ -5980,7 +6002,10 @@ fn temp_cache_path(app_root: &Path, bucket: &str, identifier: &str) -> PathBuf {
 /// `packages/<id>/...` path built from an index id) into segments that are safe to
 /// join under the source file cache. The index is source data, so a path that is
 /// rooted, drive- or UNC-qualified, or walks up with `..` is rejected rather than
-/// allowed to write outside the cache.
+/// allowed to write outside the cache. Each segment must also be a Windows-safe
+/// file name (no trailing dot or space, no reserved device name, no wildcard,
+/// quote, redirection or control character) and must not carry `#`, which would
+/// turn the rest of the source URL into a fragment.
 fn validated_source_relative_segments(relative_path: &str) -> Result<Vec<String>> {
     let normalized = relative_path.replace('\\', "/");
     let unsafe_path = || anyhow!("source index path '{relative_path}' is not a safe relative path");
@@ -5991,11 +6016,10 @@ fn validated_source_relative_segments(relative_path: &str) -> Result<Vec<String>
     normalized
         .split('/')
         .map(|segment| {
-            let dots_or_spaces_only = segment.trim_end_matches(['.', ' ']).is_empty();
-            if dots_or_spaces_only || segment.contains([':', '\0']) {
-                Err(unsafe_path())
-            } else {
+            if is_safe_file_name(segment) && !segment.contains('#') {
                 Ok(segment.to_owned())
+            } else {
+                Err(unsafe_path())
             }
         })
         .collect()
@@ -7109,20 +7133,31 @@ fn packaged_source_type(kind: SourceKind) -> &'static str {
     }
 }
 
+/// Turns a source name or identifier (a REST server picks its `SourceIdentifier`)
+/// into a single Windows-safe directory name: path and wildcard characters and
+/// control characters become `_`, and trailing dots and spaces (which Windows
+/// drops) are trimmed. A name that is still unsafe — empty or dot-only (it would
+/// name the parent directory), a reserved device name, a leading space, or too
+/// long — is prefixed with `_`, falling back to `_` alone.
 fn sanitize_path_segment(value: &str) -> String {
-    // An empty or dot-only identifier (a REST server picks its SourceIdentifier) would
-    // otherwise name the parent directory itself.
-    if value.trim_end_matches(['.', ' ']).is_empty() {
-        return "_".to_owned();
-    }
-
-    value
+    let replaced: String = value
         .chars()
         .map(|ch| match ch {
             '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ if ch.is_control() => '_',
             _ => ch,
         })
-        .collect()
+        .collect();
+    let trimmed = replaced.trim_end_matches(['.', ' ']);
+    if is_safe_file_name(trimmed) {
+        return trimmed.to_owned();
+    }
+    let prefixed = format!("_{trimmed}");
+    if is_safe_file_name(&prefixed) {
+        prefixed
+    } else {
+        "_".to_owned()
+    }
 }
 
 fn load_json_object(path: &Path) -> Result<JsonMap<String, JsonValue>> {
@@ -13450,45 +13485,45 @@ fn remove_portable_directory(
 
 #[cfg(windows)]
 fn read_portable_entry_for_installed(installed: &ListMatch) -> Result<Option<ExistingPortableRecord>> {
-    if let Some((prefix, rest)) = installed.local_id.split_once('\\')
-        && prefix.eq_ignore_ascii_case("ARP")
-    {
-        let mut parts = rest.splitn(3, '\\');
-        let scope = parts.next().unwrap_or("");
-        let arch = parts.next().unwrap_or("");
-        let subkey_name = parts.next().unwrap_or("");
-        if subkey_name.is_empty()
-            || subkey_name.contains('\\')
-            || !(scope.eq_ignore_ascii_case("User") || scope.eq_ignore_ascii_case("Machine"))
+    // Same exact keys as ARP uninstall (including `ARP\User\X86`'s WOW6432Node lookup).
+    let Some(candidates) = arp_uninstall_key_candidates(&installed.local_id) else {
+        return Ok(None);
+    };
+    for candidate in candidates {
+        let subkey = match arp_candidate_root(&candidate)
+            .open_subkey_with_flags(&candidate.key_path, KEY_READ | arp_candidate_view(&candidate))
         {
-            return Ok(None);
-        }
-        let hive = if scope.eq_ignore_ascii_case("User") {
-            RegKey::predef(HKEY_CURRENT_USER)
-        } else {
-            RegKey::predef(HKEY_LOCAL_MACHINE)
-        };
-        let view = if arch.eq_ignore_ascii_case("X86") {
-            KEY_WOW64_32KEY
-        } else {
-            KEY_WOW64_64KEY
-        };
-        let subkey = match hive.open_subkey_with_flags(
-            format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{subkey_name}"),
-            KEY_READ | view,
-        ) {
             Ok(subkey) => subkey,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error).context("reading the portable registry entry"),
         };
+        let subkey_name = candidate.key_path.rsplit('\\').next().unwrap_or_default();
         let entry = portable_entry_from_registry(&subkey, subkey_name.to_owned());
         return Ok(Some(ExistingPortableRecord {
             symlinks: portable_symlinks_from_registry(&subkey, &entry),
             entry,
-            registry_32: view == KEY_WOW64_32KEY,
+            registry_32: candidate.machine && candidate.wow64_32,
         }));
     }
     Ok(None)
+}
+
+#[cfg(windows)]
+fn arp_candidate_root(candidate: &ArpUninstallKeyCandidate) -> RegKey {
+    RegKey::predef(if candidate.machine {
+        HKEY_LOCAL_MACHINE
+    } else {
+        HKEY_CURRENT_USER
+    })
+}
+
+#[cfg(windows)]
+fn arp_candidate_view(candidate: &ArpUninstallKeyCandidate) -> u32 {
+    if candidate.wow64_32 {
+        KEY_WOW64_32KEY
+    } else {
+        KEY_WOW64_64KEY
+    }
 }
 
 #[cfg(windows)]
@@ -13615,49 +13650,34 @@ fn path_starts_with_case_insensitive(child: &Path, parent: &Path) -> Result<bool
 
 #[cfg(windows)]
 fn remove_portable_registry_entry(installed: &ListMatch) -> Result<()> {
-    let candidates: Vec<(bool, u32, String)> = if let Some((prefix, rest)) = installed.local_id.split_once('\\')
-        && prefix.eq_ignore_ascii_case("ARP")
-    {
-        let mut parts = rest.splitn(3, '\\');
-        let scope = parts.next().unwrap_or("");
-        let arch = parts.next().unwrap_or("");
-        let subkey_name = parts.next().unwrap_or("");
-        if subkey_name.is_empty()
-            || subkey_name.contains('\\')
-            || !(scope.eq_ignore_ascii_case("User") || scope.eq_ignore_ascii_case("Machine"))
-        {
-            bail!("portable registry entry has an invalid identifier");
-        }
-        let is_hkcu = scope.eq_ignore_ascii_case("User");
-        let view = if arch.eq_ignore_ascii_case("X86") {
-            KEY_WOW64_32KEY
-        } else {
-            KEY_WOW64_64KEY
-        };
-        vec![(is_hkcu, view, subkey_name.to_owned())]
-    } else {
+    // Same exact keys as ARP uninstall (including `ARP\User\X86`'s WOW6432Node
+    // lookup); the entry that was read, the first existing candidate, is removed.
+    let Some(candidates) = arp_uninstall_key_candidates(&installed.local_id) else {
         bail!("the exact portable registry key is unavailable");
     };
 
-    for (is_hkcu, view, name) in candidates {
-        let hive = if is_hkcu {
-            RegKey::predef(HKEY_CURRENT_USER)
-        } else {
-            RegKey::predef(HKEY_LOCAL_MACHINE)
+    for candidate in candidates {
+        let Some((parent_path, name)) = candidate.key_path.rsplit_once('\\') else {
+            continue;
         };
-        let uninstall = match hive.open_subkey_with_flags(
-            r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
-            KEY_READ | KEY_WRITE | view,
-        ) {
-            Ok(uninstall) => uninstall,
+        let view = arp_candidate_view(&candidate);
+        let parent =
+            match arp_candidate_root(&candidate).open_subkey_with_flags(parent_path, KEY_READ | KEY_WRITE | view) {
+                Ok(parent) => parent,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("opening the portable uninstall registry key for removal"),
+            };
+        match parent.open_subkey_with_flags(name, KEY_READ | view) {
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).context("opening the portable uninstall registry key for removal"),
-        };
-        if let Err(error) = uninstall.delete_subkey_all(&name)
+            Err(error) => return Err(error).context("opening the portable uninstall registry entry for removal"),
+        }
+        if let Err(error) = parent.delete_subkey_all(name)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             return Err(error).context("deleting the portable uninstall registry entry");
         }
+        return Ok(());
     }
     Ok(())
 }
@@ -13855,6 +13875,7 @@ fn install_portable(
     if same_existing_location {
         remove_obsolete_portable_files(&target_dir, &payload, &previous_files, &previous_directories)?;
     }
+    let created_directories = retained_portable_directories(&target_dir, &payload, created_directories);
 
     // Create a Links\<alias>.exe shim for every command so users can invoke
     // the portable from any shell, matching winget's portable workflow.
@@ -14198,6 +14219,28 @@ fn remove_obsolete_portable_files(
         .cloned()
         .collect();
     remove_tracked_portable_files(target_dir, &obsolete_files, &obsolete_directories)
+}
+
+/// The created directories to record in `PingetPortableDirectories` after an
+/// install or upgrade: the planned list minus obsolete directories that are no
+/// longer on disk (removed by [`remove_obsolete_portable_files`]). Tracking a
+/// removed directory would let a later upgrade or uninstall claim, and delete,
+/// a directory the user creates with the same name. An obsolete directory kept
+/// because it still holds files stays tracked.
+#[cfg(any(windows, test))]
+fn retained_portable_directories(
+    target_dir: &Path,
+    payload: &PortablePayload,
+    created_directories: Vec<String>,
+) -> Vec<String> {
+    let current_directories: HashSet<String> = payload.directories.iter().map(|path| path.to_lowercase()).collect();
+    created_directories
+        .into_iter()
+        .filter(|directory| {
+            current_directories.contains(&directory.to_lowercase())
+                || safe_portable_path(target_dir, directory).is_ok_and(|path| path.is_dir())
+        })
+        .collect()
 }
 
 #[cfg(any(windows, test))]

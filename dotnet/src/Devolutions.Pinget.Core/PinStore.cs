@@ -7,6 +7,10 @@ internal static class PinStore
     private const string CurrentPinTypeColumn = "type";
     private const string LegacyPinTypeColumn = "pin_type";
 
+    /// <summary>
+    /// Lists pins. A null <paramref name="sourceId"/> means no source filter; an empty one selects
+    /// source-less pins (installed packages without a correlated source), like the Rust core.
+    /// </summary>
     public static List<PinRecord> List(string? appRoot = null, string? sourceId = null)
     {
         var dbPath = SourceStoreManager.PinsDbPath(appRoot);
@@ -19,7 +23,7 @@ internal static class PinStore
         if (pinTypeColumn is null) return [];
 
         using var cmd = conn.CreateCommand();
-        if (string.IsNullOrWhiteSpace(sourceId))
+        if (sourceId is null)
         {
             cmd.CommandText = $"SELECT package_id, version, source_id, {pinTypeColumn} FROM pin";
         }
@@ -62,15 +66,34 @@ internal static class PinStore
             _ => 2
         };
 
+        // Pins are matched case-insensitively, but WinGet's pin_index is a BINARY unique index, so
+        // INSERT OR REPLACE alone would add a second row for an id/source that differs only by case.
+        // Replace such a row in the same transaction.
+        using var transaction = conn.BeginTransaction();
+        using (var deleteCmd = conn.CreateCommand())
+        {
+            deleteCmd.Transaction = transaction;
+            deleteCmd.CommandText = "DELETE FROM pin WHERE package_id = @id COLLATE NOCASE AND source_id = @src COLLATE NOCASE";
+            deleteCmd.Parameters.AddWithValue("@id", packageId);
+            deleteCmd.Parameters.AddWithValue("@src", sourceId);
+            deleteCmd.ExecuteNonQuery();
+        }
+
         using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = $"INSERT OR REPLACE INTO pin (package_id, version, source_id, {pinTypeColumn}) VALUES (@id, @ver, @src, @type)";
         cmd.Parameters.AddWithValue("@id", packageId);
         cmd.Parameters.AddWithValue("@ver", version);
         cmd.Parameters.AddWithValue("@src", sourceId);
         cmd.Parameters.AddWithValue("@type", typeInt);
         cmd.ExecuteNonQuery();
+        transaction.Commit();
     }
 
+    /// <summary>
+    /// Removes pins for a package. A null <paramref name="sourceId"/> removes them from every source; an
+    /// empty one removes only the source-less pin.
+    /// </summary>
     public static bool Remove(string packageId, string? appRoot = null, string? sourceId = null)
     {
         var dbPath = SourceStoreManager.PinsDbPath(appRoot);
@@ -80,7 +103,7 @@ internal static class PinStore
         conn.Open();
 
         using var cmd = conn.CreateCommand();
-        if (string.IsNullOrWhiteSpace(sourceId))
+        if (sourceId is null)
         {
             cmd.CommandText = "DELETE FROM pin WHERE package_id = @id COLLATE NOCASE";
         }
@@ -93,13 +116,17 @@ internal static class PinStore
         return cmd.ExecuteNonQuery() > 0;
     }
 
+    /// <summary>
+    /// Resets pins. A null <paramref name="sourceId"/> removes every pin; an empty one removes only
+    /// source-less pins.
+    /// </summary>
     public static void Reset(string? appRoot = null, string? sourceId = null)
     {
         var dbPath = SourceStoreManager.PinsDbPath(appRoot);
         SqliteConnection.ClearAllPools();
         if (File.Exists(dbPath))
         {
-            if (string.IsNullOrWhiteSpace(sourceId))
+            if (sourceId is null)
             {
                 File.Delete(dbPath);
             }

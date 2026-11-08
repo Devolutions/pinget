@@ -608,7 +608,10 @@ internal static class PreIndexedSource
     /// <c>packages/&lt;id&gt;/...</c> path built from an index id) into segments that are safe
     /// to join under the source file cache. The index is source data, so a path that is
     /// rooted, drive- or UNC-qualified, or walks up with <c>..</c> is rejected rather than
-    /// allowed to write outside the cache.
+    /// allowed to write outside the cache. Each segment must also be a Windows-safe file name (no
+    /// trailing dot or space, no reserved device name, no wildcard, quote, redirection or control
+    /// character) and must not carry <c>#</c>, which would turn the rest of the source URL into a
+    /// fragment.
     /// </summary>
     internal static string[] ValidatedSourceRelativeSegments(string relativePath)
     {
@@ -619,8 +622,7 @@ internal static class PreIndexedSource
         var segments = normalized.Split('/');
         foreach (var segment in segments)
         {
-            var dotsOrSpacesOnly = segment.TrimEnd('.', ' ').Length == 0;
-            if (dotsOrSpacesOnly || segment.Contains(':') || segment.Contains('\0'))
+            if (!Repository.IsSafeFileName(segment) || segment.Contains('#'))
                 throw UnsafeSourcePath(relativePath);
         }
 
