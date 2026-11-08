@@ -57,6 +57,7 @@ public static partial class PublisherPackaging
         var marker = ReadMarker(markerPath);
         if (marker["schemaVersion"]?.GetValue<int>() != 1 || marker["owner"]?.GetValue<string>() != "Pinget.Publisher")
             throw new PublisherException("Unsupported publisher ownership marker.");
+        var interruptedSwap = marker["pendingCommit"] is JsonObject;
         marker = ResolvePendingCommit(destination, marker)
             ?? throw new PublisherException("The first publication to this destination was interrupted before it was committed; publish again.");
         var inventory = marker["artifacts"] as JsonObject
@@ -65,18 +66,28 @@ public static partial class PublisherPackaging
         directories.Push(destination);
         while (directories.TryPop(out var directory))
         {
+            var atRoot = string.Equals(directory, destination, StringComparison.Ordinal);
             foreach (var entry in Directory.EnumerateFileSystemEntries(directory))
             {
                 var attributes = File.GetAttributes(entry);
                 if ((attributes & FileAttributes.ReparsePoint) != 0)
                     throw new PublisherException($"Reparse point is not allowed in published source: {entry}");
+                var name = Path.GetFileName(entry);
+                var relativePath = Path.GetRelativePath(destination, entry).Replace('\\', '/');
+                // An interrupted package swap leaves its staged package or partial copy at the root; they are
+                // the publisher's own and are removed by the next publish. Anything else stays untracked.
+                var swapTemporary = interruptedSwap && atRoot && !inventory.ContainsKey(relativePath);
                 if ((attributes & FileAttributes.Directory) != 0)
                 {
-                    directories.Push(entry);
+                    if (!(swapTemporary && RustPublishStagingPattern().IsMatch(name)))
+                        directories.Push(entry);
                     continue;
                 }
-                var relativePath = Path.GetRelativePath(destination, entry).Replace('\\', '/');
-                if (relativePath != MarkerName && !inventory.ContainsKey(relativePath)
+                if (atRoot && (name == MarkerName || IsMarkerTemporaryName(name)))
+                    continue;
+                if (swapTemporary && IsPublicationTemporaryName(name, atRoot: true))
+                    continue;
+                if (!inventory.ContainsKey(relativePath)
                     && !(adoptable?[relativePath] is JsonValue expected
                         && string.Equals(expected.GetValue<string>(), HashFile(entry), StringComparison.Ordinal)))
                     throw new PublisherException($"Published source contains an untracked artifact: {relativePath}");
@@ -113,11 +124,26 @@ public static partial class PublisherPackaging
     public static PublisherVerifyResult Publish(PublisherPublishOptions options) =>
         Publish(options, afterCopy: null);
 
+    /// <summary>Package-swap points observed by the publish test hook.</summary>
+    internal enum CommitStep
+    {
+        /// <summary>The pending marker is written; <c>source2.msix</c> is not yet replaced.</summary>
+        BeforePackageSwap,
+
+        /// <summary><c>source2.msix</c> is replaced; the pending record is not yet dropped.</summary>
+        AfterPackageSwap,
+    }
+
     /// <summary>
-    /// Publishes with a test hook invoked after feed artifacts are copied and before the staged
-    /// package is verified and promoted; it receives the destination and staged package paths.
+    /// Publishes with test hooks: <paramref name="afterCopy"/> runs after feed artifacts are copied and before
+    /// the staged package is verified and promoted (it receives the destination and staged package paths), and
+    /// <paramref name="onCommitStep"/> observes the package-swap steps, letting tests capture the destination
+    /// exactly as a process killed at that point would leave it.
     /// </summary>
-    internal static PublisherVerifyResult Publish(PublisherPublishOptions options, Action<string, string>? afterCopy)
+    internal static PublisherVerifyResult Publish(
+        PublisherPublishOptions options,
+        Action<string, string>? afterCopy,
+        Action<CommitStep, string>? onCommitStep = null)
     {
         var state = Path.GetFullPath(options.StateDirectory);
         var destination = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.DestinationDirectory));
@@ -298,6 +324,7 @@ public static partial class PublisherPackaging
             var pendingMarker = (JsonObject)updatedMarker.DeepClone();
             pendingMarker["pendingCommit"] = new JsonObject { ["previous"] = marker?.DeepClone() };
             WriteJsonAtomically(markerPath, pendingMarker);
+            onCommitStep?.Invoke(CommitStep.BeforePackageSwap, destination);
             try
             {
                 CopyAtomically(stagedPackage, Path.Combine(destination, "source2.msix"));
@@ -318,6 +345,7 @@ public static partial class PublisherPackaging
                 throw;
             }
             promoted = true;
+            onCommitStep?.Invoke(CommitStep.AfterPackageSwap, destination);
             WriteJsonAtomically(markerPath, updatedMarker);
             PublisherWorkspace.RecordPublished(state, buildId);
             return VerifyDestination(destination, options.PsignToolPath, trustedAnchors, SignaturePolicy.Published, adoptable: null);
@@ -485,6 +513,13 @@ public static partial class PublisherPackaging
             yield return path[..index];
         yield return path;
     }
+
+    /// <summary>
+    /// <c>.pinget-publisher.json.new</c> (Rust) or <c>.pinget-publisher.json.&lt;32-hex-guid&gt;.tmp</c> (.NET):
+    /// an ownership marker being written.
+    /// </summary>
+    private static bool IsMarkerTemporaryName(string name) =>
+        name == MarkerName + ".new" || MarkerTemporaryPattern().IsMatch(name);
 
     /// <summary>Temporary files written by the .NET or Rust publisher while publishing.</summary>
     private static bool IsPublicationTemporaryName(string name, bool atRoot) =>
@@ -716,11 +751,15 @@ public static partial class PublisherPackaging
     [GeneratedRegex(@"^[-.A-Za-z0-9]{3,50}\z", RegexOptions.CultureInvariant)]
     private static partial Regex PackageNamePattern();
 
-    // `.publish-<build-id>.staging`, created by the Rust publisher in the destination root.
+    // `.publish-<build-id>.staging`, created in the destination root by earlier Rust publishers (now under state).
     [GeneratedRegex(@"^\.publish-[0-9a-f]{64}\.staging$", RegexOptions.CultureInvariant)]
     private static partial Regex RustPublishStagingPattern();
 
     // `<file>.<32-hex-guid>.tmp`, created by CopyAtomically and WriteJsonAtomically.
     [GeneratedRegex(@"^.+\.[0-9a-f]{32}\.tmp$", RegexOptions.CultureInvariant)]
     private static partial Regex DotNetAtomicTemporaryPattern();
+
+    // `.pinget-publisher.json.<32-hex-guid>.tmp`, created by WriteJsonAtomically for the ownership marker.
+    [GeneratedRegex(@"^\.pinget-publisher\.json\.[0-9a-f]{32}\.tmp$", RegexOptions.CultureInvariant)]
+    private static partial Regex MarkerTemporaryPattern();
 }

@@ -181,10 +181,18 @@ marker is first rewritten to the new publication with
 replaced, then `pendingCommit` is dropped. A marker with `pendingCommit` is
 resolved by the next publish (and read the same way by `verify`): when
 `source2.msix` matches the marker it is committed, otherwise `previous` is
-restored together with the interrupted run's fully copied artifacts. Re-verifying
-the package about to be replaced checks digests and signer only, so an expired
-or rotated signing certificate never blocks the next publication; the newly
-signed package must have a currently valid, trusted certificate.
+restored together with the interrupted run's fully copied artifacts. Both
+implementations build the package under `--state`; the only swap leftovers in
+the destination are root-level publisher temporaries (`.source2.*.new`,
+`source2.msix.<guid>.tmp`, or a legacy Rust `.publish-<buildId>.staging`
+directory). `verify` ignores these only while the marker carries
+`pendingCommit`, and ignores ownership-marker write temporaries
+(`.pinget-publisher.json.new`, `.pinget-publisher.json.<guid>.tmp`) always;
+every other untracked file is still rejected, and the next publish deletes the
+temporaries. Re-verifying the package about to be replaced checks digests and
+signer only, so an expired or rotated signing certificate never blocks the next
+publication; the newly signed package must have a currently valid, trusted
+certificate.
 
 Index content follows WinGet's manifest model: root `AppsAndFeaturesEntries`,
 `ProductCode` and `PackageFamilyName` apply only to installers that lack them

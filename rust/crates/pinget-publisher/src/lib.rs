@@ -25,6 +25,8 @@ use zip::ZipArchive;
 mod msix;
 mod psign;
 #[cfg(test)]
+mod review_b_tests;
+#[cfg(test)]
 mod wave12_tests;
 #[cfg(test)]
 mod wave6_tests;
@@ -673,10 +675,26 @@ pub fn verify_published_destination(
 /// Returns an error for unsupported hosts, invalid package identity/version,
 /// missing tools, failed signatures, unsafe destinations, or conflicting immutable files.
 pub fn publish(options: &PublishOptions) -> Result<PublishReport> {
-    publish_after_copy(options, |_| Ok(()))
+    publish_with_hooks(options, |_| Ok(()), |_, _| {})
 }
 
-fn publish_after_copy(options: &PublishOptions, after_copy: impl FnOnce(&Path) -> Result<()>) -> Result<PublishReport> {
+/// Package-swap points observed by [`publish_with_hooks`]; tests use them to capture the
+/// destination exactly as a process killed at that point would leave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitStep {
+    /// The pending marker is written and the package is staged; `source2.msix` is not yet replaced.
+    BeforePackageSwap,
+    /// `source2.msix` is replaced; the pending record is not yet dropped.
+    AfterPackageSwap,
+}
+
+/// Publishes with test hooks: `after_copy` runs after the feed artifacts are copied (an error
+/// aborts and rolls back), and `on_commit_step` observes the package-swap steps.
+fn publish_with_hooks(
+    options: &PublishOptions,
+    after_copy: impl FnOnce(&Path) -> Result<()>,
+    on_commit_step: impl FnMut(CommitStep, &Path),
+) -> Result<PublishReport> {
     reject_reparse_components(&options.state)?;
     reject_reparse_components(&options.destination)?;
     validate_package_identity(&options.name, &options.publisher)?;
@@ -802,7 +820,9 @@ fn publish_after_copy(options: &PublishOptions, after_copy: impl FnOnce(&Path) -
         }
     }
     reject_case_variant_paths(&destination, prior.as_ref(), &snapshot_metadata.artifacts)?;
-    let temporary = destination.join(format!(".publish-{build_id}.staging"));
+    // The package is built under the private state, like the .NET publisher, so an interrupted run
+    // leaves no staging directory in the published destination.
+    let temporary = state.join(format!(".publish-{build_id}.staging"));
     if temporary.exists() {
         remove_owned_staging(&temporary)?;
     }
@@ -815,6 +835,7 @@ fn publish_after_copy(options: &PublishOptions, after_copy: impl FnOnce(&Path) -
         &build_id,
         prior,
         after_copy,
+        on_commit_step,
     );
     if result.is_err() {
         let _ = fs::remove_dir_all(&temporary);
@@ -2386,11 +2407,21 @@ fn destination_entry_paths(root: &Path) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// `.publish-<build-id>.staging`, created by the Rust publisher in the destination root.
+/// `.publish-<build-id>.staging`, created in the destination root by earlier Rust publishers; the
+/// package is now staged under the private state.
 fn is_rust_publish_staging_name(name: &str) -> bool {
     name.strip_prefix(".publish-")
         .and_then(|rest| rest.strip_suffix(".staging"))
         .is_some_and(is_lower_hex_hash)
+}
+
+/// `.pinget-publisher.json.new` (Rust) or `.pinget-publisher.json.<32-hex-guid>.tmp` (.NET): an
+/// ownership marker being written.
+fn is_marker_temporary_name(name: &str) -> bool {
+    name == ".pinget-publisher.json.new"
+        || name.strip_prefix(".pinget-publisher.json").is_some_and(|guid_suffix| {
+            guid_suffix.len() == ".".len() + 32 + ".tmp".len() && is_dotnet_atomic_temporary_name(name)
+        })
 }
 
 /// `<file>.<32-hex-guid>.tmp`, created by the .NET publisher's atomic copy and marker writes.
@@ -2521,6 +2552,7 @@ impl Drop for PublicationRollback {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn package_and_publish(
     snapshot: &Path,
     temporary: &Path,
@@ -2529,6 +2561,7 @@ fn package_and_publish(
     build_id: &str,
     prior: Option<OwnerMarker>,
     after_copy: impl FnOnce(&Path) -> Result<()>,
+    mut on_commit_step: impl FnMut(CommitStep, &Path),
 ) -> Result<PublishReport> {
     let unsigned_development = matches!(options.signing, Signing::UnsignedDevelopment);
     let metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
@@ -2633,8 +2666,6 @@ fn package_and_publish(
     }
     after_copy(destination)?;
     let target_msix = destination.join("source2.msix");
-    let staged_package = stage_package(&msix, destination, build_id)?;
-    rollback.files.push(staged_package.clone());
 
     marker.owner = "Pinget.Publisher".to_owned();
     marker.package_name = options.name.clone();
@@ -2644,12 +2675,13 @@ fn package_and_publish(
     marker.index_hash = metadata.index_hash;
     marker.unsigned_development = unsigned_development;
     marker.published_utc = Utc::now().to_rfc3339();
-    marker.artifacts = published_inventory_excluding(destination, &[temporary, staged_package.as_path()])?;
+    marker.artifacts = published_inventory(destination)?;
     marker.artifacts.insert("source2.msix".to_owned(), package_hash);
     marker.pending_commit = None;
     // Three-step commit: (1) the marker records the new publication plus the marker to restore,
-    // (2) the package is swapped, (3) the pending record is dropped. A run interrupted between
-    // the steps is completed or rolled back by the next publish (`finalize_pending_commit`).
+    // (2) the package is staged next to `source2.msix` and swapped in, (3) the pending record is
+    // dropped. A run interrupted between the steps is completed or rolled back by the next publish
+    // (`finalize_pending_commit`); the staged package only exists while the record is pending.
     let pending_marker = OwnerMarker {
         pending_commit: Some(PendingCommit {
             previous: previous_marker.clone().map(Box::new),
@@ -2657,21 +2689,28 @@ fn package_and_publish(
         ..marker.clone()
     };
     replace_owner_marker(destination, &pending_marker)?;
-    if let Err(error) = atomic_replace(&staged_package, &target_msix) {
+    let swapped = stage_package(&msix, destination, build_id).and_then(|staged_package| {
+        on_commit_step(CommitStep::BeforePackageSwap, destination);
+        atomic_replace(&staged_package, &target_msix).inspect_err(|_| {
+            let _ = fs::remove_file(&staged_package);
+        })
+    });
+    if let Err(error) = swapped {
         let _ = match &previous_marker {
             Some(previous) => replace_owner_marker(destination, previous),
             None => fs::remove_file(destination.join(".pinget-publisher.json")).map_err(PublisherError::from),
         };
-        let _ = fs::remove_file(staged_package);
         return Err(error);
     }
     rollback.committed = true;
+    on_commit_step(CommitStep::AfterPackageSwap, destination);
     replace_owner_marker(destination, &marker)?;
 
     // The marker is the publication commit record. Persist a matching state row.
     let state = options.state.canonicalize()?;
     mark_published(&state, build_id)?;
-    fs::remove_dir_all(temporary)?;
+    // The staging directory is private state; a leftover is removed by the next publish.
+    let _ = fs::remove_dir_all(temporary);
     let verified = verify_destination_with_tool(
         destination,
         options.psign_tool.as_deref(),
@@ -2924,6 +2963,7 @@ fn verify_destination_with_tool(
     let destination = fs::canonicalize(destination)?;
     let marker = read_owner_marker(&destination.join(".pinget-publisher.json"))?
         .ok_or_else(|| PublisherError::Invalid("destination has no Pinget ownership marker".to_owned()))?;
+    let interrupted_swap = marker.pending_commit.is_some();
     let marker = resolve_pending_commit(&destination, marker)?.ok_or_else(|| {
         PublisherError::Invalid(
             "the first publication to this destination was interrupted before it was committed; publish again"
@@ -2940,7 +2980,17 @@ fn verify_destination_with_tool(
             )));
         }
     }
-    let current = published_inventory(&destination)?;
+    // An interrupted package swap leaves its staged package or partial copy at the root; they are
+    // the publisher's own and are removed by the next publish. Anything else stays untracked.
+    let current = published_inventory_excluding(&destination, |name, is_directory| {
+        interrupted_swap
+            && !marker.artifacts.contains_key(name)
+            && if is_directory {
+                is_rust_publish_staging_name(name)
+            } else {
+                is_publication_temporary_name(name, true)
+            }
+    })?;
     if current.iter().any(|(path, hash)| {
         marker.artifacts.get(path) != Some(hash)
             && (marker.artifacts.contains_key(path) || adoptable.get(path) != Some(hash))
@@ -3123,17 +3173,20 @@ fn validate_owner_marker(marker: &OwnerMarker) -> Result<()> {
 }
 
 fn published_inventory(root: &Path) -> Result<BTreeMap<String, String>> {
-    published_inventory_excluding(root, &[])
+    published_inventory_excluding(root, |_, _| false)
 }
 
-fn published_inventory_excluding(root: &Path, excluded: &[&Path]) -> Result<BTreeMap<String, String>> {
+/// Hashes every file under `root` except the ownership marker, its write temporaries and the
+/// root entries `skip(name, is_directory)` selects.
+fn published_inventory_excluding(root: &Path, skip: impl Fn(&str, bool) -> bool) -> Result<BTreeMap<String, String>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
-        if excluded.iter().any(|path| *path == entry.path()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".pinget-publisher.json" || is_marker_temporary_name(&name) {
             continue;
         }
-        if entry.file_name() == ".pinget-publisher.json" || entry.file_name() == ".pinget-publisher.json.new" {
+        if skip(&name, fs::symlink_metadata(entry.path())?.is_dir()) {
             continue;
         }
         gather_files(root, &entry.path(), &mut files)?;
@@ -4332,23 +4385,27 @@ mod tests {
             timestamp_url: None,
         };
         let mut reached_after_copy = false;
-        let error = publish_after_copy(&options, |feed| {
-            reached_after_copy = true;
-            for (relative, expected) in &metadata.artifacts {
-                let path = safe_join(feed, relative).expect("copied artifact path");
+        let error = publish_with_hooks(
+            &options,
+            |feed| {
+                reached_after_copy = true;
+                for (relative, expected) in &metadata.artifacts {
+                    let path = safe_join(feed, relative).expect("copied artifact path");
+                    assert!(
+                        path.is_file(),
+                        "artifact must exist before injected failure: {relative}"
+                    );
+                    assert_eq!(sha256_hex(&fs::read(path).expect("copied artifact")), *expected);
+                }
                 assert!(
-                    path.is_file(),
-                    "artifact must exist before injected failure: {relative}"
+                    !feed.join(".pinget-publisher.json").exists(),
+                    "no ownership marker before promotion"
                 );
-                assert_eq!(sha256_hex(&fs::read(path).expect("copied artifact")), *expected);
-            }
-            assert!(
-                !feed.join(".pinget-publisher.json").exists(),
-                "no ownership marker before promotion"
-            );
-            assert!(!feed.join("source2.msix").exists(), "no root package before promotion");
-            Err(PublisherError::Invalid("injected initial post-copy failure".to_owned()))
-        })
+                assert!(!feed.join("source2.msix").exists(), "no root package before promotion");
+                Err(PublisherError::Invalid("injected initial post-copy failure".to_owned()))
+            },
+            |_, _| {},
+        )
         .expect_err("injected post-copy failure");
         assert!(reached_after_copy, "failure must occur after actual verified copies");
         assert!(error.to_string().contains("injected initial post-copy failure"));
