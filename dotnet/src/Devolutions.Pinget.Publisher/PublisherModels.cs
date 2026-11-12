@@ -32,18 +32,31 @@ public sealed record PublisherDoctorResult(
     public bool SignedPublishAvailable => PsignToolPath is not null;
 }
 
-public sealed record PublisherPublishOptions(
+public sealed record PublisherPackageOptions(
     string StateDirectory,
-    string DestinationDirectory,
+    string MsixPath,
     string PackageName,
     string Publisher,
     string PackageVersion,
-    string? PfxPath = null,
-    string? PasswordEnvironmentVariable = null,
+    string? BuildId = null,
+    string? DestinationDirectory = null);
+
+public sealed record PublisherPackageResult(
+    string BuildId,
+    string MsixPath,
+    string PackageName,
+    string Publisher,
+    string PackageVersion,
+    string IndexHash,
+    string PackageHash);
+
+public sealed record PublisherPublishOptions(
+    string StateDirectory,
+    string DestinationDirectory,
+    string MsixPath,
     bool UnsignedDevelopment = false,
     string? PsignToolPath = null,
     string? BuildId = null,
-    string? TimestampUrl = null,
     IReadOnlyList<string>? TrustedCertificateAuthorities = null);
 
 public sealed record PublisherVerifyResult(

@@ -295,15 +295,35 @@ foreach ($diffReport in @($rustDiff, $dotnetDiff)) {
 
 $rustDestination = Join-Path $workPath 'rust-unsigned-feed'
 $dotnetDestination = Join-Path $workPath 'dotnet-unsigned-feed'
+$rustStagedMsix = Join-Path (Join-Path $workPath 'rust-staged') 'source2.msix'
+$dotnetStagedMsix = Join-Path (Join-Path $workPath 'dotnet-staged') 'source2.msix'
+$rustPackage = ConvertFrom-PingetJson (Invoke-Pinget 'Rust' ($common + @(
+    'package', '--state', $rustState, '--name', $PackageName,
+    '--publisher', $Publisher, '--version', '1.0.0.0',
+    '--msix', $rustStagedMsix, '--destination', $rustDestination
+))) 'Rust package'
+$dotnetPackage = ConvertFrom-PingetJson (Invoke-Pinget 'Dotnet' ($common + @(
+    'package', '--state', $dotnetState, '--name', $PackageName,
+    '--publisher', $Publisher, '--version', '1.0.0.0',
+    '--msix', $dotnetStagedMsix, '--destination', $dotnetDestination
+))) '.NET package'
+$expectedPackageFields = @('buildId', 'msixPath', 'packageName', 'publisher', 'packageVersion', 'indexHash', 'packageHash')
+Assert-ReportFields $rustPackage $expectedPackageFields 'Rust package'
+Assert-ReportFields $dotnetPackage $expectedPackageFields '.NET package'
+if ($rustPackage.buildId -ne $rustBuildId -or $dotnetPackage.buildId -ne $dotnetBuildId -or
+    $rustPackage.packageName -cne $PackageName -or $dotnetPackage.packageName -cne $PackageName -or
+    $rustPackage.publisher -cne $Publisher -or $dotnetPackage.publisher -cne $Publisher -or
+    $rustPackage.packageVersion -cne '1.0.0.0' -or $dotnetPackage.packageVersion -cne '1.0.0.0') {
+    throw "Rust and .NET package reports did not match expected identity metadata."
+}
+
 $rustPublish = ConvertFrom-PingetJson (Invoke-Pinget 'Rust' ($common + @(
     'publish', '--state', $rustState, '--destination', $rustDestination,
-    '--name', $PackageName, '--publisher', $Publisher, '--version', '1.0.0.0',
-    '--unsigned-development'
+    '--msix', $rustStagedMsix, '--unsigned-development'
 ))) 'Rust publish'
 $dotnetPublish = ConvertFrom-PingetJson (Invoke-Pinget 'Dotnet' ($common + @(
     'publish', '--state', $dotnetState, '--destination', $dotnetDestination,
-    '--name', $PackageName, '--publisher', $Publisher, '--version', '1.0.0.0',
-    '--unsigned-development'
+    '--msix', $dotnetStagedMsix, '--unsigned-development'
 ))) '.NET publish'
 Assert-VerifiedReport $rustPublish $rustBuildId 'Rust publish'
 Assert-VerifiedReport $dotnetPublish $dotnetBuildId '.NET publish'
@@ -311,6 +331,20 @@ if ($rustPublish.subject -ne $dotnetPublish.subject -or
     $rustPublish.artifactCount -ne $dotnetPublish.artifactCount) {
     throw 'Rust and .NET publish reports differ in verified subject or artifact count.'
 }
+
+# Cross-language package -> publish interoperability: publish Rust-packaged MSIX with .NET and vice versa.
+$dotnetFromRustPkgFeed = Join-Path $workPath 'dotnet-publish-from-rust-package'
+$rustFromDotnetPkgFeed = Join-Path $workPath 'rust-publish-from-dotnet-package'
+$dotnetCrossPublish = ConvertFrom-PingetJson (Invoke-Pinget 'Dotnet' ($common + @(
+    'publish', '--state', $rustState, '--destination', $dotnetFromRustPkgFeed,
+    '--msix', $rustStagedMsix, '--unsigned-development'
+))) '.NET publish of Rust-packaged MSIX'
+$rustCrossPublish = ConvertFrom-PingetJson (Invoke-Pinget 'Rust' ($common + @(
+    'publish', '--state', $dotnetState, '--destination', $rustFromDotnetPkgFeed,
+    '--msix', $dotnetStagedMsix, '--unsigned-development'
+))) 'Rust publish of .NET-packaged MSIX'
+Assert-VerifiedReport $dotnetCrossPublish $rustBuildId '.NET publish of Rust-packaged MSIX'
+Assert-VerifiedReport $rustCrossPublish $dotnetBuildId 'Rust publish of .NET-packaged MSIX'
 # index.db records its build time, and the block map hashes it; every other part must match.
 function Get-PackagePartHashes([string] $Package) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem

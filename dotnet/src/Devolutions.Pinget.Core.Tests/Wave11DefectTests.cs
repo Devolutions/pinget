@@ -2,6 +2,7 @@ using System.CommandLine;
 using System.CommandLine.Parsing;
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using Devolutions.Pinget.Cli;
 using Devolutions.Pinget.PowerShell.Engine;
 using Devolutions.Pinget.PowerShell.Engine.PSObjects;
@@ -325,6 +326,112 @@ public class Wave11DefectTests
         }
         finally
         {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RepositoryPackageAndPublish_CliCommandsEmitExpectedJsonAndRejectRemovedSigningFlags()
+    {
+        var outputOption = new Option<string?>("--output");
+        var repository = PublisherCommands.Create(outputOption);
+        var packageCommand = Assert.Single(repository.Subcommands, c => c.Name == "package");
+        var publishCommand = Assert.Single(repository.Subcommands, c => c.Name == "publish");
+        Assert.Equal(
+            ["--build", "--destination", "--msix", "--name", "--publisher", "--state", "--version"],
+            packageCommand.Options.Select(o => $"--{o.Name}").Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal(
+            ["--build", "--destination", "--msix", "--psign-tool", "--state", "--trusted-ca", "--unsigned-development"],
+            publishCommand.Options.Select(o => $"--{o.Name}").Order(StringComparer.Ordinal).ToArray());
+
+        var directory = CreateTempDirectory();
+        try
+        {
+            var input = Path.Combine(directory, "manifests");
+            var state = Path.Combine(directory, "state");
+            var destination = Path.Combine(directory, "published");
+            var msixJsonPath = Path.Combine(directory, "out-json.msix");
+            var msixTextPath = Path.Combine(directory, "out-text.msix");
+            Directory.CreateDirectory(input);
+            File.WriteAllText(
+                Path.Combine(input, "pkg.yaml"),
+                "PackageIdentifier: Contoso.CliTest\n"
+                + "PackageVersion: 1.0.0\n"
+                + "PackageLocale: en-US\n"
+                + "Publisher: Contoso\n"
+                + "PackageName: Contoso CLI Test\n"
+                + "License: MIT\n"
+                + "ShortDescription: CLI test\n"
+                + "Installers:\n"
+                + "  - Architecture: x64\n"
+                + "    InstallerType: exe\n"
+                + "    InstallerUrl: https://example.invalid/setup.exe\n"
+                + "    InstallerSha256: 1111111111111111111111111111111111111111111111111111111111111111\n"
+                + "ManifestType: singleton\n"
+                + "ManifestVersion: 1.9.0\n",
+                new UTF8Encoding(false));
+
+            var buildRun = RunCli("repository", "build", "--state", state, "--input", input, "--output", "json");
+            Assert.Equal(0, buildRun.ExitCode);
+            using var buildDoc = JsonDocument.Parse(buildRun.Stdout);
+            var buildId = buildDoc.RootElement.GetProperty("buildId").GetString()!;
+
+            var packageJsonRun = RunCli(
+                "repository", "package",
+                "--state", state,
+                "--name", "Contoso.Source",
+                "--publisher", "CN=Contoso Source",
+                "--version", "1.0.0.0",
+                "--msix", msixJsonPath,
+                "--destination", destination,
+                "--output", "json");
+            Assert.Equal(0, packageJsonRun.ExitCode);
+            using var packageDoc = JsonDocument.Parse(packageJsonRun.Stdout);
+            Assert.Equal(
+                ["buildId", "msixPath", "packageName", "publisher", "packageVersion", "indexHash", "packageHash"],
+                packageDoc.RootElement.EnumerateObject().Select(p => p.Name).ToArray());
+            Assert.Equal(buildId, packageDoc.RootElement.GetProperty("buildId").GetString());
+            Assert.Equal(msixJsonPath, packageDoc.RootElement.GetProperty("msixPath").GetString());
+            Assert.Equal("Contoso.Source", packageDoc.RootElement.GetProperty("packageName").GetString());
+            Assert.Equal("CN=Contoso Source", packageDoc.RootElement.GetProperty("publisher").GetString());
+            Assert.Equal("1.0.0.0", packageDoc.RootElement.GetProperty("packageVersion").GetString());
+
+            var packageTextRun = RunCli(
+                "repository", "package",
+                "--state", state,
+                "--name", "Contoso.Source",
+                "--publisher", "CN=Contoso Source",
+                "--version", "1.0.0.0",
+                "--msix", msixTextPath);
+            Assert.Equal(0, packageTextRun.ExitCode);
+            Assert.Equal($"Packaged unsigned source MSIX for build {buildId} at {msixTextPath}.", packageTextRun.Stdout.Trim());
+
+            var publishRun = RunCli(
+                "repository", "publish",
+                "--state", state,
+                "--destination", destination,
+                "--msix", msixJsonPath,
+                "--unsigned-development",
+                "--output", "json");
+            Assert.Equal(0, publishRun.ExitCode);
+            using var publishDoc = JsonDocument.Parse(publishRun.Stdout);
+            Assert.Equal(
+                ["valid", "subject", "artifactCount", "buildId"],
+                publishDoc.RootElement.EnumerateObject().Select(p => p.Name).ToArray());
+            Assert.True(publishDoc.RootElement.GetProperty("valid").GetBoolean());
+            Assert.Equal(buildId, publishDoc.RootElement.GetProperty("buildId").GetString());
+
+            var removedPfx = RunCli(
+                "repository", "publish",
+                "--state", state,
+                "--destination", destination,
+                "--msix", msixJsonPath,
+                "--pfx", "cert.pfx");
+            Assert.NotEqual(0, removedPfx.ExitCode);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             Directory.Delete(directory, recursive: true);
         }
     }

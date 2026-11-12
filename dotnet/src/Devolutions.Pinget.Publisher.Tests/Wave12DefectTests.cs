@@ -1,9 +1,9 @@
 using System.IO.Compression;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json.Nodes;
+using System.Xml.Linq;
 using Microsoft.Data.Sqlite;
 using Pinget.Publisher;
 using Xunit;
@@ -182,52 +182,112 @@ public sealed class Wave12DefectTests
     {
         using var temp = new TempDirectory();
         var (state, buildId) = BuildFixture(temp);
-        var options = Options(state, Path.Combine(temp.Path, "feed"), buildId, "1.0.0.0") with { PackageName = name };
+        var msixPath = Path.Combine(temp.Path, "source.msix");
+        var destination = Path.Combine(temp.Path, "feed");
+        var packageOptions = new PublisherPackageOptions(
+            state,
+            msixPath,
+            name,
+            "CN=Pinget Wave12 Test",
+            "1.0.0.0",
+            BuildId: buildId);
         if (valid)
         {
-            Assert.True(PublisherPackaging.Publish(options).Valid);
+            var packaged = PublisherPackaging.Package(packageOptions);
+            Assert.Equal(name, packaged.PackageName);
+            Assert.True(PublisherPackaging.Publish(new PublisherPublishOptions(
+                state,
+                destination,
+                packaged.MsixPath,
+                UnsignedDevelopment: true,
+                BuildId: buildId)).Valid);
         }
         else
         {
-            var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
-            Assert.Contains("invalid MSIX package identity name", error.Message, StringComparison.Ordinal);
+            var packageError = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(packageOptions));
+            Assert.Contains("invalid MSIX package identity name", packageError.Message, StringComparison.Ordinal);
+            Assert.False(File.Exists(msixPath));
+
+            var craftedMsix = CraftMsix(
+                temp,
+                state,
+                buildId,
+                manifest =>
+                {
+                    XNamespace foundation = "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+                    manifest.Root!.Element(foundation + "Identity")!.SetAttributeValue("Name", name);
+                });
+            var publishError = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(new PublisherPublishOptions(
+                state,
+                destination,
+                craftedMsix,
+                UnsignedDevelopment: true,
+                BuildId: buildId)));
+            Assert.Contains("invalid MSIX package identity name", publishError.Message, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(destination));
         }
     }
 
     [Fact]
-    public void Publish_EmptyPfxPassword_IsPassedToTheSigningTool()
+    public void Publish_NonCanonicalManifestVersionAndDuplicateElements_AreRejected()
     {
-        if (!OperatingSystem.IsWindows())
-            return;
         using var temp = new TempDirectory();
         var (state, buildId) = BuildFixture(temp);
-        var pfx = Path.Combine(temp.Path, "signer.pfx");
-        File.WriteAllBytes(pfx, [1]);
-        var where = Path.Combine(Environment.SystemDirectory, "where.exe");
-        const string variable = "PINGET_PUBLISHER_WAVE12_EMPTY_PASSWORD";
-        var options = Options(state, Path.Combine(temp.Path, "feed"), buildId, "1.0.0.0") with
-        {
-            UnsignedDevelopment = false,
-            PfxPath = pfx,
-            PasswordEnvironmentVariable = variable,
-            PsignToolPath = where,
-        };
-        try
-        {
-            // Environment.SetEnvironmentVariable(name, "") deletes the variable on Windows.
-            Assert.True(SetEnvironmentVariable(variable, string.Empty));
-            Assert.Equal(string.Empty, Environment.GetEnvironmentVariable(variable));
-            var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
-            Assert.Contains("MSIX signing with psign-tool failed", error.Message, StringComparison.Ordinal);
 
-            Assert.True(SetEnvironmentVariable(variable, null));
-            error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
-            Assert.Contains("is not set", error.Message, StringComparison.Ordinal);
-        }
-        finally
-        {
-            SetEnvironmentVariable(variable, null);
-        }
+        var nonCanonicalMsix = CraftMsix(
+            temp,
+            state,
+            buildId,
+            static manifest =>
+            {
+                XNamespace foundation = "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+                manifest.Root!.Element(foundation + "Identity")!.SetAttributeValue("Version", "01.0.0.0");
+            });
+        var destination = Path.Combine(temp.Path, "feed-noncanonical");
+        var versionError = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(new PublisherPublishOptions(
+            state,
+            destination,
+            nonCanonicalMsix,
+            UnsignedDevelopment: true,
+            BuildId: buildId)));
+        Assert.Contains("canonical four-part form", versionError.Message, StringComparison.Ordinal);
+        Assert.False(Directory.Exists(destination));
+
+        var duplicateIdentityMsix = CraftMsix(
+            temp,
+            state,
+            buildId,
+            static manifest =>
+            {
+                XNamespace foundation = "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+                var identity = manifest.Root!.Element(foundation + "Identity")!;
+                identity.AddAfterSelf(new XElement(identity));
+            });
+        var duplicateIdentityError = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(new PublisherPublishOptions(
+            state,
+            Path.Combine(temp.Path, "feed-dup-id"),
+            duplicateIdentityMsix,
+            UnsignedDevelopment: true,
+            BuildId: buildId)));
+        Assert.Contains("Identity", duplicateIdentityError.Message, StringComparison.Ordinal);
+
+        var duplicateExtensionMsix = CraftMsix(
+            temp,
+            state,
+            buildId,
+            static manifest =>
+            {
+                XNamespace uap3 = "http://schemas.microsoft.com/appx/manifest/uap/windows10/3";
+                var extension = manifest.Descendants(uap3 + "AppExtension").Single();
+                extension.AddAfterSelf(new XElement(extension));
+            });
+        var duplicateExtensionError = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(new PublisherPublishOptions(
+            state,
+            Path.Combine(temp.Path, "feed-dup-ext"),
+            duplicateExtensionMsix,
+            UnsignedDevelopment: true,
+            BuildId: buildId)));
+        Assert.Contains("WinGet preindexed source extension", duplicateExtensionError.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -472,8 +532,53 @@ public sealed class Wave12DefectTests
         }
     }
 
-    private static PublisherPublishOptions Options(string state, string destination, string buildId, string version) =>
-        new(state, destination, "Pinget.Test.Wave12", "CN=Pinget Wave12 Test", version, UnsignedDevelopment: true, BuildId: buildId);
+    private static PublisherPublishOptions Options(string state, string destination, string buildId, string version)
+    {
+        var msixPath = Path.Combine(Path.GetDirectoryName(state)!, $"staged-{Guid.NewGuid():N}.msix");
+        _ = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            msixPath,
+            "Pinget.Test.Wave12",
+            "CN=Pinget Wave12 Test",
+            version,
+            BuildId: buildId));
+        return new PublisherPublishOptions(state, destination, msixPath, UnsignedDevelopment: true, BuildId: buildId);
+    }
+
+    private static string CraftMsix(TempDirectory temp, string state, string buildId, Action<XDocument> mutateManifest)
+    {
+        var templatePath = Path.Combine(temp.Path, $"template-{Guid.NewGuid():N}.msix");
+        _ = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            templatePath,
+            "Pinget.Test.Wave12",
+            "CN=Pinget Wave12 Test",
+            "1.0.0.0",
+            BuildId: buildId));
+        var parts = new List<(string Name, byte[] Data)>();
+        using (var archive = ZipFile.OpenRead(templatePath))
+        {
+            foreach (var entry in archive.Entries)
+            {
+                if (entry.FullName is "AppxBlockMap.xml" or "[Content_Types].xml")
+                    continue;
+                using var stream = entry.Open();
+                using var buffer = new MemoryStream();
+                stream.CopyTo(buffer);
+                var data = buffer.ToArray();
+                if (entry.FullName == "AppxManifest.xml")
+                {
+                    var manifest = XDocument.Parse(Utf8.GetString(data));
+                    mutateManifest(manifest);
+                    data = Utf8.GetBytes(manifest.ToString(SaveOptions.DisableFormatting));
+                }
+                parts.Add((entry.FullName, data));
+            }
+        }
+        var craftedPath = Path.Combine(temp.Path, $"crafted-{Guid.NewGuid():N}.msix");
+        File.WriteAllBytes(craftedPath, MsixPackageWriter.Write(parts));
+        return craftedPath;
+    }
 
     private static byte[] CreateCertificate(string subject, DateTimeOffset notBefore, DateTimeOffset notAfter)
     {
@@ -506,12 +611,6 @@ public sealed class Wave12DefectTests
             values.Add(reader.GetString(0));
         return values.ToArray();
     }
-
-#pragma warning disable SYSLIB1054 // LibraryImport would require unsafe code in the test project.
-    [DllImport("kernel32.dll", EntryPoint = "SetEnvironmentVariableW", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetEnvironmentVariable(string name, string? value);
-#pragma warning restore SYSLIB1054
 
     private sealed class TempDirectory : IDisposable
     {

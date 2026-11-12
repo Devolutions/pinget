@@ -135,8 +135,18 @@ public sealed class ReviewFixesBTests
         return (state, buildA, Build("b", "1.0.0", "2.0.0"));
     }
 
-    private static PublisherPublishOptions Options(string state, string destination, string buildId, string version) =>
-        new(state, destination, "Pinget.Test.ReviewB", "CN=Pinget Review B Test", version, UnsignedDevelopment: true, BuildId: buildId);
+    private static PublisherPublishOptions Options(string state, string destination, string buildId, string version)
+    {
+        var msixPath = Path.Combine(Path.GetDirectoryName(state)!, $"staged-{Guid.NewGuid():N}.msix");
+        _ = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            msixPath,
+            "Pinget.Test.ReviewB",
+            "CN=Pinget Review B Test",
+            version,
+            BuildId: buildId));
+        return new PublisherPublishOptions(state, destination, msixPath, UnsignedDevelopment: true, BuildId: buildId);
+    }
 
     private sealed class TempDirectory : IDisposable
     {

@@ -13,7 +13,10 @@ use pinget_core::{
     Repository, RepositoryOptions, SearchMatch, SearchResponse, ShowResult, SourceKind, SourceRecord,
     SourceUpdateResult, UninstallRequest, VersionsResult, pin_blocks_upgrade,
 };
-use pinget_publisher::{BuildOptions as PublisherBuildOptions, PublishOptions as PublisherPublishOptions, Signing};
+use pinget_publisher::{
+    BuildOptions as PublisherBuildOptions, PackageOptions as PublisherPackageOptions,
+    PublishOptions as PublisherPublishOptions,
+};
 
 mod error_codes;
 mod file_hash;
@@ -176,6 +179,7 @@ enum RepositoryCommands {
     Diff(RepositoryBuildArgs),
     Status(RepositoryStateArgs),
     Verify(RepositoryVerifyArgs),
+    Package(RepositoryPackageArgs),
     Publish(RepositoryPublishArgs),
     Doctor(RepositoryDoctorArgs),
 }
@@ -209,35 +213,39 @@ struct RepositoryVerifyArgs {
 }
 
 #[derive(Args)]
-struct RepositoryPublishArgs {
+struct RepositoryPackageArgs {
     #[arg(long)]
     state: PathBuf,
     #[arg(long)]
-    destination: PathBuf,
+    build: Option<String>,
     #[arg(long)]
     name: String,
     #[arg(long)]
     publisher: String,
     #[arg(long = "version")]
     package_version: String,
+    #[arg(long = "msix", value_name = "FILE")]
+    msix: PathBuf,
+    #[arg(long)]
+    destination: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct RepositoryPublishArgs {
+    #[arg(long)]
+    state: PathBuf,
+    #[arg(long)]
+    destination: PathBuf,
+    #[arg(long = "msix", value_name = "FILE")]
+    msix: PathBuf,
     #[arg(long)]
     build: Option<String>,
-    #[arg(long = "pfx", requires = "password_env", conflicts_with = "unsigned_development")]
-    pfx: Option<PathBuf>,
-    #[arg(long = "password-env", requires = "pfx", value_name = "ENVIRONMENT_VARIABLE")]
-    password_env: Option<String>,
-    #[arg(
-        long = "unsigned-development",
-        required_unless_present = "pfx",
-        conflicts_with_all = ["pfx", "password_env"]
-    )]
+    #[arg(long = "unsigned-development")]
     unsigned_development: bool,
     #[arg(long = "psign-tool")]
     psign_tool: Option<PathBuf>,
     #[arg(long = "trusted-ca", value_name = "CERTIFICATE")]
     trusted_ca: Vec<PathBuf>,
-    #[arg(long, requires = "pfx", conflicts_with = "unsigned_development")]
-    timestamp_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -1312,28 +1320,35 @@ fn run_repository_command(command: RepositoryCommands, output: OutputFormat) -> 
                 print_serialized(&result, output)?;
             }
         }
-        RepositoryCommands::Publish(args) => {
-            let signing = if args.unsigned_development {
-                Signing::UnsignedDevelopment
+        RepositoryCommands::Package(args) => {
+            let result = pinget_publisher::package(&PublisherPackageOptions {
+                state: args.state,
+                build_id: args.build,
+                msix: args.msix,
+                name: args.name,
+                publisher: args.publisher,
+                version: args.package_version,
+                destination: args.destination,
+            })?;
+            if output.is_text() {
+                println!(
+                    "Packaged unsigned source MSIX for build {} at {}.",
+                    result.build_id,
+                    result.msix_path.display()
+                );
             } else {
-                Signing::Pfx {
-                    path: args.pfx.ok_or_else(|| anyhow!("normal publication requires --pfx"))?,
-                    password_env: args
-                        .password_env
-                        .ok_or_else(|| anyhow!("normal publication requires --password-env"))?,
-                }
-            };
+                print_serialized(&result, output)?;
+            }
+        }
+        RepositoryCommands::Publish(args) => {
             let result = pinget_publisher::publish(&PublisherPublishOptions {
                 state: args.state,
                 build_id: args.build,
                 destination: args.destination,
-                name: args.name,
-                publisher: args.publisher,
-                version: args.package_version,
-                signing,
+                msix: args.msix,
+                unsigned_development: args.unsigned_development,
                 psign_tool: args.psign_tool,
                 trusted_ca: args.trusted_ca,
-                timestamp_url: args.timestamp_url,
             })?;
             if output.is_text() {
                 println!(
@@ -4310,5 +4325,65 @@ mod tests {
         assert_eq!(value["Installers"][0]["ReleaseDate"], "2026-05-22");
         assert!(value.get("package_identifier").is_none());
         assert!(value.get("source_name").is_none());
+    }
+
+    #[test]
+    fn repository_cli_parses_split_package_and_publish_and_rejects_removed_signing_flags() {
+        let parsed_pkg = Cli::try_parse_from([
+            "pinget",
+            "--output",
+            "json",
+            "repository",
+            "package",
+            "--state",
+            "state-dir",
+            "--name",
+            "Contoso.Source",
+            "--publisher",
+            "CN=Contoso",
+            "--version",
+            "1.0.0.0",
+            "--msix",
+            "staged/source2.msix",
+            "--destination",
+            "public-dir",
+        ])
+        .expect("repository package should parse");
+        assert_eq!(parsed_pkg.output.as_deref(), Some("json"));
+
+        Cli::try_parse_from([
+            "pinget",
+            "repository",
+            "publish",
+            "--state",
+            "state-dir",
+            "--destination",
+            "public-dir",
+            "--msix",
+            "staged/source2.msix",
+            "--trusted-ca",
+            "root-ca.cer",
+        ])
+        .expect("repository publish --msix should parse");
+
+        for removed in ["--pfx", "--password-env", "--timestamp-url", "--name"] {
+            assert!(
+                Cli::try_parse_from([
+                    "pinget",
+                    "repository",
+                    "publish",
+                    "--state",
+                    "state-dir",
+                    "--destination",
+                    "public-dir",
+                    "--msix",
+                    "staged/source2.msix",
+                    removed,
+                    "value",
+                ])
+                .is_err(),
+                "removed flag {removed} must be rejected on repository publish"
+            );
+        }
     }
 }

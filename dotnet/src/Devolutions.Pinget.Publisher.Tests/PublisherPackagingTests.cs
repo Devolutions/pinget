@@ -1,8 +1,8 @@
 using System.IO.Compression;
 using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Xml.Linq;
 using Pinget.Publisher;
 using Xunit;
@@ -28,19 +28,32 @@ public sealed class PublisherPackagingTests
         using var temp = new TempDirectory();
         var state = Path.Combine(temp.Path, "state");
         var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
-        _ = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
-        var options = new PublisherPublishOptions(
+        var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
+        var msixOut = Path.Combine(temp.Path, "invalid.msix");
+
+        var packageError = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(
+            new PublisherPackageOptions(state, msixOut, packageName, publisher, version, BuildId: build.BuildId)));
+        Assert.Contains(diagnostic, packageError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(msixOut));
+
+        var craftedMsix = CraftMsix(
+            temp,
             state,
-            Path.Combine(temp.Path, "destination"),
-            packageName,
-            publisher,
-            version,
-            UnsignedDevelopment: true);
+            build.BuildId,
+            manifest =>
+            {
+                XNamespace foundation = "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+                var identity = manifest.Root!.Element(foundation + "Identity")!;
+                identity.SetAttributeValue("Name", packageName);
+                identity.SetAttributeValue("Publisher", publisher);
+                identity.SetAttributeValue("Version", version);
+            });
+        var destination = Path.Combine(temp.Path, "destination");
+        var publishError = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(
+            new PublisherPublishOptions(state, destination, craftedMsix, UnsignedDevelopment: true, BuildId: build.BuildId)));
 
-        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
-
-        Assert.Contains(diagnostic, error.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.False(Directory.Exists(options.DestinationDirectory));
+        Assert.Contains(diagnostic, publishError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(destination));
     }
 
     [Fact]
@@ -49,39 +62,314 @@ public sealed class PublisherPackagingTests
         using var temp = new TempDirectory();
         var state = Path.Combine(temp.Path, "state");
         var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
-        _ = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
-        var options = new PublisherPublishOptions(
+        var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
+        var msixOut = Path.Combine(temp.Path, "invalid-publisher.msix");
+
+        var packageError = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(
+            new PublisherPackageOptions(state, msixOut, PackageName, "CN=Invalid\nPublisher", "1.0.0.0", BuildId: build.BuildId)));
+        Assert.Contains("Publisher", packageError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(msixOut));
+
+        var craftedMsix = CraftMsixWithRawManifestReplacement(
+            temp,
             state,
-            Path.Combine(temp.Path, "destination"),
-            PackageName,
-            "CN=Invalid\nPublisher",
-            "1.0.0.0",
-            UnsignedDevelopment: true);
+            build.BuildId,
+            $"Publisher=\"{Publisher}\"",
+            "Publisher=\"CN=Invalid&#xA;Publisher\"");
+        var destination = Path.Combine(temp.Path, "destination");
+        var publishError = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(
+            new PublisherPublishOptions(state, destination, craftedMsix, UnsignedDevelopment: true, BuildId: build.BuildId)));
 
-        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
-
-        Assert.Contains("Publisher", error.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.False(Directory.Exists(options.DestinationDirectory));
+        Assert.Contains("Publisher", publishError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(destination));
     }
 
     [Fact]
-    public void Publish_RequiresExplicitUnsignedDevelopmentOrSigningConfiguration()
+    public void Package_WritesDeterministicUnsignedMsixAndReturnsMetadata()
+    {
+        using var temp = new TempDirectory();
+        var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
+        var state = Path.Combine(temp.Path, "state");
+        var workspace = new PublisherWorkspace(state);
+        var build = workspace.Build(new PublisherBuildOptions(input, state));
+        var msixFirst = Path.Combine(temp.Path, "out", "source-a.msix");
+        var msixSecond = Path.Combine(temp.Path, "out", "source-b.msix");
+
+        var first = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            msixFirst,
+            PackageName,
+            Publisher,
+            "1.0.0.0"));
+        var second = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            msixSecond,
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: build.BuildId));
+
+        var indexPath = Path.Combine(build.SnapshotDirectory, "Public", "index.db");
+        var expectedIndexHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(indexPath))).ToLowerInvariant();
+        var bytes = File.ReadAllBytes(msixFirst);
+        Assert.Equal(bytes, File.ReadAllBytes(msixSecond));
+        Assert.Equal(build.BuildId, first.BuildId);
+        Assert.Equal(msixFirst, first.MsixPath);
+        Assert.Equal(PackageName, first.PackageName);
+        Assert.Equal(Publisher, first.Publisher);
+        Assert.Equal("1.0.0.0", first.PackageVersion);
+        Assert.Equal(expectedIndexHash, first.IndexHash);
+        Assert.Equal(Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant(), first.PackageHash);
+        Assert.Equal(first.PackageHash, second.PackageHash);
+        AssertMsixContents(msixFirst, indexPath, "1.0.0.0");
+        Assert.Null(workspace.Status().LastPublishedBuildId);
+    }
+
+    [Fact]
+    public void Package_PreflightDestinationValidation_RejectsInvalidTargetsWithoutMutatingDestination()
+    {
+        using var temp = new TempDirectory();
+        var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
+        var state = Path.Combine(temp.Path, "state");
+        var workspace = new PublisherWorkspace(state);
+        var firstBuild = workspace.Build(new PublisherBuildOptions(input, state));
+
+        // Non-existent destination is accepted without creating it.
+        var missingDestination = Path.Combine(temp.Path, "not-yet-created");
+        var preflightNew = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            Path.Combine(temp.Path, "new-dest.msix"),
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: firstBuild.BuildId,
+            DestinationDirectory: missingDestination));
+        Assert.True(File.Exists(preflightNew.MsixPath));
+        Assert.False(Directory.Exists(missingDestination));
+
+        // Unowned non-empty destination with unrelated file is rejected without mutation.
+        var unowned = Path.Combine(temp.Path, "unowned");
+        Directory.CreateDirectory(unowned);
+        File.WriteAllText(Path.Combine(unowned, "keep.txt"), "keep", new UTF8Encoding(false));
+        var unownedMsix = Path.Combine(temp.Path, "unowned.msix");
+        var unownedError = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            unownedMsix,
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: firstBuild.BuildId,
+            DestinationDirectory: unowned)));
+        Assert.Contains("non-empty unowned destination", unownedError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(unownedMsix));
+        Assert.Equal(new[] { "keep.txt" }, Directory.GetFileSystemEntries(unowned).Select(static path => Path.GetFileName(path)).ToArray());
+
+        // Publish build 1 at 1.0.0.0 to an owned destination.
+        var destination = Path.Combine(temp.Path, "published");
+        _ = PublisherPackaging.Publish(UnsignedOptions(state, destination, "1.0.0.0", firstBuild.BuildId));
+        var originalMarker = File.ReadAllBytes(Path.Combine(destination, ".pinget-publisher.json"));
+        var originalMsix = File.ReadAllBytes(Path.Combine(destination, "source2.msix"));
+
+        var wrongIdentityMsix = Path.Combine(temp.Path, "wrong-id.msix");
+        var identityError = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            wrongIdentityMsix,
+            "Pinget.Publisher.Other",
+            Publisher,
+            "1.0.0.1",
+            BuildId: firstBuild.BuildId,
+            DestinationDirectory: destination)));
+        Assert.Contains("different source package identity or publisher", identityError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(wrongIdentityMsix));
+
+        var wrongPublisherMsix = Path.Combine(temp.Path, "wrong-pub.msix");
+        var publisherError = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            wrongPublisherMsix,
+            PackageName,
+            "CN=Another Publisher",
+            "1.0.0.1",
+            BuildId: firstBuild.BuildId,
+            DestinationDirectory: destination)));
+        Assert.Contains("different source package identity or publisher", publisherError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(wrongPublisherMsix));
+
+        File.AppendAllText(
+            Path.Combine(input, "Pinget.Test.Matrix_1.10.0.locale.en-US.yaml"),
+            "# second build\n",
+            new UTF8Encoding(false));
+        var secondBuild = workspace.Build(new PublisherBuildOptions(input, state));
+
+        var downgradeMsix = Path.Combine(temp.Path, "downgrade.msix");
+        var downgradeError = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            downgradeMsix,
+            PackageName,
+            Publisher,
+            "0.9.9.9",
+            BuildId: secondBuild.BuildId,
+            DestinationDirectory: destination)));
+        Assert.Contains("greater than published version", downgradeError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(downgradeMsix));
+
+        var reusedVersionDifferentBuildMsix = Path.Combine(temp.Path, "same-version-diff-build.msix");
+        var sameVersionError = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            reusedVersionDifferentBuildMsix,
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: secondBuild.BuildId,
+            DestinationDirectory: destination)));
+        Assert.Contains("already been used for different build content", sameVersionError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(reusedVersionDifferentBuildMsix));
+
+        // Same version + same buildId succeeds, and higher version + new buildId succeeds without mutating destination.
+        var idempotent = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            Path.Combine(temp.Path, "idempotent.msix"),
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: firstBuild.BuildId,
+            DestinationDirectory: destination));
+        Assert.True(File.Exists(idempotent.MsixPath));
+
+        var upgraded = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            Path.Combine(temp.Path, "upgraded.msix"),
+            PackageName,
+            Publisher,
+            "1.0.0.1",
+            BuildId: secondBuild.BuildId,
+            DestinationDirectory: destination));
+        Assert.True(File.Exists(upgraded.MsixPath));
+        Assert.Equal(originalMarker, File.ReadAllBytes(Path.Combine(destination, ".pinget-publisher.json")));
+        Assert.Equal(originalMsix, File.ReadAllBytes(Path.Combine(destination, "source2.msix")));
+
+        // Interrupted first publish (pendingCommit with previous: null) is treated as unowned without mutating destination.
+        var interruptedFirst = Path.Combine(temp.Path, "interrupted-first");
+        _ = PublisherPackaging.Publish(UnsignedOptions(state, interruptedFirst, "1.0.0.0", firstBuild.BuildId));
+        var interruptedMarkerPath = Path.Combine(interruptedFirst, ".pinget-publisher.json");
+        var interruptedMarker = JsonNode.Parse(File.ReadAllText(interruptedMarkerPath))!.AsObject();
+        interruptedMarker["pendingCommit"] = new JsonObject { ["previous"] = null };
+        File.WriteAllText(interruptedMarkerPath, interruptedMarker.ToJsonString(), new UTF8Encoding(false));
+        var interruptedMarkerBytes = File.ReadAllBytes(interruptedMarkerPath);
+        File.Delete(Path.Combine(interruptedFirst, "source2.msix"));
+
+        var retryPackage = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            Path.Combine(temp.Path, "interrupted-retry.msix"),
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: firstBuild.BuildId,
+            DestinationDirectory: interruptedFirst));
+        Assert.True(File.Exists(retryPackage.MsixPath));
+        Assert.Equal(interruptedMarkerBytes, File.ReadAllBytes(interruptedMarkerPath));
+    }
+
+    [Fact]
+    public void Package_And_Publish_RejectOverlappingOrDirectoryMsixPaths()
+    {
+        using var temp = new TempDirectory();
+        var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
+        var state = Path.Combine(temp.Path, "state");
+        var destination = Path.Combine(temp.Path, "published");
+        var existingDirectory = Directory.CreateDirectory(Path.Combine(temp.Path, "dir-as-msix")).FullName;
+        var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
+
+        var packageInState = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(
+            new PublisherPackageOptions(state, Path.Combine(state, "out.msix"), PackageName, Publisher, "1.0.0.0", BuildId: build.BuildId)));
+        Assert.Contains("state and msix directories must not overlap", packageInState.Message, StringComparison.Ordinal);
+
+        var packageInDestination = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(
+            new PublisherPackageOptions(
+                state,
+                Path.Combine(destination, "out.msix"),
+                PackageName,
+                Publisher,
+                "1.0.0.0",
+                BuildId: build.BuildId,
+                DestinationDirectory: destination)));
+        Assert.Contains("destination and msix directories must not overlap", packageInDestination.Message, StringComparison.Ordinal);
+
+        var packageIsDirectory = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(
+            new PublisherPackageOptions(state, existingDirectory, PackageName, Publisher, "1.0.0.0", BuildId: build.BuildId)));
+        Assert.Contains("MSIX output path is a directory", packageIsDirectory.Message, StringComparison.Ordinal);
+
+        var publishInState = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(
+            new PublisherPublishOptions(state, destination, Path.Combine(state, "source2.msix"), UnsignedDevelopment: true, BuildId: build.BuildId)));
+        Assert.Contains("state and msix directories must not overlap", publishInState.Message, StringComparison.Ordinal);
+
+        var publishInDestination = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(
+            new PublisherPublishOptions(state, destination, Path.Combine(destination, "source2.msix"), UnsignedDevelopment: true, BuildId: build.BuildId)));
+        Assert.Contains("destination and msix directories must not overlap", publishInDestination.Message, StringComparison.Ordinal);
+
+        var publishIsDirectory = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(
+            new PublisherPublishOptions(state, destination, existingDirectory, UnsignedDevelopment: true, BuildId: build.BuildId)));
+        Assert.Contains("Source MSIX does not exist", publishIsDirectory.Message, StringComparison.Ordinal);
+
+        var publishMissingFile = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(
+            new PublisherPublishOptions(state, destination, Path.Combine(temp.Path, "missing.msix"), UnsignedDevelopment: true, BuildId: build.BuildId)));
+        Assert.Contains("Source MSIX does not exist", publishMissingFile.Message, StringComparison.Ordinal);
+        Assert.False(Directory.Exists(destination));
+    }
+
+    [Fact]
+    public void Publish_UnsignedMsixWithoutUnsignedDevelopment_IsRejected()
     {
         using var temp = new TempDirectory();
         var state = Path.Combine(temp.Path, "state");
+        var destination = Path.Combine(temp.Path, "destination");
         var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
-        _ = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
-        var options = new PublisherPublishOptions(
-            state,
-            Path.Combine(temp.Path, "destination"),
-            PackageName,
-            Publisher,
-            "1.0.0.0");
+        var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
+        var packaged = PublisherPackaging.Package(
+            new PublisherPackageOptions(state, Path.Combine(temp.Path, "unsigned.msix"), PackageName, Publisher, "1.0.0.0", BuildId: build.BuildId));
+        var fakeTool = CreateNoOpVerifyTool(temp.Path);
 
-        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
+        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(
+            new PublisherPublishOptions(state, destination, packaged.MsixPath, UnsignedDevelopment: false, PsignToolPath: fakeTool, BuildId: build.BuildId)));
 
-        Assert.Contains("Choose exactly one", error.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.False(Directory.Exists(options.DestinationDirectory));
+        Assert.Contains("source MSIX is not signed", error.Message, StringComparison.Ordinal);
+        Assert.False(Directory.Exists(destination));
+        Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
+        Assert.Empty(Directory.EnumerateDirectories(state, ".publish-*"));
+    }
+
+    [Theory]
+    [InlineData("AppxSignature.p7x")]
+    [InlineData("appxsignature.p7x")]
+    [InlineData("AppxMetadata/CodeIntegrity.cat")]
+    public void Publish_And_VerifyDestination_RejectSignedMsixInUnsignedDevelopmentMode(string signatureEntry)
+    {
+        using var temp = new TempDirectory();
+        var state = Path.Combine(temp.Path, "state");
+        var destination = Path.Combine(temp.Path, "destination");
+        var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
+        var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
+        var unsignedPackage = PublisherPackaging.Package(
+            new PublisherPackageOptions(state, Path.Combine(temp.Path, "unsigned.msix"), PackageName, Publisher, "1.0.0.0", BuildId: build.BuildId));
+        var signedLookingMsix = AddZipEntry(unsignedPackage.MsixPath, Path.Combine(temp.Path, "signed-looking.msix"), signatureEntry, "PKCX"u8.ToArray());
+
+        var publishError = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(
+            new PublisherPublishOptions(state, destination, signedLookingMsix, UnsignedDevelopment: true, BuildId: build.BuildId)));
+
+        Assert.Contains("Cannot publish a signed MSIX with --unsigned-development", publishError.Message, StringComparison.Ordinal);
+        Assert.False(Directory.Exists(destination));
+        Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
+
+        _ = PublisherPackaging.Publish(
+            new PublisherPublishOptions(state, destination, unsignedPackage.MsixPath, UnsignedDevelopment: true, BuildId: build.BuildId));
+        var publishedMsix = Path.Combine(destination, "source2.msix");
+        File.Copy(signedLookingMsix, publishedMsix, overwrite: true);
+        var markerPath = Path.Combine(destination, ".pinget-publisher.json");
+        var marker = JsonNode.Parse(File.ReadAllText(markerPath))!.AsObject();
+        marker["artifacts"]!["source2.msix"] = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(publishedMsix))).ToLowerInvariant();
+        File.WriteAllText(markerPath, marker.ToJsonString(), new UTF8Encoding(false));
+
+        var verifyError = Assert.Throws<PublisherException>(() => PublisherPackaging.VerifyDestination(destination));
+        Assert.Contains("Unsigned development destination contains a signed source2.msix.", verifyError.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -179,12 +467,17 @@ public sealed class PublisherPackagingTests
         _ = PublisherPackaging.Publish(UnsignedOptions(state, destination, "1.0.0.0", build.BuildId));
         var oldIndex = File.ReadAllBytes(Path.Combine(destination, "source2.msix"));
         var oldMarker = File.ReadAllBytes(Path.Combine(destination, ".pinget-publisher.json"));
-        var changedIdentity = new PublisherPublishOptions(
+        var changedIdentityPackage = PublisherPackaging.Package(new PublisherPackageOptions(
             state,
-            destination,
+            Path.Combine(temp.Path, "other-identity.msix"),
             "Pinget.Publisher.Other",
             Publisher,
             "1.0.0.0",
+            BuildId: build.BuildId));
+        var changedIdentity = new PublisherPublishOptions(
+            state,
+            destination,
+            changedIdentityPackage.MsixPath,
             UnsignedDevelopment: true,
             BuildId: build.BuildId);
 
@@ -240,41 +533,34 @@ public sealed class PublisherPackagingTests
         var state = Path.Combine(temp.Path, "state");
         var destination = Path.Combine(temp.Path, "published");
         var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
-        const string password = "safe-test-password";
-        var pfx = CreateSigningPfx(Path.Combine(temp.Path, "signer.pfx"), Publisher, password);
-        const string passwordVariable = "PINGET_PUBLISHER_TEST_MISSING_TOOL_PASSWORD";
-        var previousPassword = Environment.GetEnvironmentVariable(passwordVariable);
-        Environment.SetEnvironmentVariable(passwordVariable, password);
-        try
-        {
-            var options = new PublisherPublishOptions(
-                state,
-                destination,
-                PackageName,
-                Publisher,
-                "1.0.0.0",
-                PfxPath: pfx,
-                PasswordEnvironmentVariable: passwordVariable,
-                PsignToolPath: Path.Combine(temp.Path, "missing", "psign-tool.exe"),
-                BuildId: build.BuildId);
+        var packaged = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            Path.Combine(temp.Path, "source.msix"),
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: build.BuildId));
+        var options = new PublisherPublishOptions(
+            state,
+            destination,
+            packaged.MsixPath,
+            UnsignedDevelopment: false,
+            PsignToolPath: Path.Combine(temp.Path, "missing", "psign-tool.exe"),
+            BuildId: build.BuildId);
 
-            var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
+        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
 
-            Assert.Contains("psign-tool does not exist at", error.Message, StringComparison.Ordinal);
-            Assert.False(File.Exists(Path.Combine(destination, "source2.msix")));
-            Assert.False(File.Exists(Path.Combine(destination, ".pinget-publisher.json")));
-            Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
-            Assert.Empty(Directory.EnumerateDirectories(state, ".publish-*"));
+        Assert.Contains("psign-tool does not exist at", error.Message, StringComparison.Ordinal);
+        Assert.False(Directory.Exists(destination));
+        Assert.False(File.Exists(Path.Combine(destination, "source2.msix")));
+        Assert.False(File.Exists(Path.Combine(destination, ".pinget-publisher.json")));
+        Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
+        Assert.Empty(Directory.EnumerateDirectories(state, ".publish-*"));
 
-            var retry = PublisherPackaging.Publish(UnsignedOptions(state, destination, "1.0.0.0", build.BuildId));
-            Assert.True(retry.Valid);
-            Assert.True(PublisherPackaging.VerifyDestination(destination).Valid);
-            Assert.Equal(build.BuildId, new PublisherWorkspace(state).Status().LastPublishedBuildId);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable(passwordVariable, previousPassword);
-        }
+        var retry = PublisherPackaging.Publish(UnsignedOptions(state, destination, "1.0.0.0", build.BuildId));
+        Assert.True(retry.Valid);
+        Assert.True(PublisherPackaging.VerifyDestination(destination).Valid);
+        Assert.Equal(build.BuildId, new PublisherWorkspace(state).Status().LastPublishedBuildId);
     }
 
     [Fact]
@@ -339,41 +625,34 @@ public sealed class PublisherPackagingTests
         var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
         var where = Path.Combine(Environment.SystemDirectory, "where.exe");
         Assert.True(File.Exists(where), "Windows where.exe is required for the controlled failing-tool case.");
-        const string password = "safe-test-password";
-        var pfx = CreateSigningPfx(Path.Combine(temp.Path, "signer.pfx"), Publisher, password);
-        const string passwordVariable = "PINGET_PUBLISHER_TEST_PFX_PASSWORD";
-        var previousPassword = Environment.GetEnvironmentVariable(passwordVariable);
-        Environment.SetEnvironmentVariable(passwordVariable, password);
-        try
-        {
-            var options = new PublisherPublishOptions(
-                state,
-                destination,
-                PackageName,
-                Publisher,
-                "1.0.0.0",
-                PfxPath: pfx,
-                PasswordEnvironmentVariable: passwordVariable,
-                PsignToolPath: where,
-                BuildId: build.BuildId);
+        var packaged = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            Path.Combine(temp.Path, "source.msix"),
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: build.BuildId));
+        var options = new PublisherPublishOptions(
+            state,
+            destination,
+            packaged.MsixPath,
+            UnsignedDevelopment: false,
+            PsignToolPath: where,
+            BuildId: build.BuildId);
 
-            var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
+        var error = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(options));
 
-            Assert.Contains("MSIX signing with psign-tool failed", error.Message, StringComparison.Ordinal);
-            Assert.DoesNotContain(password, error.Message, StringComparison.Ordinal);
-            Assert.False(File.Exists(Path.Combine(destination, "source2.msix")));
-            Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
+        Assert.Contains("MSIX digest verification with psign-tool failed", error.Message, StringComparison.Ordinal);
+        Assert.False(Directory.Exists(destination));
+        Assert.False(File.Exists(Path.Combine(destination, "source2.msix")));
+        Assert.Null(new PublisherWorkspace(state).Status().LastPublishedBuildId);
+        Assert.Empty(Directory.EnumerateDirectories(state, ".publish-*"));
 
-            var retry = PublisherPackaging.Publish(
-                UnsignedOptions(state, destination, "1.0.0.0", build.BuildId));
-            Assert.True(retry.Valid);
-            Assert.True(PublisherPackaging.VerifyDestination(destination).Valid);
-            Assert.Equal(build.BuildId, new PublisherWorkspace(state).Status().LastPublishedBuildId);
-        }
-        finally
-        {
-            Environment.SetEnvironmentVariable(passwordVariable, previousPassword);
-        }
+        var retry = PublisherPackaging.Publish(
+            UnsignedOptions(state, destination, "1.0.0.0", build.BuildId));
+        Assert.True(retry.Valid);
+        Assert.True(PublisherPackaging.VerifyDestination(destination).Valid);
+        Assert.Equal(build.BuildId, new PublisherWorkspace(state).Status().LastPublishedBuildId);
     }
 
     [Fact]
@@ -469,15 +748,23 @@ public sealed class PublisherPackagingTests
         string state,
         string destination,
         string version,
-        string buildId) =>
-        new(
+        string buildId)
+    {
+        var msixPath = Path.Combine(Path.GetDirectoryName(state)!, $"staged-{Guid.NewGuid():N}.msix");
+        _ = PublisherPackaging.Package(new PublisherPackageOptions(
             state,
-            destination,
+            msixPath,
             PackageName,
             Publisher,
             version,
+            BuildId: buildId));
+        return new PublisherPublishOptions(
+            state,
+            destination,
+            msixPath,
             UnsignedDevelopment: true,
             BuildId: buildId);
+    }
 
     private static void AssertMsixContents(string packagePath, string expectedIndexPath, string version)
     {
@@ -535,23 +822,103 @@ public sealed class PublisherPackagingTests
         File.WriteAllBytes(packagePath, MsixPackageWriter.Write(parts));
     }
 
-    private static string CreateSigningPfx(string path, string subject, string password)
+    private static string CraftMsix(TempDirectory temp, string state, string buildId, Action<XDocument> mutateManifest)
     {
-        using var rsa = RSA.Create(2048);
-        var request = new CertificateRequest(
-            subject,
-            rsa,
-            HashAlgorithmName.SHA256,
-            RSASignaturePadding.Pkcs1);
-        request.CertificateExtensions.Add(
-            new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, critical: true));
-        var usages = new OidCollection { new("1.3.6.1.5.5.7.3.3") };
-        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(usages, critical: false));
-        using var certificate = request.CreateSelfSigned(
-            DateTimeOffset.UtcNow.AddMinutes(-5),
-            DateTimeOffset.UtcNow.AddDays(2));
-        File.WriteAllBytes(path, certificate.Export(X509ContentType.Pfx, password));
-        return path;
+        var templatePath = Path.Combine(temp.Path, $"template-{Guid.NewGuid():N}.msix");
+        _ = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            templatePath,
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: buildId));
+        var parts = new List<(string Name, byte[] Data)>();
+        using (var archive = ZipFile.OpenRead(templatePath))
+        {
+            foreach (var entry in archive.Entries)
+            {
+                if (entry.FullName is "AppxBlockMap.xml" or "[Content_Types].xml")
+                    continue;
+                using var stream = entry.Open();
+                using var buffer = new MemoryStream();
+                stream.CopyTo(buffer);
+                var data = buffer.ToArray();
+                if (entry.FullName == "AppxManifest.xml")
+                {
+                    var manifest = XDocument.Parse(Encoding.UTF8.GetString(data));
+                    mutateManifest(manifest);
+                    data = Encoding.UTF8.GetBytes(manifest.ToString(SaveOptions.DisableFormatting));
+                }
+                parts.Add((entry.FullName, data));
+            }
+        }
+        var craftedPath = Path.Combine(temp.Path, $"crafted-{Guid.NewGuid():N}.msix");
+        File.WriteAllBytes(craftedPath, MsixPackageWriter.Write(parts));
+        return craftedPath;
+    }
+
+    private static string CraftMsixWithRawManifestReplacement(
+        TempDirectory temp,
+        string state,
+        string buildId,
+        string oldValue,
+        string newValue)
+    {
+        var templatePath = Path.Combine(temp.Path, $"template-{Guid.NewGuid():N}.msix");
+        _ = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            templatePath,
+            PackageName,
+            Publisher,
+            "1.0.0.0",
+            BuildId: buildId));
+        var parts = new List<(string Name, byte[] Data)>();
+        using (var archive = ZipFile.OpenRead(templatePath))
+        {
+            foreach (var entry in archive.Entries)
+            {
+                if (entry.FullName is "AppxBlockMap.xml" or "[Content_Types].xml")
+                    continue;
+                using var stream = entry.Open();
+                using var buffer = new MemoryStream();
+                stream.CopyTo(buffer);
+                var data = buffer.ToArray();
+                if (entry.FullName == "AppxManifest.xml")
+                {
+                    var xml = Encoding.UTF8.GetString(data);
+                    var replaced = xml.Replace(oldValue, newValue, StringComparison.Ordinal);
+                    Assert.NotEqual(xml, replaced);
+                    data = new UTF8Encoding(false).GetBytes(replaced);
+                }
+                parts.Add((entry.FullName, data));
+            }
+        }
+        var craftedPath = Path.Combine(temp.Path, $"crafted-{Guid.NewGuid():N}.msix");
+        File.WriteAllBytes(craftedPath, MsixPackageWriter.Write(parts));
+        return craftedPath;
+    }
+
+    private static string AddZipEntry(string sourceMsixPath, string outputMsixPath, string entryName, byte[] entryData)
+    {
+        File.Copy(sourceMsixPath, outputMsixPath, overwrite: true);
+        using var archive = ZipFile.Open(outputMsixPath, ZipArchiveMode.Update);
+        using var stream = archive.CreateEntry(entryName).Open();
+        stream.Write(entryData);
+        return outputMsixPath;
+    }
+
+    private static string CreateNoOpVerifyTool(string directory)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var cmd = Path.Combine(directory, "noop-psign-tool.cmd");
+            File.WriteAllText(cmd, "@echo off\r\nexit /b 0\r\n", new UTF8Encoding(false));
+            return cmd;
+        }
+        var sh = Path.Combine(directory, "noop-psign-tool");
+        File.WriteAllText(sh, "#!/bin/sh\nexit 0\n", new UTF8Encoding(false));
+        File.SetUnixFileMode(sh, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return sh;
     }
 
     private static string CopyFixture(string name, string destination)

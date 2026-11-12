@@ -189,8 +189,12 @@ public sealed class MsixPackageWriterTests
     }
 
     [Fact]
-    public void Sign_PassesArgumentsThroughResponseFileAndRedactsPassword()
+    public void Verify_UsesResponseFileAndReportsToolFailure()
     {
+        var lineBreakError = Assert.Throws<PublisherException>(() =>
+            PsignTool.Verify("unused-tool", "line\nbreak.msix", "CN=Pinget Signer", [], SignaturePolicy.Superseded));
+        Assert.Contains("line break", lineBreakError.Message, StringComparison.Ordinal);
+
         if (!OperatingSystem.IsWindows())
             return;
         using var temp = new TempDirectory();
@@ -209,37 +213,22 @@ public sealed class MsixPackageWriterTests
                     $"echo %*> \"{commandLine}\"",
                     "set \"RSP=%~1\"",
                     $"copy /y \"%RSP:~1%\" \"{captured}\" >nul",
-                    "echo signing failed for secret-pa$$word 1>&2",
+                    "echo digest verification failed for corrupt blockmap 1>&2",
                     "exit /b 7",
                 ]) + "\r\n",
             new UTF8Encoding(false));
-        const string password = "secret-pa$$word";
         var package = Path.Combine(temp.Path, "source2.msix");
-        var pfx = Path.Combine(temp.Path, "signer.pfx");
 
         var error = Assert.Throws<PublisherException>(() =>
-            PsignTool.Sign(tool, package, pfx, password, "https://timestamp.example.test"));
+            PsignTool.Verify(tool, package, "CN=Pinget Signer", [], SignaturePolicy.Published));
 
-        Assert.StartsWith("MSIX signing with psign-tool failed (exit code 7): ", error.Message, StringComparison.Ordinal);
-        Assert.Contains("<redacted>", error.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain(password, error.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain(password, File.ReadAllText(commandLine), StringComparison.Ordinal);
+        Assert.Equal(
+            "MSIX digest verification with psign-tool failed (exit code 7): digest verification failed for corrupt blockmap",
+            error.Message);
         Assert.StartsWith("@", File.ReadAllText(commandLine).Trim().Trim('"'), StringComparison.Ordinal);
         Assert.Equal(
-            PsignTool.ResponseFile(
-            [
-                "--mode", "portable", "sign", "--pfx", pfx, $"--password={password}", "--digest", "sha256",
-                "--timestamp-url", "https://timestamp.example.test", "--timestamp-digest", "sha256", package,
-            ]),
+            PsignTool.ResponseFile(["portable", "verify-msix", package]),
             File.ReadAllText(captured));
-    }
-
-    [Fact]
-    public void Sign_RejectsPasswordWithLineBreaks()
-    {
-        var error = Assert.Throws<PublisherException>(() =>
-            PsignTool.Sign("unused-tool", "package.msix", "signer.pfx", "line\nbreak", null));
-        Assert.Contains("line breaks", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

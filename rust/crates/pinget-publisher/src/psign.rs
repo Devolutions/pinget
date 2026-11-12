@@ -1,9 +1,8 @@
-//! Signs and verifies MSIX packages with the cross-platform `psign-tool` from
+//! Verifies MSIX packages with the cross-platform `psign-tool` from
 //! <https://github.com/Devolutions/psign>.
 //!
 //! Every invocation passes its arguments through a response file in a private
-//! temporary directory so the PFX password never appears on a process command
-//! line, and so `.cmd` tool shims never re-parse arguments.
+//! temporary directory so `.cmd` tool shims never re-parse arguments.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -63,36 +62,6 @@ pub(crate) fn require_psign_tool(explicit: Option<&Path>) -> Result<PathBuf> {
     })
 }
 
-/// Signs `package` in place with a PFX, using portable Authenticode signing.
-pub(crate) fn sign(tool: &Path, package: &Path, pfx: &Path, password: &str, timestamp_url: Option<&str>) -> Result<()> {
-    if password.contains(['\r', '\n']) {
-        return Err(PublisherError::Invalid(
-            "the PFX password must not contain line breaks".to_owned(),
-        ));
-    }
-    let mut arguments = vec![
-        "--mode".to_owned(),
-        "portable".to_owned(),
-        "sign".to_owned(),
-        "--pfx".to_owned(),
-        path_argument(pfx)?,
-        // `--password=<value>` keeps a leading `@` from being read as a response-file include.
-        format!("--password={password}"),
-        "--digest".to_owned(),
-        "sha256".to_owned(),
-    ];
-    if let Some(url) = timestamp_url {
-        arguments.extend([
-            "--timestamp-url".to_owned(),
-            url.to_owned(),
-            "--timestamp-digest".to_owned(),
-            "sha256".to_owned(),
-        ]);
-    }
-    arguments.push(path_argument(package)?);
-    run(tool, "MSIX signing", &arguments, Some(password)).map(|_| ())
-}
-
 /// How much of a signature [`verify`] checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignaturePolicy {
@@ -127,7 +96,6 @@ pub(crate) fn verify(
             "verify-msix".to_owned(),
             package_argument.clone(),
         ],
-        None,
     )?;
     verify_signer(tool, package, publisher, policy == SignaturePolicy::NewlySigned)?;
     if policy == SignaturePolicy::Superseded {
@@ -152,7 +120,6 @@ Pass --trusted-ca with the signing root certificate when it is not trusted by de
                 "pa".to_owned(),
                 package_argument,
             ],
-            None,
         )
         .map_err(untrusted)?;
     } else {
@@ -161,7 +128,7 @@ Pass --trusted-ca with the signing root certificate when it is not trusted by de
             arguments.push("--trusted-ca".to_owned());
             arguments.push(path_argument(anchor)?);
         }
-        run(tool, "MSIX signature trust verification", &arguments, None).map_err(untrusted)?;
+        run(tool, "MSIX signature trust verification", &arguments).map_err(untrusted)?;
     }
     Ok(())
 }
@@ -184,7 +151,6 @@ fn verify_signer(tool: &Path, package: &Path, publisher: &str, require_current_v
             "inspect-pkcs7".to_owned(),
             path_argument(&signature_path)?,
         ],
-        None,
     )?;
     let report: serde_json::Value = serde_json::from_slice(&output)
         .map_err(|_| PublisherError::Tool("psign-tool returned an unreadable signature report".to_owned()))?;
@@ -331,7 +297,7 @@ fn path_argument(path: &Path) -> Result<String> {
 }
 
 /// Runs `psign-tool @<response file>` and returns standard output.
-fn run(tool: &Path, operation: &str, arguments: &[String], secret: Option<&str>) -> Result<Vec<u8>> {
+fn run(tool: &Path, operation: &str, arguments: &[String]) -> Result<Vec<u8>> {
     let workspace = Workspace::create()?;
     let response_path = workspace.write("arguments.rsp", response_file(arguments).as_bytes())?;
     // `Command` escapes arguments for `cmd.exe` when `tool` is a `.cmd` shim.
@@ -347,7 +313,7 @@ fn run(tool: &Path, operation: &str, arguments: &[String], secret: Option<&str>)
     Err(PublisherError::Tool(format!(
         "{operation} with psign-tool failed ({}): {}",
         output.status,
-        failure_message(&output.stdout, &output.stderr, secret)
+        failure_message(&output.stdout, &output.stderr)
     )))
 }
 
@@ -360,16 +326,14 @@ fn response_file(arguments: &[String]) -> String {
         .collect()
 }
 
-/// Uses standard error, or standard output when it is empty, with `secret` redacted.
-fn failure_message(stdout: &[u8], stderr: &[u8], secret: Option<&str>) -> String {
-    let mut message = String::from_utf8_lossy(stderr).trim().to_owned();
+/// Uses standard error, or standard output when it is empty.
+fn failure_message(stdout: &[u8], stderr: &[u8]) -> String {
+    let message = String::from_utf8_lossy(stderr).trim().to_owned();
     if message.is_empty() {
-        message = String::from_utf8_lossy(stdout).trim().to_owned();
+        String::from_utf8_lossy(stdout).trim().to_owned()
+    } else {
+        message
     }
-    if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
-        message = message.replace(secret, "<redacted>");
-    }
-    message
 }
 
 /// A private temporary directory removed on drop.
@@ -513,16 +477,10 @@ mod tests {
     }
 
     #[test]
-    fn failure_message_prefers_stderr_and_redacts_the_secret() {
-        assert_eq!(
-            failure_message(b"ignored", b" bad password s3cret\n", Some("s3cret")),
-            "bad password <redacted>"
-        );
-        assert_eq!(
-            failure_message(b"stdout s3cret", b"  ", Some("s3cret")),
-            "stdout <redacted>"
-        );
-        assert_eq!(failure_message(b"", b"no secret", None), "no secret");
+    fn failure_message_prefers_stderr_over_stdout() {
+        assert_eq!(failure_message(b"ignored", b" digest mismatch\n"), "digest mismatch");
+        assert_eq!(failure_message(b"stdout detail", b"  "), "stdout detail");
+        assert_eq!(failure_message(b"", b"verification error"), "verification error");
     }
 
     #[test]
@@ -546,30 +504,30 @@ mod tests {
         fs::write(
             &tool,
             format!(
-                "@echo off\r\nsetlocal DisableDelayedExpansion\r\nset \"RSP=%~1\"\r\ncopy /y \"%RSP:~1%\" \"{}\" >nul\r\necho signing failed for s3cret 1>&2\r\nexit /b 7\r\n",
+                "@echo off\r\nsetlocal DisableDelayedExpansion\r\nset \"RSP=%~1\"\r\ncopy /y \"%RSP:~1%\" \"{}\" >nul\r\necho digest verification failed 1>&2\r\nexit /b 7\r\n",
                 captured.display()
             ),
         )
         .expect("fake tool");
 
-        let error = sign(
+        let error = verify(
             &tool,
             Path::new("C:\\a b\\source2.msix"),
-            Path::new("signer.pfx"),
-            "s3cret",
-            None,
+            SUBJECT,
+            &[],
+            SignaturePolicy::NewlySigned,
         )
         .expect_err("fake tool fails");
         let PublisherError::Tool(message) = error else {
             panic!("expected tool error");
         };
-        assert!(message.starts_with("MSIX signing with psign-tool failed"), "{message}");
         assert!(
-            message.contains("<redacted>") && !message.contains("s3cret"),
+            message.starts_with("MSIX digest verification with psign-tool failed"),
             "{message}"
         );
+        assert!(message.contains("digest verification failed"), "{message}");
         let response = fs::read_to_string(&captured).expect("captured response file");
-        assert!(response.contains("\"--password=s3cret\"\n"), "{response}");
+        assert!(response.contains("\"portable\"\n\"verify-msix\"\n"), "{response}");
         assert!(response.ends_with("\"C:\\a b\\source2.msix\"\n"), "{response}");
         fs::remove_dir_all(&root).expect("cleanup");
     }

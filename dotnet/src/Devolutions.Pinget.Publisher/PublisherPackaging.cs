@@ -1,10 +1,10 @@
 using System.IO.Compression;
 using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using System.Xml;
 using System.Xml.Linq;
 
 namespace Pinget.Publisher;
@@ -121,6 +121,115 @@ public static partial class PublisherPackaging
         return new PublisherVerifyResult(true, "published WinGet v2 static source", inventory.Count, marker["buildId"]?.GetValue<string>());
     }
 
+    public static PublisherPackageResult Package(PublisherPackageOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.StateDirectory))
+            throw new PublisherException("Publisher state directory must not be empty.");
+        if (string.IsNullOrWhiteSpace(options.MsixPath))
+            throw new PublisherException("MSIX output path must not be empty.");
+        var state = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.StateDirectory));
+        PublisherWorkspace.EnsureSafeExistingPath(state);
+        if (!Directory.Exists(state))
+            throw new PublisherException($"Publisher state does not exist: {state}");
+        var msixFullPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.MsixPath));
+        var msixParent = Path.GetDirectoryName(msixFullPath)
+            ?? throw new PublisherException("MSIX output path must not be a filesystem root.");
+        EnsureSafePathOrAncestors(msixFullPath);
+        if (Directory.Exists(msixFullPath))
+            throw new PublisherException($"MSIX output path is a directory: {msixFullPath}");
+        PublisherWorkspace.EnsureDisjoint(state, msixFullPath, "state", "msix");
+
+        string? destination = null;
+        if (options.DestinationDirectory is not null)
+        {
+            if (string.IsNullOrWhiteSpace(options.DestinationDirectory))
+                throw new PublisherException("Publication destination must not be empty.");
+            destination = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.DestinationDirectory));
+            if (Path.GetDirectoryName(destination) is null)
+                throw new PublisherException("Publication destination must not be a filesystem root.");
+            EnsureSafePathOrAncestors(destination);
+            if (File.Exists(destination))
+                throw new PublisherException($"Publication destination is a file: {destination}");
+            PublisherWorkspace.EnsureDisjoint(state, destination, "state", "destination");
+            PublisherWorkspace.EnsureDisjoint(destination, msixFullPath, "destination", "msix");
+        }
+
+        ValidateIdentity(options.PackageName, options.Publisher);
+        var version = ParsePackageVersion(options.PackageVersion);
+
+        using (var existingState = PublisherWorkspace.OpenState(state, create: false))
+        {
+        }
+        using var writerLock = PublisherWorkspace.AcquireLock(state);
+        var workspace = new PublisherWorkspace(state);
+        var buildId = options.BuildId ?? workspace.Status().LastBuildId
+            ?? throw new PublisherException("Publisher state has no successful build to package.");
+        _ = workspace.Verify(buildId);
+
+        var buildPath = Path.Combine(state, "builds", buildId);
+        var snapshotArtifacts = ReadSnapshotArtifacts(buildPath);
+        var expectedIndexHash = ReadSnapshotIndexHash(buildPath);
+
+        if (destination is not null && Directory.Exists(destination))
+        {
+            var markerPath = Path.Combine(destination, MarkerName);
+            var rawMarker = ExistingDestinationMarker(markerPath);
+            var effectiveMarker = rawMarker is null ? null : ResolvePendingCommit(destination, rawMarker);
+            if (effectiveMarker is null)
+            {
+                EnsureAdoptableUnownedDestination(destination, snapshotArtifacts, allowUncommittedMarker: rawMarker is not null);
+            }
+            else
+            {
+                var existingIdentity = effectiveMarker["packageName"]?.GetValue<string>();
+                var existingPublisher = effectiveMarker["publisher"]?.GetValue<string>();
+                if (!string.Equals(existingIdentity, options.PackageName, StringComparison.Ordinal)
+                    || !string.Equals(existingPublisher, options.Publisher, StringComparison.Ordinal))
+                    throw new PublisherException("The destination is already owned by a different source package identity or publisher.");
+                var oldVersionText = effectiveMarker["packageVersion"]?.GetValue<string>();
+                if (oldVersionText is null || !Version.TryParse(oldVersionText, out var oldVersion))
+                    throw new PublisherException("Existing publisher marker has an invalid source package version.");
+                var comparison = version.CompareTo(oldVersion);
+                if (comparison < 0)
+                    throw new PublisherException($"Source package version {version} must be greater than published version {oldVersion}.");
+                if (comparison == 0
+                    && !string.Equals(effectiveMarker["buildId"]?.GetValue<string>(), buildId, StringComparison.Ordinal))
+                    throw new PublisherException("The source package version has already been used for different build content.");
+            }
+        }
+
+        var indexBytes = File.ReadAllBytes(Path.Combine(buildPath, "Public", "index.db"));
+        var actualIndexHash = Convert.ToHexString(SHA256.HashData(indexBytes)).ToLowerInvariant();
+        if (!string.Equals(actualIndexHash, expectedIndexHash, StringComparison.Ordinal))
+            throw new PublisherException("Snapshot v2 index hash does not match snapshot metadata.");
+
+        var msixBytes = MsixPackageWriter.Write(
+        [
+            ("AppxManifest.xml", AppxManifest(options.PackageName, options.Publisher, version)),
+            ("Assets/StoreLogo.png", LogoPng),
+            ("Assets/Logo150.png", LogoPng),
+            ("Assets/Logo44.png", LogoPng),
+            ("Public/index.db", indexBytes),
+        ]);
+
+        Directory.CreateDirectory(msixParent);
+        PublisherWorkspace.EnsureSafeExistingPath(msixParent);
+        EnsureSafePathOrAncestors(msixFullPath);
+        if (Directory.Exists(msixFullPath))
+            throw new PublisherException($"MSIX output path is a directory: {msixFullPath}");
+        WriteBytesAtomically(msixFullPath, msixBytes);
+
+        var packageHash = Convert.ToHexString(SHA256.HashData(msixBytes)).ToLowerInvariant();
+        return new PublisherPackageResult(
+            buildId,
+            msixFullPath,
+            options.PackageName,
+            options.Publisher,
+            version.ToString(),
+            expectedIndexHash,
+            packageHash);
+    }
+
     public static PublisherVerifyResult Publish(PublisherPublishOptions options) =>
         Publish(options, afterCopy: null);
 
@@ -145,34 +254,39 @@ public static partial class PublisherPackaging
         Action<string, string>? afterCopy,
         Action<CommitStep, string>? onCommitStep = null)
     {
-        var state = Path.GetFullPath(options.StateDirectory);
+        if (string.IsNullOrWhiteSpace(options.StateDirectory))
+            throw new PublisherException("Publisher state directory must not be empty.");
+        if (string.IsNullOrWhiteSpace(options.DestinationDirectory))
+            throw new PublisherException("Publication destination must not be empty.");
+        if (string.IsNullOrWhiteSpace(options.MsixPath))
+            throw new PublisherException("Source MSIX path must not be empty.");
+        var state = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.StateDirectory));
         var destination = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.DestinationDirectory));
+        var msixFullPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.MsixPath));
+        var destinationParent = Path.GetDirectoryName(destination)
+            ?? throw new PublisherException("Publication destination must not be a filesystem root.");
+        if (Path.GetDirectoryName(msixFullPath) is null)
+            throw new PublisherException("Source MSIX path must not be a filesystem root.");
         PublisherWorkspace.EnsureDisjoint(state, destination, "state", "destination");
+        PublisherWorkspace.EnsureDisjoint(state, msixFullPath, "state", "msix");
+        PublisherWorkspace.EnsureDisjoint(destination, msixFullPath, "destination", "msix");
         PublisherWorkspace.EnsureSafeExistingPath(state);
         if (!Directory.Exists(state))
             throw new PublisherException($"Publisher state does not exist: {state}");
-        ValidateIdentity(options.PackageName, options.Publisher);
-        var version = ParsePackageVersion(options.PackageVersion);
-        if (options.UnsignedDevelopment == (options.PfxPath is not null))
-            throw new PublisherException("Choose exactly one: --unsigned-development or --pfx with a signing password environment variable.");
-        if (options.PfxPath is not null && string.IsNullOrWhiteSpace(options.PasswordEnvironmentVariable))
-            throw new PublisherException("Signing requires --password-env naming the environment variable containing the PFX password.");
-        if (options.UnsignedDevelopment && options.PasswordEnvironmentVariable is not null)
-            throw new PublisherException("--unsigned-development cannot be combined with --password-env.");
-        if (options.TimestampUrl is not null
-            && (options.UnsignedDevelopment
-                || !Uri.TryCreate(options.TimestampUrl, UriKind.Absolute, out var timestampUri)
-                || (timestampUri.Scheme != Uri.UriSchemeHttps && timestampUri.Scheme != Uri.UriSchemeHttp)
-                || options.TimestampUrl.Any(char.IsWhiteSpace)))
-            throw new PublisherException("--timestamp-url requires signed publication and an HTTP(S) URL.");
+        EnsureSafePathOrAncestors(destination);
+        if (File.Exists(destination))
+            throw new PublisherException($"Publication destination is a file: {destination}");
+        EnsureSafePathOrAncestors(msixFullPath);
+        if (Directory.Exists(msixFullPath) || !File.Exists(msixFullPath))
+            throw new PublisherException($"Source MSIX does not exist: {msixFullPath}");
+
         using (var existingState = PublisherWorkspace.OpenState(state, create: false))
         {
         }
         using var writerLock = PublisherWorkspace.AcquireLock(state);
-        var destinationParent = Path.GetDirectoryName(destination)
-            ?? throw new PublisherException("Publication destination must not be a filesystem root.");
         PublisherWorkspace.EnsureSafeExistingPath(destinationParent);
         Directory.CreateDirectory(destinationParent);
+        PublisherWorkspace.EnsureSafeExistingPath(destinationParent);
         var destinationLockPath = Path.Combine(destinationParent, Path.GetFileName(destination) + ".pinget-publisher.lock");
         if (File.Exists(destinationLockPath) && (File.GetAttributes(destinationLockPath) & FileAttributes.ReparsePoint) != 0)
             throw new PublisherException("Destination lock cannot be a reparse point.");
@@ -186,58 +300,9 @@ public static partial class PublisherPackaging
             ?? throw new PublisherException("Publisher state has no successful build to publish.");
         _ = workspace.Verify(buildId);
 
-        PublisherWorkspace.EnsureSafeExistingPath(destination);
-        Directory.CreateDirectory(destination);
-        PublisherWorkspace.EnsureSafeExistingPath(destination);
         var buildPath = Path.Combine(state, "builds", buildId);
         var snapshotArtifacts = ReadSnapshotArtifacts(buildPath);
-        var markerPath = Path.Combine(destination, MarkerName);
-        // An interrupted package swap is completed or rolled back before anything else looks at the marker.
-        var marker = FinalizePendingCommit(destination, markerPath, ExistingDestinationMarker(markerPath));
-        if (marker is null)
-        {
-            EnsureAdoptableUnownedDestination(destination, snapshotArtifacts);
-            RemoveStalePublicationTemporaries(destination, new JsonObject { ["artifacts"] = new JsonObject() });
-        }
-        else
-        {
-            RemoveStalePublicationTemporaries(destination, marker);
-        }
-        var oldBuildId = marker?["buildId"]?.GetValue<string>();
-        var oldVersionText = marker?["packageVersion"]?.GetValue<string>();
-        if (marker is not null)
-        {
-            var reuse = string.Equals(oldBuildId, buildId, StringComparison.Ordinal)
-                && Version.TryParse(oldVersionText, out var publishedVersion) && version.CompareTo(publishedVersion) == 0;
-            // The package about to be replaced only needs intact digests and the expected signer: an
-            // expired or rotated signing certificate must not block the next publication. Fully copied
-            // artifacts of this snapshot left by an interrupted publication are adopted.
-            var verified = VerifyDestination(
-                destination,
-                options.PsignToolPath,
-                trustedAnchors,
-                reuse ? SignaturePolicy.Published : SignaturePolicy.Superseded,
-                snapshotArtifacts);
-            var existingIdentity = marker["packageName"]?.GetValue<string>();
-            var existingPublisher = marker["publisher"]?.GetValue<string>();
-            if (!string.Equals(existingIdentity, options.PackageName, StringComparison.Ordinal)
-                || !string.Equals(existingPublisher, options.Publisher, StringComparison.Ordinal))
-                throw new PublisherException("The destination is already owned by a different source package identity or publisher.");
-            if (oldVersionText is null || !Version.TryParse(oldVersionText, out var oldVersion))
-                throw new PublisherException("Existing publisher marker has an invalid source package version.");
-            var comparison = version.CompareTo(oldVersion);
-            if (comparison < 0)
-                throw new PublisherException($"Source package version {version} must be greater than published version {oldVersion}.");
-            if (comparison == 0)
-            {
-                if (!string.Equals(oldBuildId, buildId, StringComparison.Ordinal)
-                    || (marker["unsignedDevelopment"]?.GetValue<bool>() ?? false) != options.UnsignedDevelopment)
-                    throw new PublisherException("The source package version has already been used for different build content or signing mode.");
-                PublisherWorkspace.RecordPublished(state, buildId);
-                return verified;
-            }
-        }
-        RejectCaseVariantPaths(destination, marker, snapshotArtifacts);
+        var expectedIndexHash = ReadSnapshotIndexHash(buildPath);
 
         var stagingRoot = Path.Combine(state, $".publish-{Guid.NewGuid():N}");
         Directory.CreateDirectory(stagingRoot);
@@ -247,24 +312,67 @@ public static partial class PublisherPackaging
         try
         {
             var stagedPackage = Path.Combine(stagingRoot, "source2.msix");
-            File.WriteAllBytes(stagedPackage, MsixPackageWriter.Write(
-            [
-                ("AppxManifest.xml", AppxManifest(options, version)),
-                ("Assets/StoreLogo.png", LogoPng),
-                ("Assets/Logo150.png", LogoPng),
-                ("Assets/Logo44.png", LogoPng),
-                ("Public/index.db", File.ReadAllBytes(Path.Combine(buildPath, "Public", "index.db"))),
-            ]));
+            EnsureSafePathOrAncestors(msixFullPath);
+            if (Directory.Exists(msixFullPath) || !File.Exists(msixFullPath))
+                throw new PublisherException($"Source MSIX does not exist: {msixFullPath}");
+            File.Copy(msixFullPath, stagedPackage, overwrite: false);
+            if (OperatingSystem.IsWindows())
+                File.SetAttributes(stagedPackage, FileAttributes.Normal);
+
+            var (packageName, publisher, version) = InspectStagedMsix(stagedPackage, expectedIndexHash, options.UnsignedDevelopment);
             if (!options.UnsignedDevelopment)
+                PsignTool.Verify(psignTool!, stagedPackage, publisher, trustedAnchors, SignaturePolicy.NewlySigned);
+
+            PublisherWorkspace.EnsureSafeExistingPath(destination);
+            Directory.CreateDirectory(destination);
+            PublisherWorkspace.EnsureSafeExistingPath(destination);
+            var markerPath = Path.Combine(destination, MarkerName);
+            // An interrupted package swap is completed or rolled back before anything else looks at the marker.
+            var marker = FinalizePendingCommit(destination, markerPath, ExistingDestinationMarker(markerPath));
+            if (marker is null)
             {
-                // A PFX exported without a password is signed with an empty one, like the Rust publisher.
-                var password = Environment.GetEnvironmentVariable(options.PasswordEnvironmentVariable!)
-                    ?? throw new PublisherException($"Signing password environment variable '{options.PasswordEnvironmentVariable}' is not set.");
-                if (!File.Exists(Path.GetFullPath(options.PfxPath!)))
-                    throw new PublisherException($"PFX file does not exist: {Path.GetFullPath(options.PfxPath!)}");
-                PsignTool.Sign(psignTool!, stagedPackage, Path.GetFullPath(options.PfxPath!), password, options.TimestampUrl);
-                PsignTool.Verify(psignTool!, stagedPackage, options.Publisher, trustedAnchors, SignaturePolicy.NewlySigned);
+                EnsureAdoptableUnownedDestination(destination, snapshotArtifacts);
+                RemoveStalePublicationTemporaries(destination, new JsonObject { ["artifacts"] = new JsonObject() });
             }
+            else
+            {
+                RemoveStalePublicationTemporaries(destination, marker);
+            }
+            var oldBuildId = marker?["buildId"]?.GetValue<string>();
+            var oldVersionText = marker?["packageVersion"]?.GetValue<string>();
+            if (marker is not null)
+            {
+                var reuse = string.Equals(oldBuildId, buildId, StringComparison.Ordinal)
+                    && Version.TryParse(oldVersionText, out var publishedVersion) && version.CompareTo(publishedVersion) == 0;
+                // The package about to be replaced only needs intact digests and the expected signer: an
+                // expired or rotated signing certificate must not block the next publication. Fully copied
+                // artifacts of this snapshot left by an interrupted publication are adopted.
+                var verified = VerifyDestination(
+                    destination,
+                    options.PsignToolPath,
+                    trustedAnchors,
+                    reuse ? SignaturePolicy.Published : SignaturePolicy.Superseded,
+                    snapshotArtifacts);
+                var existingIdentity = marker["packageName"]?.GetValue<string>();
+                var existingPublisher = marker["publisher"]?.GetValue<string>();
+                if (!string.Equals(existingIdentity, packageName, StringComparison.Ordinal)
+                    || !string.Equals(existingPublisher, publisher, StringComparison.Ordinal))
+                    throw new PublisherException("The destination is already owned by a different source package identity or publisher.");
+                if (oldVersionText is null || !Version.TryParse(oldVersionText, out var oldVersion))
+                    throw new PublisherException("Existing publisher marker has an invalid source package version.");
+                var comparison = version.CompareTo(oldVersion);
+                if (comparison < 0)
+                    throw new PublisherException($"Source package version {version} must be greater than published version {oldVersion}.");
+                if (comparison == 0)
+                {
+                    if (!string.Equals(oldBuildId, buildId, StringComparison.Ordinal)
+                        || (marker["unsignedDevelopment"]?.GetValue<bool>() ?? false) != options.UnsignedDevelopment)
+                        throw new PublisherException("The source package version has already been used for different build content or signing mode.");
+                    PublisherWorkspace.RecordPublished(state, buildId);
+                    return verified;
+                }
+            }
+            RejectCaseVariantPaths(destination, marker, snapshotArtifacts);
 
             var existingArtifacts = marker?["artifacts"]?.DeepClone() as JsonObject ?? new JsonObject();
             foreach (var item in snapshotArtifacts)
@@ -307,11 +415,11 @@ public static partial class PublisherPackaging
             {
                 ["schemaVersion"] = 1,
                 ["owner"] = "Pinget.Publisher",
-                ["packageName"] = options.PackageName,
-                ["publisher"] = options.Publisher,
+                ["packageName"] = packageName,
+                ["publisher"] = publisher,
                 ["packageVersion"] = version.ToString(),
                 ["buildId"] = buildId,
-                ["indexHash"] = ReadSnapshotIndexHash(buildPath),
+                ["indexHash"] = expectedIndexHash,
                 ["unsignedDevelopment"] = options.UnsignedDevelopment,
                 ["publishedUtc"] = DateTimeOffset.UtcNow.ToString("O"),
                 ["artifacts"] = existingArtifacts,
@@ -436,7 +544,10 @@ public static partial class PublisherPackaging
     /// nothing but what an interrupted first publication of this snapshot left behind: publisher
     /// temporaries, Rust staging directories and fully copied artifacts of the snapshot.
     /// </summary>
-    private static void EnsureAdoptableUnownedDestination(string destination, JsonObject snapshotArtifacts)
+    private static void EnsureAdoptableUnownedDestination(
+        string destination,
+        JsonObject snapshotArtifacts,
+        bool allowUncommittedMarker = false)
     {
         var pending = new Stack<string>();
         pending.Push(destination);
@@ -456,7 +567,8 @@ public static partial class PublisherPackaging
                     continue;
                 }
                 var relative = Path.GetRelativePath(destination, entry).Replace('\\', '/');
-                var adoptable = IsPublicationTemporaryName(name, atRoot)
+                var adoptable = (allowUncommittedMarker && atRoot && name == MarkerName)
+                    || IsPublicationTemporaryName(name, atRoot)
                     || (snapshotArtifacts[relative] is JsonValue expected
                         && string.Equals(expected.GetValue<string>(), HashFile(entry), StringComparison.Ordinal));
                 if (!adoptable)
@@ -595,39 +707,166 @@ public static partial class PublisherPackaging
             ?? throw new PublisherException("Snapshot index hash is missing.");
     }
 
+    private static (string PackageName, string Publisher, Version Version) InspectStagedMsix(
+        string stagedPackage,
+        string expectedIndexHash,
+        bool unsignedDevelopment)
+    {
+        string? rawName;
+        string? rawPublisher;
+        string? rawVersion;
+        string actualIndexHash;
+        bool hasSignature;
+        try
+        {
+            using var archive = ZipFile.OpenRead(stagedPackage);
+            (rawName, rawPublisher, rawVersion, actualIndexHash) = ReadMsixPayload(archive);
+            hasSignature = HasSignatureArtifacts(archive);
+        }
+        catch (PublisherException) { throw; }
+        catch (Exception ex) { throw new PublisherException($"Could not verify source MSIX contents: {ex.Message}", ex); }
+
+        var packageName = rawName
+            ?? throw new PublisherException("MSIX AppxManifest.xml Identity has no Name.");
+        var publisher = rawPublisher
+            ?? throw new PublisherException("MSIX AppxManifest.xml Identity has no Publisher.");
+        var versionText = rawVersion
+            ?? throw new PublisherException("MSIX AppxManifest.xml Identity has no Version.");
+        ValidateIdentity(packageName, publisher);
+        var version = ParsePackageVersion(versionText);
+        if (!string.Equals(versionText, version.ToString(), StringComparison.Ordinal))
+            throw new PublisherException($"Source MSIX manifest version '{versionText}' is not in canonical four-part form '{version}'.");
+        if (!string.Equals(actualIndexHash, expectedIndexHash, StringComparison.Ordinal))
+            throw new PublisherException("MSIX contains a v2 index different from the published build.");
+        if (unsignedDevelopment && hasSignature)
+            throw new PublisherException("Cannot publish a signed MSIX with --unsigned-development; omit --unsigned-development so signature verification runs.");
+        return (packageName, publisher, version);
+    }
+
     private static void VerifyMsixContents(string packagePath, JsonObject marker)
     {
         try
         {
             using var archive = ZipFile.OpenRead(packagePath);
-            var manifestEntry = archive.GetEntry("AppxManifest.xml")
-                ?? throw new PublisherException("MSIX does not contain AppxManifest.xml.");
-            var indexEntry = archive.GetEntry("Public/index.db")
-                ?? throw new PublisherException("MSIX does not expose Public/index.db.");
-            using (var indexStream = indexEntry.Open())
-            {
-                var actualIndexHash = Convert.ToHexString(SHA256.HashData(indexStream)).ToLowerInvariant();
-                if (!string.Equals(actualIndexHash, marker["indexHash"]?.GetValue<string>(), StringComparison.Ordinal))
-                    throw new PublisherException("MSIX contains a v2 index different from the published build.");
-            }
-
-            using var manifestStream = manifestEntry.Open();
-            var xml = XDocument.Load(manifestStream);
-            XNamespace foundation = "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
-            XNamespace uap3 = "http://schemas.microsoft.com/appx/manifest/uap/windows10/3";
-            var identity = xml.Root?.Element(foundation + "Identity")
-                ?? throw new PublisherException("MSIX AppxManifest.xml has no Identity.");
-            if (!string.Equals((string?)identity.Attribute("Name"), marker["packageName"]?.GetValue<string>(), StringComparison.Ordinal)
-                || !string.Equals((string?)identity.Attribute("Publisher"), marker["publisher"]?.GetValue<string>(), StringComparison.Ordinal)
-                || !string.Equals((string?)identity.Attribute("Version"), marker["packageVersion"]?.GetValue<string>(), StringComparison.Ordinal))
+            if (marker["unsignedDevelopment"]?.GetValue<bool>() == true && HasSignatureArtifacts(archive))
+                throw new PublisherException("Unsigned development destination contains a signed source2.msix.");
+            var (packageName, publisher, versionText, actualIndexHash) = ReadMsixPayload(archive);
+            if (!string.Equals(actualIndexHash, marker["indexHash"]?.GetValue<string>(), StringComparison.Ordinal))
+                throw new PublisherException("MSIX contains a v2 index different from the published build.");
+            if (!string.Equals(packageName, marker["packageName"]?.GetValue<string>(), StringComparison.Ordinal)
+                || !string.Equals(publisher, marker["publisher"]?.GetValue<string>(), StringComparison.Ordinal)
+                || !string.Equals(versionText, marker["packageVersion"]?.GetValue<string>(), StringComparison.Ordinal))
                 throw new PublisherException("MSIX identity does not match the publisher ownership marker.");
-            var extension = xml.Descendants(uap3 + "AppExtension").SingleOrDefault();
-            if (!string.Equals((string?)extension?.Attribute("Name"), "com.microsoft.winget.source", StringComparison.Ordinal)
-                || !string.Equals((string?)extension?.Attribute("PublicFolder"), "Public", StringComparison.Ordinal))
-                throw new PublisherException("MSIX does not expose the expected WinGet preindexed source extension.");
+            ValidateIdentity(packageName!, publisher!);
+            var parsedVersion = ParsePackageVersion(versionText!);
+            if (!string.Equals(versionText, parsedVersion.ToString(), StringComparison.Ordinal))
+                throw new PublisherException($"Source MSIX manifest version '{versionText}' is not in canonical four-part form '{parsedVersion}'.");
         }
         catch (PublisherException) { throw; }
         catch (Exception ex) { throw new PublisherException($"Could not verify source MSIX contents: {ex.Message}", ex); }
+    }
+
+    private static (string? PackageName, string? Publisher, string? VersionText, string IndexHash) ReadMsixPayload(ZipArchive archive)
+    {
+        var seenEntries = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in archive.Entries)
+        {
+            if (entry.FullName.Contains('\\', StringComparison.Ordinal))
+                throw new PublisherException($"MSIX contains a backslash entry path: {entry.FullName}");
+            var lower = entry.FullName.ToLowerInvariant();
+            if (!seenEntries.Add(lower))
+                throw new PublisherException($"MSIX contains duplicate or case-conflicting entry: {entry.FullName}");
+        }
+
+        var manifestEntries = archive.Entries
+            .Where(entry => AsciiEqualsIgnoreCase(entry.FullName, "AppxManifest.xml"))
+            .ToArray();
+        if (manifestEntries.Length == 0)
+            throw new PublisherException("MSIX does not contain AppxManifest.xml.");
+        if (manifestEntries.Length > 1)
+            throw new PublisherException("MSIX contains duplicate AppxManifest.xml entries.");
+        if (!string.Equals(manifestEntries[0].FullName, "AppxManifest.xml", StringComparison.Ordinal))
+            throw new PublisherException("MSIX does not contain AppxManifest.xml.");
+
+        var indexEntries = archive.Entries
+            .Where(entry => AsciiEqualsIgnoreCase(entry.FullName, "Public/index.db"))
+            .ToArray();
+        if (indexEntries.Length == 0)
+            throw new PublisherException("MSIX does not expose Public/index.db.");
+        if (indexEntries.Length > 1)
+            throw new PublisherException("MSIX contains duplicate Public/index.db entries.");
+        if (!string.Equals(indexEntries[0].FullName, "Public/index.db", StringComparison.Ordinal))
+            throw new PublisherException("MSIX does not expose Public/index.db.");
+
+        string actualIndexHash;
+        using (var indexStream = indexEntries[0].Open())
+        {
+            actualIndexHash = Convert.ToHexString(SHA256.HashData(indexStream)).ToLowerInvariant();
+        }
+
+        using var manifestStream = manifestEntries[0].Open();
+        var readerSettings = new XmlReaderSettings
+        {
+            DtdProcessing = DtdProcessing.Prohibit,
+            XmlResolver = null,
+        };
+        using var xmlReader = XmlReader.Create(manifestStream, readerSettings);
+        var xml = XDocument.Load(xmlReader);
+        XNamespace foundation = "http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+        XNamespace uap3 = "http://schemas.microsoft.com/appx/manifest/uap/windows10/3";
+        if (xml.Root is null || xml.Root.Name != foundation + "Package")
+            throw new PublisherException("MSIX AppxManifest.xml has no Identity.");
+        var identities = xml.Descendants(foundation + "Identity").ToArray();
+        if (identities.Length == 0)
+            throw new PublisherException("MSIX AppxManifest.xml has no Identity.");
+        if (identities.Length > 1 || identities[0].Parent != xml.Root)
+            throw new PublisherException("MSIX AppxManifest.xml must contain a single Identity element.");
+        var identity = identities[0];
+        var extensions = xml.Descendants(uap3 + "AppExtension")
+            .Where(element => string.Equals((string?)element.Attribute("Name"), "com.microsoft.winget.source", StringComparison.Ordinal))
+            .ToArray();
+        if (extensions.Length != 1
+            || !string.Equals((string?)extensions[0].Attribute("PublicFolder"), "Public", StringComparison.Ordinal))
+            throw new PublisherException("MSIX does not expose the expected WinGet preindexed source extension.");
+
+        return (
+            (string?)identity.Attribute("Name"),
+            (string?)identity.Attribute("Publisher"),
+            (string?)identity.Attribute("Version"),
+            actualIndexHash);
+    }
+
+    private static bool HasSignatureArtifacts(ZipArchive archive) =>
+        archive.Entries.Any(entry =>
+        {
+            var normalized = entry.FullName.Replace('\\', '/');
+            return AsciiEqualsIgnoreCase(normalized, "AppxSignature.p7x")
+                || AsciiEqualsIgnoreCase(normalized, "AppxMetadata/CodeIntegrity.cat");
+        });
+
+    private static bool AsciiEqualsIgnoreCase(string left, string right)
+    {
+        if (left.Length != right.Length)
+            return false;
+        for (var index = 0; index < left.Length; index++)
+        {
+            var a = char.IsAsciiLetterUpper(left[index]) ? (char)(left[index] | 0x20) : left[index];
+            var b = char.IsAsciiLetterUpper(right[index]) ? (char)(right[index] | 0x20) : right[index];
+            if (a != b)
+                return false;
+        }
+        return true;
+    }
+
+    private static void EnsureSafePathOrAncestors(string path)
+    {
+        PublisherWorkspace.EnsureSafeExistingPath(path);
+        var parent = Path.GetDirectoryName(path);
+        if (parent is not null && Directory.Exists(parent))
+        {
+            if (new FileInfo(path).LinkTarget is not null || new DirectoryInfo(path).LinkTarget is not null)
+                throw new PublisherException($"Reparse points are not allowed in publisher paths: {path}");
+        }
     }
 
     private static void ValidateIdentity(string packageName, string publisher)
@@ -656,10 +895,10 @@ public static partial class PublisherPackaging
     private static IReadOnlyList<string> TrustedAnchors(IReadOnlyList<string>? trustedCertificateAuthorities) =>
         trustedCertificateAuthorities?.Select(Path.GetFullPath).ToArray() ?? [];
 
-    private static byte[] AppxManifest(PublisherPublishOptions options, Version version)
+    private static byte[] AppxManifest(string packageName, string publisher, Version version)
     {
-        var name = System.Security.SecurityElement.Escape(options.PackageName);
-        var publisher = System.Security.SecurityElement.Escape(options.Publisher);
+        var name = System.Security.SecurityElement.Escape(packageName);
+        var escapedPublisher = System.Security.SecurityElement.Escape(publisher);
         var versionText = version.ToString();
         var xml = $"""
             <?xml version="1.0" encoding="utf-8"?>
@@ -667,7 +906,7 @@ public static partial class PublisherPackaging
                      xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
                      xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
                      IgnorableNamespaces="uap uap3">
-              <Identity Name="{name}" ProcessorArchitecture="neutral" Publisher="{publisher}" Version="{versionText}" />
+              <Identity Name="{name}" ProcessorArchitecture="neutral" Publisher="{escapedPublisher}" Version="{versionText}" />
               <Properties>
                 <DisplayName>Pinget preindexed source</DisplayName>
                 <PublisherDisplayName>Pinget source publisher</PublisherDisplayName>

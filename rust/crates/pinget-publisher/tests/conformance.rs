@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pinget_publisher::PublisherError;
 use pinget_publisher::{BuildOptions, build, diff, status, verify};
 #[cfg(windows)]
-use pinget_publisher::{PublishOptions, Signing, publish, verify_published_destination};
+use pinget_publisher::{PackageOptions, PublishOptions, package, publish, verify_published_destination};
 use rusqlite::Connection;
 #[cfg(windows)]
 use serde_json::Value;
@@ -1017,8 +1017,35 @@ fn publish_rejects_identity_change_and_untracked_artifact_without_mutation() {
     let original_index = fs::read(destination.join("source2.msix")).expect("index should exist");
     let original_marker = fs::read(destination.join(".pinget-publisher.json")).expect("marker should exist");
 
+    let preflight_error = package(&PackageOptions {
+        state: state.clone(),
+        build_id: Some(first_build.build_id.clone()),
+        msix: temp.path.join("preflight-rejected.msix"),
+        name: "Pinget.Publisher.Other".to_owned(),
+        publisher: "CN=Pinget Publisher Conformance Test".to_owned(),
+        version: "1.0.0.0".to_owned(),
+        destination: Some(destination.clone()),
+    })
+    .expect_err("package --destination preflight must reject owned identity changes before signing");
+    assert!(
+        preflight_error.to_string().contains("different package identity"),
+        "unexpected preflight diagnostic: {preflight_error}"
+    );
+    assert!(!temp.path.join("preflight-rejected.msix").exists());
+
+    let changed_msix = temp.path.join("other-identity.msix");
+    package(&PackageOptions {
+        state: state.clone(),
+        build_id: Some(first_build.build_id.clone()),
+        msix: changed_msix.clone(),
+        name: "Pinget.Publisher.Other".to_owned(),
+        publisher: "CN=Pinget Publisher Conformance Test".to_owned(),
+        version: "1.0.0.0".to_owned(),
+        destination: None,
+    })
+    .expect("packaging without --destination should succeed");
     let mut changed_identity = unsigned_publish_options(&state, &destination, "1.0.0.0", &first_build.build_id);
-    changed_identity.name = "Pinget.Publisher.Other".to_owned();
+    changed_identity.msix = changed_msix;
     let identity_error = publish(&changed_identity).expect_err("owned package identity must remain stable");
     assert!(
         identity_error.to_string().contains("different package identity"),
@@ -1094,21 +1121,15 @@ fn publish_failed_packaging_tool_does_not_publish_or_record_build() {
         .join("System32")
         .join("where.exe");
     assert!(where_tool.is_file(), "where.exe should be available on Windows");
-    let pfx = temp.path.join("placeholder.pfx");
-    fs::write(&pfx, b"not a certificate").expect("placeholder PFX");
     let mut options = unsigned_publish_options(&state, &destination, "1.0.0.0", &build_report.build_id);
-    options.signing = Signing::Pfx {
-        path: pfx,
-        // Any set variable works: the controlled failing signing tool never reads it.
-        password_env: "WINDIR".to_owned(),
-    };
+    options.unsigned_development = false;
     options.psign_tool = Some(where_tool);
 
-    let error = publish(&options).expect_err("the controlled failing signing tool must fail");
+    let error = publish(&options).expect_err("the controlled failing verification tool must fail");
 
     assert!(
         error.to_string().contains("failed"),
-        "unexpected signing diagnostic: {error}"
+        "unexpected verification diagnostic: {error}"
     );
     assert!(!destination.join("source2.msix").exists());
     assert!(!destination.join(".pinget-publisher.json").exists());
@@ -1119,9 +1140,9 @@ fn publish_failed_packaging_tool_does_not_publish_or_record_build() {
             .is_none()
     );
 
-    options.signing = Signing::UnsignedDevelopment;
+    options.unsigned_development = true;
     options.psign_tool = None;
-    let retry = publish(&options).expect("retry without the failing tool should succeed");
+    let retry = publish(&options).expect("retry in unsigned development mode should succeed");
     assert!(retry.valid);
     assert_eq!(retry.build_id, build_report.build_id);
     assert!(
@@ -1492,17 +1513,29 @@ fn apply_mutation(input: &Path, mutation: &str) {
 
 #[cfg(windows)]
 fn unsigned_publish_options(state: &Path, destination: &Path, version: &str, build_id: &str) -> PublishOptions {
+    static NEXT_MSIX: AtomicU64 = AtomicU64::new(0);
+    let msix = state.parent().expect("temp root").join(format!(
+        "staged-{build_id}-{version}-{}.msix",
+        NEXT_MSIX.fetch_add(1, Ordering::Relaxed)
+    ));
+    package(&PackageOptions {
+        state: state.to_path_buf(),
+        build_id: Some(build_id.to_owned()),
+        msix: msix.clone(),
+        name: "Pinget.Publisher.Conformance".to_owned(),
+        publisher: "CN=Pinget Publisher Conformance Test".to_owned(),
+        version: version.to_owned(),
+        destination: None,
+    })
+    .expect("unsigned test MSIX should package");
     PublishOptions {
         state: state.to_path_buf(),
         build_id: Some(build_id.to_owned()),
         destination: destination.to_path_buf(),
-        name: "Pinget.Publisher.Conformance".to_owned(),
-        publisher: "CN=Pinget Publisher Conformance Test".to_owned(),
-        version: version.to_owned(),
-        signing: Signing::UnsignedDevelopment,
+        msix,
+        unsigned_development: true,
         psign_tool: None,
         trusted_ca: Vec::new(),
-        timestamp_url: None,
     }
 }
 

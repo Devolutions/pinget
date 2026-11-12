@@ -111,23 +111,51 @@ internal static class PublisherCommands
                 $"MSZIP: {(result.NativeMsZipAvailable ? "available" : "unavailable")}; psign-tool: {result.PsignToolPath ?? "not found"}; signed publishing available: {(result.SignedPublishAvailable ? "yes" : "no")}.");
         }));
 
+        var statePackage = new Option<string>("--state", "Publisher working directory") { IsRequired = true };
+        var buildPackage = new Option<string?>("--build", "Build snapshot ID (defaults to latest)");
+        var namePackage = new Option<string>("--name", "MSIX package identity name") { IsRequired = true };
+        var publisherPackage = new Option<string>("--publisher", "MSIX publisher distinguished name") { IsRequired = true };
+        var versionPackage = new Option<string>("--version", "Four-part MSIX package version") { IsRequired = true };
+        var msixPackage = new Option<string>("--msix", "Output path for the unsigned source MSIX") { IsRequired = true };
+        var destinationPackage = new Option<string?>("--destination", "Optional published directory for pre-flight ownership and version validation");
+        var package = new Command("package", "Package an unsigned source MSIX from a build snapshot");
+        foreach (var option in new Option[]
+                 {
+                     statePackage, buildPackage, namePackage, publisherPackage, versionPackage, msixPackage, destinationPackage,
+                 })
+            package.AddOption(option);
+        package.SetHandler(context => Run(context, outputOption, () =>
+        {
+            var result = PublisherPackaging.Package(new PublisherPackageOptions(
+                context.ParseResult.GetValueForOption(statePackage)!,
+                context.ParseResult.GetValueForOption(msixPackage)!,
+                context.ParseResult.GetValueForOption(namePackage)!,
+                context.ParseResult.GetValueForOption(publisherPackage)!,
+                context.ParseResult.GetValueForOption(versionPackage)!,
+                context.ParseResult.GetValueForOption(buildPackage),
+                context.ParseResult.GetValueForOption(destinationPackage)));
+            return (Object(
+                ("buildId", JsonValue.Create(result.BuildId)),
+                ("msixPath", JsonValue.Create(result.MsixPath)),
+                ("packageName", JsonValue.Create(result.PackageName)),
+                ("publisher", JsonValue.Create(result.Publisher)),
+                ("packageVersion", JsonValue.Create(result.PackageVersion)),
+                ("indexHash", JsonValue.Create(result.IndexHash)),
+                ("packageHash", JsonValue.Create(result.PackageHash))),
+                $"Packaged unsigned source MSIX for build {result.BuildId} at {result.MsixPath}.");
+        }));
+
         var statePublish = new Option<string>("--state", "Publisher working directory") { IsRequired = true };
         var destinationPublish = new Option<string>("--destination", "Static source output directory") { IsRequired = true };
-        var namePublish = new Option<string>("--name", "MSIX package identity name") { IsRequired = true };
-        var publisherPublish = new Option<string>("--publisher", "MSIX publisher distinguished name") { IsRequired = true };
-        var versionPublish = new Option<string>("--version", "Four-part MSIX package version") { IsRequired = true };
-        var pfxPublish = new Option<string?>("--pfx", "PFX file used to sign the source MSIX");
-        var passwordEnvPublish = new Option<string?>("--password-env", "Environment variable containing the PFX password");
+        var msixPublish = new Option<string>("--msix", "Signed source MSIX file (or unsigned MSIX with --unsigned-development)") { IsRequired = true };
         var unsignedPublish = new Option<bool>("--unsigned-development", "Allow explicitly unsigned development publishing");
         var psignToolPublish = PsignToolOption();
         var trustedCaPublish = TrustedCaOption();
-        var timestampPublish = new Option<string?>("--timestamp-url", "HTTP(S) RFC 3161 timestamp service URL");
         var buildPublish = new Option<string?>("--build", "Build snapshot ID (defaults to latest)");
-        var publish = new Command("publish", "Package and publish a source2.msix and immutable artifacts");
+        var publish = new Command("publish", "Publish a source2.msix and immutable artifacts");
         foreach (var option in new Option[]
                  {
-                     statePublish, destinationPublish, namePublish, publisherPublish, versionPublish,
-                     pfxPublish, passwordEnvPublish, unsignedPublish, psignToolPublish, trustedCaPublish, buildPublish, timestampPublish,
+                     statePublish, destinationPublish, msixPublish, unsignedPublish, psignToolPublish, trustedCaPublish, buildPublish,
                  })
             publish.AddOption(option);
         publish.SetHandler(context => Run(context, outputOption, () =>
@@ -135,15 +163,10 @@ internal static class PublisherCommands
             var result = PublisherPackaging.Publish(new PublisherPublishOptions(
                 context.ParseResult.GetValueForOption(statePublish)!,
                 context.ParseResult.GetValueForOption(destinationPublish)!,
-                context.ParseResult.GetValueForOption(namePublish)!,
-                context.ParseResult.GetValueForOption(publisherPublish)!,
-                context.ParseResult.GetValueForOption(versionPublish)!,
-                context.ParseResult.GetValueForOption(pfxPublish),
-                context.ParseResult.GetValueForOption(passwordEnvPublish),
+                context.ParseResult.GetValueForOption(msixPublish)!,
                 context.ParseResult.GetValueForOption(unsignedPublish),
                 context.ParseResult.GetValueForOption(psignToolPublish),
                 context.ParseResult.GetValueForOption(buildPublish),
-                context.ParseResult.GetValueForOption(timestampPublish),
                 context.ParseResult.GetValueForOption(trustedCaPublish)));
             return (Object(
                 ("valid", JsonValue.Create(result.Valid)),
@@ -158,6 +181,7 @@ internal static class PublisherCommands
         root.AddCommand(status);
         root.AddCommand(verify);
         root.AddCommand(doctor);
+        root.AddCommand(package);
         root.AddCommand(publish);
         return root;
     }

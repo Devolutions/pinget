@@ -1,4 +1,4 @@
-//! Builds and publishes signed WinGet v2 static preindexed sources.
+//! Builds, packages, and publishes WinGet v2 static preindexed sources.
 //!
 //! The publisher reads standard manifest YAML without opening client source
 //! state, writes immutable snapshots, and publishes only from those snapshots.
@@ -7,13 +7,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
-use quick_xml::Reader;
+use quick_xml::NsReader;
 use quick_xml::events::Event;
+use quick_xml::name::ResolveResult;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
@@ -167,16 +168,48 @@ pub struct VerifyReport {
     pub build_id: Option<String>,
 }
 
-/// Explicit packaging policy for a local publication.
+/// Inputs required to create an unsigned source MSIX from an immutable snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Signing {
-    /// Sign with the supplied PFX and obtain its password from the named environment variable.
-    Pfx { path: PathBuf, password_env: String },
-    /// Permit publishing an unsigned package for development only.
-    UnsignedDevelopment,
+pub struct PackageOptions {
+    /// Publisher state directory.
+    pub state: PathBuf,
+    /// Snapshot to package; `None` selects the latest successful snapshot.
+    pub build_id: Option<String>,
+    /// Output path for the unsigned MSIX package.
+    pub msix: PathBuf,
+    /// Stable AppX package identity name.
+    pub name: String,
+    /// Publisher distinguished name used by the package and signing certificate.
+    pub publisher: String,
+    /// Four-component AppX package version.
+    pub version: String,
+    /// Optional destination directory for pre-flight ownership and version validation.
+    pub destination: Option<PathBuf>,
 }
 
-/// Inputs required to package and publish an immutable snapshot.
+/// Summary of a packaged unsigned source MSIX.
+///
+/// The serialized form is the shared CLI JSON contract for `repository package`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageReport {
+    /// Snapshot packaged into the MSIX.
+    pub build_id: String,
+    /// Output path of the written unsigned MSIX.
+    pub msix_path: PathBuf,
+    /// AppX package identity name.
+    pub package_name: String,
+    /// AppX publisher distinguished name.
+    pub publisher: String,
+    /// Canonical four-part AppX package version.
+    pub package_version: String,
+    /// Lowercase hex SHA-256 of `Public/index.db`.
+    pub index_hash: String,
+    /// Lowercase hex SHA-256 of the written unsigned MSIX bytes.
+    pub package_hash: String,
+}
+
+/// Inputs required to verify a source MSIX and publish an immutable snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishOptions {
     /// Publisher state directory.
@@ -185,20 +218,14 @@ pub struct PublishOptions {
     pub build_id: Option<String>,
     /// Local static hosting directory.
     pub destination: PathBuf,
-    /// Stable AppX package identity name.
-    pub name: String,
-    /// Publisher distinguished name used by the package and signing certificate.
-    pub publisher: String,
-    /// Four-component AppX package version.
-    pub version: String,
-    /// Signing policy.
-    pub signing: Signing,
+    /// Signed source MSIX (or unsigned MSIX when `unsigned_development` is `true`).
+    pub msix: PathBuf,
+    /// Permit publishing an unsigned MSIX for development only.
+    pub unsigned_development: bool,
     /// Optional path to `psign-tool`; `PATH` and the .NET global tool directory are searched when omitted.
     pub psign_tool: Option<PathBuf>,
     /// Certificates trusted as signature anchors instead of the platform default.
     pub trusted_ca: Vec<PathBuf>,
-    /// Optional RFC 3161 timestamp URL used for signed publication.
-    pub timestamp_url: Option<String>,
 }
 
 /// Local publication result.
@@ -670,12 +697,153 @@ pub fn verify_published_destination(
     )
 }
 
-/// Packages, signs when requested, verifies and publishes one immutable snapshot.
+/// Builds an unsigned `source2.msix` from an immutable snapshot for external signing.
 ///
 /// # Errors
 ///
-/// Returns an error for unsupported hosts, invalid package identity/version,
-/// missing tools, failed signatures, unsafe destinations, or conflicting immutable files.
+/// Returns an error for invalid package identity/version, overlapping or unsafe paths,
+/// invalid snapshot state, or failed optional pre-flight destination checks.
+pub fn package(options: &PackageOptions) -> Result<PackageReport> {
+    if options.msix.as_os_str().is_empty() {
+        return Err(PublisherError::Invalid("MSIX output path must not be empty".to_owned()));
+    }
+    reject_reparse_components(&options.state)?;
+    reject_reparse_components(&options.msix)?;
+    if options.msix.is_dir() {
+        return Err(PublisherError::Invalid(format!(
+            "MSIX output path is a directory: {}",
+            options.msix.display()
+        )));
+    }
+    validate_package_identity(&options.name, &options.publisher)?;
+    let package_version = normalize_msix_version(&options.version)?;
+    let state = fs::canonicalize(&options.state)?;
+    let msix_abs = canonicalize_future_path(&options.msix)?;
+    if msix_abs.is_dir() {
+        return Err(PublisherError::Invalid(format!(
+            "MSIX output path is a directory: {}",
+            options.msix.display()
+        )));
+    }
+    ensure_disjoint_roots(&state, &msix_abs)?;
+    let destination_abs = match &options.destination {
+        Some(dest) => {
+            if dest.as_os_str().is_empty() {
+                return Err(PublisherError::Invalid(
+                    "destination directory must not be empty".to_owned(),
+                ));
+            }
+            reject_reparse_components(dest)?;
+            let abs = canonicalize_future_path(dest)?;
+            ensure_disjoint_roots(&state, &abs)?;
+            ensure_disjoint_roots(&abs, &msix_abs)?;
+            Some(abs)
+        }
+        None => None,
+    };
+
+    let connection = open_state(&state, false)?;
+    let _lock = acquire_lock(&state)?;
+    let build_id = match &options.build_id {
+        Some(value) => value.clone(),
+        None => connection.query_row("SELECT value FROM metadata WHERE name='lastBuildId'", [], |row| {
+            row.get::<_, String>(0)
+        })?,
+    };
+    validate_build_id(&build_id)?;
+    let snapshot = state.join("builds").join(&build_id);
+    verify_snapshot_path(&snapshot)?;
+    let snapshot_metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
+    validate_recorded_snapshot(&connection, &snapshot_metadata)?;
+
+    if let Some(dest) = destination_abs.filter(|path| path.exists()) {
+        let dest = fs::canonicalize(&dest)?;
+        let raw_marker = read_owner_marker(&dest.join(".pinget-publisher.json"))?;
+        let had_uncommitted_marker = raw_marker.is_some();
+        let effective_marker = match raw_marker {
+            Some(marker) => resolve_pending_commit(&dest, marker)?,
+            None => None,
+        };
+        match effective_marker {
+            Some(owner) => {
+                if owner.package_name != options.name || owner.publisher != options.publisher {
+                    return Err(PublisherError::Invalid(
+                        "destination is owned by a different package identity".to_owned(),
+                    ));
+                }
+                match compare_quad_version(&package_version, &owner.package_version)? {
+                    std::cmp::Ordering::Less => {
+                        return Err(PublisherError::Invalid(format!(
+                            "package version {package_version} must be greater than previously published version {}",
+                            owner.package_version
+                        )));
+                    }
+                    std::cmp::Ordering::Equal if owner.build_id != build_id => {
+                        return Err(PublisherError::Invalid(
+                            "the package version has already been used for different build content".to_owned(),
+                        ));
+                    }
+                    std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {}
+                }
+            }
+            None => {
+                ensure_adoptable_unowned_destination(&dest, &snapshot_metadata.artifacts, had_uncommitted_marker)?;
+            }
+        }
+    }
+
+    let index_bytes = fs::read(snapshot.join("Public").join("index.db"))?;
+    let index_hash = sha256_hex(&index_bytes);
+    if index_hash != snapshot_metadata.index_hash {
+        return Err(PublisherError::Invalid("snapshot index hash mismatch".to_owned()));
+    }
+    let mut package_files = appx_assets(&options.name, &options.publisher, &package_version)?;
+    package_files.push(("Public/index.db".to_owned(), index_bytes));
+    let msix_bytes = msix::write_package(&package_files)?;
+    let package_hash = sha256_hex(&msix_bytes);
+
+    let parent = msix_abs.parent().ok_or_else(|| {
+        PublisherError::Invalid(format!(
+            "MSIX output path has no parent directory: {}",
+            options.msix.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    reject_reparse_components(&msix_abs)?;
+    let file_name = msix_abs
+        .file_name()
+        .ok_or_else(|| PublisherError::Invalid(format!("invalid MSIX output path: {}", options.msix.display())))?
+        .to_string_lossy();
+    let temp_msix = parent.join(format!(".{file_name}.{}.tmp", unique_temporary_suffix()));
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp_msix)?;
+        file.write_all(&msix_bytes)?;
+        file.sync_all()?;
+        drop(file);
+        atomic_replace(&temp_msix, &msix_abs)
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_msix);
+        return Err(error);
+    }
+
+    Ok(PackageReport {
+        build_id,
+        msix_path: display_path(&fs::canonicalize(&msix_abs)?),
+        package_name: options.name.clone(),
+        publisher: options.publisher.clone(),
+        package_version,
+        index_hash,
+        package_hash,
+    })
+}
+
+/// Verifies a source MSIX and publishes one immutable snapshot to a local static directory.
+///
+/// # Errors
+///
+/// Returns an error for invalid MSIX contents or identity/version, missing verification tools,
+/// untrusted or missing signatures, unsafe destinations, or conflicting immutable files.
 pub fn publish(options: &PublishOptions) -> Result<PublishReport> {
     publish_with_hooks(options, |_| Ok(()), |_, _| {})
 }
@@ -699,26 +867,26 @@ fn publish_with_hooks(
 ) -> Result<PublishReport> {
     reject_reparse_components(&options.state)?;
     reject_reparse_components(&options.destination)?;
-    validate_package_identity(&options.name, &options.publisher)?;
-    // Publish the canonical four-part version so the AppX identity, the ownership marker and
-    // later comparisons agree with the .NET publisher (`01.0.0.0` -> `1.0.0.0`).
-    let normalized = PublishOptions {
-        version: normalize_msix_version(&options.version)?,
-        ..options.clone()
-    };
-    let options = &normalized;
-    if let Some(url) = &options.timestamp_url
-        && (!matches!(options.signing, Signing::Pfx { .. })
-            || !(url.starts_with("https://") || url.starts_with("http://"))
-            || url.chars().any(char::is_whitespace))
-    {
-        return Err(PublisherError::Invalid(
-            "--timestamp-url requires signed publication and an HTTP(S) URL".to_owned(),
-        ));
+    reject_reparse_components(&options.msix)?;
+    if !options.msix.exists() || options.msix.is_dir() {
+        return Err(PublisherError::Invalid(format!(
+            "source MSIX does not exist: {}",
+            options.msix.display()
+        )));
     }
     let state = fs::canonicalize(&options.state)?;
     let destination_abs = canonicalize_future_path(&options.destination)?;
+    let msix_abs = fs::canonicalize(&options.msix)?;
     ensure_disjoint_roots(&state, &destination_abs)?;
+    ensure_disjoint_roots(&state, &msix_abs)?;
+    ensure_disjoint_roots(&destination_abs, &msix_abs)?;
+
+    let psign_tool = if options.unsigned_development {
+        None
+    } else {
+        Some(psign::require_psign_tool(options.psign_tool.as_deref())?)
+    };
+
     let connection = open_state(&state, false)?;
     let _lock = acquire_lock(&state)?;
     let build_id = match &options.build_id {
@@ -733,115 +901,152 @@ fn publish_with_hooks(
     let snapshot_metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
     validate_recorded_snapshot(&connection, &snapshot_metadata)?;
 
-    read_owner_marker(&destination_abs.join(".pinget-publisher.json"))?;
-    let _destination_lock = acquire_destination_lock(&destination_abs)?;
-    fs::create_dir_all(&destination_abs)?;
-    let destination = fs::canonicalize(&destination_abs)?;
-    ensure_disjoint_roots(&state, &destination)?;
-    let marker_path = destination.join(".pinget-publisher.json");
-    // An interrupted package swap is completed or rolled back before anything else looks at the marker.
-    let prior = finalize_pending_commit(&destination, read_owner_marker(&marker_path)?)?;
-    match prior.as_ref() {
-        Some(owner) => remove_stale_publication_temporaries(&destination, &owner.artifacts)?,
-        None => {
-            ensure_adoptable_unowned_destination(&destination, &snapshot_metadata.artifacts)?;
-            remove_stale_publication_temporaries(&destination, &BTreeMap::new())?;
-        }
-    }
-    let unsigned_development = matches!(options.signing, Signing::UnsignedDevelopment);
-    if let Some(owner) = prior.as_ref() {
-        let reuse = owner.build_id == build_id
-            && compare_quad_version(&options.version, &owner.package_version)? == std::cmp::Ordering::Equal;
-        // The package about to be replaced only needs intact digests and the expected signer: an
-        // expired or rotated signing certificate must not block the next publication.
-        let policy = if reuse {
-            psign::SignaturePolicy::Published
-        } else {
-            psign::SignaturePolicy::Superseded
-        };
-        // Fully copied artifacts of this snapshot left by an interrupted publication are adopted.
-        let verified = verify_destination_with_tool(
-            &destination,
-            options.psign_tool.as_deref(),
-            &options.trusted_ca,
-            policy,
-            &snapshot_metadata.artifacts,
-        )?;
-        if owner.package_name != options.name || owner.publisher != options.publisher {
-            return Err(PublisherError::Invalid(
-                "destination is owned by a different package identity".to_owned(),
-            ));
-        }
-        if reuse {
-            if owner.unsigned_development != unsigned_development {
-                return Err(PublisherError::Invalid(
-                    "the package version has already been published with a different signing mode".to_owned(),
-                ));
-            }
-            mark_published(&state, &build_id)?;
-            return Ok(PublishReport {
-                valid: true,
-                subject: verified.subject,
-                artifact_count: verified.artifact_count,
-                build_id,
-                destination: display_path(&destination),
-                unsigned_development: owner.unsigned_development,
-                reused: true,
-            });
-        }
-        match compare_quad_version(&options.version, &owner.package_version)? {
-            std::cmp::Ordering::Less => {
-                return Err(PublisherError::Invalid(format!(
-                    "package version {} must be greater than previously published version {}",
-                    options.version, owner.package_version
-                )));
-            }
-            std::cmp::Ordering::Equal => {
-                return Err(PublisherError::Invalid(
-                    "the package version has already been used for different build content".to_owned(),
-                ));
-            }
-            std::cmp::Ordering::Greater => {}
-        }
-    }
-    let current_inventory = published_inventory(&destination)?;
-    if let Some(owner) = prior.as_ref() {
-        for (path, expected) in &owner.artifacts {
-            if current_inventory.get(path) != Some(expected) {
-                return Err(PublisherError::Invalid(format!(
-                    "owned publication file is missing or modified: {path}"
-                )));
-            }
-        }
-        for (path, actual) in &current_inventory {
-            if owner.artifacts.get(path) != Some(actual) && snapshot_metadata.artifacts.get(path) != Some(actual) {
-                return Err(PublisherError::Invalid(format!(
-                    "destination contains an untracked or modified file: {path}"
-                )));
-            }
-        }
-    }
-    reject_case_variant_paths(&destination, prior.as_ref(), &snapshot_metadata.artifacts)?;
-    // The package is built under the private state, like the .NET publisher, so an interrupted run
-    // leaves no staging directory in the published destination.
+    // Stage `--msix` into private state immediately so all inspection, verification, hashing,
+    // and promotion run against an immutable copy rather than a caller-mutable path.
     let temporary = state.join(format!(".publish-{build_id}.staging"));
     if temporary.exists() {
         remove_owned_staging(&temporary)?;
     }
     fs::create_dir(&temporary)?;
-    let result = package_and_publish(
-        &snapshot,
-        &temporary,
-        &destination,
-        options,
-        &build_id,
-        prior,
-        after_copy,
-        on_commit_step,
-    );
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&temporary);
-    }
+    let result = (|| -> Result<PublishReport> {
+        let staged_msix = temporary.join("source2.msix");
+        fs::copy(&msix_abs, &staged_msix)?;
+        let parsed_msix = parse_source_msix(&staged_msix)?;
+        validate_package_identity(&parsed_msix.package_name, &parsed_msix.publisher)?;
+        let canonical_version = normalize_msix_version(&parsed_msix.package_version)?;
+        if parsed_msix.package_version != canonical_version {
+            return Err(PublisherError::Invalid(format!(
+                "source MSIX manifest version '{}' is not in canonical four-part form '{canonical_version}'",
+                parsed_msix.package_version
+            )));
+        }
+        if parsed_msix.index_hash != snapshot_metadata.index_hash {
+            return Err(PublisherError::Invalid(
+                "source MSIX contains a v2 index different from the published build".to_owned(),
+            ));
+        }
+        if options.unsigned_development {
+            if parsed_msix.has_signature_parts {
+                return Err(PublisherError::Invalid(
+                    "cannot publish a signed MSIX with --unsigned-development; omit --unsigned-development so signature verification runs"
+                        .to_owned(),
+                ));
+            }
+        } else if let Some(tool) = psign_tool.as_deref() {
+            psign::verify(
+                tool,
+                &staged_msix,
+                &parsed_msix.publisher,
+                &options.trusted_ca,
+                psign::SignaturePolicy::NewlySigned,
+            )?;
+        }
+
+        read_owner_marker(&destination_abs.join(".pinget-publisher.json"))?;
+        let _destination_lock = acquire_destination_lock(&destination_abs)?;
+        fs::create_dir_all(&destination_abs)?;
+        let destination = fs::canonicalize(&destination_abs)?;
+        ensure_disjoint_roots(&state, &destination)?;
+        ensure_disjoint_roots(&destination, &msix_abs)?;
+        let marker_path = destination.join(".pinget-publisher.json");
+        // An interrupted package swap is completed or rolled back before anything else looks at the marker.
+        let prior = finalize_pending_commit(&destination, read_owner_marker(&marker_path)?)?;
+        match prior.as_ref() {
+            Some(owner) => remove_stale_publication_temporaries(&destination, &owner.artifacts)?,
+            None => {
+                ensure_adoptable_unowned_destination(&destination, &snapshot_metadata.artifacts, false)?;
+                remove_stale_publication_temporaries(&destination, &BTreeMap::new())?;
+            }
+        }
+        let unsigned_development = options.unsigned_development;
+        if let Some(owner) = prior.as_ref() {
+            let reuse = owner.build_id == build_id
+                && compare_quad_version(&canonical_version, &owner.package_version)? == std::cmp::Ordering::Equal;
+            // The package about to be replaced only needs intact digests and the expected signer: an
+            // expired or rotated signing certificate must not block the next publication.
+            let policy = if reuse {
+                psign::SignaturePolicy::Published
+            } else {
+                psign::SignaturePolicy::Superseded
+            };
+            // Fully copied artifacts of this snapshot left by an interrupted publication are adopted.
+            let verified = verify_destination_with_tool(
+                &destination,
+                options.psign_tool.as_deref(),
+                &options.trusted_ca,
+                policy,
+                &snapshot_metadata.artifacts,
+            )?;
+            if owner.package_name != parsed_msix.package_name || owner.publisher != parsed_msix.publisher {
+                return Err(PublisherError::Invalid(
+                    "destination is owned by a different package identity".to_owned(),
+                ));
+            }
+            if reuse {
+                if owner.unsigned_development != unsigned_development {
+                    return Err(PublisherError::Invalid(
+                        "the package version has already been published with a different signing mode".to_owned(),
+                    ));
+                }
+                mark_published(&state, &build_id)?;
+                return Ok(PublishReport {
+                    valid: true,
+                    subject: verified.subject,
+                    artifact_count: verified.artifact_count,
+                    build_id: build_id.clone(),
+                    destination: display_path(&destination),
+                    unsigned_development: owner.unsigned_development,
+                    reused: true,
+                });
+            }
+            match compare_quad_version(&canonical_version, &owner.package_version)? {
+                std::cmp::Ordering::Less => {
+                    return Err(PublisherError::Invalid(format!(
+                        "package version {} must be greater than previously published version {}",
+                        canonical_version, owner.package_version
+                    )));
+                }
+                std::cmp::Ordering::Equal => {
+                    return Err(PublisherError::Invalid(
+                        "the package version has already been used for different build content".to_owned(),
+                    ));
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        let current_inventory = published_inventory(&destination)?;
+        if let Some(owner) = prior.as_ref() {
+            for (path, expected) in &owner.artifacts {
+                if current_inventory.get(path) != Some(expected) {
+                    return Err(PublisherError::Invalid(format!(
+                        "owned publication file is missing or modified: {path}"
+                    )));
+                }
+            }
+            for (path, actual) in &current_inventory {
+                if owner.artifacts.get(path) != Some(actual) && snapshot_metadata.artifacts.get(path) != Some(actual) {
+                    return Err(PublisherError::Invalid(format!(
+                        "destination contains an untracked or modified file: {path}"
+                    )));
+                }
+            }
+        }
+        reject_case_variant_paths(&destination, prior.as_ref(), &snapshot_metadata.artifacts)?;
+        promote_staged_package(
+            &snapshot,
+            &staged_msix,
+            &destination,
+            options,
+            &parsed_msix.package_name,
+            &parsed_msix.publisher,
+            &canonical_version,
+            &build_id,
+            prior,
+            after_copy,
+            on_commit_step,
+        )
+    })();
+    let _ = fs::remove_dir_all(&temporary);
     result
 }
 
@@ -2305,7 +2510,11 @@ fn is_publication_temporary_name(name: &str, at_root: bool) -> bool {
 /// Allows publishing into a destination without an ownership marker only when it is empty or
 /// holds nothing but what an interrupted first publication of this snapshot left behind:
 /// publisher temporaries, Rust staging directories and fully copied artifacts of the snapshot.
-fn ensure_adoptable_unowned_destination(destination: &Path, snapshot: &BTreeMap<String, String>) -> Result<()> {
+fn ensure_adoptable_unowned_destination(
+    destination: &Path,
+    snapshot: &BTreeMap<String, String>,
+    allow_uncommitted_marker: bool,
+) -> Result<()> {
     let mut pending = vec![destination.to_path_buf()];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
@@ -2331,7 +2540,8 @@ fn ensure_adoptable_unowned_destination(destination: &Path, snapshot: &BTreeMap<
                 .map_err(|_| PublisherError::Invalid("published path escaped destination".to_owned()))?
                 .to_string_lossy()
                 .replace('\\', "/");
-            let adoptable = is_publication_temporary_name(&name, at_root)
+            let adoptable = (allow_uncommitted_marker && at_root && name == ".pinget-publisher.json")
+                || is_publication_temporary_name(&name, at_root)
                 || match snapshot.get(&relative) {
                     Some(expected) => sha256_hex(&fs::read(&path)?) == *expected,
                     None => false,
@@ -2558,55 +2768,28 @@ impl Drop for PublicationRollback {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn package_and_publish(
+fn promote_staged_package(
     snapshot: &Path,
-    temporary: &Path,
+    staged_msix: &Path,
     destination: &Path,
     options: &PublishOptions,
+    package_name: &str,
+    publisher: &str,
+    package_version: &str,
     build_id: &str,
     prior: Option<OwnerMarker>,
     after_copy: impl FnOnce(&Path) -> Result<()>,
     mut on_commit_step: impl FnMut(CommitStep, &Path),
 ) -> Result<PublishReport> {
-    let unsigned_development = matches!(options.signing, Signing::UnsignedDevelopment);
+    let unsigned_development = options.unsigned_development;
     let metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
-    let mut package_files = appx_assets(&options.name, &options.publisher, &options.version)?;
-    package_files.push((
-        "Public/index.db".to_owned(),
-        fs::read(snapshot.join("Public").join("index.db"))?,
-    ));
-    let msix = temporary.join("source2.msix");
-    write_relative(temporary, "source2.msix", &msix::write_package(&package_files)?)?;
-    match &options.signing {
-        Signing::Pfx { path, password_env } => {
-            if !path.is_file() {
-                return Err(PublisherError::Invalid(format!(
-                    "PFX does not exist: {}",
-                    path.display()
-                )));
-            }
-            let password = std::env::var(password_env).map_err(|_| {
-                PublisherError::Invalid(format!("password environment variable {password_env} is not set"))
-            })?;
-            let psign_tool = psign::require_psign_tool(options.psign_tool.as_deref())?;
-            psign::sign(&psign_tool, &msix, path, &password, options.timestamp_url.as_deref())?;
-            psign::verify(
-                &psign_tool,
-                &msix,
-                &options.publisher,
-                &options.trusted_ca,
-                psign::SignaturePolicy::NewlySigned,
-            )?;
-        }
-        Signing::UnsignedDevelopment => {}
-    }
     let previous_marker = prior.clone();
     let mut marker = prior.unwrap_or_else(|| OwnerMarker {
         schema_version: 1,
         owner: "Pinget.Publisher".to_owned(),
-        package_name: options.name.clone(),
-        publisher: options.publisher.clone(),
-        package_version: options.version.clone(),
+        package_name: package_name.to_owned(),
+        publisher: publisher.to_owned(),
+        package_version: package_version.to_owned(),
         build_id: build_id.to_owned(),
         index_hash: metadata.index_hash.clone(),
         unsigned_development,
@@ -2614,12 +2797,12 @@ fn package_and_publish(
         artifacts: BTreeMap::new(),
         pending_commit: None,
     });
-    marker.package_version = options.version.clone();
+    marker.package_version = package_version.to_owned();
     marker.build_id = build_id.to_owned();
     marker.index_hash = metadata.index_hash.clone();
     marker.unsigned_development = unsigned_development;
-    verify_msix_contents(&msix, &marker)?;
-    let package_hash = sha256_hex(&fs::read(&msix)?);
+    verify_msix_contents(staged_msix, &marker)?;
+    let package_hash = sha256_hex(&fs::read(staged_msix)?);
     let mut rollback = PublicationRollback::default();
     for relative in metadata.artifacts.keys() {
         let target = safe_join(destination, relative)?;
@@ -2673,9 +2856,9 @@ fn package_and_publish(
     let target_msix = destination.join("source2.msix");
 
     marker.owner = "Pinget.Publisher".to_owned();
-    marker.package_name = options.name.clone();
-    marker.publisher = options.publisher.clone();
-    marker.package_version = options.version.clone();
+    marker.package_name = package_name.to_owned();
+    marker.publisher = publisher.to_owned();
+    marker.package_version = package_version.to_owned();
     marker.build_id = build_id.to_owned();
     marker.index_hash = metadata.index_hash;
     marker.unsigned_development = unsigned_development;
@@ -2694,7 +2877,7 @@ fn package_and_publish(
         ..marker.clone()
     };
     replace_owner_marker(destination, &pending_marker)?;
-    let swapped = stage_package(&msix, destination, build_id).and_then(|staged_package| {
+    let swapped = stage_package(staged_msix, destination, build_id).and_then(|staged_package| {
         on_commit_step(CommitStep::BeforePackageSwap, destination);
         atomic_replace(&staged_package, &target_msix).inspect_err(|_| {
             let _ = fs::remove_file(&staged_package);
@@ -2714,8 +2897,6 @@ fn package_and_publish(
     // The marker is the publication commit record. Persist a matching state row.
     let state = options.state.canonicalize()?;
     mark_published(&state, build_id)?;
-    // The staging directory is private state; a leftover is removed by the next publish.
-    let _ = fs::remove_dir_all(temporary);
     let verified = verify_destination_with_tool(
         destination,
         options.psign_tool.as_deref(),
@@ -2844,10 +3025,83 @@ fn lock_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn verify_msix_contents(package_path: &Path, marker: &OwnerMarker) -> Result<()> {
+const APPX_FOUNDATION_NS: &[u8] = b"http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+const APPX_UAP3_NS: &[u8] = b"http://schemas.microsoft.com/appx/manifest/uap/windows10/3";
+
+struct ParsedSourceMsix {
+    package_name: String,
+    publisher: String,
+    package_version: String,
+    index_hash: String,
+    has_signature_parts: bool,
+}
+
+/// Scans raw ZIP central-directory records from `cd_start` so exact-name duplicates (which
+/// `zip::ZipArchive` collapses in its index map), case-variant duplicates, and backslash entry
+/// paths are rejected consistently with the .NET publisher.
+fn inspect_msix_central_directory(package_path: &Path, archive_len: usize, cd_start: u64) -> Result<bool> {
+    let mut file = File::open(package_path)?;
+    file.seek(SeekFrom::Start(cd_start))?;
+    let mut seen_lower = BTreeSet::new();
+    let mut raw_count = 0usize;
+    let mut has_signature_parts = false;
+    let mut header_tail = [0u8; 42];
+    loop {
+        let mut sig = [0u8; 4];
+        file.read_exact(&mut sig).map_err(|error| {
+            PublisherError::Invalid(format!("could not read source MSIX central directory: {error}"))
+        })?;
+        let signature = u32::from_le_bytes(sig);
+        if signature != 0x0201_4b50 {
+            if signature == 0x0605_4b50 || signature == 0x0606_4b50 {
+                break;
+            }
+            return Err(PublisherError::Invalid(
+                "source MSIX has a corrupt central directory".to_owned(),
+            ));
+        }
+        file.read_exact(&mut header_tail).map_err(|error| {
+            PublisherError::Invalid(format!("could not read source MSIX central directory header: {error}"))
+        })?;
+        let name_len = usize::from(u16::from_le_bytes([header_tail[24], header_tail[25]]));
+        let extra_len = i64::from(u16::from_le_bytes([header_tail[26], header_tail[27]]));
+        let comment_len = i64::from(u16::from_le_bytes([header_tail[28], header_tail[29]]));
+        let mut name_bytes = vec![0u8; name_len];
+        file.read_exact(&mut name_bytes)
+            .map_err(|error| PublisherError::Invalid(format!("could not read source MSIX entry name: {error}")))?;
+        file.seek(SeekFrom::Current(extra_len + comment_len))?;
+        let name = std::str::from_utf8(&name_bytes)
+            .map_err(|_| PublisherError::Invalid("source MSIX contains a non-UTF-8 entry name".to_owned()))?;
+        if name.contains('\\') {
+            return Err(PublisherError::Invalid(format!(
+                "source MSIX contains a backslash entry path: {name}"
+            )));
+        }
+        let lower = name.to_ascii_lowercase();
+        if !seen_lower.insert(lower.clone()) {
+            return Err(PublisherError::Invalid(format!(
+                "source MSIX contains duplicate or case-conflicting entry: {name}"
+            )));
+        }
+        if lower == "appxsignature.p7x" || lower == "appxmetadata/codeintegrity.cat" {
+            has_signature_parts = true;
+        }
+        raw_count += 1;
+    }
+    if raw_count != archive_len {
+        return Err(PublisherError::Invalid(
+            "source MSIX central directory entry count mismatch".to_owned(),
+        ));
+    }
+    Ok(has_signature_parts)
+}
+
+fn parse_source_msix(package_path: &Path) -> Result<ParsedSourceMsix> {
     let file = File::open(package_path)?;
     let mut archive = ZipArchive::new(file)
         .map_err(|error| PublisherError::Invalid(format!("could not read source MSIX: {error}")))?;
+    let has_signature_parts =
+        inspect_msix_central_directory(package_path, archive.len(), archive.central_directory_start())?;
     let index_hash = {
         let mut index = archive.by_name("Public/index.db").map_err(|error| {
             PublisherError::Invalid(format!("source MSIX does not contain Public/index.db: {error}"))
@@ -2856,11 +3110,6 @@ fn verify_msix_contents(package_path: &Path, marker: &OwnerMarker) -> Result<()>
         index.read_to_end(&mut bytes)?;
         sha256_hex(&bytes)
     };
-    if index_hash != marker.index_hash {
-        return Err(PublisherError::Invalid(
-            "source MSIX contains a v2 index different from the published build".to_owned(),
-        ));
-    }
     let manifest = {
         let mut entry = archive.by_name("AppxManifest.xml").map_err(|error| {
             PublisherError::Invalid(format!("source MSIX does not contain AppxManifest.xml: {error}"))
@@ -2869,54 +3118,101 @@ fn verify_msix_contents(package_path: &Path, marker: &OwnerMarker) -> Result<()>
         entry.read_to_end(&mut bytes)?;
         bytes
     };
-    let mut reader = Reader::from_reader(manifest.as_slice());
+    let mut reader = NsReader::from_reader(manifest.as_slice());
     reader.config_mut().trim_text(true);
+    let mut depth = 0usize;
+    let mut has_package_root = false;
     let mut identity = None;
     let mut extension = None;
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(element) | Event::Empty(element)) => {
-                let local_name = element.local_name();
-                if local_name.as_ref() == b"Identity" {
-                    if identity.replace(xml_attributes(&reader, &element)?).is_some() {
-                        return Err(PublisherError::Invalid(
-                            "source MSIX has multiple package identities".to_owned(),
-                        ));
-                    }
-                } else if local_name.as_ref() == b"AppExtension" {
-                    let attributes = xml_attributes(&reader, &element)?;
-                    match (attributes.get("Name").map(String::as_str), extension.is_some()) {
-                        (Some("com.microsoft.winget.source"), true) => {
-                            return Err(PublisherError::Invalid(
-                                "source MSIX has multiple WinGet source extensions".to_owned(),
-                            ));
-                        }
-                        (Some("com.microsoft.winget.source"), false) => {
-                            extension = Some(attributes);
-                        }
-                        _ => {}
-                    }
-                }
+    let mut visit_element = |ns: ResolveResult<'_>,
+                             element: &quick_xml::events::BytesStart<'_>,
+                             elem_depth: usize,
+                             decoder: quick_xml::Decoder|
+     -> Result<()> {
+        let ns_bytes = match ns {
+            ResolveResult::Bound(namespace) => Some(namespace.into_inner()),
+            ResolveResult::Unbound => None,
+            ResolveResult::Unknown(_) => {
+                return Err(PublisherError::Invalid(
+                    "source MSIX manifest uses an undeclared XML namespace prefix".to_owned(),
+                ));
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => {
-                return Err(PublisherError::Invalid(format!(
-                    "could not parse source MSIX manifest: {error}"
-                )));
+        };
+        let local_name = element.local_name();
+        if elem_depth == 0 {
+            if has_package_root || ns_bytes != Some(APPX_FOUNDATION_NS) || local_name.as_ref() != b"Package" {
+                return Err(PublisherError::Invalid(
+                    "source MSIX manifest root must be foundation Package".to_owned(),
+                ));
+            }
+            has_package_root = true;
+            return Ok(());
+        }
+        if ns_bytes == Some(APPX_FOUNDATION_NS) && local_name.as_ref() == b"Identity" {
+            if elem_depth != 1 {
+                return Err(PublisherError::Invalid(
+                    "source MSIX Identity must be a direct child of Package".to_owned(),
+                ));
+            }
+            if identity.replace(unprefixed_xml_attributes(decoder, element)?).is_some() {
+                return Err(PublisherError::Invalid(
+                    "source MSIX has multiple package identities".to_owned(),
+                ));
+            }
+        } else if ns_bytes == Some(APPX_UAP3_NS) && local_name.as_ref() == b"AppExtension" {
+            let attributes = unprefixed_xml_attributes(decoder, element)?;
+            match (attributes.get("Name").map(String::as_str), extension.is_some()) {
+                (Some("com.microsoft.winget.source"), true) => {
+                    return Err(PublisherError::Invalid(
+                        "source MSIX has multiple WinGet source extensions".to_owned(),
+                    ));
+                }
+                (Some("com.microsoft.winget.source"), false) => {
+                    extension = Some(attributes);
+                }
+                _ => {}
             }
         }
+        Ok(())
+    };
+    loop {
+        let decoder = reader.decoder();
+        match reader.read_resolved_event()? {
+            (ns, Event::Start(element)) => {
+                visit_element(ns, &element, depth, decoder)?;
+                depth += 1;
+            }
+            (ns, Event::Empty(element)) => {
+                visit_element(ns, &element, depth, decoder)?;
+            }
+            (_, Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+            }
+            (_, Event::DocType(_)) => {
+                return Err(PublisherError::Invalid(
+                    "source MSIX manifest must not contain a DOCTYPE declaration".to_owned(),
+                ));
+            }
+            (_, Event::Eof) => break,
+            _ => {}
+        }
     }
-    let identity =
-        identity.ok_or_else(|| PublisherError::Invalid("source MSIX manifest has no Identity element".to_owned()))?;
-    if identity.get("Name") != Some(&marker.package_name)
-        || identity.get("Publisher") != Some(&marker.publisher)
-        || identity.get("Version") != Some(&marker.package_version)
-    {
+    if !has_package_root {
         return Err(PublisherError::Invalid(
-            "source MSIX identity does not match the publisher ownership marker".to_owned(),
+            "source MSIX manifest has no Package root".to_owned(),
         ));
     }
+    let mut identity =
+        identity.ok_or_else(|| PublisherError::Invalid("source MSIX manifest has no Identity element".to_owned()))?;
+    let package_name = identity
+        .remove("Name")
+        .ok_or_else(|| PublisherError::Invalid("source MSIX Identity has no Name attribute".to_owned()))?;
+    let publisher = identity
+        .remove("Publisher")
+        .ok_or_else(|| PublisherError::Invalid("source MSIX Identity has no Publisher attribute".to_owned()))?;
+    let package_version = identity
+        .remove("Version")
+        .ok_or_else(|| PublisherError::Invalid("source MSIX Identity has no Version attribute".to_owned()))?;
     let extension = extension
         .ok_or_else(|| PublisherError::Invalid("source MSIX has no WinGet preindexed source extension".to_owned()))?;
     if extension.get("PublicFolder").is_none_or(|value| value != "Public") {
@@ -2924,23 +3220,75 @@ fn verify_msix_contents(package_path: &Path, marker: &OwnerMarker) -> Result<()>
             "source MSIX extension does not expose the Public folder".to_owned(),
         ));
     }
+    Ok(ParsedSourceMsix {
+        package_name,
+        publisher,
+        package_version,
+        index_hash,
+        has_signature_parts,
+    })
+}
+
+impl From<quick_xml::Error> for PublisherError {
+    fn from(error: quick_xml::Error) -> Self {
+        Self::Invalid(format!("could not parse source MSIX manifest: {error}"))
+    }
+}
+
+fn verify_msix_contents(package_path: &Path, marker: &OwnerMarker) -> Result<()> {
+    let parsed = parse_source_msix(package_path)?;
+    if parsed.index_hash != marker.index_hash {
+        return Err(PublisherError::Invalid(
+            "source MSIX contains a v2 index different from the published build".to_owned(),
+        ));
+    }
+    if parsed.package_name != marker.package_name
+        || parsed.publisher != marker.publisher
+        || parsed.package_version != marker.package_version
+    {
+        return Err(PublisherError::Invalid(
+            "source MSIX identity does not match the publisher ownership marker".to_owned(),
+        ));
+    }
+    validate_package_identity(&parsed.package_name, &parsed.publisher)?;
+    let canonical_version = normalize_msix_version(&parsed.package_version)?;
+    if parsed.package_version != canonical_version {
+        return Err(PublisherError::Invalid(format!(
+            "source MSIX manifest version '{}' is not in canonical four-part form '{canonical_version}'",
+            parsed.package_version
+        )));
+    }
+    if marker.unsigned_development && parsed.has_signature_parts {
+        return Err(PublisherError::Invalid(
+            "unsigned development destination contains a signed source2.msix".to_owned(),
+        ));
+    }
     Ok(())
 }
 
-fn xml_attributes<R: std::io::BufRead>(
-    reader: &Reader<R>,
+fn unprefixed_xml_attributes(
+    decoder: quick_xml::Decoder,
     element: &quick_xml::events::BytesStart<'_>,
 ) -> Result<BTreeMap<String, String>> {
     let mut attributes = BTreeMap::new();
     for attribute in element.attributes() {
         let attribute =
             attribute.map_err(|error| PublisherError::Invalid(format!("invalid AppxManifest attribute: {error}")))?;
-        let name = String::from_utf8_lossy(attribute.key.local_name().as_ref()).into_owned();
+        if attribute.key.prefix().is_some() || attribute.key.as_ref() == b"xmlns" {
+            continue;
+        }
+        let name = std::str::from_utf8(attribute.key.local_name().as_ref())
+            .map_err(|_| PublisherError::Invalid("invalid UTF-8 in AppxManifest attribute name".to_owned()))?
+            .to_owned();
         let value = attribute
-            .decode_and_unescape_value(reader.decoder())
+            .decode_and_unescape_value(decoder)
             .map_err(|error| PublisherError::Invalid(format!("invalid AppxManifest attribute: {error}")))?
             .into_owned();
-        attributes.insert(name, value);
+        if attributes.insert(name.clone(), value).is_some() {
+            return Err(PublisherError::Invalid(format!(
+                "duplicate AppxManifest attribute: {name}"
+            )));
+        }
     }
     Ok(attributes)
 }
@@ -4373,17 +4721,28 @@ mod tests {
             metadata.artifacts.len() >= 2,
             "manifest and version sidecar must be copied"
         );
+        let staged_msix = root.join("source2.unsigned.msix");
+        let package_report = package(&PackageOptions {
+            state: state.clone(),
+            build_id: Some(build_report.build_id.clone()),
+            msix: staged_msix.clone(),
+            name: "Pinget.Test.InitialRollback".to_owned(),
+            publisher: "CN=Pinget Initial Rollback Test".to_owned(),
+            version: "1.0.0.0".to_owned(),
+            destination: Some(destination.clone()),
+        })
+        .expect("package unsigned source MSIX");
+        assert_eq!(package_report.build_id, build_report.build_id);
+        assert_eq!(package_report.index_hash, metadata.index_hash);
+        assert!(staged_msix.is_file());
         let options = PublishOptions {
             state: state.clone(),
             destination: destination.clone(),
             build_id: Some(build_report.build_id.clone()),
-            name: "Pinget.Test.InitialRollback".to_owned(),
-            publisher: "CN=Pinget Initial Rollback Test".to_owned(),
-            version: "1.0.0.0".to_owned(),
-            signing: Signing::UnsignedDevelopment,
+            msix: staged_msix,
+            unsigned_development: true,
             psign_tool: None,
             trusted_ca: Vec::new(),
-            timestamp_url: None,
         };
         let mut reached_after_copy = false;
         let error = publish_with_hooks(
@@ -4534,5 +4893,254 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tags2_map", [], |row| row.get(0))
             .expect("maps");
         assert_eq!(count, 2, "both packages retain the same shared row");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_and_publish_enforce_msix_disjointness_canonical_manifest_and_signing_mode() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = unit_directory("package-publish-guards");
+        let _cleanup = Cleanup(root.clone());
+        let input = root.join("input");
+        let state = root.join("state");
+        let destination = root.join("destination");
+        fs::create_dir(&input).expect("manifest input");
+        fs::write(
+            input.join("package.yaml"),
+            concat!(
+                "PackageIdentifier: Pinget.Test.Guards\n",
+                "PackageVersion: 1.0.0\nPackageLocale: en-US\n",
+                "Publisher: Pinget Test\nPackageName: Guards\n",
+                "License: MIT\nShortDescription: Package and publish guard tests\n",
+                "Installers:\n  - Architecture: x64\n    InstallerType: exe\n",
+                "    InstallerUrl: https://example.invalid/unused.exe\n",
+                "    InstallerSha256: 1111111111111111111111111111111111111111111111111111111111111111\n",
+                "ManifestType: singleton\nManifestVersion: 1.9.0\n",
+            ),
+        )
+        .expect("manifest");
+        let build_report = build(&BuildOptions {
+            input,
+            state: state.clone(),
+        })
+        .expect("build snapshot");
+
+        // `--msix` must not overlap `--state` or `--destination` or point to a directory.
+        for bad_msix in [state.join("source2.msix"), destination.join("source2.msix")] {
+            let err = package(&PackageOptions {
+                state: state.clone(),
+                build_id: Some(build_report.build_id.clone()),
+                msix: bad_msix,
+                name: "Pinget.Test.Guards".to_owned(),
+                publisher: "CN=Pinget Guards".to_owned(),
+                version: "1.0.0.0".to_owned(),
+                destination: Some(destination.clone()),
+            })
+            .expect_err("overlapping msix path must fail");
+            assert!(err.to_string().contains("overlap"), "{err}");
+        }
+        let existing_dir = root.join("msix-dir");
+        fs::create_dir(&existing_dir).expect("dir");
+        assert!(
+            package(&PackageOptions {
+                state: state.clone(),
+                build_id: Some(build_report.build_id.clone()),
+                msix: existing_dir,
+                name: "Pinget.Test.Guards".to_owned(),
+                publisher: "CN=Pinget Guards".to_owned(),
+                version: "1.0.0.0".to_owned(),
+                destination: None,
+            })
+            .is_err()
+        );
+
+        let staged = root.join("staged").join("source2.msix");
+        let pkg_report = package(&PackageOptions {
+            state: state.clone(),
+            build_id: Some(build_report.build_id.clone()),
+            msix: staged.clone(),
+            name: "Pinget.Test.Guards".to_owned(),
+            publisher: "CN=Pinget Guards".to_owned(),
+            version: "01.0.0.0".to_owned(),
+            destination: Some(destination.clone()),
+        })
+        .expect("package");
+        assert_eq!(pkg_report.package_version, "1.0.0.0");
+
+        // Injecting `AppxSignature.p7x` into an MSIX passed with `--unsigned-development` must fail.
+        let fake_signed = root.join("fake-signed.msix");
+        {
+            let mut reader = ZipArchive::new(File::open(&staged).expect("open staged")).expect("zip");
+            let mut writer = zip::ZipWriter::new(File::create(&fake_signed).expect("create fake signed"));
+            let zip_opts = zip::write::SimpleFileOptions::default();
+            for idx in 0..reader.len() {
+                let mut entry = reader.by_index(idx).expect("entry");
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).expect("read");
+                writer.start_file(entry.name(), zip_opts).expect("start");
+                writer.write_all(&buf).expect("write");
+            }
+            writer.start_file("AppxSignature.p7x", zip_opts).expect("sig");
+            writer.write_all(b"PKCX").expect("sig bytes");
+            writer.finish().expect("finish");
+        }
+        let signed_in_unsigned_err = publish(&PublishOptions {
+            state: state.clone(),
+            build_id: Some(build_report.build_id.clone()),
+            destination: destination.clone(),
+            msix: fake_signed.clone(),
+            unsigned_development: true,
+            psign_tool: None,
+            trusted_ca: Vec::new(),
+        })
+        .expect_err("signed MSIX must be rejected in unsigned-development mode");
+        assert!(
+            signed_in_unsigned_err.to_string().contains("--unsigned-development"),
+            "{signed_in_unsigned_err}"
+        );
+        assert!(!destination.exists());
+
+        // Non-canonical `Version="01.0.0.0"` inside `AppxManifest.xml` must be rejected by `publish`.
+        let non_canonical = root.join("non-canonical.msix");
+        {
+            let mut files = appx_assets("Pinget.Test.Guards", "CN=Pinget Guards", "01.0.0.0").expect("assets");
+            let index_bytes = fs::read(build_report.snapshot_directory.join("Public/index.db")).expect("index");
+            files.push(("Public/index.db".to_owned(), index_bytes));
+            fs::write(&non_canonical, msix::write_package(&files).expect("msix")).expect("write");
+        }
+        let non_canonical_err = publish(&PublishOptions {
+            state: state.clone(),
+            build_id: Some(build_report.build_id.clone()),
+            destination: destination.clone(),
+            msix: non_canonical,
+            unsigned_development: true,
+            psign_tool: None,
+            trusted_ca: Vec::new(),
+        })
+        .expect_err("non-canonical manifest version must fail");
+        assert!(
+            non_canonical_err.to_string().contains("canonical"),
+            "{non_canonical_err}"
+        );
+
+        // Valid unsigned publish succeeds, and tampering `destination/source2.msix` to include a
+        // signature fails `verify_published_destination` even if its hash is updated in the marker.
+        publish(&PublishOptions {
+            state: state.clone(),
+            build_id: Some(build_report.build_id),
+            destination: destination.clone(),
+            msix: staged,
+            unsigned_development: true,
+            psign_tool: None,
+            trusted_ca: Vec::new(),
+        })
+        .expect("valid unsigned publish");
+        fs::copy(&fake_signed, destination.join("source2.msix")).expect("tamper msix");
+        let mut marker = read_owner_marker(&destination.join(".pinget-publisher.json"))
+            .expect("read marker")
+            .expect("marker");
+        marker.artifacts.insert(
+            "source2.msix".to_owned(),
+            sha256_hex(&fs::read(&fake_signed).expect("bytes")),
+        );
+        replace_owner_marker(&destination, &marker).expect("write tampered marker");
+        let tampered_verify = verify_published_destination(&destination, None, &[])
+            .expect_err("unsigned destination with signed MSIX must fail verification");
+        assert!(tampered_verify.to_string().contains("signed"), "{tampered_verify}");
+
+        // Interrupted first publication marker (`pendingCommit: { previous: null }`) is allowed in
+        // `package --destination` pre-flight without mutating the destination.
+        let interrupted_dest = root.join("interrupted-first");
+        fs::create_dir(&interrupted_dest).expect("interrupted dir");
+        let uncommitted_marker = OwnerMarker {
+            schema_version: 1,
+            owner: "Pinget.Publisher".to_owned(),
+            package_name: "Pinget.Test.Other".to_owned(),
+            publisher: "CN=Other".to_owned(),
+            package_version: "9.9.9.9".to_owned(),
+            build_id: "0".repeat(64),
+            index_hash: "0".repeat(64),
+            unsigned_development: true,
+            published_utc: "2026-01-01T00:00:00Z".to_owned(),
+            artifacts: [("source2.msix".to_owned(), "0".repeat(64))].into_iter().collect(),
+            pending_commit: Some(PendingCommit { previous: None }),
+        };
+        replace_owner_marker(&interrupted_dest, &uncommitted_marker).expect("write uncommitted marker");
+        let marker_before = fs::read(interrupted_dest.join(".pinget-publisher.json")).expect("read marker");
+        package(&PackageOptions {
+            state: state.clone(),
+            build_id: Some(pkg_report.build_id.clone()),
+            msix: root.join("after-interrupted.msix"),
+            name: "Pinget.Test.Guards".to_owned(),
+            publisher: "CN=Pinget Guards".to_owned(),
+            version: "1.0.0.0".to_owned(),
+            destination: Some(interrupted_dest.clone()),
+        })
+        .expect("package preflight must allow uncommitted initial marker");
+        assert_eq!(
+            fs::read(interrupted_dest.join(".pinget-publisher.json")).expect("marker preserved"),
+            marker_before
+        );
+
+        // Prefixed attribute shadowing (`x:Publisher`), DOCTYPE, and backslash/duplicate ZIP entries fail.
+        let shadowed_manifest = br#"<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+         xmlns:x="http://example.invalid/shadow">
+  <Identity Name="Pinget.Test.Guards" Publisher="CN=Untrusted" x:Publisher="CN=Pinget Guards" Version="1.0.0.0" />
+  <Applications><Application Id="SourceData"><Extensions>
+    <uap3:Extension Category="windows.appExtension">
+      <uap3:AppExtension Name="com.microsoft.winget.source" Id="IndexDB" PublicFolder="Public" />
+    </uap3:Extension>
+  </Extensions></Application></Applications>
+</Package>"#;
+        let shadowed_msix = root.join("shadowed.msix");
+        let index_bytes =
+            fs::read(state.join("builds").join(&pkg_report.build_id).join("Public/index.db")).expect("index");
+        fs::write(
+            &shadowed_msix,
+            msix::write_package(&[
+                ("AppxManifest.xml".to_owned(), shadowed_manifest.to_vec()),
+                ("Public/index.db".to_owned(), index_bytes.clone()),
+            ])
+            .expect("msix"),
+        )
+        .expect("write shadowed");
+        let parsed_shadow = parse_source_msix(&shadowed_msix).expect("parse unprefixed attributes");
+        assert_eq!(parsed_shadow.publisher, "CN=Untrusted");
+
+        let doctype_msix = root.join("doctype.msix");
+        let doctype_manifest = [b"<!DOCTYPE Package>\n".as_slice(), shadowed_manifest.as_slice()].concat();
+        fs::write(
+            &doctype_msix,
+            msix::write_package(&[
+                ("AppxManifest.xml".to_owned(), doctype_manifest),
+                ("Public/index.db".to_owned(), index_bytes.clone()),
+            ])
+            .expect("msix"),
+        )
+        .expect("write doctype");
+        assert!(parse_source_msix(&doctype_msix).is_err());
+
+        let backslash_zip = root.join("backslash.msix");
+        {
+            let mut zw = zip::ZipWriter::new(File::create(&backslash_zip).expect("zip"));
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("AppxManifest.xml", opts).expect("start");
+            zw.write_all(shadowed_manifest).expect("write");
+            zw.start_file("Public/index.db", opts).expect("start");
+            zw.write_all(&index_bytes).expect("write");
+            zw.start_file("Assets\\Logo.png", opts).expect("start");
+            zw.write_all(LOGO_PNG).expect("write");
+            zw.finish().expect("finish");
+        }
+        assert!(parse_source_msix(&backslash_zip).is_err());
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
