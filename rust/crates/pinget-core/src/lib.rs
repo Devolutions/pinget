@@ -3668,11 +3668,11 @@ impl Repository {
                     id: package_id.clone(),
                     name: package_name,
                     moniker: json_string(&item, "Moniker"),
-                    version: Some(latest.version.clone()),
+                    version: Some(latest.version),
                     channel: if latest.channel.is_empty() {
                         None
                     } else {
-                        Some(latest.channel.clone())
+                        Some(latest.channel)
                     },
                     match_criteria: rest_match_criteria(&item, query, semantics),
                 },
@@ -4687,11 +4687,7 @@ fn list_package_matches(package: &InstalledPackage, query: &ListQuery) -> bool {
         return false;
     }
 
-    if (query.moniker.is_some() || query.tag.is_some() || query.command.is_some()) && correlated.is_none() {
-        return false;
-    }
-
-    true
+    !((query.moniker.is_some() || query.tag.is_some() || query.command.is_some()) && correlated.is_none())
 }
 
 fn manifest_matches_installed_package_family_name(manifest: &Manifest, installed_pfns: &[String]) -> bool {

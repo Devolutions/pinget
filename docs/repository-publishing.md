@@ -169,6 +169,59 @@ Hosting authentication and endpoint credentials are the host/client's concern:
 this publisher does not add a secret store, token broker or authenticated
 REST-source protocol.
 
+## Vendor static feed workflow (`pinget` + `psign`)
+
+To publish a vendor-owned static WinGet source alongside `microsoft/winget-pkgs`
+(including open pull requests that have not merged upstream yet), use the
+PowerShell 7.4+ helper scripts under `scripts\`:
+
+1. **Sync merged + pending manifests** (`scripts\Sync-WinGetManifests.ps1`):
+   sparse-clones a manifest subtree (default `manifests/d/Devolutions`) from
+   `microsoft/winget-pkgs` and applies open pull requests authored by the
+   vendor bot (`devolutionsbot` by default) via 3-way git merge (`git apply
+   --index --3way`), preserving renames and refusing stale/conflicting hunks.
+2. **Build and sign the static site** (`scripts\Build-DevolutionsStaticFeed.ps1`):
+   runs `pinget repository build`, `pinget repository verify`, and
+   `pinget repository publish` with `psign-tool`. When `-PackageVersion` is
+   omitted, it starts at `1.0.0.0`, reuses the existing version for unchanged
+   snapshots, and increments the 4-part AppX version automatically when build
+   content changes. In isolated test environments, pass `-GenerateTestPki` to
+   mint a disposable 2-tier PKI (`root-ca.cer`, `codesign.pfx`, and
+   `tls-server.pfx`) via `psign-tool portable generate-root-ca`,
+   `issue-code-signing-cert` and `issue-tls-server-cert` (`root-ca.pfx` is
+   deleted immediately), then verify `source2.msix` against `--trusted-ca
+   root-ca.cer` without altering the build machine's certificate store. Never
+   export or trust `-GenerateTestPki` material outside an isolated test machine.
+3. **Serve over HTTPS in a test environment** (`scripts\Serve-StaticFeed.ps1`):
+   serves the published directory concurrently over TLS (default unprivileged
+   port `8443`; pass `-Port 443` when elevated) with `GET`/`HEAD`, `ETag` (`304
+   Not Modified`), single-range `206 Partial Content` / `416 Range Not
+   Satisfiable`, `Cache-Control` (`no-cache` for `source2.msix`, immutable
+   caching for hashed manifests/sidecars), dotfile blocking, and transient TLS
+   key cleanup on exit. In an isolated test VM, import only `root-ca.cer` into
+   `Cert:\LocalMachine\Root` to trust both HTTPS transport and `source2.msix`
+   `AppxSip` / `WinVerifyTrust` verification. In production, upload new
+   `manifests/` and `packages/` objects to static HTTPS storage/CDN first, then
+   promote `source2.msix` signed with the vendor's publicly trusted code-signing
+   certificate.
+
+```powershell
+$env:STATIC_FEED_TLS_PASSWORD = '<random-test-secret>'
+pwsh -NoLogo -NoProfile -File .\scripts\Build-DevolutionsStaticFeed.ps1 `
+    -WorkspaceDirectory .\artifacts\devolutions-feed `
+    -GenerateTestPki `
+    -TlsPasswordEnvironmentVariable STATIC_FEED_TLS_PASSWORD `
+    -TlsDnsNames @('winget.devolutions.test', 'localhost') `
+    -TlsIpAddresses @('127.0.0.1')
+
+pwsh -NoLogo -NoProfile -File .\scripts\Serve-StaticFeed.ps1 `
+    -Root .\artifacts\devolutions-feed\site `
+    -CertificatePath .\artifacts\devolutions-feed\pki\tls-server.pfx `
+    -CertificatePasswordEnvironmentVariable STATIC_FEED_TLS_PASSWORD `
+    -BindAddress 127.0.0.1 `
+    -Port 8443
+```
+
 ## CI and compatibility
 
 In CI, persist the publisher state between runs if you want meaningful diffs,
@@ -228,12 +281,12 @@ This feature does not define a cross-platform manifest format, macOS package
 installation, managed script bundles, assignment policy, a REST source,
 background enforcement or new PowerShell cmdlets.
 
-Manifest ingestion accepts an explicit set of `ManifestVersion` values from
-`1.0.0` through `1.10.0` and checks required fields, document roles and merged
-structure. These checks are not a replacement for full upstream JSON-schema
-validation of every manifest property. Search normalization reuses Pinget's
-existing normalizers; compatibility evidence covers the tested fixtures, not
-every possible name or publisher string.
+Manifest ingestion accepts an explicit set of `ManifestVersion` values (`1.0.0`
+through `1.12.0`, `1.28.0` and `1.31.0`) and checks required fields, document
+roles and merged structure. These checks are not a replacement for full upstream
+JSON-schema validation of every manifest property. Search normalization reuses
+Pinget's existing normalizers; compatibility evidence covers the tested
+fixtures, not every possible name or publisher string.
 
 ## Building and distributing the libraries
 

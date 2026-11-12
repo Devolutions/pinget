@@ -31,8 +31,10 @@ mod wave12_tests;
 #[cfg(test)]
 mod wave6_tests;
 
+// Includes all upstream WinGet frozen manifest versions (plus 1.11.0/1.8.0/1.3.0 minor slots accepted for compatibility).
 const SUPPORTED_MANIFEST_VERSIONS: &[&str] = &[
-    "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0",
+    "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0", "1.11.0",
+    "1.12.0", "1.28.0", "1.31.0",
 ];
 const INDEX_SCHEMA: &str = include_str!("index-schema.sql");
 const STATE_SCHEMA: &str = include_str!("state-schema.sql");
@@ -1025,11 +1027,11 @@ fn scan_manifests(root: &Path) -> Result<(Inventory, ManifestGroups)> {
         let package = merge_documents(&first.id, docs.clone())?;
         let fields = catalog_fields_all(std::slice::from_ref(&package))?;
         manifests.push(ManifestInventory {
-            id: package.id.clone(),
-            name: package.name.clone(),
-            version: package.version.clone(),
+            id: package.id,
+            name: package.name,
             latest_version: package.version.clone(),
-            moniker: package.moniker.clone(),
+            version: package.version,
+            moniker: package.moniker,
             manifest_path: String::new(),
             manifest_hash: String::new(),
             sidecar_path: String::new(),
@@ -1351,6 +1353,7 @@ fn is_manifest_string_field(key: &str) -> bool {
                 | "PurchaseUrl"
                 | "InstallationNotes"
                 | "InstallLocation"
+                | "DefaultInstallLocation"
                 | "RelativeFilePath"
                 | "PortableCommandAlias"
                 | "IconUrl"
@@ -1378,6 +1381,8 @@ fn is_manifest_string_field(key: &str) -> bool {
                 | "Platform"
                 | "UpgradeBehavior"
                 | "AuthenticationType"
+                | "Resource"
+                | "ModuleName"
                 | "Argument"
                 | "Command"
                 | "Uninstall"
@@ -3781,20 +3786,16 @@ fn require_regular_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn validate_build_id(build_id: &str) -> Result<()> {
