@@ -50,17 +50,28 @@ fn two_builds(root: &Path) -> (PathBuf, String, String) {
 }
 
 fn options(state: &Path, destination: &Path, build_id: &str, version: &str) -> PublishOptions {
+    let msix = state.parent().expect("root").join(format!(
+        "staged-{build_id}-{version}-{}.msix",
+        unique_temporary_suffix()
+    ));
+    package(&PackageOptions {
+        state: state.to_path_buf(),
+        build_id: Some(build_id.to_owned()),
+        msix: msix.clone(),
+        name: "Pinget.Test.ReviewB".to_owned(),
+        publisher: "CN=Pinget Review B Test".to_owned(),
+        version: version.to_owned(),
+        destination: None,
+    })
+    .expect("package");
     PublishOptions {
         state: state.to_path_buf(),
         destination: destination.to_path_buf(),
         build_id: Some(build_id.to_owned()),
-        name: "Pinget.Test.ReviewB".to_owned(),
-        publisher: "CN=Pinget Review B Test".to_owned(),
-        version: version.to_owned(),
-        signing: Signing::UnsignedDevelopment,
+        msix,
+        unsigned_development: true,
         psign_tool: None,
         trusted_ca: Vec::new(),
-        timestamp_url: None,
     }
 }
 

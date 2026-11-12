@@ -105,19 +105,23 @@ pinget repository build --input <manifest-directory> --state <work-directory>
 pinget repository diff --input <manifest-directory> --state <work-directory>
 pinget repository status --state <work-directory>
 pinget repository verify --state <work-directory> [--build <build-id>]
-pinget repository verify --destination <published-directory>
-pinget repository doctor
-pinget repository publish --state <work-directory> --destination <published-directory> `
+pinget repository verify --destination <published-directory> [--psign-tool <path>] [--trusted-ca <certificate>...]
+pinget repository doctor [--psign-tool <path>]
+pinget repository package --state <work-directory> [--build <build-id>] `
   --name <stable-msix-identity> --publisher <certificate-subject> --version <four-part-version> `
-  (--pfx <file> --password-env <environment-variable> | --unsigned-development)
+  --msix <output-msix-file> [--destination <published-directory>]
+pinget repository publish --state <work-directory> [--build <build-id>] `
+  --destination <published-directory> --msix <msix-file> `
+  [--unsigned-development] [--psign-tool <path>] [--trusted-ca <certificate>...]
 ```
 
-The `build` command creates a snapshot; it does not publish or sign an MSIX.
-The `publish` command consumes that snapshot and uses `source2.msix` as the
-published source-package path. Test harnesses may pass a built CLI executable
-or an already-built .NET CLI assembly, but must preserve these argument
-meanings. This command contract is a Pinget implementation expectation and is
-not part of the upstream WinGet format.
+The `build` command creates a snapshot; it does not package, publish or sign an
+MSIX. The `package` command writes an unsigned `source2.msix` for external
+signing (for example via `psign-tool`), and `publish` verifies that MSIX and
+promotes immutable artifacts first and `source2.msix` last. Test harnesses may
+pass a built CLI executable or an already-built .NET CLI assembly, but must
+preserve these argument meanings. This command contract is a Pinget
+implementation expectation and is not part of the upstream WinGet format.
 
 ## Production publisher cross-language contract (tested separately)
 

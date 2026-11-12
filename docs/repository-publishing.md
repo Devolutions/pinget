@@ -20,23 +20,27 @@ URLs; the build does not download or execute them.
 - Separate directories for inputs, publisher state and published files.
   Do not put one inside another or use symlinks/reparse points in them.
 - For signed publication, [`psign-tool`](https://github.com/Devolutions/psign)
-  **0.8.2 or later**, a cross-platform Authenticode signer: `dotnet tool
-  install -g Devolutions.Psign.Tool`. Earlier versions produce MSIX signatures
-  that Windows rejects. `repository doctor` reports whether it was found on
-  `PATH` or in the .NET global tool directory; `--psign-tool` supplies an
-  explicit path. The Windows SDK (`makeappx.exe`, `signtool.exe`) is not used:
-  the publisher writes the MSIX container itself.
-- A code-signing certificate with its private key in a PFX, and a publisher
-  distinguished name matching that certificate's subject.
+  **0.8.2 or later**, a cross-platform Authenticode signer and verifier:
+  `dotnet tool install -g Devolutions.Psign.Tool`. Earlier versions produce
+  MSIX signatures that Windows rejects. `repository doctor` reports whether it
+  was found on `PATH` or in the .NET global tool directory; `--psign-tool`
+  supplies an explicit path for signature verification. The Windows SDK
+  (`makeappx.exe`, `signtool.exe`) is not used: `pinget repository package`
+  writes the unsigned MSIX container itself, you sign it externally with
+  `psign-tool` (or another Authenticode MSIX signer), and `pinget repository
+  publish` verifies and promotes it.
+- A code-signing certificate or cloud signing profile (PFX, Azure Artifact
+  Signing, Azure Key Vault, or HSM), and a publisher distinguished name
+  matching that certificate's subject.
 
 Building requires Windows because sidecars are compressed with the native
-Windows Compression API. `publish`, `verify`, `status` and `diff` also run on
-Linux and macOS, so a snapshot built on Windows can be signed and published
-elsewhere. Do not infer publishing support from the availability of the CLI on
-a platform. A missing signing tool fails rather than silently producing
-unsigned output.
+Windows Compression API. `package`, `publish`, `verify`, `status` and `diff`
+also run on Linux and macOS, so a snapshot built on Windows can be packaged,
+signed and published elsewhere. Do not infer building support from the
+availability of the CLI on a platform. A missing verification tool or unsigned
+MSIX fails `publish` unless `--unsigned-development` is explicitly passed.
 
-## Build, inspect and publish
+## Build, package, sign and publish
 
 Use the Rust or .NET CLI, not both at once against the same state directory.
 The directories below are siblings, outside the input manifest tree:
@@ -71,45 +75,75 @@ ownership records can still be verified and updated through normal publication.
 
 State lives in `publisher.db`. Each snapshot is under `builds\<buildId>`,
 with `snapshot.json`, `Public\index.db` and hosted files under
-`feed\manifests` and `feed\packages`. Use `--build <buildId>` with `publish`
-or state verification to select a snapshot other than the latest.
+`feed\manifests` and `feed\packages`. Use `--build <buildId>` with `package`,
+`publish` or state verification to select a snapshot other than the latest.
 
-Prepare the PFX outside both the input and published directories. Supply the
-password to the process through your CI secret mechanism, not a literal command
-line or checked-in file:
+First, emit an unsigned `source2.msix` outside both `--state` and
+`--destination`. Passing `--destination` to `package` pre-validates destination
+ownership and version ordering before you invoke an external signer:
 
 ```powershell
-# SOURCE_PFX_PASSWORD is already populated by the CI secret store.
-pinget repository publish --state .\publisher-state --destination .\public `
+pinget repository package --state .\publisher-state --destination .\public `
     --name Pinget.InternalSource --publisher 'CN=Example Source Publisher' `
-    --version 1.0.0.0 --pfx .\secrets\source.pfx `
-    --password-env SOURCE_PFX_PASSWORD
-
-pinget repository verify --destination .\public
+    --version 1.0.0.0 --msix .\staged\source2.msix
 ```
 
 The source package version is an explicit **four-component MSIX version**,
 separate from any application version. Keep the source identity and publisher
 stable, and increase the source version on each changed publication.
 
-For local format development only, replace the signing options with
-`--unsigned-development`. This is not a production trust configuration. The
-publisher does not install certificates, configure WinGet source trust or
+Next, sign `.\staged\source2.msix` directly with `psign-tool` (Pinget never
+handles signing keys, PFX passwords or cloud credentials). Choose the signing
+backend appropriate for your environment:
+
+```powershell
+# Option A: Azure Artifact Signing (managed identity, workload identity, or service principal)
+psign-tool --mode portable sign `
+    --artifact-signing-endpoint https://wus2.codesigning.azure.net `
+    --artifact-signing-account-name <account> `
+    --artifact-signing-profile-name <profile> `
+    --artifact-signing-managed-identity `
+    --digest sha256 `
+    --timestamp-url http://timestamp.acs.microsoft.com --timestamp-digest sha256 `
+    .\staged\source2.msix
+
+# Option B: Azure Key Vault
+psign-tool --mode portable sign `
+    --azure-key-vault-url https://<vault>.vault.azure.net `
+    --azure-key-vault-certificate <cert-name> `
+    --azure-key-vault-managed-identity `
+    --digest sha256 `
+    --timestamp-url <tsa-url> --timestamp-digest sha256 `
+    .\staged\source2.msix
+
+# Option C: Local/CI PFX via a private @response.rsp file so the password stays off the command line
+psign-tool @.\secrets\sign.rsp
+```
+
+Finally, promote the signed MSIX and snapshot artifacts:
+
+```powershell
+pinget repository publish --state .\publisher-state --destination .\public `
+    --msix .\staged\source2.msix
+
+pinget repository verify --destination .\public
+```
+
+For local format development only, skip the signing step and pass
+`--unsigned-development` to `publish` (`publish` rejects signed packages when
+`--unsigned-development` is set). This is not a production trust configuration.
+The publisher does not install certificates, configure WinGet source trust or
 change the caller's sources.
 
-The PFX password is not stored in publisher state or normal diagnostics. The
-publisher hands it to `psign-tool` through a response file in a private
-temporary directory, deleted after signing, rather than on the command line.
-It is still present briefly on disk and in the signing process, so use a
-protected build agent and restrict access to both that agent and the PFX.
-
-After signing, the publisher checks the package digests, that the signer
-certificate subject matches `--publisher` and carries the Code Signing usage,
-and that the signature chains to a trusted root. On Windows the root must be
-trusted by the machine, like `signtool verify /pa`; on Linux and macOS psign's
-Microsoft AuthRoot anchors are used. For a private or self-signed root, pass
-its certificate with `--trusted-ca` (repeatable) to `publish` and
-`verify --destination`.
+Before promoting `source2.msix`, `publish` stages a private copy of `--msix`,
+verifies that `Public/index.db` matches the snapshot, validates the canonical
+`AppxManifest.xml` identity and version, and (unless `--unsigned-development`
+is passed) runs read-only `psign-tool` checks on the package digests, signer
+certificate subject (`Identity/@Publisher`), Code Signing usage and root trust.
+On Windows the root must be trusted by the machine, like `signtool verify /pa`;
+on Linux and macOS psign's Microsoft AuthRoot anchors are used. For a private
+or self-signed root, pass its certificate with `--trusted-ca` (repeatable) to
+`publish` and `verify --destination`.
 
 ## Host the result
 
@@ -180,18 +214,21 @@ PowerShell 7.4+ helper scripts under `scripts\`:
    `microsoft/winget-pkgs` and applies open pull requests authored by the
    vendor bot (`devolutionsbot` by default) via 3-way git merge (`git apply
    --index --3way`), preserving renames and refusing stale/conflicting hunks.
-2. **Build and sign the static site** (`scripts\Build-DevolutionsStaticFeed.ps1`):
-   runs `pinget repository build`, `pinget repository verify`, and
-   `pinget repository publish` with `psign-tool`. When `-PackageVersion` is
-   omitted, it starts at `1.0.0.0`, reuses the existing version for unchanged
-   snapshots, and increments the 4-part AppX version automatically when build
-   content changes. In isolated test environments, pass `-GenerateTestPki` to
-   mint a disposable 2-tier PKI (`root-ca.cer`, `codesign.pfx`, and
-   `tls-server.pfx`) via `psign-tool portable generate-root-ca`,
-   `issue-code-signing-cert` and `issue-tls-server-cert` (`root-ca.pfx` is
-   deleted immediately), then verify `source2.msix` against `--trusted-ca
-   root-ca.cer` without altering the build machine's certificate store. Never
-   export or trust `-GenerateTestPki` material outside an isolated test machine.
+2. **Build, package, sign and publish the static site** (`scripts\Build-DevolutionsStaticFeed.ps1`):
+   runs `pinget repository build`, `pinget repository verify`, `pinget
+   repository package`, external `psign-tool` signing (either from PFX /
+   `-GenerateTestPki` or custom `-PsignSignArguments` for Azure Artifact Signing,
+   Azure Key Vault or `@sign.rsp`), and `pinget repository publish --msix`.
+   When `-PackageVersion` is omitted, it starts at `1.0.0.0`, reuses the
+   existing version for unchanged snapshots, and increments the 4-part AppX
+   version automatically when build content changes. In isolated test
+   environments, pass `-GenerateTestPki` to mint a disposable 2-tier PKI
+   (`root-ca.cer`, `codesign.pfx`, and `tls-server.pfx`) via `psign-tool
+   portable generate-root-ca`, `issue-code-signing-cert` and
+   `issue-tls-server-cert` (`root-ca.pfx` is deleted immediately), then verify
+   `source2.msix` against `--trusted-ca root-ca.cer` without altering the build
+   machine's certificate store. Never export or trust `-GenerateTestPki`
+   material outside an isolated test machine.
 3. **Serve over HTTPS in a test environment** (`scripts\Serve-StaticFeed.ps1`):
    serves the published directory concurrently over TLS (default unprivileged
    port `8443`; pass `-Port 443` when elevated) with `GET`/`HEAD`, `ETag` (`304
@@ -226,9 +263,11 @@ pwsh -NoLogo -NoProfile -File .\scripts\Serve-StaticFeed.ps1 `
 
 In CI, persist the publisher state between runs if you want meaningful diffs,
 but keep it separate from deployment output. Run `build`, inspect `diff`, run
-`verify`, then publish with the next source version. Upload to a staging
-location before index-last promotion. Restrict signing credentials to trusted
-branches and protected deployment jobs; do not expose them to pull-request code.
+`verify`, emit the unsigned MSIX with `package` using the next source version,
+sign it with `psign-tool` in your protected signing step, and run `publish
+--msix`. Upload to a staging location before index-last promotion. Restrict
+signing credentials to trusted branches and protected deployment jobs; do not
+expose them to pull-request code.
 
 The manual [source-build workflow](../.github/workflows/repository-build.yml)
 is a minimal unsigned build example: give it a repository-relative manifest

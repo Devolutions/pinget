@@ -228,13 +228,26 @@ public sealed class Wave6DefectTests
         var (state, buildId) = BuildFixture(temp);
         var destination = Path.Combine(temp.Path, "feed");
 
-        PublisherPackaging.Publish(Options(state, destination, "01.0.0.0", buildId));
+        var packaged = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            Path.Combine(temp.Path, "leading-zero.msix"),
+            "Pinget.Test.Wave6",
+            "CN=Pinget Wave6 Test",
+            "01.0.0.0",
+            BuildId: buildId));
+        Assert.Equal("1.0.0.0", packaged.PackageVersion);
+        PublisherPackaging.Publish(new PublisherPublishOptions(
+            state,
+            destination,
+            packaged.MsixPath,
+            UnsignedDevelopment: true,
+            BuildId: buildId));
 
         var marker = JsonNode.Parse(File.ReadAllText(Path.Combine(destination, ".pinget-publisher.json")))!;
         Assert.Equal("1.0.0.0", marker["packageVersion"]!.GetValue<string>());
         Assert.True(PublisherPackaging.Publish(Options(state, destination, "1.0.0.0", buildId)).Valid);
-        Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(Options(state, destination, "+1.0.0.1", buildId)));
-        Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(Options(state, destination, " 1.0.0.1", buildId)));
+        Assert.Throws<PublisherException>(() => Options(state, destination, "+1.0.0.1", buildId));
+        Assert.Throws<PublisherException>(() => Options(state, destination, " 1.0.0.1", buildId));
     }
 
     [Fact]
@@ -312,8 +325,18 @@ public sealed class Wave6DefectTests
         return (state, new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state)).BuildId);
     }
 
-    private static PublisherPublishOptions Options(string state, string destination, string version, string buildId) =>
-        new(state, destination, "Pinget.Test.Wave6", "CN=Pinget Wave6 Test", version, UnsignedDevelopment: true, BuildId: buildId);
+    private static PublisherPublishOptions Options(string state, string destination, string version, string buildId)
+    {
+        var msixPath = Path.Combine(Path.GetDirectoryName(state)!, $"staged-{Guid.NewGuid():N}.msix");
+        _ = PublisherPackaging.Package(new PublisherPackageOptions(
+            state,
+            msixPath,
+            "Pinget.Test.Wave6",
+            "CN=Pinget Wave6 Test",
+            version,
+            BuildId: buildId));
+        return new PublisherPublishOptions(state, destination, msixPath, UnsignedDevelopment: true, BuildId: buildId);
+    }
 
     private static string[] ReadColumn(SqliteConnection database, string sql)
     {

@@ -27,13 +27,12 @@ internal enum SignaturePolicy
 }
 
 /// <summary>
-/// Signs and verifies MSIX packages with the cross-platform <c>psign-tool</c> from
+/// Verifies MSIX packages with the cross-platform <c>psign-tool</c> from
 /// https://github.com/Devolutions/psign (dotnet tool <c>Devolutions.Psign.Tool</c>).
 /// </summary>
 /// <remarks>
 /// Every invocation passes its arguments through a response file in a private temporary
-/// directory so the PFX password never appears on a process command line, and so
-/// <c>.cmd</c> tool shims never re-parse arguments.
+/// directory so <c>.cmd</c> tool shims never re-parse arguments.
 /// </remarks>
 internal static class PsignTool
 {
@@ -78,25 +77,6 @@ internal static class PsignTool
             throw new PublisherException($"psign-tool does not exist at {Path.GetFullPath(explicitPath)}");
         return Find(explicitPath) ?? throw new PublisherException(
             "psign-tool was not found; install it with `dotnet tool install -g Devolutions.Psign.Tool` or pass --psign-tool");
-    }
-
-    /// <summary>Signs <paramref name="package"/> in place with a PFX, using portable Authenticode signing.</summary>
-    public static void Sign(string tool, string package, string pfx, string password, string? timestampUrl)
-    {
-        if (password.Contains('\r') || password.Contains('\n'))
-            throw new PublisherException("the PFX password must not contain line breaks");
-        var arguments = new List<string>
-        {
-            "--mode", "portable", "sign",
-            "--pfx", PathArgument(pfx),
-            // `--password=<value>` keeps a leading `@` from being read as a response-file include.
-            $"--password={password}",
-            "--digest", "sha256",
-        };
-        if (timestampUrl is not null)
-            arguments.AddRange(["--timestamp-url", timestampUrl, "--timestamp-digest", "sha256"]);
-        arguments.Add(PathArgument(package));
-        _ = Run(tool, "MSIX signing", arguments, password);
     }
 
     /// <summary>
@@ -235,7 +215,6 @@ internal static class PsignTool
         string tool,
         string operation,
         IReadOnlyList<string> arguments,
-        string? secret = null,
         string? failureHint = null)
     {
         int exitCode;
@@ -277,8 +256,6 @@ internal static class PsignTool
         var message = stderr.Trim();
         if (message.Length == 0)
             message = stdout.Trim();
-        if (!string.IsNullOrEmpty(secret))
-            message = message.Replace(secret, "<redacted>", StringComparison.Ordinal);
         if (message.Length > 4000)
             message = message[..4000].Trim();
         var error = $"{operation} with psign-tool failed (exit code {exitCode}): {message}";

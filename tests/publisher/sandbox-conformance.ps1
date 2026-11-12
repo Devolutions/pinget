@@ -121,6 +121,39 @@ function Invoke-PublisherCommand {
     }
 }
 
+function Invoke-PsignResponseFile {
+    param(
+        [string[]] $Arguments,
+        [string] $SecretToRedact = ''
+    )
+    $rspDir = Join-Path $script:WorkRoot ('psign-rsp-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $rspDir -Force | Out-Null
+    $rspPath = Join-Path $rspDir 'sign.rsp'
+    try {
+        for ($argIndex = 0; $argIndex -lt $Arguments.Count; $argIndex++) {
+            if ($Arguments[$argIndex].IndexOfAny([char[]]@("`r", "`n")) -ge 0) {
+                throw "psign-tool argument at index $argIndex must not contain CR or LF line breaks."
+            }
+        }
+        $lines = foreach ($arg in $Arguments) {
+            '"' + $arg.Replace('"', '""') + '"'
+        }
+        [System.IO.File]::WriteAllText($rspPath, ($lines -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+        $output = & $script:PsignToolPath "@$rspPath" 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+        if (-not [string]::IsNullOrEmpty($SecretToRedact)) {
+            $text = $text.Replace($SecretToRedact, '<redacted>')
+        }
+        if ($exitCode -ne 0) {
+            throw "psign-tool exited with ${exitCode}:`n$text"
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $rspDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Publish-ProductionInput {
     param([string] $InputDirectory, [string] $PackageVersion)
     $build = Invoke-PublisherCommand @(
@@ -129,18 +162,53 @@ function Publish-ProductionInput {
     if ([string]::IsNullOrWhiteSpace($build.buildId)) {
         throw 'Production publisher build returned no buildId.'
     }
-    $published = Invoke-PublisherCommand @(
-        'publish', '--state', $script:PublisherStateDirectory,
-        '--destination', $script:feed, '--name', $script:PublisherName,
-        '--publisher', $script:PublisherIdentity, '--version', $PackageVersion,
-        '--pfx', $script:PfxPath, '--password-env', $script:PfxPasswordEnvironmentVariable,
-        '--psign-tool', $script:PsignToolPath,
-        '--build', $build.buildId
-    )
-    if (-not $published.valid) {
-        throw "Production publisher did not verify its signed output: $($published.message)"
+    $stagedDir = Join-Path $script:WorkRoot ('staged-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stagedDir -Force | Out-Null
+    $stagedMsix = Join-Path $stagedDir 'source2.msix'
+    try {
+        $packaged = Invoke-PublisherCommand @(
+            'package', '--state', $script:PublisherStateDirectory,
+            '--build', $build.buildId,
+            '--name', $script:PublisherName,
+            '--publisher', $script:PublisherIdentity,
+            '--version', $PackageVersion,
+            '--msix', $stagedMsix,
+            '--destination', $script:feed
+        )
+        if ($packaged.buildId -ne $build.buildId) {
+            throw "Production publisher package returned unexpected buildId '$($packaged.buildId)'."
+        }
+        $pfxPassword = [Environment]::GetEnvironmentVariable($script:PfxPasswordEnvironmentVariable)
+        if ($null -eq $pfxPassword) {
+            throw "PFX password environment variable '$($script:PfxPasswordEnvironmentVariable)' is not set."
+        }
+        try {
+            Invoke-PsignResponseFile -Arguments @(
+                '--mode', 'portable', 'sign',
+                '--pfx', ([System.IO.Path]::GetFullPath($script:PfxPath)),
+                "--password=$pfxPassword",
+                '--digest', 'sha256',
+                $stagedMsix
+            ) -SecretToRedact $pfxPassword
+        }
+        finally {
+            $pfxPassword = $null
+        }
+        $published = Invoke-PublisherCommand @(
+            'publish', '--state', $script:PublisherStateDirectory,
+            '--build', $build.buildId,
+            '--destination', $script:feed,
+            '--msix', $stagedMsix,
+            '--psign-tool', $script:PsignToolPath
+        )
+        if (-not $published.valid) {
+            throw "Production publisher did not verify its signed output: $($published.message)"
+        }
+        return $build.buildId
     }
-    return $build.buildId
+    finally {
+        Remove-Item -LiteralPath $stagedDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-PingetReaderCommand {

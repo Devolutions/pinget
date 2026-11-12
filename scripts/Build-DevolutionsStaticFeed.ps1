@@ -30,6 +30,10 @@ param(
 
     [string] $SigningPasswordEnvironmentVariable,
 
+    [string] $TimestampUrl,
+
+    [string[]] $PsignSignArguments = @(),
+
     [string[]] $TrustedCaPaths = @(),
 
     [string] $ManifestRepository = 'microsoft/winget-pkgs',
@@ -83,6 +87,11 @@ function Invoke-ResponseFileTool {
     New-Item -ItemType Directory -Path $rspDir -Force | Out-Null
     $rspPath = Join-Path $rspDir 'args.rsp'
     try {
+        for ($argIndex = 0; $argIndex -lt $Arguments.Count; $argIndex++) {
+            if ($Arguments[$argIndex].IndexOfAny([char[]]@("`r", "`n")) -ge 0) {
+                throw "psign-tool argument at index $argIndex must not contain CR or LF line breaks."
+            }
+        }
         $lines = foreach ($arg in $Arguments) {
             '"' + $arg.Replace('"', '""') + '"'
         }
@@ -341,8 +350,27 @@ try {
         }
     }
 
-    if ([string]::IsNullOrWhiteSpace($SigningPfxPath) -or [string]::IsNullOrWhiteSpace($SigningPasswordEnvironmentVariable)) {
-        throw 'Provide -GenerateTestPki or both -SigningPfxPath and -SigningPasswordEnvironmentVariable.'
+    if ($PsignSignArguments.Count -gt 0 -and (
+            $GenerateTestPki -or
+            -not [string]::IsNullOrWhiteSpace($SigningPfxPath) -or
+            -not [string]::IsNullOrWhiteSpace($SigningPasswordEnvironmentVariable) -or
+            -not [string]::IsNullOrWhiteSpace($TimestampUrl)
+        )) {
+        throw 'Do not combine -PsignSignArguments with -GenerateTestPki, -SigningPfxPath, -SigningPasswordEnvironmentVariable, or -TimestampUrl.'
+    }
+    if ($PsignSignArguments.Count -eq 0 -and (
+            [string]::IsNullOrWhiteSpace($SigningPfxPath) -or
+            [string]::IsNullOrWhiteSpace($SigningPasswordEnvironmentVariable)
+        )) {
+        throw 'Provide -GenerateTestPki, -PsignSignArguments, or both -SigningPfxPath and -SigningPasswordEnvironmentVariable.'
+    }
+    $parsedTimestampUri = $null
+    if (-not [string]::IsNullOrWhiteSpace($TimestampUrl) -and (
+            $TimestampUrl -match '\s' -or
+            -not [Uri]::TryCreate($TimestampUrl, [UriKind]::Absolute, [ref]$parsedTimestampUri) -or
+            ($parsedTimestampUri.Scheme -ne [Uri]::UriSchemeHttp -and $parsedTimestampUri.Scheme -ne [Uri]::UriSchemeHttps)
+        )) {
+        throw '-TimestampUrl must be an absolute HTTP or HTTPS URL without whitespace.'
     }
 
     $buildRaw = & $pingetFullPath --output json repository build --input $manifestsDir --state $stateDir
@@ -358,17 +386,63 @@ try {
         -BuildId ([string]$buildReport.buildId) `
         -RotatedSigningAuthority $mintedNewSigningAuthority
 
+    $stagedDir = Join-Path $workFullPath 'staged'
+    New-Item -ItemType Directory -Path $stagedDir -Force | Out-Null
+    $stagedMsix = Join-Path $stagedDir 'source2.msix'
+
+    $packageRaw = & $pingetFullPath --output json repository package `
+        --state $stateDir `
+        --build $buildReport.buildId `
+        --name $PackageName `
+        --publisher $Publisher `
+        --version $effectivePackageVersion `
+        --msix $stagedMsix `
+        --destination $siteDir
+    if ($LASTEXITCODE -ne 0) { throw "pinget repository package failed." }
+    $packageReport = $packageRaw | ConvertFrom-Json
+
+    if ($PsignSignArguments.Count -gt 0) {
+        $customSignArgs = [string[]]($PsignSignArguments + @($stagedMsix))
+        $null = Invoke-ResponseFileTool -ToolPath $psignFullPath -Arguments $customSignArgs
+    }
+    else {
+        $pfxFullPath = [System.IO.Path]::GetFullPath($SigningPfxPath)
+        if (-not (Test-Path -LiteralPath $pfxFullPath -PathType Leaf)) {
+            throw "Signing PFX does not exist: $pfxFullPath"
+        }
+        $signPassword = [Environment]::GetEnvironmentVariable($SigningPasswordEnvironmentVariable)
+        if ($null -eq $signPassword) {
+            throw "Signing password environment variable '$SigningPasswordEnvironmentVariable' is not set."
+        }
+        $signArgs = [System.Collections.Generic.List[string]]::new()
+        $signArgs.AddRange([string[]]@(
+            '--mode', 'portable', 'sign',
+            '--pfx', $pfxFullPath,
+            "--password=$signPassword",
+            '--digest', 'sha256'
+        ))
+        if (-not [string]::IsNullOrWhiteSpace($TimestampUrl)) {
+            $signArgs.Add('--timestamp-url')
+            $signArgs.Add($TimestampUrl)
+            $signArgs.Add('--timestamp-digest')
+            $signArgs.Add('sha256')
+        }
+        $signArgs.Add($stagedMsix)
+        try {
+            $null = Invoke-ResponseFileTool -ToolPath $psignFullPath -Arguments $signArgs.ToArray() -SecretsToRedact @($signPassword)
+        }
+        finally {
+            $signPassword = $null
+        }
+    }
+
     $publishArgs = [System.Collections.Generic.List[string]]::new()
     $publishArgs.AddRange([string[]]@(
         '--output', 'json', 'repository', 'publish',
         '--state', $stateDir,
         '--build', $buildReport.buildId,
         '--destination', $siteDir,
-        '--name', $PackageName,
-        '--publisher', $Publisher,
-        '--version', $effectivePackageVersion,
-        '--pfx', ([System.IO.Path]::GetFullPath($SigningPfxPath)),
-        '--password-env', $SigningPasswordEnvironmentVariable,
+        '--msix', $stagedMsix,
         '--psign-tool', $psignFullPath
     ))
     foreach ($ca in $TrustedCaPaths) {
@@ -401,6 +475,7 @@ try {
         PackageVersion = $effectivePackageVersion
         Sync = $syncReport
         Build = $buildReport
+        Package = $packageReport
         Publish = $publishReport
         Verify = $verifyDestReport
         TestPki = $generatedPki

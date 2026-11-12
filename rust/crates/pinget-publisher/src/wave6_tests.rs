@@ -262,17 +262,28 @@ fn p10_publisher_temporary_names_are_recognized_narrowly() {
 
 #[cfg(windows)]
 fn publish_options(state: &Path, destination: &Path, build_id: &str, version: &str) -> PublishOptions {
+    let msix = state.parent().expect("root").join(format!(
+        "staged-{build_id}-{version}-{}.msix",
+        unique_temporary_suffix()
+    ));
+    package(&PackageOptions {
+        state: state.to_path_buf(),
+        build_id: Some(build_id.to_owned()),
+        msix: msix.clone(),
+        name: "Pinget.Test.Wave6".to_owned(),
+        publisher: "CN=Pinget Wave6 Test".to_owned(),
+        version: version.to_owned(),
+        destination: None,
+    })
+    .expect("package");
     PublishOptions {
         state: state.to_path_buf(),
         destination: destination.to_path_buf(),
         build_id: Some(build_id.to_owned()),
-        name: "Pinget.Test.Wave6".to_owned(),
-        publisher: "CN=Pinget Wave6 Test".to_owned(),
-        version: version.to_owned(),
-        signing: Signing::UnsignedDevelopment,
+        msix,
+        unsigned_development: true,
         psign_tool: None,
         trusted_ca: Vec::new(),
-        timestamp_url: None,
     }
 }
 
