@@ -1027,11 +1027,11 @@ fn scan_manifests(root: &Path) -> Result<(Inventory, ManifestGroups)> {
         let package = merge_documents(&first.id, docs.clone())?;
         let fields = catalog_fields_all(std::slice::from_ref(&package))?;
         manifests.push(ManifestInventory {
-            id: package.id.clone(),
-            name: package.name.clone(),
-            version: package.version.clone(),
+            id: package.id,
+            name: package.name,
             latest_version: package.version.clone(),
-            moniker: package.moniker.clone(),
+            version: package.version,
+            moniker: package.moniker,
             manifest_path: String::new(),
             manifest_hash: String::new(),
             sidecar_path: String::new(),
