@@ -408,6 +408,7 @@ public sealed class Wave12DefectTests
             + $"ArchiveBinariesDependOnPath: true\nInstallationMetadata:\n  DefaultInstallLocation: 1.10\n"
             + $"Authentication:\n  AuthenticationType: microsoftEntraId\n  "
             + $"MicrosoftEntraIdAuthenticationInfo:\n    Resource: 12345\n"
+            + $"ModuleName: 2026.1\n"
             + $"Installers:\n  - Architecture: x64\n    NestedInstallerType: portable\n    "
             + $"InstallerUrl: https://cdn.devolutions.net/download/devo.zip\n    InstallerSha256: {Hash}\n    "
             + $"NestedInstallerFiles:\n      - RelativeFilePath: devo.exe\n        PortableCommandAlias: devo\n"
@@ -425,6 +426,7 @@ public sealed class Wave12DefectTests
         Assert.True(json["ArchiveBinariesDependOnPath"]!.GetValue<bool>());
         Assert.Equal("1.10", json["InstallationMetadata"]!["DefaultInstallLocation"]!.GetValue<string>());
         Assert.Equal("12345", json["Authentication"]!["MicrosoftEntraIdAuthenticationInfo"]!["Resource"]!.GetValue<string>());
+        Assert.Equal("2026.1", json["ModuleName"]!.GetValue<string>());
         Assert.Equal("devo", json["Installers"]![0]!["NestedInstallerFiles"]![0]!["PortableCommandAlias"]!.GetValue<string>());
     }
 

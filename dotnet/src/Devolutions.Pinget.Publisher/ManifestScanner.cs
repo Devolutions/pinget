@@ -44,6 +44,7 @@ internal sealed record ScanResult(
 
 internal static partial class ManifestScanner
 {
+    // Includes all upstream WinGet frozen manifest versions (plus 1.11.0/1.8.0/1.3.0 minor slots accepted for compatibility).
     private static readonly HashSet<string> SupportedSchemaVersions = new(StringComparer.Ordinal)
     {
         "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0",
@@ -222,7 +223,7 @@ internal static partial class ManifestScanner
             or "FileExtensions" or "Protocols" or "Capabilities" or "RestrictedCapabilities"
             or "InstallerSwitches" or "InstallLocation" or "DefaultInstallLocation"
             or "InstallModes" or "Platform" or "UpgradeBehavior" or "NestedInstallerType"
-            or "IconResolution" or "IconTheme" or "AuthenticationType" or "Resource" or "Argument"
+            or "IconResolution" or "IconTheme" or "AuthenticationType" or "Resource" or "ModuleName" or "Argument"
             or "Command" or "Custom" or "Silent" or "SilentWithProgress" or "Interactive"
             or "Log" or "Repair" or "Uninstall" or "Update" or "Channel"
             or "WindowsFeatures" or "WindowsLibraries" or "ExternalDependencies" or "DocumentLabel"

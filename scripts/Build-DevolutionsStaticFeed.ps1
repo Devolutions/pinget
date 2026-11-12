@@ -1,3 +1,4 @@
+#Requires -Version 7.4
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -11,13 +12,19 @@ param(
 
     [string] $Publisher = 'CN=Devolutions Inc., O=Devolutions Inc., L=Lavaltrie, S=Quebec, C=CA',
 
-    [string] $PackageVersion = '1.0.0.0',
+    [string] $PackageVersion,
 
     [string[]] $TlsDnsNames = @('winget.devolutions.test', 'localhost'),
 
     [string[]] $TlsIpAddresses = @('127.0.0.1'),
 
     [switch] $GenerateTestPki,
+
+    [switch] $ForceRegenerateTestPki,
+
+    [string] $TlsPasswordEnvironmentVariable,
+
+    [switch] $EmitTlsPemKey,
 
     [string] $SigningPfxPath,
 
@@ -32,6 +39,8 @@ param(
     [string] $PullRequestAuthor = 'devolutionsbot',
 
     [switch] $SkipOpenPullRequests,
+
+    [switch] $SkipConflictingPullRequests,
 
     [switch] $SkipManifestSync,
 
@@ -147,6 +156,9 @@ if (-not $SkipManifestSync) {
     if ($SkipOpenPullRequests) {
         $syncParams['SkipOpenPullRequests'] = $true
     }
+    if ($SkipConflictingPullRequests) {
+        $syncParams['SkipConflictingPullRequests'] = $true
+    }
     if (-not [string]::IsNullOrWhiteSpace($SparseCheckoutDirectory)) {
         $syncParams['SparseCheckoutDirectory'] = $SparseCheckoutDirectory
     }
@@ -156,9 +168,63 @@ elseif (-not (Test-Path -LiteralPath $manifestsDir -PathType Container)) {
     throw "Manifest directory does not exist and -SkipManifestSync was specified: $manifestsDir"
 }
 
+function Step-QuadVersion {
+    param([string] $Version)
+    $parts = $Version.Trim().Split('.')
+    if ($parts.Length -ne 4) {
+        throw "Existing published packageVersion '$Version' is not a 4-part AppX version."
+    }
+    $nums = [int[]]::new(4)
+    for ($i = 0; $i -lt 4; $i++) {
+        $parsed = 0
+        if (-not [int]::TryParse($parts[$i], [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -or
+            $parsed -lt 0 -or $parsed -gt 65535) {
+            throw "Existing published packageVersion '$Version' has an out-of-range AppX component '$($parts[$i])'."
+        }
+        $nums[$i] = $parsed
+    }
+    for ($i = 3; $i -ge 0; $i--) {
+        if ($nums[$i] -lt 65535) {
+            $nums[$i]++
+            for ($j = $i + 1; $j -lt 4; $j++) {
+                $nums[$j] = 0
+            }
+            return ($nums -join '.')
+        }
+    }
+    throw "Cannot auto-increment exhausted AppX packageVersion '$Version'."
+}
+
+function Resolve-EffectivePackageVersion {
+    param(
+        [string] $ExplicitVersion,
+        [string] $DestinationDir,
+        [string] $BuildId,
+        [bool] $RotatedSigningAuthority
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitVersion)) {
+        return $ExplicitVersion.Trim()
+    }
+    $markerPath = Join-Path $DestinationDir '.pinget-publisher.json'
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+        return '1.0.0.0'
+    }
+    $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+    $priorVersion = [string]$marker.packageVersion
+    if ([string]::IsNullOrWhiteSpace($priorVersion)) {
+        return '1.0.0.0'
+    }
+    $hasPending = $null -ne $marker.PSObject.Properties['pendingCommit'] -and $null -ne $marker.pendingCommit
+    if (-not $RotatedSigningAuthority -and -not $hasPending -and [string]$marker.buildId -eq $BuildId) {
+        return $priorVersion
+    }
+    return Step-QuadVersion -Version $priorVersion
+}
+
 $generatedPki = $null
 $ephemeralSignPasswordVar = $null
 $ephemeralSignPassword = $null
+$mintedNewSigningAuthority = $false
 
 try {
     if ($GenerateTestPki) {
@@ -169,69 +235,99 @@ try {
         $codeSignPfx = Join-Path $pkiDir 'codesign.pfx'
         $codeSignCer = Join-Path $pkiDir 'codesign.cer'
         $tlsPfx = Join-Path $pkiDir 'tls-server.pfx'
-        $tlsPem = Join-Path $pkiDir 'tls-fullchain.pem'
-        $tlsKey = Join-Path $pkiDir 'tls-server.key'
-        $tlsPasswordFile = Join-Path $pkiDir 'tls-password.txt'
+        $tlsPem = if ($EmitTlsPemKey) { Join-Path $pkiDir 'tls-fullchain.pem' } else { $null }
+        $tlsKey = if ($EmitTlsPemKey) { Join-Path $pkiDir 'tls-server.key' } else { $null }
 
-        $caPassword = New-EphemeralSecret
-        $ephemeralSignPassword = New-EphemeralSecret
-        $tlsPassword = New-EphemeralSecret
+        $canReuseExistingTestPki = (-not $ForceRegenerateTestPki) -and
+            (-not [string]::IsNullOrWhiteSpace($SigningPasswordEnvironmentVariable)) -and
+            (Test-Path -LiteralPath $rootCer -PathType Leaf) -and
+            (Test-Path -LiteralPath $codeSignPfx -PathType Leaf) -and
+            (Test-Path -LiteralPath $tlsPfx -PathType Leaf)
 
-        try {
-            $null = Invoke-ResponseFileTool -ToolPath $psignFullPath -Arguments @(
-                'portable', 'generate-root-ca',
-                '--subject', 'CN=Devolutions Static Feed Test Root CA, O=Devolutions Inc., C=CA',
-                '--validity-days', '3650',
-                '--cert-out', $rootCer,
-                '--pem-out', $rootPem,
-                '--pfx-out', $rootPfx,
-                "--password=$caPassword"
-            ) -SecretsToRedact @($caPassword)
-
-            $null = Invoke-ResponseFileTool -ToolPath $psignFullPath -Arguments @(
-                'portable', 'issue-code-signing-cert',
-                '--ca-pfx', $rootPfx,
-                "--ca-password=$caPassword",
-                '--subject', $Publisher,
-                '--validity-days', '365',
-                '--pfx-out', $codeSignPfx,
-                "--password=$ephemeralSignPassword",
-                '--cert-out', $codeSignCer
-            ) -SecretsToRedact @($caPassword, $ephemeralSignPassword)
-
-            $tlsArgs = [System.Collections.Generic.List[string]]::new()
-            $tlsArgs.AddRange([string[]]@(
-                'portable', 'issue-tls-server-cert',
-                '--ca-pfx', $rootPfx,
-                "--ca-password=$caPassword",
-                '--validity-days', '365',
-                '--pfx-out', $tlsPfx,
-                "--password=$tlsPassword",
-                '--pem-out', $tlsPem,
-                '--key-out', $tlsKey
-            ))
-            foreach ($dns in $TlsDnsNames) {
-                $tlsArgs.Add('--dns')
-                $tlsArgs.Add($dns)
+        if (-not $canReuseExistingTestPki) {
+            $mintedNewSigningAuthority = $true
+            $caPassword = New-EphemeralSecret
+            if (-not [string]::IsNullOrWhiteSpace($SigningPasswordEnvironmentVariable)) {
+                $existingSignPw = [Environment]::GetEnvironmentVariable($SigningPasswordEnvironmentVariable)
+                if ($null -eq $existingSignPw) {
+                    throw "Signing password environment variable '$SigningPasswordEnvironmentVariable' is not set."
+                }
+                $ephemeralSignPassword = $existingSignPw
             }
-            foreach ($ip in $TlsIpAddresses) {
-                $tlsArgs.Add('--ip')
-                $tlsArgs.Add($ip)
+            else {
+                $ephemeralSignPassword = New-EphemeralSecret
+                $ephemeralSignPasswordVar = 'PINGET_STATIC_FEED_SIGN_PW_' + [Guid]::NewGuid().ToString('N')
+                [Environment]::SetEnvironmentVariable($ephemeralSignPasswordVar, $ephemeralSignPassword, 'Process')
+                $SigningPasswordEnvironmentVariable = $ephemeralSignPasswordVar
             }
-            $null = Invoke-ResponseFileTool -ToolPath $psignFullPath -Arguments $tlsArgs.ToArray() -SecretsToRedact @($caPassword, $tlsPassword)
 
-            # Remove the Root CA private key immediately after issuing the leaf certificates.
-            Remove-Item -LiteralPath $rootPfx -Force
-            [System.IO.File]::WriteAllText($tlsPasswordFile, $tlsPassword, [System.Text.UTF8Encoding]::new($false))
-        }
-        finally {
-            $caPassword = $null
+            $tlsPassword = [string]::Empty
+            if (-not [string]::IsNullOrWhiteSpace($TlsPasswordEnvironmentVariable)) {
+                $envTlsPw = [Environment]::GetEnvironmentVariable($TlsPasswordEnvironmentVariable)
+                if ($null -eq $envTlsPw) {
+                    throw "TLS password environment variable '$TlsPasswordEnvironmentVariable' is not set."
+                }
+                $tlsPassword = $envTlsPw
+            }
+
+            try {
+                $null = Invoke-ResponseFileTool -ToolPath $psignFullPath -Arguments @(
+                    'portable', 'generate-root-ca',
+                    '--subject', 'CN=Devolutions Static Feed Test Root CA, O=Devolutions Inc., C=CA',
+                    '--validity-days', '3650',
+                    '--cert-out', $rootCer,
+                    '--pem-out', $rootPem,
+                    '--pfx-out', $rootPfx,
+                    "--password=$caPassword"
+                ) -SecretsToRedact @($caPassword)
+
+                $null = Invoke-ResponseFileTool -ToolPath $psignFullPath -Arguments @(
+                    'portable', 'issue-code-signing-cert',
+                    '--ca-pfx', $rootPfx,
+                    "--ca-password=$caPassword",
+                    '--subject', $Publisher,
+                    '--validity-days', '365',
+                    '--pfx-out', $codeSignPfx,
+                    "--password=$ephemeralSignPassword",
+                    '--cert-out', $codeSignCer
+                ) -SecretsToRedact @($caPassword, $ephemeralSignPassword)
+
+                $tlsArgs = [System.Collections.Generic.List[string]]::new()
+                $tlsArgs.AddRange([string[]]@(
+                    'portable', 'issue-tls-server-cert',
+                    '--ca-pfx', $rootPfx,
+                    "--ca-password=$caPassword",
+                    '--validity-days', '365',
+                    '--pfx-out', $tlsPfx,
+                    "--password=$tlsPassword"
+                ))
+                if ($EmitTlsPemKey) {
+                    $tlsArgs.Add('--pem-out')
+                    $tlsArgs.Add($tlsPem)
+                    $tlsArgs.Add('--key-out')
+                    $tlsArgs.Add($tlsKey)
+                }
+                foreach ($dns in $TlsDnsNames) {
+                    $tlsArgs.Add('--dns')
+                    $tlsArgs.Add($dns)
+                }
+                foreach ($ip in $TlsIpAddresses) {
+                    $tlsArgs.Add('--ip')
+                    $tlsArgs.Add($ip)
+                }
+                $null = Invoke-ResponseFileTool -ToolPath $psignFullPath -Arguments $tlsArgs.ToArray() -SecretsToRedact @($caPassword, $tlsPassword)
+            }
+            finally {
+                # Always remove the Root CA private key even if leaf issuance fails.
+                if (Test-Path -LiteralPath $rootPfx) {
+                    Remove-Item -LiteralPath $rootPfx -Force -ErrorAction SilentlyContinue
+                }
+                $caPassword = $null
+                $tlsPassword = $null
+            }
         }
 
-        $ephemeralSignPasswordVar = 'PINGET_STATIC_FEED_SIGN_PW_' + [Guid]::NewGuid().ToString('N')
-        [Environment]::SetEnvironmentVariable($ephemeralSignPasswordVar, $ephemeralSignPassword, 'Process')
         $SigningPfxPath = $codeSignPfx
-        $SigningPasswordEnvironmentVariable = $ephemeralSignPasswordVar
         $TrustedCaPaths = @($rootCer)
         $generatedPki = [pscustomobject]@{
             RootCaCertPath = $rootCer
@@ -241,7 +337,7 @@ try {
             TlsServerPfxPath = $tlsPfx
             TlsFullChainPemPath = $tlsPem
             TlsPrivateKeyPath = $tlsKey
-            TlsPasswordFilePath = $tlsPasswordFile
+            ReusedExistingPki = $canReuseExistingTestPki
         }
     }
 
@@ -256,6 +352,12 @@ try {
     $verifyStateRaw = & $pingetFullPath --output json repository verify --state $stateDir --build $buildReport.buildId
     if ($LASTEXITCODE -ne 0) { throw "pinget repository verify --state failed." }
 
+    $effectivePackageVersion = Resolve-EffectivePackageVersion `
+        -ExplicitVersion $PackageVersion `
+        -DestinationDir $siteDir `
+        -BuildId ([string]$buildReport.buildId) `
+        -RotatedSigningAuthority $mintedNewSigningAuthority
+
     $publishArgs = [System.Collections.Generic.List[string]]::new()
     $publishArgs.AddRange([string[]]@(
         '--output', 'json', 'repository', 'publish',
@@ -264,7 +366,7 @@ try {
         '--destination', $siteDir,
         '--name', $PackageName,
         '--publisher', $Publisher,
-        '--version', $PackageVersion,
+        '--version', $effectivePackageVersion,
         '--pfx', ([System.IO.Path]::GetFullPath($SigningPfxPath)),
         '--password-env', $SigningPasswordEnvironmentVariable,
         '--psign-tool', $psignFullPath
@@ -296,6 +398,7 @@ try {
         SiteDirectory = $siteDir
         StateDirectory = $stateDir
         ManifestsDirectory = $manifestsDir
+        PackageVersion = $effectivePackageVersion
         Sync = $syncReport
         Build = $buildReport
         Publish = $publishReport

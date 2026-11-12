@@ -543,6 +543,7 @@ fn schema_versions_1_11_1_12_1_28_and_1_31_preserve_string_and_boolean_fields() 
              ArchiveBinariesDependOnPath: true\nInstallationMetadata:\n  DefaultInstallLocation: 1.10\n\
              Authentication:\n  AuthenticationType: microsoftEntraId\n  \
              MicrosoftEntraIdAuthenticationInfo:\n    Resource: 12345\n\
+             ModuleName: 2026.1\n\
              Installers:\n  - Architecture: x64\n    NestedInstallerType: portable\n    \
              InstallerUrl: https://cdn.devolutions.net/download/devo.zip\n    InstallerSha256: {HASH}\n    \
              NestedInstallerFiles:\n      - RelativeFilePath: devo.exe\n        PortableCommandAlias: devo\n\
@@ -571,6 +572,7 @@ fn schema_versions_1_11_1_12_1_28_and_1_31_preserve_string_and_boolean_fields() 
             json["Authentication"]["MicrosoftEntraIdAuthenticationInfo"]["Resource"].as_str(),
             Some("12345")
         );
+        assert_eq!(json["ModuleName"].as_str(), Some("2026.1"));
         assert_eq!(
             json["Installers"][0]["NestedInstallerFiles"][0]["PortableCommandAlias"].as_str(),
             Some("devo")

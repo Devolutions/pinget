@@ -10,10 +10,33 @@ param(
 
     [string] $BindAddress = '127.0.0.1',
 
-    [int] $Port = 443
+    [int] $Port = 8443,
+
+    [int] $MaxConcurrentClients = 64
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($MaxConcurrentClients -lt 1) {
+    throw 'MaxConcurrentClients must be at least 1.'
+}
+
+# Ensure CodeDom / Add-Type on Windows PowerShell 5.1 has a writable process TMP/TEMP directory.
+$tempProbe = Join-Path ([System.IO.Path]::GetTempPath()) ("pinget-serve-probe-" + [Guid]::NewGuid().ToString('N'))
+try {
+    [System.IO.File]::WriteAllText($tempProbe, 'ok')
+    Remove-Item -LiteralPath $tempProbe -Force -ErrorAction SilentlyContinue
+}
+catch {
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $fallbackTemp = Join-Path $env:LOCALAPPDATA 'Temp'
+        New-Item -ItemType Directory -Path $fallbackTemp -Force | Out-Null
+        [Environment]::SetEnvironmentVariable('TMP', $fallbackTemp, 'Process')
+        [Environment]::SetEnvironmentVariable('TEMP', $fallbackTemp, 'Process')
+        $env:TMP = $fallbackTemp
+        $env:TEMP = $fallbackTemp
+    }
+}
 
 $rootPath = [System.IO.Path]::GetFullPath($Root)
 if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) {
@@ -36,274 +59,431 @@ if (-not [string]::IsNullOrWhiteSpace($CertificatePasswordEnvironmentVariable)) 
 }
 
 $ipAddress = [System.Net.IPAddress]::Parse($BindAddress)
-$certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-    $certFullPath,
-    $password,
-    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable `
-        -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet
-)
+$useOsDefaultTls = $PSVersionTable.PSVersion.Major -ge 7
 
-function Get-FeedContentType {
-    param([string] $Path)
-    switch ([System.IO.Path]::GetExtension($Path).ToLowerInvariant()) {
-        '.msix' { return 'application/msix' }
-        '.yaml' { return 'application/yaml' }
-        '.yml'  { return 'application/yaml' }
-        default { return 'application/octet-stream' }
-    }
-}
-
-function Write-SimpleHttpResponse {
-    param(
-        [System.Net.Security.SslStream] $TlsStream,
-        [string] $Status,
-        [bool] $CloseConnection
+# Windows Schannel (lsass.exe) requires a persisted key container (UserKeySet) rather than
+# EphemeralKeySet for SslStream.AuthenticateAsServer; omit Exportable and delete the transient
+# key container on shutdown so private key material does not outlive the server process.
+$loaderType = 'System.Security.Cryptography.X509Certificates.X509CertificateLoader' -as [type]
+$certificate = if ($null -ne $loaderType) {
+    $loaderType::LoadPkcs12FromFile(
+        $certFullPath,
+        $password,
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet
     )
-    $connHeader = if ($CloseConnection) { 'close' } else { 'keep-alive' }
-    $headerText = "HTTP/1.1 $Status`r`nContent-Length: 0`r`nConnection: $connHeader`r`n`r`n"
-    $bytes = [System.Text.Encoding]::ASCII.GetBytes($headerText)
-    $TlsStream.Write($bytes, 0, $bytes.Length)
-    $TlsStream.Flush()
-}
-
-function Invoke-SingleHttpRequest {
-    param(
-        [System.Net.Security.SslStream] $TlsStream,
-        [string] $RootPrefix
-    )
-    $headerBuffer = [System.IO.MemoryStream]::new()
-    try {
-        $state = 0
-        while ($headerBuffer.Length -lt 65536) {
-            try {
-                $byte = $TlsStream.ReadByte()
-            }
-            catch {
-                return $false
-            }
-            if ($byte -lt 0) {
-                return $false
-            }
-            $headerBuffer.WriteByte([byte]$byte)
-            if (($state -eq 0 -and $byte -eq 13) -or ($state -eq 2 -and $byte -eq 13)) { $state++ }
-            elseif (($state -eq 1 -and $byte -eq 10) -or ($state -eq 3 -and $byte -eq 10)) { $state++ }
-            else { $state = if ($byte -eq 13) { 1 } else { 0 } }
-            if ($state -eq 4) { break }
-        }
-        if ($state -ne 4) {
-            return $false
-        }
-        $requestText = [System.Text.Encoding]::ASCII.GetString($headerBuffer.ToArray())
-    }
-    finally {
-        $headerBuffer.Dispose()
-    }
-
-    $lines = $requestText -split "`r`n" | Where-Object { $_.Length -gt 0 }
-    if ($lines.Count -eq 0) {
-        return $false
-    }
-    $requestParts = $lines[0] -split ' ', 3
-    if ($requestParts.Count -lt 2) {
-        Write-SimpleHttpResponse -TlsStream $TlsStream -Status '400 Bad Request' -CloseConnection $true
-        return $false
-    }
-
-    $method = $requestParts[0].ToUpperInvariant()
-    $rawTarget = $requestParts[1]
-    $headers = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    for ($i = 1; $i -lt $lines.Count; $i++) {
-        $colon = $lines[$i].IndexOf(':')
-        if ($colon -gt 0) {
-            $headers[$lines[$i].Substring(0, $colon).Trim()] = $lines[$i].Substring($colon + 1).Trim()
-        }
-    }
-
-    $connValue = $null
-    $closeConnection = $headers.TryGetValue('Connection', [ref]$connValue) -and
-        ($connValue.IndexOf('close', [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
-
-    if ($method -notin @('GET', 'HEAD')) {
-        Write-SimpleHttpResponse -TlsStream $TlsStream -Status '405 Method Not Allowed' -CloseConnection $closeConnection
-        return (-not $closeConnection)
-    }
-
-    $targetPath = if ($rawTarget.StartsWith('/')) { $rawTarget } else { '/' + $rawTarget }
-    $parsedUri = $null
-    if (-not [System.Uri]::TryCreate("https://localhost$targetPath", [System.UriKind]::Absolute, [ref]$parsedUri)) {
-        Write-SimpleHttpResponse -TlsStream $TlsStream -Status '400 Bad Request' -CloseConnection $true
-        return $false
-    }
-
-    $unescaped = [System.Uri]::UnescapeDataString($parsedUri.AbsolutePath).TrimStart('/')
-    if ([string]::IsNullOrWhiteSpace($unescaped)) {
-        $unescaped = 'source2.msix'
-    }
-
-    foreach ($segment in ($unescaped -split '/')) {
-        if ([string]::IsNullOrEmpty($segment) -or $segment.StartsWith('.') -or $segment.Contains('\')) {
-            Write-SimpleHttpResponse -TlsStream $TlsStream -Status '404 Not Found' -CloseConnection $closeConnection
-            return (-not $closeConnection)
-        }
-    }
-
-    $fullPath = [System.IO.Path]::GetFullPath(
-        [System.IO.Path]::Combine($RootPrefix, $unescaped.Replace('/', [System.IO.Path]::DirectorySeparatorChar))
-    )
-    if (-not $fullPath.StartsWith($RootPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
-        -not [System.IO.File]::Exists($fullPath)) {
-        Write-SimpleHttpResponse -TlsStream $TlsStream -Status '404 Not Found' -CloseConnection $closeConnection
-        return (-not $closeConnection)
-    }
-
-    $fileInfo = [System.IO.FileInfo]::new($fullPath)
-    $totalLength = $fileInfo.Length
-    $lastModifiedRfc = $fileInfo.LastWriteTimeUtc.ToString('R', [System.Globalization.CultureInfo]::InvariantCulture)
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hashStream = [System.IO.File]::Open($fullPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-        try {
-            $digest = $sha.ComputeHash($hashStream)
-        }
-        finally {
-            $hashStream.Dispose()
-        }
-    }
-    finally {
-        $sha.Dispose()
-    }
-    $etagBuilder = [System.Text.StringBuilder]::new(34).Append('"')
-    for ($i = 0; $i -lt 16; $i++) {
-        [void]$etagBuilder.Append($digest[$i].ToString('x2', [System.Globalization.CultureInfo]::InvariantCulture))
-    }
-    $etag = $etagBuilder.Append('"').ToString()
-
-    $cacheControl = if ($unescaped.Equals('source2.msix', [System.StringComparison]::OrdinalIgnoreCase)) {
-        'no-cache'
-    }
-    else {
-        'public, max-age=31536000, immutable'
-    }
-    $connHeader = if ($closeConnection) { 'close' } else { 'keep-alive' }
-
-    $ifNoneMatch = $null
-    if ($headers.TryGetValue('If-None-Match', [ref]$ifNoneMatch) -and
-        [string]::Equals($ifNoneMatch.Trim(), $etag, [System.StringComparison]::Ordinal)) {
-        $notModifiedHeader = [System.Text.Encoding]::ASCII.GetBytes(
-            "HTTP/1.1 304 Not Modified`r`n" +
-            "ETag: $etag`r`n" +
-            "Last-Modified: $lastModifiedRfc`r`n" +
-            "Cache-Control: $cacheControl`r`n" +
-            "Connection: $connHeader`r`n`r`n"
-        )
-        $TlsStream.Write($notModifiedHeader, 0, $notModifiedHeader.Length)
-        $TlsStream.Flush()
-        return (-not $closeConnection)
-    }
-
-    [long]$start = 0
-    [long]$end = $totalLength - 1
-    $isPartial = $false
-    $rangeHeader = $null
-    if ($totalLength -gt 0 -and
-        $headers.TryGetValue('Range', [ref]$rangeHeader) -and
-        $rangeHeader.StartsWith('bytes=', [System.StringComparison]::OrdinalIgnoreCase)) {
-        $spec = $rangeHeader.Substring(6).Trim()
-        $dash = $spec.IndexOf('-')
-        if ($dash -ge 0 -and $spec.IndexOf(',') -lt 0) {
-            $left = $spec.Substring(0, $dash).Trim()
-            $right = $spec.Substring($dash + 1).Trim()
-            [long]$parsedStart = 0
-            if ($left.Length -gt 0 -and [long]::TryParse($left, [ref]$parsedStart)) {
-                [long]$parsedEnd = $totalLength - 1
-                if ($right.Length -gt 0) {
-                    [long]$rawEnd = 0
-                    if ([long]::TryParse($right, [ref]$rawEnd)) {
-                        $parsedEnd = [Math]::Min($rawEnd, $totalLength - 1)
-                    }
-                }
-                if ($parsedStart -ge 0 -and $parsedStart -le $parsedEnd -and $parsedStart -lt $totalLength) {
-                    $start = $parsedStart
-                    $end = $parsedEnd
-                    $isPartial = $true
-                }
-            }
-        }
-    }
-
-    [long]$sendLength = if ($totalLength -eq 0) { 0 } else { $end - $start + 1 }
-    $statusLine = if ($isPartial) { 'HTTP/1.1 206 Partial Content' } else { 'HTTP/1.1 200 OK' }
-    $contentType = Get-FeedContentType -Path $fullPath
-    $responseHeader = "$statusLine`r`n" +
-        "Content-Type: $contentType`r`n" +
-        "Content-Length: $sendLength`r`n" +
-        "Accept-Ranges: bytes`r`n" +
-        "ETag: $etag`r`n" +
-        "Last-Modified: $lastModifiedRfc`r`n" +
-        "Cache-Control: $cacheControl`r`n"
-    if ($isPartial) {
-        $responseHeader += "Content-Range: bytes $start-$end/$totalLength`r`n"
-    }
-    $responseHeader += "Connection: $connHeader`r`n`r`n"
-
-    $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($responseHeader)
-    $TlsStream.Write($headerBytes, 0, $headerBytes.Length)
-
-    if ($method -eq 'GET' -and $sendLength -gt 0) {
-        $fileStream = [System.IO.File]::Open($fullPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-        try {
-            [void]$fileStream.Seek($start, [System.IO.SeekOrigin]::Begin)
-            $buffer = [byte[]]::new(65536)
-            [long]$remaining = $sendLength
-            while ($remaining -gt 0) {
-                $toRead = [int][Math]::Min([long]$buffer.Length, $remaining)
-                $read = $fileStream.Read($buffer, 0, $toRead)
-                if ($read -le 0) { break }
-                $TlsStream.Write($buffer, 0, $read)
-                $remaining -= $read
-            }
-        }
-        finally {
-            $fileStream.Dispose()
-        }
-    }
-    $TlsStream.Flush()
-    return (-not $closeConnection)
-}
-
-$sslProtocols = if ($PSVersionTable.PSVersion.Major -ge 7) {
-    [System.Security.Authentication.SslProtocols]::None
 }
 else {
-    [System.Security.Authentication.SslProtocols]::Tls12
+    [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $certFullPath,
+        $password,
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet
+    )
 }
 
-$listener = [System.Net.Sockets.TcpListener]::new($ipAddress, $Port)
-$listener.Start()
-Write-Output "Serving $rootPrefix over HTTPS on $($ipAddress):$Port"
+$serverSource = @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
-try {
-    while ($true) {
-        $client = $listener.AcceptTcpClient()
-        $tls = $null
-        try {
-            $client.ReceiveTimeout = 5000
-            $client.SendTimeout = 30000
-            $tls = [System.Net.Security.SslStream]::new($client.GetStream(), $false)
-            $tls.AuthenticateAsServer($certificate, $false, $sslProtocols, $false)
-            while (Invoke-SingleHttpRequest -TlsStream $tls -RootPrefix $rootPrefix) {
+namespace Pinget.StaticFeedHost
+{
+    public static class TlsStaticServer
+    {
+        public static void Run(
+            string rootPrefix,
+            X509Certificate2 certificate,
+            IPAddress bindAddress,
+            int port,
+            int maxConcurrentClients,
+            bool useOsDefaultTls)
+        {
+            SslProtocols protocols = useOsDefaultTls ? SslProtocols.None : SslProtocols.Tls12;
+            var concurrencyGate = new SemaphoreSlim(maxConcurrentClients, maxConcurrentClients);
+            var listener = new TcpListener(bindAddress, port);
+            listener.Start();
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "Serving {0} over HTTPS on {1}:{2}", rootPrefix, bindAddress, port));
+            Console.Out.Flush();
+
+            try
+            {
+                while (true)
+                {
+                    TcpClient client = listener.AcceptTcpClient();
+                    concurrencyGate.Wait();
+                    Task.Run(() =>
+                    {
+                        try
+                        {
+                            HandleClient(client, certificate, protocols, rootPrefix);
+                        }
+                        finally
+                        {
+                            concurrencyGate.Release();
+                        }
+                    });
+                }
+            }
+            finally
+            {
+                listener.Stop();
+                DeleteTransientPrivateKey(certificate);
+                certificate.Dispose();
+                concurrencyGate.Dispose();
             }
         }
-        catch {
-            Write-Verbose "Transient client error: $($_.Exception.Message)"
+
+        private static void DeleteTransientPrivateKey(X509Certificate2 certificate)
+        {
+            try
+            {
+                using (RSA rsa = certificate.GetRSAPrivateKey())
+                {
+                    var rsaCng = rsa as RSACng;
+                    if (rsaCng != null && rsaCng.Key != null)
+                    {
+                        rsaCng.Key.Delete();
+                        return;
+                    }
+                    var rsaCsp = rsa as RSACryptoServiceProvider;
+                    if (rsaCsp != null)
+                    {
+                        rsaCsp.PersistKeyInCsp = false;
+                        rsaCsp.Clear();
+                        return;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                using (ECDsa ecdsa = certificate.GetECDsaPrivateKey())
+                {
+                    var ecdsaCng = ecdsa as ECDsaCng;
+                    if (ecdsaCng != null && ecdsaCng.Key != null)
+                    {
+                        ecdsaCng.Key.Delete();
+                    }
+                }
+            }
+            catch
+            {
+            }
         }
-        finally {
-            if ($null -ne $tls) { $tls.Dispose() }
-            $client.Dispose()
+
+        private static void HandleClient(TcpClient client, X509Certificate2 certificate, SslProtocols protocols, string rootPrefix)
+        {
+            using (client)
+            {
+                client.ReceiveTimeout = 10000;
+                client.SendTimeout = 30000;
+                using (var tls = new SslStream(client.GetStream(), false))
+                {
+                    try
+                    {
+                        tls.AuthenticateAsServer(certificate, false, protocols, false);
+                        while (ServeOneRequest(tls, rootPrefix))
+                        {
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore transient client disconnects and TLS probes.
+                    }
+                }
+            }
+        }
+
+        private static bool ServeOneRequest(SslStream tls, string rootPrefix)
+        {
+            var headerBytes = new MemoryStream();
+            int state = 0;
+            while (headerBytes.Length < 65536)
+            {
+                int b;
+                try
+                {
+                    b = tls.ReadByte();
+                }
+                catch
+                {
+                    return false;
+                }
+                if (b < 0)
+                {
+                    return false;
+                }
+                headerBytes.WriteByte((byte)b);
+                if ((state == 0 && b == '\r') || (state == 2 && b == '\r')) state++;
+                else if ((state == 1 && b == '\n') || (state == 3 && b == '\n')) state++;
+                else state = (b == '\r') ? 1 : 0;
+                if (state == 4) break;
+            }
+            if (state != 4)
+            {
+                return false;
+            }
+
+            string requestText = Encoding.ASCII.GetString(headerBytes.ToArray());
+            string[] lines = requestText.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+            if (lines.Length == 0)
+            {
+                return false;
+            }
+
+            string[] requestParts = lines[0].Split(new[] { ' ' }, 3);
+            if (requestParts.Length < 2)
+            {
+                WriteSimpleResponse(tls, "400 Bad Request", true, null);
+                return false;
+            }
+
+            string method = requestParts[0].ToUpperInvariant();
+            string rawTarget = requestParts[1];
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 1; i < lines.Length; i++)
+            {
+                int colon = lines[i].IndexOf(':');
+                if (colon > 0)
+                {
+                    headers[lines[i].Substring(0, colon).Trim()] = lines[i].Substring(colon + 1).Trim();
+                }
+            }
+
+            string connValue;
+            bool closeConnection = headers.TryGetValue("Connection", out connValue) &&
+                connValue.IndexOf("close", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (method != "GET" && method != "HEAD")
+            {
+                WriteSimpleResponse(tls, "405 Method Not Allowed", closeConnection, null);
+                return !closeConnection;
+            }
+
+            string targetPath = rawTarget.StartsWith("/", StringComparison.Ordinal) ? rawTarget : "/" + rawTarget;
+            Uri parsedUri;
+            if (!Uri.TryCreate("https://localhost" + targetPath, UriKind.Absolute, out parsedUri))
+            {
+                WriteSimpleResponse(tls, "400 Bad Request", true, null);
+                return false;
+            }
+
+            string unescaped = Uri.UnescapeDataString(parsedUri.AbsolutePath).TrimStart('/');
+            if (string.IsNullOrWhiteSpace(unescaped))
+            {
+                unescaped = "source2.msix";
+            }
+
+            string[] segments = unescaped.Split('/');
+            foreach (string seg in segments)
+            {
+                if (string.IsNullOrEmpty(seg) || seg.StartsWith(".", StringComparison.Ordinal) || seg.IndexOf('\\') >= 0)
+                {
+                    WriteSimpleResponse(tls, "404 Not Found", closeConnection, null);
+                    return !closeConnection;
+                }
+            }
+
+            string fullPath = Path.GetFullPath(Path.Combine(rootPrefix, unescaped.Replace('/', Path.DirectorySeparatorChar)));
+            if (!fullPath.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(fullPath))
+            {
+                WriteSimpleResponse(tls, "404 Not Found", closeConnection, null);
+                return !closeConnection;
+            }
+
+            var info = new FileInfo(fullPath);
+            long totalLength = info.Length;
+            DateTime lastModifiedUtc = info.LastWriteTimeUtc;
+            string etag;
+            using (var fsHash = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var sha = SHA256.Create())
+            {
+                byte[] digest = sha.ComputeHash(fsHash);
+                var sb = new StringBuilder(34).Append('"');
+                for (int i = 0; i < 16; i++) sb.Append(digest[i].ToString("x2", CultureInfo.InvariantCulture));
+                etag = sb.Append('"').ToString();
+            }
+
+            string cacheControl = unescaped.Equals("source2.msix", StringComparison.OrdinalIgnoreCase)
+                ? "no-cache"
+                : "public, max-age=31536000, immutable";
+            string contentType = GetContentType(fullPath);
+
+            string inm;
+            if (headers.TryGetValue("If-None-Match", out inm) && string.Equals(inm.Trim(), etag, StringComparison.Ordinal))
+            {
+                string notModified = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "HTTP/1.1 304 Not Modified\r\nETag: {0}\r\nLast-Modified: {1:R}\r\nCache-Control: {2}\r\nConnection: {3}\r\n\r\n",
+                    etag,
+                    lastModifiedUtc,
+                    cacheControl,
+                    closeConnection ? "close" : "keep-alive");
+                byte[] nmBytes = Encoding.ASCII.GetBytes(notModified);
+                tls.Write(nmBytes, 0, nmBytes.Length);
+                tls.Flush();
+                return !closeConnection;
+            }
+
+            long start = 0;
+            long end = totalLength - 1;
+            bool isPartial = false;
+            string rangeHeader;
+            if (headers.TryGetValue("Range", out rangeHeader) &&
+                rangeHeader.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase))
+            {
+                string spec = rangeHeader.Substring(6).Trim();
+                // Multi-range requests fall back to a full 200 response; invalid single-range requests return 416.
+                if (spec.IndexOf(',') < 0)
+                {
+                    if (!TryParseSingleByteRange(spec, totalLength, out start, out end))
+                    {
+                        WriteSimpleResponse(
+                            tls,
+                            "416 Range Not Satisfiable",
+                            closeConnection,
+                            string.Format(CultureInfo.InvariantCulture, "Content-Range: bytes */{0}\r\n", totalLength));
+                        return !closeConnection;
+                    }
+                    isPartial = true;
+                }
+            }
+
+            long sendLength = totalLength == 0 ? 0 : (end - start + 1);
+            var responseBuilder = new StringBuilder();
+            responseBuilder.Append(isPartial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n");
+            responseBuilder.AppendFormat(CultureInfo.InvariantCulture, "Content-Type: {0}\r\n", contentType);
+            responseBuilder.AppendFormat(CultureInfo.InvariantCulture, "Content-Length: {0}\r\n", sendLength);
+            responseBuilder.Append("Accept-Ranges: bytes\r\n");
+            responseBuilder.AppendFormat(CultureInfo.InvariantCulture, "ETag: {0}\r\n", etag);
+            responseBuilder.AppendFormat(CultureInfo.InvariantCulture, "Last-Modified: {0:R}\r\n", lastModifiedUtc);
+            responseBuilder.AppendFormat(CultureInfo.InvariantCulture, "Cache-Control: {0}\r\n", cacheControl);
+            if (isPartial)
+            {
+                responseBuilder.AppendFormat(CultureInfo.InvariantCulture, "Content-Range: bytes {0}-{1}/{2}\r\n", start, end, totalLength);
+            }
+            responseBuilder.AppendFormat(CultureInfo.InvariantCulture, "Connection: {0}\r\n\r\n", closeConnection ? "close" : "keep-alive");
+
+            byte[] headerOut = Encoding.ASCII.GetBytes(responseBuilder.ToString());
+            tls.Write(headerOut, 0, headerOut.Length);
+
+            if (method == "GET" && sendLength > 0)
+            {
+                using (var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    fs.Seek(start, SeekOrigin.Begin);
+                    byte[] buffer = new byte[65536];
+                    long remaining = sendLength;
+                    while (remaining > 0)
+                    {
+                        int toRead = (int)Math.Min(buffer.Length, remaining);
+                        int read = fs.Read(buffer, 0, toRead);
+                        if (read <= 0) break;
+                        tls.Write(buffer, 0, read);
+                        remaining -= read;
+                    }
+                }
+            }
+            tls.Flush();
+            return !closeConnection;
+        }
+
+        private static bool TryParseSingleByteRange(string spec, long totalLength, out long start, out long end)
+        {
+            start = 0;
+            end = 0;
+            if (totalLength <= 0)
+            {
+                return false;
+            }
+            int dash = spec.IndexOf('-');
+            if (dash < 0)
+            {
+                return false;
+            }
+            string left = spec.Substring(0, dash).Trim();
+            string right = spec.Substring(dash + 1).Trim();
+            if (left.Length == 0)
+            {
+                long suffixLength;
+                if (right.Length == 0 || !long.TryParse(right, NumberStyles.None, CultureInfo.InvariantCulture, out suffixLength) || suffixLength <= 0)
+                {
+                    return false;
+                }
+                start = suffixLength >= totalLength ? 0 : totalLength - suffixLength;
+                end = totalLength - 1;
+                return true;
+            }
+
+            long parsedStart;
+            if (!long.TryParse(left, NumberStyles.None, CultureInfo.InvariantCulture, out parsedStart) || parsedStart < 0 || parsedStart >= totalLength)
+            {
+                return false;
+            }
+            if (right.Length == 0)
+            {
+                start = parsedStart;
+                end = totalLength - 1;
+                return true;
+            }
+
+            long parsedEnd;
+            if (!long.TryParse(right, NumberStyles.None, CultureInfo.InvariantCulture, out parsedEnd) || parsedEnd < parsedStart)
+            {
+                return false;
+            }
+            start = parsedStart;
+            end = Math.Min(parsedEnd, totalLength - 1);
+            return true;
+        }
+
+        private static void WriteSimpleResponse(SslStream tls, string status, bool closeConnection, string extraHeaders)
+        {
+            string resp = string.Format(
+                CultureInfo.InvariantCulture,
+                "HTTP/1.1 {0}\r\n{1}Content-Length: 0\r\nConnection: {2}\r\n\r\n",
+                status,
+                extraHeaders ?? string.Empty,
+                closeConnection ? "close" : "keep-alive");
+            byte[] bytes = Encoding.ASCII.GetBytes(resp);
+            tls.Write(bytes, 0, bytes.Length);
+            tls.Flush();
+        }
+
+        private static string GetContentType(string path)
+        {
+            string ext = Path.GetExtension(path).ToLowerInvariant();
+            switch (ext)
+            {
+                case ".msix": return "application/msix";
+                case ".yaml":
+                case ".yml": return "application/yaml";
+                default: return "application/octet-stream";
+            }
         }
     }
 }
-finally {
-    $listener.Stop()
-    $certificate.Dispose()
+'@
+
+if (-not ('Pinget.StaticFeedHost.TlsStaticServer' -as [type])) {
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        Add-Type -TypeDefinition $serverSource -ReferencedAssemblies @('System.dll', 'System.Core.dll')
+    }
+    else {
+        Add-Type -TypeDefinition $serverSource
+    }
 }
+
+[Pinget.StaticFeedHost.TlsStaticServer]::Run($rootPrefix, $certificate, $ipAddress, $Port, $MaxConcurrentClients, $useOsDefaultTls)
