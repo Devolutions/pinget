@@ -47,7 +47,8 @@ internal static partial class ManifestScanner
     private static readonly HashSet<string> SupportedSchemaVersions = new(StringComparer.Ordinal)
     {
         "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0",
-        "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0",
+        "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0", "1.11.0",
+        "1.12.0", "1.28.0", "1.31.0",
     };
 
     private static readonly HashSet<string> DocumentTypes = new(StringComparer.Ordinal)
@@ -219,9 +220,9 @@ internal static partial class ManifestScanner
             or "License" or "Copyright" or "ShortDescription" or "Description" or "ReleaseNotes"
             or "ReleaseDate" or "RelativeFilePath" or "PortableCommandAlias" or "Commands" or "Tags"
             or "FileExtensions" or "Protocols" or "Capabilities" or "RestrictedCapabilities"
-            or "InstallerSwitches" or "InstallLocation"
+            or "InstallerSwitches" or "InstallLocation" or "DefaultInstallLocation"
             or "InstallModes" or "Platform" or "UpgradeBehavior" or "NestedInstallerType"
-            or "IconResolution" or "IconTheme" or "AuthenticationType" or "Argument"
+            or "IconResolution" or "IconTheme" or "AuthenticationType" or "Resource" or "Argument"
             or "Command" or "Custom" or "Silent" or "SilentWithProgress" or "Interactive"
             or "Log" or "Repair" or "Uninstall" or "Update" or "Channel"
             or "WindowsFeatures" or "WindowsLibraries" or "ExternalDependencies" or "DocumentLabel"

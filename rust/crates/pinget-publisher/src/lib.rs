@@ -32,7 +32,8 @@ mod wave12_tests;
 mod wave6_tests;
 
 const SUPPORTED_MANIFEST_VERSIONS: &[&str] = &[
-    "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0",
+    "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0", "1.8.0", "1.9.0", "1.10.0", "1.11.0",
+    "1.12.0", "1.28.0", "1.31.0",
 ];
 const INDEX_SCHEMA: &str = include_str!("index-schema.sql");
 const STATE_SCHEMA: &str = include_str!("state-schema.sql");
@@ -1351,6 +1352,7 @@ fn is_manifest_string_field(key: &str) -> bool {
                 | "PurchaseUrl"
                 | "InstallationNotes"
                 | "InstallLocation"
+                | "DefaultInstallLocation"
                 | "RelativeFilePath"
                 | "PortableCommandAlias"
                 | "IconUrl"
@@ -1378,6 +1380,7 @@ fn is_manifest_string_field(key: &str) -> bool {
                 | "Platform"
                 | "UpgradeBehavior"
                 | "AuthenticationType"
+                | "Resource"
                 | "Argument"
                 | "Command"
                 | "Uninstall"

@@ -525,3 +525,60 @@ fn r12_7_package_row_uses_latest_version_arp_range_and_rows_follow_ordinal_ignor
     drop(index);
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+#[test]
+fn schema_versions_1_11_1_12_1_28_and_1_31_preserve_string_and_boolean_fields() {
+    for schema_version in ["1.11.0", "1.12.0", "1.28.0", "1.31.0"] {
+        let version_doc = format!(
+            "PackageIdentifier: Devolutions.Cli\nPackageVersion: 2026.3.3.0\nDefaultLocale: en-US\n\
+             ManifestType: version\nManifestVersion: {schema_version}\n"
+        );
+        let locale_doc = format!(
+            "PackageIdentifier: Devolutions.Cli\nPackageVersion: 2026.3.3.0\nPackageLocale: en-US\n\
+             Publisher: Devolutions Inc.\nPackageName: Devolutions CLI\nLicense: Proprietary\n\
+             ShortDescription: Devolutions CLI\nManifestType: defaultLocale\nManifestVersion: {schema_version}\n"
+        );
+        let installer_doc = format!(
+            "PackageIdentifier: Devolutions.Cli\nPackageVersion: 2026.3.3.0\nInstallerType: zip\n\
+             ArchiveBinariesDependOnPath: true\nInstallationMetadata:\n  DefaultInstallLocation: 1.10\n\
+             Authentication:\n  AuthenticationType: microsoftEntraId\n  \
+             MicrosoftEntraIdAuthenticationInfo:\n    Resource: 12345\n\
+             Installers:\n  - Architecture: x64\n    NestedInstallerType: portable\n    \
+             InstallerUrl: https://cdn.devolutions.net/download/devo.zip\n    InstallerSha256: {HASH}\n    \
+             NestedInstallerFiles:\n      - RelativeFilePath: devo.exe\n        PortableCommandAlias: devo\n\
+             ManifestType: installer\nManifestVersion: {schema_version}\n"
+        );
+        let merged = merge(
+            "schema-modern",
+            &[
+                ("Devolutions.Cli.yaml", version_doc),
+                ("Devolutions.Cli.locale.en-US.yaml", locale_doc),
+                ("Devolutions.Cli.installer.yaml", installer_doc),
+            ],
+        )
+        .expect("modern schema version must merge");
+        assert_eq!(merged.len(), 1);
+        let json: serde_json::Value =
+            serde_json::from_slice(&serialize_merged(&merged[0].locale_docs[0].document).expect("serialize"))
+                .expect("json");
+        assert_eq!(json["ManifestVersion"].as_str(), Some(schema_version));
+        assert_eq!(json["ArchiveBinariesDependOnPath"].as_bool(), Some(true));
+        assert_eq!(
+            json["InstallationMetadata"]["DefaultInstallLocation"].as_str(),
+            Some("1.10")
+        );
+        assert_eq!(
+            json["Authentication"]["MicrosoftEntraIdAuthenticationInfo"]["Resource"].as_str(),
+            Some("12345")
+        );
+        assert_eq!(
+            json["Installers"][0]["NestedInstallerFiles"][0]["PortableCommandAlias"].as_str(),
+            Some("devo")
+        );
+    }
+
+    let unsupported = manifest("Pinget.Wave12", "1.0.0", "", &installer("exe", ""))
+        .replace("ManifestVersion: 1.9.0", "ManifestVersion: 1.99.0");
+    let error = merge("schema-unsupported", &[("a.yaml", unsupported)]).expect_err("1.99.0 is unsupported");
+    assert!(error.to_string().contains("unsupported ManifestVersion"), "{error}");
+}

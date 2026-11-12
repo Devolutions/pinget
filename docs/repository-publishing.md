@@ -169,6 +169,43 @@ Hosting authentication and endpoint credentials are the host/client's concern:
 this publisher does not add a secret store, token broker or authenticated
 REST-source protocol.
 
+## Vendor static feed workflow (`pinget` + `psign`)
+
+To publish a vendor-owned static WinGet source alongside `microsoft/winget-pkgs`
+(including open pull requests that have not merged upstream yet), use the helper
+scripts under `scripts\`:
+
+1. **Sync merged + pending manifests** (`scripts\Sync-WinGetManifests.ps1`):
+   sparse-clones a manifest subtree (default `manifests/d/Devolutions`) from
+   `microsoft/winget-pkgs` and overlays open pull requests authored by the
+   vendor bot (`devolutionsbot` by default).
+2. **Build and sign the static site** (`scripts\Build-DevolutionsStaticFeed.ps1`):
+   runs `pinget repository build`, `pinget repository verify`, and
+   `pinget repository publish` with `psign-tool`. In isolated test environments,
+   pass `-GenerateTestPki` to mint a disposable 2-tier PKI (`root-ca.cer`,
+   `codesign.pfx`, and `tls-server.pfx`) via `psign-tool portable
+   generate-root-ca`, `issue-code-signing-cert` and `issue-tls-server-cert`,
+   then verify `source2.msix` against `--trusted-ca root-ca.cer` without
+   altering the build machine's certificate store.
+3. **Serve over HTTPS in a test environment** (`scripts\Serve-StaticFeed.ps1`):
+   serves the published directory over TLS with `GET`/`HEAD`, `ETag` (`304 Not
+   Modified`), single-range `206 Partial Content`, `Cache-Control` (`no-cache`
+   for `source2.msix`, immutable caching for hashed manifests/sidecars), and
+   dotfile blocking. In an isolated test VM, import only `root-ca.cer` into
+   `Cert:\LocalMachine\Root` to trust both HTTPS transport and `source2.msix`
+   `AppxSip` / `WinVerifyTrust` verification. In production, upload new
+   `manifests/` and `packages/` objects to static HTTPS storage/CDN first, then
+   promote `source2.msix` signed with the vendor's publicly trusted code-signing
+   certificate.
+
+```powershell
+pwsh -NoLogo -NoProfile -File .\scripts\Build-DevolutionsStaticFeed.ps1 `
+    -WorkspaceDirectory .\artifacts\devolutions-feed `
+    -GenerateTestPki `
+    -TlsDnsNames @('winget.devolutions.test', 'localhost') `
+    -TlsIpAddresses @('127.0.0.1')
+```
+
 ## CI and compatibility
 
 In CI, persist the publisher state between runs if you want meaningful diffs,
@@ -228,12 +265,12 @@ This feature does not define a cross-platform manifest format, macOS package
 installation, managed script bundles, assignment policy, a REST source,
 background enforcement or new PowerShell cmdlets.
 
-Manifest ingestion accepts an explicit set of `ManifestVersion` values from
-`1.0.0` through `1.10.0` and checks required fields, document roles and merged
-structure. These checks are not a replacement for full upstream JSON-schema
-validation of every manifest property. Search normalization reuses Pinget's
-existing normalizers; compatibility evidence covers the tested fixtures, not
-every possible name or publisher string.
+Manifest ingestion accepts an explicit set of `ManifestVersion` values (`1.0.0`
+through `1.12.0`, `1.28.0` and `1.31.0`) and checks required fields, document
+roles and merged structure. These checks are not a replacement for full upstream
+JSON-schema validation of every manifest property. Search normalization reuses
+Pinget's existing normalizers; compatibility evidence covers the tested
+fixtures, not every possible name or publisher string.
 
 ## Building and distributing the libraries
 

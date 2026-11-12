@@ -388,6 +388,55 @@ public sealed class Wave12DefectTests
         Assert.Equal(buildA, PublisherPackaging.VerifyDestination(destination).BuildId);
     }
 
+    [Theory]
+    [InlineData("1.11.0")]
+    [InlineData("1.12.0")]
+    [InlineData("1.28.0")]
+    [InlineData("1.31.0")]
+    public void Scan_ModernManifestVersions_PreservesStringAndBooleanFields(string schemaVersion)
+    {
+        using var temp = new TempDirectory();
+        var versionDoc =
+            $"PackageIdentifier: Devolutions.Cli\nPackageVersion: 2026.3.3.0\nDefaultLocale: en-US\n"
+            + $"ManifestType: version\nManifestVersion: {schemaVersion}\n";
+        var localeDoc =
+            $"PackageIdentifier: Devolutions.Cli\nPackageVersion: 2026.3.3.0\nPackageLocale: en-US\n"
+            + $"Publisher: Devolutions Inc.\nPackageName: Devolutions CLI\nLicense: Proprietary\n"
+            + $"ShortDescription: Devolutions CLI\nManifestType: defaultLocale\nManifestVersion: {schemaVersion}\n";
+        var installerDoc =
+            $"PackageIdentifier: Devolutions.Cli\nPackageVersion: 2026.3.3.0\nInstallerType: zip\n"
+            + $"ArchiveBinariesDependOnPath: true\nInstallationMetadata:\n  DefaultInstallLocation: 1.10\n"
+            + $"Authentication:\n  AuthenticationType: microsoftEntraId\n  "
+            + $"MicrosoftEntraIdAuthenticationInfo:\n    Resource: 12345\n"
+            + $"Installers:\n  - Architecture: x64\n    NestedInstallerType: portable\n    "
+            + $"InstallerUrl: https://cdn.devolutions.net/download/devo.zip\n    InstallerSha256: {Hash}\n    "
+            + $"NestedInstallerFiles:\n      - RelativeFilePath: devo.exe\n        PortableCommandAlias: devo\n"
+            + $"ManifestType: installer\nManifestVersion: {schemaVersion}\n";
+
+        var scan = ManifestScanner.Scan(WriteInput(
+            temp,
+            ("Devolutions.Cli.yaml", versionDoc),
+            ("Devolutions.Cli.locale.en-US.yaml", localeDoc),
+            ("Devolutions.Cli.installer.yaml", installerDoc)));
+
+        var merged = Assert.Single(scan.Manifests);
+        var json = JsonNode.Parse(Encoding.UTF8.GetString(merged.Content))!.AsObject();
+        Assert.Equal(schemaVersion, json["ManifestVersion"]!.GetValue<string>());
+        Assert.True(json["ArchiveBinariesDependOnPath"]!.GetValue<bool>());
+        Assert.Equal("1.10", json["InstallationMetadata"]!["DefaultInstallLocation"]!.GetValue<string>());
+        Assert.Equal("12345", json["Authentication"]!["MicrosoftEntraIdAuthenticationInfo"]!["Resource"]!.GetValue<string>());
+        Assert.Equal("devo", json["Installers"]![0]!["NestedInstallerFiles"]![0]!["PortableCommandAlias"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Scan_UnsupportedModernManifestVersion_IsRejected()
+    {
+        var unsupported = Manifest("Pinget.Wave12", "1.0.0", string.Empty, Installer("exe", string.Empty))
+            .Replace("ManifestVersion: 1.9.0", "ManifestVersion: 1.99.0", StringComparison.Ordinal);
+        var error = Assert.Throws<PublisherException>(() => ScanSingle(unsupported));
+        Assert.Contains("Unsupported ManifestVersion", error.Message, StringComparison.Ordinal);
+    }
+
     private static (string State, string BuildA, string BuildB) TwoBuilds(TempDirectory temp)
     {
         var first = Manifest("Pinget.Wave12", "1.0.0", string.Empty, Installer("exe", string.Empty));
