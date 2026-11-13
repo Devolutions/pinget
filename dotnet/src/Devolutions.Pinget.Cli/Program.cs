@@ -7,7 +7,7 @@ using System.Text.Json.Serialization.Metadata;
 using Devolutions.Pinget.Cli;
 using Devolutions.Pinget.Core;
 
-const string Version = "0.14.1";
+const string Version = "0.15.0";
 const string UpgradeUnsupportedWarning = "Upgrading packages is not supported on this platform; no changes were made.";
 
 using var utf8Output = CliConsole.UseUtf8Output();
