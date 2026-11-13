@@ -2,5 +2,5 @@ namespace Devolutions.Pinget.PowerShell.Engine;
 
 public static class PowerShellEngineVersion
 {
-    public const string Current = "0.14.1";
+    public const string Current = "0.15.0";
 }
