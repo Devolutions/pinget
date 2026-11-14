@@ -192,7 +192,7 @@ jobs:
           dotnet tool install Devolutions.Psign.Tool --version $env:PSIGN_VERSION --tool-path artifacts/psign
           if ($LASTEXITCODE -ne 0) { throw 'psign-tool installation failed.' }
         env:
-          PSIGN_VERSION: 0.8.2
+          PSIGN_VERSION: 0.8.5
 
       - name: Run signed stock WinGet acceptance with runner-local credentials
         shell: pwsh
