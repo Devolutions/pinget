@@ -177,8 +177,9 @@ public class Wave4DefectTests
             """));
 
         // Wave 8 (R8-5): an installer declaring no dependencies inherits the root ones at parse time, as in WinGet.
-        Assert.Equal(["Root.Dep", "root.dep"], manifest.Installers[0].PackageDependencies);
-        Assert.Equal(["Arm.Dep", "ARM.DEP", "Other.Dep"], manifest.Installers[1].PackageDependencies);
+        // Wave 18 (W18-8): like WinGet DependencyList::Add, a repeated id is already collapsed at parse time.
+        Assert.Equal(["Root.Dep"], manifest.Installers[0].PackageDependencies);
+        Assert.Equal(["Arm.Dep", "Other.Dep"], manifest.Installers[1].PackageDependencies);
         Assert.Equal(["Root.Dep"], Repository.SelectedInstallerPackageDependencies(manifest, manifest.Installers[0]));
         Assert.Equal(["Arm.Dep", "Other.Dep"], Repository.SelectedInstallerPackageDependencies(manifest, manifest.Installers[1]));
     }

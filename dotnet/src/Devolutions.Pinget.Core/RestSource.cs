@@ -957,7 +957,7 @@ internal static class RestSource
             Version = resolvedVersion,
             Channel = resolvedChannel,
             Publisher = GetOptStr(defaultLocale, "Publisher"),
-            Description = GetOptStr(defaultLocale, "Description") ?? GetOptStr(defaultLocale, "ShortDescription"),
+            Description = GetOptStr(defaultLocale, "Description") is { Length: > 0 } description ? description : GetOptStr(defaultLocale, "ShortDescription"),
             ShortDescription = GetOptStr(defaultLocale, "ShortDescription"),
             Moniker = GetOptStr(defaultLocale, "Moniker") ?? GetOptStr(data, "Moniker"),
             PackageUrl = GetOptStr(defaultLocale, "PackageUrl"),

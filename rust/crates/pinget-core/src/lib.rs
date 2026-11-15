@@ -22,6 +22,8 @@ mod wave16_tests;
 #[cfg(test)]
 mod wave17_tests;
 #[cfg(test)]
+mod wave18_tests;
+#[cfg(test)]
 mod wave1_tests;
 #[cfg(test)]
 mod wave2_tests;
@@ -8863,6 +8865,11 @@ fn parse_yaml_manifest_bundle_parts<B: AsRef<[u8]>>(parts: &[B]) -> Result<(Mani
                     value
                 }
             };
+            // An empty document (a stray `---`) is not a manifest part; keeping it as `null` would make
+            // the structured document look like a multi-file manifest and drop the real content.
+            if model_value.is_null() {
+                continue;
+            }
             documents.push(serde_json::to_value(&model_value).context("failed to convert YAML manifest document")?);
             if let YamlValue::Mapping(mapping) = model_value {
                 mappings.push(mapping);
@@ -8897,7 +8904,9 @@ fn parse_yaml_manifest_bundle_parts<B: AsRef<[u8]>>(parts: &[B]) -> Result<(Mani
             version,
             channel: yaml_string_from_root(&merged, "Channel").unwrap_or_default(),
             publisher: yaml_localized_string(&merged, "Publisher"),
+            // WinGet `show`: an empty Description falls back to ShortDescription.
             description: yaml_localized_string(&merged, "Description")
+                .filter(|value| !value.is_empty())
                 .or_else(|| yaml_localized_string(&merged, "ShortDescription")),
             moniker: yaml_string_from_root(&merged, "Moniker"),
             package_url: yaml_localized_string(&merged, "PackageUrl"),
@@ -8913,7 +8922,7 @@ fn parse_yaml_manifest_bundle_parts<B: AsRef<[u8]>>(parts: &[B]) -> Result<(Mani
             release_notes_url: yaml_localized_string(&merged, "ReleaseNotesUrl"),
             tags: yaml_string_list(&merged, "Tags"),
             agreements: yaml_agreement_list(&merged),
-            package_dependencies: yaml_package_dependencies(&merged),
+            package_dependencies: package_dependency_ids(&yaml_dependencies(&merged)),
             documentation: yaml_documentation_list(&merged),
             icons: yaml_icon_list(&merged),
             installers,
@@ -9112,6 +9121,7 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
         channel: resolved_channel.clone(),
         publisher: json_string(default_locale, "Publisher"),
         description: json_string(default_locale, "Description")
+            .filter(|value| !value.is_empty())
             .or_else(|| json_string(default_locale, "ShortDescription")),
         moniker: json_string(default_locale, "Moniker"),
         package_url: json_string(default_locale, "PackageUrl"),
@@ -9304,6 +9314,8 @@ fn split_merged_manifest_document(merged: &JsonValue) -> Vec<JsonValue> {
             "InstallationNotes",
             "Documentations",
             "Icons",
+            // A merged manifest carries its non-default locales here; keep them in the round trip.
+            "Localization",
         ],
     );
     default_locale_document.insert(
@@ -9497,8 +9509,7 @@ fn parse_yaml_installers(root: &YamlMapping) -> Vec<Installer> {
             .iter()
             .filter_map(YamlValue::as_mapping)
             .map(|item| {
-                let mut merged = base.clone();
-                merge_yaml_mapping(&mut merged, item);
+                let merged = merge_installer_over_root_defaults(&base, item);
                 let switches = yaml_installer_switches(item).with_fallback(&base_switches);
                 let mut installer = installer_from_yaml(&merged, switches);
                 // WinGet: installer `Dependencies` of any kind override the root ones entirely;
@@ -9524,6 +9535,89 @@ fn parse_yaml_installers(root: &YamlMapping) -> Vec<Installer> {
         installer.package_dependencies = package_dependency_ids(&installer.dependencies);
         vec![installer]
     }
+}
+
+/// Root fields WinGet stashes before populating an installer and only restores when the
+/// installer's effective type uses them (see `ManifestYamlPopulator::PopulateManifest`).
+const TYPE_GATED_INSTALLER_KEYS: [&str; 5] = [
+    "ProductCode",
+    "PackageFamilyName",
+    "AppsAndFeaturesEntries",
+    "NestedInstallerType",
+    "NestedInstallerFiles",
+];
+
+/// One installer entry over the root installer defaults, the way WinGet populates it: an installer
+/// key with an empty (null) value is ignored instead of erasing the root value, and the root
+/// `ProductCode`, `PackageFamilyName`, `AppsAndFeaturesEntries` and nested-installer fields only
+/// apply to installer types that use them.
+fn merge_installer_over_root_defaults(base: &YamlMapping, item: &YamlMapping) -> YamlMapping {
+    let mut merged = base.clone();
+    for key in TYPE_GATED_INSTALLER_KEYS {
+        merged.remove(YamlValue::from(key));
+    }
+    for (key, value) in item {
+        if !value.is_null() {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+
+    // Only an absent key inherits; an explicit empty list still overrides the root (review A #8).
+    let restore = |merged: &mut YamlMapping, key: &str| {
+        if !merged.contains_key(YamlValue::from(key))
+            && let Some(value) = base.get(YamlValue::from(key))
+        {
+            merged.insert(YamlValue::from(key), value.clone());
+        }
+    };
+
+    let base_type = yaml_string(&merged, "InstallerType")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if base_type == "zip" {
+        restore(&mut merged, "NestedInstallerFiles");
+        restore(&mut merged, "NestedInstallerType");
+    }
+    let effective_type = if base_type == "zip" {
+        yaml_string(&merged, "NestedInstallerType")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+    } else {
+        base_type
+    };
+
+    if installer_type_writes_arp_entry(&effective_type) {
+        restore(&mut merged, "AppsAndFeaturesEntries");
+    }
+    let entries_use_package_family_name = yaml_apps_and_features_entries(&merged).iter().any(|entry| {
+        entry
+            .installer_type
+            .as_deref()
+            .is_some_and(|value| installer_type_uses_package_family_name(&value.trim().to_ascii_lowercase()))
+    });
+    if installer_type_uses_package_family_name(&effective_type) || entries_use_package_family_name {
+        restore(&mut merged, "PackageFamilyName");
+    }
+    if installer_type_writes_arp_entry(&effective_type) {
+        restore(&mut merged, "ProductCode");
+    }
+    merged
+}
+
+/// WinGet `DoesInstallerTypeUseProductCode` / `DoesInstallerTypeWriteAppsAndFeaturesEntry`
+/// (lowercase installer type).
+fn installer_type_writes_arp_entry(installer_type: &str) -> bool {
+    matches!(
+        installer_type,
+        "exe" | "inno" | "msi" | "nullsoft" | "wix" | "burn" | "portable"
+    )
+}
+
+/// WinGet `DoesInstallerTypeUsePackageFamilyName` (lowercase installer type; `appx` is msix).
+fn installer_type_uses_package_family_name(installer_type: &str) -> bool {
+    matches!(installer_type, "msix" | "appx" | "msstore")
 }
 
 fn installer_defaults(root: &YamlMapping) -> YamlMapping {
@@ -9562,6 +9656,7 @@ fn installer_defaults(root: &YamlMapping) -> YamlMapping {
 }
 
 fn installer_from_yaml(root: &YamlMapping, switches: InstallerSwitches) -> Installer {
+    let dependencies = yaml_dependencies(root);
     Installer {
         architecture: yaml_string(root, "Architecture"),
         installer_type: yaml_string(root, "InstallerType"),
@@ -9580,7 +9675,7 @@ fn installer_from_yaml(root: &YamlMapping, switches: InstallerSwitches) -> Insta
         minimum_os_version: yaml_string(root, "MinimumOSVersion"),
         switches,
         commands: yaml_string_list(root, "Commands"),
-        package_dependencies: yaml_package_dependencies(root),
+        package_dependencies: package_dependency_ids(&dependencies),
         require_explicit_upgrade: yaml_scalar_bool(root, "RequireExplicitUpgrade"),
         installer_success_codes: yaml_return_code_list(root, "InstallerSuccessCodes"),
         expected_return_codes: yaml_expected_return_codes(root),
@@ -9589,7 +9684,7 @@ fn installer_from_yaml(root: &YamlMapping, switches: InstallerSwitches) -> Insta
         excluded_markets: yaml_markets(root, "ExcludedMarkets"),
         unsupported_os_architectures: yaml_string_list(root, "UnsupportedOSArchitectures"),
         upgrade_behavior: yaml_string(root, "UpgradeBehavior"),
-        dependencies: yaml_dependencies(root),
+        dependencies,
         apps_and_features_entries: yaml_apps_and_features_entries(root),
     }
 }
@@ -9608,29 +9703,59 @@ fn yaml_dependencies(root: &YamlMapping) -> InstallerDependencies {
     else {
         return InstallerDependencies::default();
     };
-    InstallerDependencies {
-        windows_features: yaml_string_list(dependencies, "WindowsFeatures"),
-        windows_libraries: yaml_string_list(dependencies, "WindowsLibraries"),
-        package_dependencies: dependencies
-            .get(YamlValue::from("PackageDependencies"))
-            .and_then(YamlValue::as_sequence)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(YamlValue::as_mapping)
-                    .filter_map(|item| {
-                        Some(PackageDependency {
-                            package_identifier: yaml_string(item, "PackageIdentifier")?,
-                            minimum_version: yaml_string(item, "MinimumVersion")
-                                .map(|value| value.trim().to_owned())
-                                .filter(|value| !value.is_empty()),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        external_dependencies: yaml_string_list(dependencies, "ExternalDependencies"),
+    let mut package_dependencies: Vec<PackageDependency> = Vec::new();
+    for item in dependencies
+        .get(YamlValue::from("PackageDependencies"))
+        .and_then(YamlValue::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(YamlValue::as_mapping)
+    {
+        let Some(id) = yaml_string(item, "PackageIdentifier").map(|value| value.trim().to_owned()) else {
+            continue;
+        };
+        let minimum_version = yaml_string(item, "MinimumVersion")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        // WinGet `DependencyList::Add`: a repeated id keeps its first position and the highest minimum.
+        if let Some(existing) = package_dependencies
+            .iter_mut()
+            .find(|existing| existing.package_identifier.eq_ignore_ascii_case(&id))
+        {
+            if let Some(minimum) = minimum_version
+                && existing
+                    .minimum_version
+                    .as_deref()
+                    .is_none_or(|current| compare_version(&minimum, current) == Ordering::Greater)
+            {
+                existing.minimum_version = Some(minimum);
+            }
+            continue;
+        }
+        package_dependencies.push(PackageDependency {
+            package_identifier: id,
+            minimum_version,
+        });
     }
+    InstallerDependencies {
+        windows_features: yaml_dependency_id_list(dependencies, "WindowsFeatures"),
+        windows_libraries: yaml_dependency_id_list(dependencies, "WindowsLibraries"),
+        package_dependencies,
+        external_dependencies: yaml_dependency_id_list(dependencies, "ExternalDependencies"),
+    }
+}
+
+/// A `WindowsFeatures`/`WindowsLibraries`/`ExternalDependencies` list as WinGet stores it: ids
+/// trimmed, blanks dropped and repeats removed case-insensitively (`DependencyList::Add`).
+fn yaml_dependency_id_list(dependencies: &YamlMapping, key: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in yaml_string_list(dependencies, key) {
+        let id = id.trim();
+        if !id.is_empty() && !ids.iter().any(|existing| existing.eq_ignore_ascii_case(id)) {
+            ids.push(id.to_owned());
+        }
+    }
+    ids
 }
 
 fn yaml_apps_and_features_entries(root: &YamlMapping) -> Vec<AppsAndFeaturesEntry> {
@@ -10199,21 +10324,6 @@ impl ManifestCorrelationCodes {
     }
 }
 
-fn yaml_package_dependencies(root: &YamlMapping) -> Vec<String> {
-    root.get(YamlValue::from("Dependencies"))
-        .and_then(YamlValue::as_mapping)
-        .and_then(|deps| deps.get(YamlValue::from("PackageDependencies")))
-        .and_then(YamlValue::as_sequence)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(YamlValue::as_mapping)
-                .filter_map(|item| yaml_string(item, "PackageIdentifier"))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn yaml_nested_installer_files(root: &YamlMapping) -> Vec<NestedInstallerFile> {
     root.get(YamlValue::from("NestedInstallerFiles"))
         .and_then(YamlValue::as_sequence)
@@ -10379,6 +10489,15 @@ impl<'de> serde::de::DeserializeSeed<'de> for RawScalarSeed<'_> {
     {
         match self.0 {
             YamlValue::Number(_) => String::deserialize(deserializer).map(YamlValue::String),
+            // `True`/`FALSE` stay text like WinGet and the C# reader read them; only the canonical
+            // spellings stay booleans so `show -o json` keeps `true`/`false` values.
+            YamlValue::Bool(value) => String::deserialize(deserializer).map(|text| {
+                if text == value.to_string() {
+                    YamlValue::Bool(*value)
+                } else {
+                    YamlValue::String(text)
+                }
+            }),
             YamlValue::Sequence(items) => deserializer.deserialize_seq(RawScalarSequenceVisitor(items)),
             YamlValue::Mapping(mapping) => deserializer.deserialize_map(RawScalarMappingVisitor(mapping)),
             other => {
