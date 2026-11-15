@@ -146,6 +146,21 @@ internal static class InstalledPackages
         Microsoft.Win32.RegistryHive hive, string scopeLabel, string archLabel,
         Microsoft.Win32.RegistryView view)
     {
+        try
+        {
+            using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
+            CollectArpPackages(packages, seen, upgradeCodeMap, baseKey, scopeLabel, archLabel);
+        }
+        catch { /* skip unreadable hive */ }
+    }
+
+    /// <summary>Reads the Uninstall entries under <paramref name="baseKey"/> (a hive/view root).</summary>
+    [SupportedOSPlatform("windows")]
+    internal static void CollectArpPackages(
+        List<InstalledPackage> packages, HashSet<string> seen,
+        Dictionary<string, string> upgradeCodeMap,
+        Microsoft.Win32.RegistryKey baseKey, string scopeLabel, string archLabel)
+    {
         // Like WinGet's ARPHelper (and the Rust core), each hive/view is read through the standard
         // Uninstall path only: HKLM's 32-bit view already maps it to WOW6432Node, and HKCU is shared
         // between views (WinGet never reads HKCU\Software\WOW6432Node), so user entries are X64.
@@ -153,7 +168,6 @@ internal static class InstalledPackages
 
         try
         {
-            using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
             using var uninstallKey = baseKey.OpenSubKey(arpPath);
             if (uninstallKey is null) return;
 
@@ -175,9 +189,8 @@ internal static class InstalledPackages
                     // packages are filtered by location.
                     var installLocation = ReadString(subkey, "InstallLocation");
 
-                    if (ReadString(subkey, "ParentKeyName") is not null)
-                        continue;
-
+                    // WinGet's ARPHelper only skips SystemComponent entries; entries with a ParentKeyName
+                    // (updates/add-ons registered under a parent product) are still listed.
                     var version = DetermineArpVersion(
                         ReadString(subkey, "DisplayVersion"),
                         ReadDword(subkey, "VersionMajor"),
@@ -271,13 +284,26 @@ internal static class InstalledPackages
         Microsoft.Win32.RegistryHive hive, string scopeLabel,
         Microsoft.Win32.RegistryView view)
     {
-        const string appModelPackagesPath =
-            @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
-
         try
         {
             using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
-            using var appModelKey = baseKey.OpenSubKey(appModelPackagesPath);
+            CollectAppModelPackages(packages, seen, baseKey, scopeLabel);
+        }
+        catch { /* skip unreadable hive */ }
+    }
+
+    internal const string AppModelPackagesPath =
+        @"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
+
+    /// <summary>Reads the AppModel package repository under <paramref name="baseKey"/> (a hive/view root).</summary>
+    [SupportedOSPlatform("windows")]
+    internal static void CollectAppModelPackages(
+        List<InstalledPackage> packages, HashSet<string> seen,
+        Microsoft.Win32.RegistryKey baseKey, string scopeLabel)
+    {
+        try
+        {
+            using var appModelKey = baseKey.OpenSubKey(AppModelPackagesPath);
             if (appModelKey is null) return;
 
             foreach (var subkeyName in appModelKey.GetSubKeyNames())
@@ -296,9 +322,11 @@ internal static class InstalledPackages
                     if (parsed is null) continue;
                     if (IsMsixSplitResourcePackage(parsed.Value.ResourceId)) continue;
 
+                    // Like WinGet's MSIX enumeration, fall back to the package name from the identity when no
+                    // display name is available instead of dropping the package from the list.
                     var displayName = ReadString(subkey, "DisplayName") ?? GetAppModelDisplayName(subkey);
                     if (string.IsNullOrWhiteSpace(displayName))
-                        continue;
+                        displayName = parsed.Value.Name;
 
                     var localId = $@"MSIX\{subkeyName}";
                     var dedupKey = $"{localId}|{displayName.ToLowerInvariant()}|{parsed.Value.Version.ToLowerInvariant()}";
@@ -412,8 +440,8 @@ internal static class InstalledPackages
         // The package family name is always Name_PublisherId; the resource id only appears in the full name.
         var familyName = $"{name}_{publisherHash}";
 
-        return new MsixPackageFullName(version, resourceId, familyName);
+        return new MsixPackageFullName(version, resourceId, familyName, name);
     }
 
-    internal readonly record struct MsixPackageFullName(string Version, string ResourceId, string FamilyName);
+    internal readonly record struct MsixPackageFullName(string Version, string ResourceId, string FamilyName, string Name);
 }
