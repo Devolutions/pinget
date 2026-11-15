@@ -12,6 +12,8 @@ mod wave10_tests;
 #[cfg(test)]
 mod wave11_tests;
 #[cfg(test)]
+mod wave13_tests;
+#[cfg(test)]
 mod wave1_tests;
 #[cfg(test)]
 mod wave2_tests;
@@ -2637,7 +2639,8 @@ impl Repository {
             .as_ref()
             .is_some_and(|existing| install_is_update(&existing.installed_version, &manifest.version));
         ensure_upgrade_allowed(&installer, is_update)?;
-        if !is_update {
+        let uninstall_previous = uninstalls_previous_version(request, &installer, is_update);
+        if !upgrade_switch_applies(is_update, uninstall_previous) {
             // The `Upgrade` switch only applies when updating an existing installation.
             installer.switches.upgrade = None;
         }
@@ -2662,9 +2665,7 @@ impl Repository {
         }
 
         let mut warnings = Vec::new();
-        if (request.uninstall_previous || (is_update && upgrade_behavior_is(&installer, "uninstallPrevious")))
-            && let Some(previous) = existing_match.as_ref()
-        {
+        if uninstall_previous && let Some(previous) = existing_match.as_ref() {
             // Remove the installed version that was found above, not whatever the
             // install query (which may pin the *new* version) happens to match.
             let exit_code = uninstall_package(previous, &create_uninstall_previous_request(previous), &mut warnings)
@@ -2705,14 +2706,16 @@ impl Repository {
             &mut warnings,
         )?;
         self.emit_install_progress(InstallProgress::InstallerFinished { exit_code });
-        Ok(completed_install_result(
+        let mut result = completed_install_result(
             &manifest,
             &installer,
             installer_path,
             installer_type,
             exit_code,
             warnings,
-        ))
+        );
+        remove_installer_after_success(&mut result);
+        Ok(result)
     }
 
     fn find_installed_package_for_install(
@@ -9828,6 +9831,36 @@ fn upgrade_behavior_is(installer: &Installer, behavior: &str) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case(behavior))
 }
 
+/// WinGet ExecuteInstallerForType: the previous version is uninstalled first only when the install
+/// updates an existing installation and `--uninstall-previous` or `UpgradeBehavior:
+/// uninstallPrevious` asks for it; a same-version reinstall keeps the installed package.
+fn uninstalls_previous_version(request: &InstallRequest, installer: &Installer, is_update: bool) -> bool {
+    is_update && (request.uninstall_previous || upgrade_behavior_is(installer, "uninstallPrevious"))
+}
+
+/// The `Upgrade` switch applies only to an update that runs over the existing installation. Once
+/// the previous version has been uninstalled the installer runs as a fresh install (WinGet clears
+/// `InstallerExecutionUseUpdate`).
+fn upgrade_switch_applies(is_update: bool, uninstalls_previous: bool) -> bool {
+    is_update && !uninstalls_previous
+}
+
+/// Like WinGet's RemoveInstaller, deletes the downloaded installer once it ran successfully so
+/// installers do not pile up in the temporary directory. A failed run keeps it for diagnosis.
+fn remove_installer_after_success(result: &mut InstallResult) {
+    if !result.success || result.installer_path.as_os_str().is_empty() {
+        return;
+    }
+    if let Err(error) = fs::remove_file(&result.installer_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        result.warnings.push(format!(
+            "Could not remove the downloaded installer '{}': {error}",
+            result.installer_path.display()
+        ));
+    }
+}
+
 /// True when installing `target_version` over `installed_version` changes the installed version.
 fn install_is_update(installed_version: &str, target_version: &str) -> bool {
     compare_version(installed_version, target_version) != Ordering::Equal
@@ -12366,7 +12399,14 @@ fn format_msi_property(token: &str) -> Result<String> {
     let Some((name, value)) = token.split_once('=') else {
         bail!("invalid MSI property argument: {token}");
     };
-    if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+    // Like WinGet's ParsePropertyToken: the name starts with a letter, digit, `_` or `%`
+    // (environment variable) and runs to the `=`, so names such as `MY.PROP` are valid.
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_alphanumeric() || first == '_' || first == '%')
+        || name.chars().any(char::is_whitespace)
+    {
         bail!("invalid MSI property name: {name}");
     }
     if value.contains(char::is_whitespace) && !(value.starts_with('"') && value.ends_with('"')) {
@@ -12526,24 +12566,33 @@ fn installer_command_arguments_with_options(
         return Vec::new();
     }
 
-    let configured = match request.mode {
-        InstallerMode::Interactive => installer.switches.interactive.as_deref(),
-        InstallerMode::SilentWithProgress => installer
-            .switches
-            .silent_with_progress
-            .as_deref()
-            .or(installer.switches.silent.as_deref()),
-        InstallerMode::Silent => installer
-            .switches
-            .silent
-            .as_deref()
-            .or(installer.switches.silent_with_progress.as_deref()),
+    // WinGet merges the installer type's default switches into the manifest per switch kind, so
+    // the requested mode's own switch (manifest, then type default) wins; the other silent mode's
+    // manifest switch is only a fallback for types without defaults (e.g. a generic exe).
+    let non_blank = |value: &Option<String>| value.clone().filter(|value| !value.trim().is_empty());
+    let (requested, other) = match request.mode {
+        InstallerMode::Interactive => (non_blank(&installer.switches.interactive), None),
+        InstallerMode::SilentWithProgress => (
+            non_blank(&installer.switches.silent_with_progress),
+            non_blank(&installer.switches.silent),
+        ),
+        InstallerMode::Silent => (
+            non_blank(&installer.switches.silent),
+            non_blank(&installer.switches.silent_with_progress),
+        ),
     };
 
-    if let Some(value) = configured.filter(|value| !value.trim().is_empty()) {
-        args.extend(split_installer_switches(value));
+    if let Some(value) = requested {
+        args.extend(split_installer_switches(&value));
     } else {
-        args.extend(default_installer_arguments(installer_type, request.mode));
+        let defaults = default_installer_arguments(installer_type, request.mode);
+        if defaults.is_empty()
+            && let Some(value) = other
+        {
+            args.extend(split_installer_switches(&value));
+        } else {
+            args.extend(defaults);
+        }
     }
 
     let log_path = request.log_path.as_ref().map(|path| path.display().to_string());
@@ -12562,15 +12611,19 @@ fn installer_command_arguments_with_options(
     // WinGet appends `Upgrade` after the custom switches when updating an existing installation;
     // the install flow clears it for a fresh install.
     append_switches(&mut args, installer.switches.upgrade.clone());
-    append_install_location_switch(
-        &mut args,
-        resolve_template_switch(
-            installer.switches.install_location.as_deref(),
-            default_install_location_switch(installer_type),
-            log_path.as_deref(),
-            install_path,
-        ),
-    );
+    // Like WinGet, the InstallLocation switch is only added when `--location` is supplied, even
+    // when the manifest's switch has no `<INSTALLPATH>` token.
+    if install_path.is_some_and(|path| !path.trim().is_empty()) {
+        append_install_location_switch(
+            &mut args,
+            resolve_template_switch(
+                installer.switches.install_location.as_deref(),
+                default_install_location_switch(installer_type),
+                log_path.as_deref(),
+                install_path,
+            ),
+        );
+    }
     args
 }
 
@@ -12902,6 +12955,29 @@ fn cmd_uninstall_arguments(uninstall_line: &str) -> String {
     format!("/D /S /C \"{uninstall_line}\"")
 }
 
+/// The ARP command to run and whether it is the `QuietUninstallString`. Like WinGet's
+/// GetUninstallInfo, silent modes prefer `QuietUninstallString` and interactive prefers
+/// `UninstallString`, each falling back to the other. A blank value is ignored: cmd.exe would
+/// run nothing and exit 0, reporting an uninstall that never happened.
+#[cfg(any(windows, test))]
+fn select_arp_uninstall_command(
+    mode: InstallerMode,
+    quiet: Option<String>,
+    standard: Option<String>,
+) -> Option<(String, bool)> {
+    let quiet = quiet
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (value, true));
+    let standard = standard
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| (value, false));
+    if mode == InstallerMode::Interactive {
+        standard.or(quiet)
+    } else {
+        quiet.or(standard)
+    }
+}
+
 #[cfg(windows)]
 fn try_uninstall_arp(installed: &ListMatch, request: &UninstallRequest) -> Result<Option<i32>> {
     if let Some(candidates) = arp_uninstall_key_candidates(&installed.local_id) {
@@ -12976,14 +13052,11 @@ fn run_arp_uninstall_entry(
         return Ok(exit_code);
     }
 
-    let quiet_uninstall_cmd = subkey.get_value::<String, _>("QuietUninstallString").ok();
-    let uninstall_cmd: String = if request.mode == InstallerMode::Interactive {
-        subkey.get_value("UninstallString").ok()
-    } else {
-        quiet_uninstall_cmd
-            .clone()
-            .or_else(|| subkey.get_value("UninstallString").ok())
-    }
+    let (uninstall_cmd, is_quiet_command) = select_arp_uninstall_command(
+        request.mode,
+        subkey.get_value::<String, _>("QuietUninstallString").ok(),
+        subkey.get_value::<String, _>("UninstallString").ok(),
+    )
     .context("No uninstall command found in registry")?;
 
     if is_winget_uninstall_command(&uninstall_cmd)
@@ -12993,12 +13066,8 @@ fn run_arp_uninstall_entry(
     }
 
     let log_path = request.log_path.as_ref().map(|value| value.display().to_string());
-    let uninstall_line = build_uninstall_command_with_mode(
-        &uninstall_cmd,
-        request.mode,
-        quiet_uninstall_cmd.is_some(),
-        log_path.as_deref(),
-    );
+    let uninstall_line =
+        build_uninstall_command_with_mode(&uninstall_cmd, request.mode, is_quiet_command, log_path.as_deref());
     // `UninstallString` is a complete command line and may already contain
     // its own quotes (e.g. `"C:\path with spaces\unins.exe"`). Passing it
     // through Command::arg causes Rust's CRT-style quoting to backslash-escape
@@ -13042,6 +13111,16 @@ fn registry_entry_matches_installed_package(
     product_code: Option<&str>,
     installed: &ListMatch,
 ) -> bool {
+    // An MSIX package has no ARP entry of its own; a same-named ARP entry belongs to another
+    // (unpackaged) install, and running its uninstaller would remove the wrong product.
+    if installed
+        .local_id
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MSIX\\"))
+    {
+        return false;
+    }
+
     if let Some(arp_subkey_name) = arp_subkey_name(&installed.local_id)
         && subkey_name.eq_ignore_ascii_case(arp_subkey_name)
     {
@@ -13167,8 +13246,11 @@ fn build_winget_uninstall_arguments_with_scope(
         args.push(scope.to_owned());
     }
 
-    if request.mode == InstallerMode::Silent {
-        args.push("--silent".to_owned());
+    match request.mode {
+        InstallerMode::Silent => args.push("--silent".to_owned()),
+        // winget's default is silent-with-progress, so an interactive request must say so.
+        InstallerMode::Interactive => args.push("--interactive".to_owned()),
+        InstallerMode::SilentWithProgress => {}
     }
 
     Some(args)

@@ -1216,7 +1216,8 @@ public class Repository : IDisposable
         // install to the upgrade flow). A same-version reinstall (repair, --force) is not.
         var isUpdate = existingMatch is not null && InstallIsUpdate(existingMatch.InstalledVersion, manifest.Version);
         EnsureUpgradeAllowed(selectedInstaller, isUpdate);
-        if (!isUpdate && selectedInstaller.Switches.Upgrade is not null)
+        var uninstallPrevious = UninstallsPreviousVersion(request, selectedInstaller, isUpdate);
+        if (!UpgradeSwitchApplies(isUpdate, uninstallPrevious) && selectedInstaller.Switches.Upgrade is not null)
         {
             // The `Upgrade` switch only applies when updating an existing installation.
             selectedInstaller = selectedInstaller with { Switches = selectedInstaller.Switches with { Upgrade = null } };
@@ -1241,7 +1242,7 @@ public class Repository : IDisposable
         }
 
         var warnings = new List<string>();
-        if ((request.UninstallPrevious || (isUpdate && UpgradeBehaviorIs(selectedInstaller, "uninstallPrevious"))) && existingMatch is not null)
+        if (uninstallPrevious && existingMatch is not null)
         {
             // Remove the installed version that was found above, not whatever the
             // install query (which may pin the *new* version) happens to match.
@@ -1272,7 +1273,44 @@ public class Repository : IDisposable
             installerPath = PrepareInstallerForExecution(installerPath, installerType);
         }
         var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
-        return CompletedInstallResult(manifest, selectedInstaller, installerPath, installerType, exitCode, warnings);
+        var result = CompletedInstallResult(manifest, selectedInstaller, installerPath, installerType, exitCode, warnings);
+        RemoveInstallerAfterSuccess(result);
+        return result;
+    }
+
+    /// <summary>
+    /// WinGet ExecuteInstallerForType: the previous version is uninstalled first only when the install updates
+    /// an existing installation and --uninstall-previous or <c>UpgradeBehavior: uninstallPrevious</c> asks for
+    /// it; a same-version reinstall keeps the installed package.
+    /// </summary>
+    internal static bool UninstallsPreviousVersion(InstallRequest request, Installer installer, bool isUpdate)
+        => isUpdate && (request.UninstallPrevious || UpgradeBehaviorIs(installer, "uninstallPrevious"));
+
+    /// <summary>
+    /// The <c>Upgrade</c> switch applies only to an update that runs over the existing installation. Once the
+    /// previous version has been uninstalled the installer runs as a fresh install (WinGet clears
+    /// InstallerExecutionUseUpdate).
+    /// </summary>
+    internal static bool UpgradeSwitchApplies(bool isUpdate, bool uninstallsPrevious)
+        => isUpdate && !uninstallsPrevious;
+
+    /// <summary>
+    /// Like WinGet's RemoveInstaller, deletes the downloaded installer once it ran successfully so installers
+    /// do not pile up in the temporary directory. A failed run keeps it for diagnosis.
+    /// </summary>
+    internal static void RemoveInstallerAfterSuccess(InstallResult result)
+    {
+        if (!result.Success || string.IsNullOrEmpty(result.InstallerPath) || !File.Exists(result.InstallerPath))
+            return;
+
+        try
+        {
+            File.Delete(result.InstallerPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            result.Warnings.Add($"Could not remove the downloaded installer '{result.InstallerPath}': {ex.Message}");
+        }
     }
 
     /// <summary>
