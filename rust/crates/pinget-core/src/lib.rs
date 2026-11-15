@@ -12,6 +12,8 @@ mod wave10_tests;
 #[cfg(test)]
 mod wave11_tests;
 #[cfg(test)]
+mod wave14_tests;
+#[cfg(test)]
 mod wave1_tests;
 #[cfg(test)]
 mod wave2_tests;
@@ -3872,10 +3874,24 @@ impl Repository {
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned);
                     let headers = response.headers().clone();
-                    let bytes = response.bytes().context("failed to read preindexed package bytes")?;
-                    let payload = bytes.to_vec();
-                    let index_bytes = extract_zip_member(&payload, "Public/index.db")
-                        .context("preindexed package did not contain Public/index.db")?;
+                    // A candidate whose body cannot be read or carries no index is skipped like
+                    // a failed request, so a broken source2.msix still falls back to source.msix.
+                    let downloaded = response
+                        .bytes()
+                        .context("failed to read preindexed package bytes")
+                        .and_then(|bytes| {
+                            let payload = bytes.to_vec();
+                            extract_zip_member(&payload, "Public/index.db")
+                                .context("preindexed package did not contain Public/index.db")
+                                .map(|index_bytes| (payload, index_bytes))
+                        });
+                    let (payload, index_bytes) = match downloaded {
+                        Ok(downloaded) => downloaded,
+                        Err(error) => {
+                            last_error = Some(error.context(format!("candidate {candidate} was unusable")));
+                            continue;
+                        }
+                    };
 
                     fs::write(self.preindexed_package_path(&source_snapshot), &payload)
                         .context("failed to persist source package")?;
@@ -4210,7 +4226,10 @@ impl Repository {
                 .collect()
         };
 
-        let detail = system_winget_update_sources(source_name)?;
+        // A source may be selected by its identifier, but `winget source update --name`
+        // only knows source names, so hand WinGet the name it was resolved to.
+        let winget_name = source_name.and_then(|_| selected_names.first().cloned());
+        let detail = system_winget_update_sources(winget_name.as_deref())?;
         self.refresh_system_winget_sources()?;
 
         Ok(selected_names
@@ -6111,7 +6130,9 @@ fn system_winget_source_refresh_warning(error: &anyhow::Error) -> String {
 }
 
 fn load_or_refresh_system_winget_mirror_store(app_root: &Path, force_refresh: bool) -> Result<SourceStore> {
-    if !force_refresh && let Some(store) = load_system_winget_mirror_store(app_root)? {
+    // The mirror is only a cache of `winget source export`: an unreadable one (say, cut short
+    // by an interrupted write) is re-exported rather than failing every open from then on.
+    if !force_refresh && let Ok(Some(store)) = load_system_winget_mirror_store(app_root) {
         return Ok(store);
     }
 
@@ -6119,7 +6140,11 @@ fn load_or_refresh_system_winget_mirror_store(app_root: &Path, force_refresh: bo
 }
 
 fn refresh_system_winget_mirror_store(app_root: &Path) -> Result<SourceStore> {
-    let prior = load_system_winget_mirror_store(app_root)?.unwrap_or_default();
+    // The prior mirror only contributes cached refresh metadata, so an unreadable one is dropped.
+    let prior = load_system_winget_mirror_store(app_root)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let mut exported = load_system_winget_source_store()?;
     merge_source_cache_metadata(&mut exported, &prior);
     save_system_winget_mirror_store(app_root, &exported)?;
@@ -6128,14 +6153,13 @@ fn refresh_system_winget_mirror_store(app_root: &Path) -> Result<SourceStore> {
 }
 
 fn merge_source_cache_metadata(target: &mut SourceStore, prior: &SourceStore) {
-    let prior_by_identifier: HashMap<_, _> = prior
-        .sources
-        .iter()
-        .map(|source| (source.identifier.to_ascii_lowercase(), source))
-        .collect();
-
     for source in &mut target.sources {
-        let Some(previous) = prior_by_identifier.get(&source.identifier.to_ascii_lowercase()) else {
+        // ETag, Last-Modified and the source version describe what was fetched from the old
+        // argument; a source re-added at another URL must not revalidate against them.
+        let Some(previous) = prior.sources.iter().find(|previous| {
+            previous.identifier.eq_ignore_ascii_case(&source.identifier)
+                && same_source_argument(&previous.arg, &source.arg)
+        }) else {
             continue;
         };
         source.last_update = previous.last_update;
@@ -6143,6 +6167,12 @@ fn merge_source_cache_metadata(target: &mut SourceStore, prior: &SourceStore) {
         source.etag = previous.etag.clone();
         source.last_modified = previous.last_modified.clone();
     }
+}
+
+fn same_source_argument(left: &str, right: &str) -> bool {
+    left.trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(right.trim().trim_end_matches('/'))
 }
 
 fn save_store(app_root: &Path, store: &SourceStore) -> Result<()> {
@@ -6352,6 +6382,10 @@ type WingetSourceCommandRunner = fn(&[String]) -> Result<WingetSourceCommandResu
 static SYSTEM_WINGET_SOURCE_COMMAND_RUNNER: RwLock<WingetSourceCommandRunner> =
     RwLock::new(run_winget_source_command_process);
 
+/// Serializes the tests (in every test module) that swap the global WinGet command runner.
+#[cfg(test)]
+static SYSTEM_WINGET_RUNNER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn run_checked_winget_source_command(args: Vec<String>, action: &str) -> Result<WingetSourceCommandResult> {
     let result = run_winget_source_command(&args)?;
     if result.exit_code == 0 {
@@ -6533,6 +6567,16 @@ fn parse_system_winget_source_export(output: &str) -> Result<Vec<SourceRecord>> 
         && let Some(sources) = parse_system_winget_source_export_value(&value)?
     {
         return Ok(sources);
+    }
+
+    // With nothing configured, WinGet's ExportSourceList prints the localized
+    // SourceListNoSources message instead of JSON; that is an empty list, not an error.
+    if !output
+        .lines()
+        .map(str::trim)
+        .any(|line| line.starts_with('{') || line.starts_with('['))
+    {
+        return Ok(Vec::new());
     }
 
     let mut sources = Vec::new();
@@ -6729,6 +6773,9 @@ fn parse_packaged_source_store(user_sources_yaml: Option<&str>, metadata_yaml: O
         }
     }
 
+    // Like WinGet's SourceList (a stable sort on Priority), higher priorities come first and
+    // sources of equal priority keep their listed order.
+    sources.sort_by_key(|source| std::cmp::Reverse(source.priority));
     Some(SourceStore { sources })
 }
 
@@ -6926,6 +6973,8 @@ fn render_packaged_sources_yaml(store: &SourceStore) -> String {
         lines.push(format!("    Type: {}", packaged_source_type(source.kind)));
         lines.push(format!("    Arg: {}", yaml_scalar(&source.arg)));
         lines.push(format!("    Data: {}", yaml_scalar(&source.identifier)));
+        // WinGet's SourceList reads the identifier from `Identifier`, never from `Data`.
+        lines.push(format!("    Identifier: {}", yaml_scalar(&source.identifier)));
         lines.push(format!(
             "    TrustLevel: {}",
             if source.trust_level.eq_ignore_ascii_case("Trusted") {
@@ -7580,8 +7629,13 @@ fn query_v1_versions(connection: &Connection, package_rowid: i64) -> Result<Vec<
 fn resolve_v1_relative_path(connection: &Connection, pathpart_id: i64) -> Result<String> {
     let mut parts = Vec::new();
     let mut current = Some(pathpart_id);
+    // The index is source data: a parent chain that loops back must not spin forever.
+    let mut visited = HashSet::new();
 
     while let Some(id) = current {
+        if !visited.insert(id) {
+            bail!("pathpart {pathpart_id} has a parent cycle at pathpart {id}");
+        }
         let (parent, pathpart) = query_optional_value(
             connection,
             "SELECT parent, pathpart FROM pathparts WHERE rowid = ?1",
@@ -15635,10 +15689,8 @@ mod tests {
         bail!("{SYSTEM_WINGET_PROGRAM_NAME} was not found on the PATH")
     }
 
-    static SYSTEM_WINGET_RUNNER_LOCK: Mutex<()> = Mutex::new(());
-
     fn lock_system_winget_source_command_runner() -> std::sync::MutexGuard<'static, ()> {
-        SYSTEM_WINGET_RUNNER_LOCK
+        SYSTEM_WINGET_RUNNER_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
