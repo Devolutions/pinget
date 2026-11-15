@@ -740,102 +740,56 @@ internal static class PreIndexedSource
     // V2 WHERE clause builder — operates on the flat `packages` table
     private static (string WhereClause, List<string> Parameters) BuildV2Where(
         PackageQuery query, SearchSemantics semantics)
+        => BuildWhere(query, semantics, v2: true, "id", "name", "moniker", "packages.rowid");
+
+    /// <summary>
+    /// Like WinGet's SearchRequest, the query and every filter must all match (AND); each filter uses the
+    /// request's match type (substring for a many-search unless --exact). The positional query matches any of
+    /// id, name or moniker (and, for a non-exact many-search, a tag or command). Mirrors the Rust
+    /// build_preindexed_where_clause.
+    /// </summary>
+    private static (string WhereClause, List<string> Parameters) BuildWhere(
+        PackageQuery query, SearchSemantics semantics, bool v2,
+        string idColumn, string nameColumn, string monikerColumn, string rowidColumn)
     {
         var parameters = new List<string>();
         bool exact = query.Exact || semantics == SearchSemantics.Single;
+        var conditions = new List<string>();
 
         if (query.Id is not null)
-            return (SingleFieldCondition("id", query.Id, exact, parameters), parameters);
+            conditions.Add(SingleFieldCondition(idColumn, query.Id, exact, parameters));
         if (query.Name is not null)
-            return (SingleFieldCondition("name", query.Name, exact, parameters), parameters);
+            conditions.Add(SingleFieldCondition(nameColumn, query.Name, exact, parameters));
         if (query.Moniker is not null)
-            return (SingleFieldCondition("moniker", query.Moniker, exact, parameters), parameters);
+            conditions.Add(SingleFieldCondition(monikerColumn, query.Moniker, exact, parameters));
         if (query.Tag is not null)
-            return (MappedFieldCondition(true, "tag", query.Tag, "packages.rowid", true, parameters), parameters);
+            conditions.Add(MappedFieldCondition(v2, "tag", query.Tag, rowidColumn, exact, parameters));
         if (query.Command is not null)
-            return (MappedFieldCondition(true, "command", query.Command, "packages.rowid", true, parameters), parameters);
+            conditions.Add(MappedFieldCondition(v2, "command", query.Command, rowidColumn, exact, parameters));
 
         if (query.Query is not null)
         {
-            if (exact)
+            var queryConditions = new List<string>
             {
-                var conditions = new[]
-                {
-                    SingleFieldCondition("id", query.Query, true, parameters),
-                    SingleFieldCondition("name", query.Query, true, parameters),
-                    SingleFieldCondition("moniker", query.Query, true, parameters),
-                };
-                return ($"({string.Join(" OR ", conditions)})", parameters);
-            }
-            else
+                SingleFieldCondition(idColumn, query.Query, exact, parameters),
+                SingleFieldCondition(nameColumn, query.Query, exact, parameters),
+                SingleFieldCondition(monikerColumn, query.Query, exact, parameters),
+            };
+            if (!exact && semantics == SearchSemantics.Many)
             {
-                var conditions = new List<string>
-                {
-                    SingleFieldCondition("id", query.Query, false, parameters),
-                    SingleFieldCondition("name", query.Query, false, parameters),
-                    SingleFieldCondition("moniker", query.Query, false, parameters),
-                };
-                if (semantics == SearchSemantics.Many)
-                {
-                    conditions.Add(MappedFieldCondition(true, "tag", query.Query, "packages.rowid", false, parameters));
-                    conditions.Add(MappedFieldCondition(true, "command", query.Query, "packages.rowid", false, parameters));
-                }
-                return ($"({string.Join(" OR ", conditions)})", parameters);
+                queryConditions.Add(MappedFieldCondition(v2, "tag", query.Query, rowidColumn, false, parameters));
+                queryConditions.Add(MappedFieldCondition(v2, "command", query.Query, rowidColumn, false, parameters));
             }
+            conditions.Add($"({string.Join(" OR ", queryConditions)})");
         }
 
-        return ("1 = 1", parameters);
+        return (conditions.Count == 0 ? "1 = 1" : string.Join(" AND ", conditions), parameters);
     }
 
     // V1 WHERE clause builder — operates on the manifest/ids/names/monikers join
     private static (string WhereClause, List<string> Parameters) BuildV1Where(
         PackageQuery query, SearchSemantics semantics)
-    {
-        var parameters = new List<string>();
-        bool exact = query.Exact || semantics == SearchSemantics.Single;
-
-        if (query.Id is not null)
-            return (SingleFieldCondition("ids.id", query.Id, exact, parameters), parameters);
-        if (query.Name is not null)
-            return (SingleFieldCondition("names.name", query.Name, exact, parameters), parameters);
-        if (query.Moniker is not null)
-            return (SingleFieldCondition("monikers.moniker", query.Moniker, exact, parameters), parameters);
-        if (query.Tag is not null)
-            return (MappedFieldCondition(false, "tag", query.Tag, "manifest.rowid", true, parameters), parameters);
-        if (query.Command is not null)
-            return (MappedFieldCondition(false, "command", query.Command, "manifest.rowid", true, parameters), parameters);
-
-        if (query.Query is not null)
-        {
-            if (exact)
-            {
-                var conditions = new[]
-                {
-                    SingleFieldCondition("ids.id", query.Query, true, parameters),
-                    SingleFieldCondition("names.name", query.Query, true, parameters),
-                    SingleFieldCondition("monikers.moniker", query.Query, true, parameters),
-                };
-                return ($"({string.Join(" OR ", conditions)})", parameters);
-            }
-            else
-            {
-                var conditions = new List<string>
-                {
-                    SingleFieldCondition("ids.id", query.Query, false, parameters),
-                    SingleFieldCondition("names.name", query.Query, false, parameters),
-                    SingleFieldCondition("monikers.moniker", query.Query, false, parameters),
-                };
-                if (semantics == SearchSemantics.Many)
-                {
-                    conditions.Add(MappedFieldCondition(false, "tag", query.Query, "manifest.rowid", false, parameters));
-                    conditions.Add(MappedFieldCondition(false, "command", query.Query, "manifest.rowid", false, parameters));
-                }
-                return ($"({string.Join(" OR ", conditions)})", parameters);
-            }
-        }
-
-        return ("1 = 1", parameters);
-    }
+        => BuildWhere(query, semantics, v2: false, "ids.id", "names.name", "monikers.moniker", "manifest.rowid");
 
     private static string SingleFieldCondition(string column, string value, bool exact, List<string> parameters)
     {

@@ -473,9 +473,10 @@ fn rest_exact_and_many_lookups_keep_their_match_types() {
         ..PackageQuery::default()
     };
     let body = build_rest_search_body(&many, &RestInformation::default(), SearchSemantics::Many).expect("body");
+    // WinGet's SearchSourceApplyFilters gives the tag filter the request's match type too.
     assert_eq!(
         match_types(&body, "Filters"),
-        pairs(&[("PackageIdentifier", "Substring"), ("Tag", "Exact")])
+        pairs(&[("PackageIdentifier", "Substring"), ("Tag", "Substring")])
     );
 }
 

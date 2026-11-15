@@ -168,8 +168,23 @@ internal static class RestSource
             });
         }
 
-        return (results, results.Count >= maxResults);
+        var truncated = RestSearchTruncated(json, results.Count, maxResults);
+        if (results.Count > maxResults)
+            results.RemoveRange(maxResults, results.Count - maxResults);
+        return (results, truncated);
     }
+
+    /// <summary>
+    /// WinGet's RestInterface marks a search truncated only when the server returned more than
+    /// <c>MaximumResults</c> matches or a <c>ContinuationToken</c> says more are available; exactly
+    /// <c>MaximumResults</c> matches with no token is the complete result. Mirrors the Rust rest_search_truncated.
+    /// </summary>
+    internal static bool RestSearchTruncated(JsonElement response, int resultCount, int maxResults) =>
+        resultCount > maxResults ||
+        (response.ValueKind == JsonValueKind.Object &&
+         response.TryGetProperty("ContinuationToken", out var token) &&
+         token.ValueKind == JsonValueKind.String &&
+         !string.IsNullOrWhiteSpace(token.GetString()));
 
     public static (Manifest Manifest, object StructuredDocuments) FetchManifestWithDocuments(HttpClient client, SourceRecord source,
         RestInformation info, string packageId, string version, string channel)
@@ -270,23 +285,19 @@ internal static class RestSource
             inclusions.Add((JsonNode?)PackageMatchFilter("PackageName", query.Query, matchType));
             inclusions.Add((JsonNode?)PackageMatchFilter("Moniker", query.Query, matchType));
             obj["Inclusions"] = inclusions;
-            AppendRequiredFilters(filters, info);
-            if (filters.Count > 0)
-                obj["Filters"] = filters;
-            return obj.ToJsonString();
+        }
+        else if (query.Query is not null)
+        {
+            obj["Query"] = new JsonObject { ["KeyWord"] = query.Query, ["MatchType"] = matchType };
         }
 
-        if (query.Query is not null)
-            obj["Query"] = new JsonObject { ["KeyWord"] = query.Query, ["MatchType"] = matchType };
-
+        // Every filter uses the request's match type, like WinGet's SearchSourceApplyFilters
+        // (a many-search tag or command filter is a substring match unless --exact is given).
         if (query.Id is not null) AddFilter("PackageIdentifier", query.Id, matchType);
         if (query.Name is not null) AddFilter("PackageName", query.Name, matchType);
         if (query.Moniker is not null) AddFilter("Moniker", query.Moniker, matchType);
-        // Tag and command filters stay exact for many-search; a single lookup uses the
-        // single-lookup match type like WinGet's SearchSourceApplyFilters.
-        string tagMatchType = semantics == SearchSemantics.Single ? matchType : "Exact";
-        if (query.Tag is not null) AddFilter("Tag", query.Tag, tagMatchType);
-        if (query.Command is not null) AddFilter("Command", query.Command, tagMatchType);
+        if (query.Tag is not null) AddFilter("Tag", query.Tag, matchType);
+        if (query.Command is not null) AddFilter("Command", query.Command, matchType);
 
         AppendRequiredFilters(filters, info);
 
@@ -961,23 +972,47 @@ internal static class RestSource
     internal static bool IsUnknownVersion(string? version) =>
         version is not null && version.Trim().Equals("Unknown", StringComparison.OrdinalIgnoreCase);
 
+    internal static bool IsLatestVersion(string? version) =>
+        version is not null && version.Trim().Equals("Latest", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Compares versions like WinGet's <c>Version</c>, including its approximate comparators: with equal base
+    /// versions <c>&lt; 1.0</c> sorts below <c>1.0</c>, which sorts below <c>&gt; 1.0</c>. Mirrors the Rust
+    /// compare_version.
+    /// </summary>
     internal static int CompareVersionStrings(string a, string b)
     {
+        var (baseA, comparatorA) = SplitApproximateVersion(a);
+        var (baseB, comparatorB) = SplitApproximateVersion(b);
+        var cmp = CompareBaseVersionStrings(baseA, baseB);
+        return cmp != 0 ? cmp : comparatorA.CompareTo(comparatorB);
+    }
+
+    // -1 for "< x", 0 for a plain version, 1 for "> x".
+    private static (string Base, int Comparator) SplitApproximateVersion(string value)
+    {
+        var trimmed = value.Trim();
+        if (trimmed.StartsWith('<'))
+            return (trimmed[1..].Trim(), -1);
+        if (trimmed.StartsWith('>'))
+            return (trimmed[1..].Trim(), 1);
+        return (trimmed, 0);
+    }
+
+    private static int CompareBaseVersionStrings(string a, string b)
+    {
+        // WinGet sorts `Latest` above every other version and `Unknown` below every known one.
+        bool aLatest = IsLatestVersion(a);
+        bool bLatest = IsLatestVersion(b);
+        if (aLatest || bLatest)
+            return aLatest == bLatest ? 0 : aLatest ? 1 : -1;
+
         bool aUnknown = IsUnknownVersion(a);
         bool bUnknown = IsUnknownVersion(b);
         if (aUnknown != bUnknown)
             return aUnknown ? -1 : 1;
         if (aUnknown)
             return 0;
-
-        var aLessThan = StripLessThanPrefix(a);
-        var bLessThan = StripLessThanPrefix(b);
-        if (aLessThan is not null && bLessThan is not null)
-            return CompareVersionStrings(aLessThan, bLessThan);
-        if (aLessThan is not null && CompareVersionStrings(aLessThan, b) == 0)
-            return -1;
-        if (bLessThan is not null && CompareVersionStrings(a, bLessThan) == 0)
-            return 1;
 
         var partsA = TokenizeVersion(a);
         var partsB = TokenizeVersion(b);
@@ -1080,12 +1115,6 @@ internal static class RestSource
         var digit = trimmed.AsSpan().IndexOfAnyInRange('0', '9');
         var split = trimmed.IndexOf('.');
         return digit >= 0 && (split < 0 || digit < split) ? trimmed[digit..] : trimmed;
-    }
-
-    private static string? StripLessThanPrefix(string value)
-    {
-        var trimmed = value.TrimStart();
-        return trimmed.StartsWith('<') ? trimmed[1..].TrimStart() : null;
     }
 
     internal record RestMatchResult

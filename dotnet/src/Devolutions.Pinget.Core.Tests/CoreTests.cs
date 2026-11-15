@@ -3367,11 +3367,13 @@ Installers:
     {
         var installers = new List<Installer>
         {
+            // Same scope: a user/machine pair is decided by WinGet's default user scope preference
+            // (Wave16DefectTests), not by the command tie-break.
             new()
             {
                 Architecture = "x64",
                 InstallerType = "exe",
-                Scope = "user",
+                Scope = "machine",
                 Locale = "en-US",
                 Switches = new InstallerSwitches(),
             },
@@ -3389,7 +3391,7 @@ Installers:
         var selected = Repository.SelectInstaller(installers, new PackageQuery { InstallerType = "exe" });
 
         Assert.NotNull(selected);
-        Assert.Equal("machine", selected!.Scope);
+        Assert.Equal(["powertoys"], selected!.Commands);
     }
 
     [Fact]

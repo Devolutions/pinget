@@ -16,6 +16,8 @@ mod wave13_tests;
 #[cfg(test)]
 mod wave14_tests;
 #[cfg(test)]
+mod wave16_tests;
+#[cfg(test)]
 mod wave1_tests;
 #[cfg(test)]
 mod wave2_tests;
@@ -3692,8 +3694,10 @@ impl Repository {
             });
         }
 
+        let truncated = rest_search_truncated(&json, results.len(), max_results);
+        results.truncate(max_results);
         Ok(SearchSourceMatches {
-            truncated: results.len() >= max_results,
+            truncated,
             matches: results,
         })
     }
@@ -7693,74 +7697,82 @@ fn build_preindexed_where_clause(query: &PackageQuery, v2: bool, semantics: Sear
     let moniker_column = if v2 { "moniker" } else { "monikers.moniker" };
     let exact_match = query.exact || semantics == SearchSemantics::Single;
     let mut params = Vec::new();
+    // Like WinGet's SearchRequest, the query and every filter must all match (AND); each
+    // filter uses the request's match type (substring for a many-search unless --exact).
+    let mut conditions = Vec::new();
 
     if let Some(value) = &query.id {
-        return (
-            single_field_condition(id_column, value, exact_match, &mut params),
-            params,
-        );
+        conditions.push(single_field_condition(id_column, value, exact_match, &mut params));
     }
     if let Some(value) = &query.name {
-        return (
-            single_field_condition(name_column, value, exact_match, &mut params),
-            params,
-        );
+        conditions.push(single_field_condition(name_column, value, exact_match, &mut params));
     }
     if let Some(value) = &query.moniker {
-        return (
-            single_field_condition(moniker_column, value, exact_match, &mut params),
-            params,
-        );
+        conditions.push(single_field_condition(moniker_column, value, exact_match, &mut params));
     }
     if let Some(value) = &query.tag {
-        return (
-            mapped_field_condition(v2, "tag", value, rowid_column, true, &mut params),
-            params,
-        );
+        conditions.push(mapped_field_condition(
+            v2,
+            "tag",
+            value,
+            rowid_column,
+            exact_match,
+            &mut params,
+        ));
     }
     if let Some(value) = &query.command {
-        return (
-            mapped_field_condition(v2, "command", value, rowid_column, true, &mut params),
-            params,
-        );
+        conditions.push(mapped_field_condition(
+            v2,
+            "command",
+            value,
+            rowid_column,
+            exact_match,
+            &mut params,
+        ));
     }
     if let Some(value) = &query.query {
-        if exact_match {
-            let conditions = [
-                single_field_condition(id_column, value, true, &mut params),
-                single_field_condition(name_column, value, true, &mut params),
-                single_field_condition(moniker_column, value, true, &mut params),
-            ];
-            return (format!("({})", conditions.join(" OR ")), params);
-        }
-
-        let mut conditions = vec![
-            single_field_condition(id_column, value, false, &mut params),
-            single_field_condition(name_column, value, false, &mut params),
-            single_field_condition(moniker_column, value, false, &mut params),
-        ];
-        if semantics == SearchSemantics::Many {
-            conditions.push(mapped_field_condition(
-                v2,
-                "tag",
-                value,
-                rowid_column,
-                false,
-                &mut params,
-            ));
-            conditions.push(mapped_field_condition(
-                v2,
-                "command",
-                value,
-                rowid_column,
-                false,
-                &mut params,
-            ));
-        }
-        return (format!("({})", conditions.join(" OR ")), params);
+        conditions.push(preindexed_query_condition(
+            value,
+            v2,
+            exact_match,
+            semantics,
+            [id_column, name_column, moniker_column, rowid_column],
+            &mut params,
+        ));
     }
 
-    ("1 = 1".to_owned(), Vec::new())
+    if conditions.is_empty() {
+        ("1 = 1".to_owned(), params)
+    } else {
+        (conditions.join(" AND "), params)
+    }
+}
+
+fn preindexed_query_condition(
+    value: &str,
+    v2: bool,
+    exact_match: bool,
+    semantics: SearchSemantics,
+    [id_column, name_column, moniker_column, rowid_column]: [&str; 4],
+    params: &mut Vec<String>,
+) -> String {
+    let mut conditions = vec![
+        single_field_condition(id_column, value, exact_match, params),
+        single_field_condition(name_column, value, exact_match, params),
+        single_field_condition(moniker_column, value, exact_match, params),
+    ];
+    if !exact_match && semantics == SearchSemantics::Many {
+        conditions.push(mapped_field_condition(v2, "tag", value, rowid_column, false, params));
+        conditions.push(mapped_field_condition(
+            v2,
+            "command",
+            value,
+            rowid_column,
+            false,
+            params,
+        ));
+    }
+    format!("({})", conditions.join(" OR "))
 }
 
 fn single_field_condition(column: &str, value: &str, exact: bool, params: &mut Vec<String>) -> String {
@@ -7857,30 +7869,20 @@ fn build_rest_search_body(
                 rest_filter("Moniker", value, match_type),
             ];
             root.insert("Inclusions".to_owned(), JsonValue::Array(inclusions));
-            let mut filters = Vec::new();
-            append_required_rest_filters(&mut filters, info);
-            if !filters.is_empty() {
-                root.insert("Filters".to_owned(), JsonValue::Array(filters));
-            }
-            return Ok(JsonValue::Object(root));
+        } else {
+            root.insert(
+                "Query".to_owned(),
+                serde_json::json!({
+                    "KeyWord": value,
+                    "MatchType": match_type,
+                }),
+            );
         }
-
-        root.insert(
-            "Query".to_owned(),
-            serde_json::json!({
-                "KeyWord": value,
-                "MatchType": match_type,
-            }),
-        );
     }
 
-    // Tag and command filters stay exact for many-search; a single lookup uses the
-    // single-lookup match type like WinGet's SearchSourceApplyFilters.
-    let tag_match_type = if semantics == SearchSemantics::Single {
-        match_type
-    } else {
-        "Exact"
-    };
+    // Every filter uses the request's match type, like WinGet's SearchSourceApplyFilters
+    // (a many-search tag or command filter is a substring match unless --exact is given).
+    let tag_match_type = match_type;
     let mut filters = Vec::new();
     if let Some(value) = &query.id {
         filters.push(rest_filter("PackageIdentifier", value, match_type));
@@ -7904,6 +7906,17 @@ fn build_rest_search_body(
     }
 
     Ok(JsonValue::Object(root))
+}
+
+/// WinGet's RestInterface marks a search truncated only when the server returned more than
+/// `MaximumResults` matches or a `ContinuationToken` says more are available; exactly
+/// `MaximumResults` matches with no token is the complete result.
+fn rest_search_truncated(response: &JsonValue, result_count: usize, max_results: usize) -> bool {
+    result_count > max_results
+        || response
+            .get("ContinuationToken")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|token| !token.trim().is_empty())
 }
 
 fn append_required_rest_filters(filters: &mut Vec<JsonValue>, info: &RestInformation) {
@@ -10467,6 +10480,17 @@ fn select_installer_for_system(
     let system_architecture = current_architecture();
     let system_platform = current_platform();
     let current_os_version = current_os_version();
+    let preference = InstallerPreference {
+        requested_locale,
+        preferred_locales,
+        requested_architecture,
+        requested_type,
+        system_architecture,
+        preferred_scope: requested_scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .unwrap_or("user"),
+    };
 
     installers
         .iter()
@@ -10486,20 +10510,191 @@ fn select_installer_for_system(
         .filter(|(_, installer)| !installer_unsupported_on_architecture(installer, system_architecture))
         .filter(|(_, installer)| installer_matches_market(installer, market))
         .filter(|(_, installer)| installer_matches_locale(installer.locale.as_deref(), requested_locale))
-        .max_by_key(|(index, installer)| {
-            (
-                installer_rank(
-                    installer,
-                    requested_locale,
-                    preferred_locales,
-                    requested_architecture,
-                    system_architecture,
-                ),
-                std::cmp::Reverse(*index),
-            )
-        })
         .map(|(_, installer)| installer)
+        .fold(None::<&Installer>, |best, candidate| match best {
+            Some(current) if !installer_is_better(candidate, current, &preference) => Some(current),
+            _ => Some(candidate),
+        })
         .cloned()
+}
+
+/// What installer selection prefers, after WinGet's `ManifestComparator` comparators.
+struct InstallerPreference<'a> {
+    requested_locale: Option<&'a str>,
+    preferred_locales: &'a [String],
+    requested_architecture: Option<&'a str>,
+    requested_type: Option<&'a str>,
+    system_architecture: &'a str,
+    /// The requested scope, else WinGet's default `installBehavior.preferences.scope` (user).
+    preferred_scope: &'a str,
+}
+
+/// One comparator's verdict on two installers: a strong verdict decides at once, otherwise the
+/// first weak verdict (in comparator priority order) decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallerComparison {
+    Neither,
+    Weak(bool),
+    Strong(bool),
+}
+
+fn rank_comparison(first: i32, second: i32, strong: bool) -> InstallerComparison {
+    match first.cmp(&second) {
+        Ordering::Equal => InstallerComparison::Neither,
+        ordering if strong => InstallerComparison::Strong(ordering == Ordering::Greater),
+        ordering => InstallerComparison::Weak(ordering == Ordering::Greater),
+    }
+}
+
+/// WinGet `ManifestComparator::IsFirstBetter`: comparators in priority order (locale, scope,
+/// architecture, installer type, then Pinget's command tie-break); the first strong verdict
+/// wins, else the first weak one; a full tie keeps the earlier installer.
+fn installer_is_better(first: &Installer, second: &Installer, preference: &InstallerPreference<'_>) -> bool {
+    let comparisons = [
+        locale_comparison(first, second, preference),
+        scope_comparison(first, second, preference.preferred_scope),
+        architecture_comparison(first, second, preference),
+        // A requested installer type is a requirement; the default type preference only
+        // orders installers when no type was requested.
+        match preference.requested_type {
+            Some(_) => InstallerComparison::Neither,
+            None => rank_comparison(installer_type_rank(first), installer_type_rank(second), false),
+        },
+        rank_comparison(
+            i32::from(!first.commands.is_empty()),
+            i32::from(!second.commands.is_empty()),
+            false,
+        ),
+    ];
+    let mut weak = None;
+    for comparison in comparisons {
+        match comparison {
+            InstallerComparison::Strong(first_is_better) => return first_is_better,
+            InstallerComparison::Weak(first_is_better) => {
+                weak.get_or_insert(first_is_better);
+            }
+            InstallerComparison::Neither => {}
+        }
+    }
+    weak.unwrap_or(false)
+}
+
+/// WinGet `LocaleComparator`: a better (compatible) locale match is strong; an undeclared locale
+/// over one that matches nothing is weak.
+fn locale_comparison(
+    first: &Installer,
+    second: &Installer,
+    preference: &InstallerPreference<'_>,
+) -> InstallerComparison {
+    let rank = |installer: &Installer| match preference.requested_locale {
+        Some(_) => locale_rank(installer.locale.as_deref(), preference.requested_locale),
+        None => preferred_locale_rank(installer.locale.as_deref(), preference.preferred_locales),
+    };
+    // Requested-locale ranks: 3 exact, 2 same language, 1 undeclared. Preferred-language ranks:
+    // 4 and up match a preference, 1 undeclared, 0 no match.
+    let compatible_rank = if preference.requested_locale.is_some() { 2 } else { 4 };
+    let (first_rank, second_rank) = (rank(first), rank(second));
+    rank_comparison(
+        first_rank,
+        second_rank,
+        first_rank >= compatible_rank || second_rank >= compatible_rank,
+    )
+}
+
+fn declared_installer_scope(installer: &Installer) -> Option<&str> {
+    installer
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+}
+
+/// WinGet `ScopeComparator`: the preferred scope beats the other scope strongly and an
+/// undeclared scope weakly.
+fn scope_comparison(first: &Installer, second: &Installer, preferred_scope: &str) -> InstallerComparison {
+    let matches = |installer: &Installer| {
+        declared_installer_scope(installer).is_some_and(|scope| scope.eq_ignore_ascii_case(preferred_scope))
+    };
+    match (matches(first), matches(second)) {
+        (true, false) if declared_installer_scope(second).is_some() => InstallerComparison::Strong(true),
+        (true, false) => InstallerComparison::Weak(true),
+        (false, true) if declared_installer_scope(first).is_some() => InstallerComparison::Strong(false),
+        (false, true) => InstallerComparison::Weak(false),
+        _ => InstallerComparison::Neither,
+    }
+}
+
+/// WinGet `MachineArchitectureComparator`: a better architecture is a strong verdict when it is
+/// the requested (else the system) architecture, a weak one otherwise.
+fn architecture_comparison(
+    first: &Installer,
+    second: &Installer,
+    preference: &InstallerPreference<'_>,
+) -> InstallerComparison {
+    let rank = |installer: &Installer| {
+        architecture_rank(
+            installer.architecture.as_deref(),
+            preference.requested_architecture,
+            preference.system_architecture,
+        )
+    };
+    let (first_rank, second_rank) = (rank(first), rank(second));
+    let better = if first_rank >= second_rank { first } else { second };
+    let strong_architecture = preference
+        .requested_architecture
+        .unwrap_or(preference.system_architecture);
+    let strong = better
+        .architecture
+        .as_deref()
+        .is_some_and(|architecture| architecture.eq_ignore_ascii_case(strong_architecture));
+    rank_comparison(first_rank, second_rank, strong)
+}
+
+/// WinGet `ManifestInstaller::EffectiveInstallerType`: an archive (`zip`) installs its nested
+/// installer type. `appx` is the same installer type as `msix`.
+fn installer_selection_types(installer: &Installer) -> [Option<String>; 2] {
+    let base = installer.installer_type.as_deref().map(canonical_installer_type);
+    let effective = match base.as_deref() {
+        Some("zip") => installer
+            .nested_installer_type
+            .as_deref()
+            .map(canonical_installer_type)
+            .filter(|value| !value.is_empty()),
+        _ => None,
+    };
+    [base, effective]
+}
+
+fn canonical_installer_type(value: &str) -> String {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "appx" { "msix".to_owned() } else { value }
+}
+
+/// `--installer-type` matches the base or the effective (nested) installer type, like WinGet's
+/// `InstallerTypeComparator`.
+fn installer_matches_type(installer: &Installer, requested_type: Option<&str>) -> bool {
+    let Some(requested) = requested_type.map(canonical_installer_type) else {
+        return true;
+    };
+    installer_selection_types(installer)
+        .into_iter()
+        .flatten()
+        .any(|installer_type| installer_type == requested)
+}
+
+/// WinGet's default installer type preference (used when no type is requested): earlier types
+/// rank higher; an archive ranks by its nested type.
+fn installer_type_rank(installer: &Installer) -> i32 {
+    const PREFERENCE: [&str; 9] = [
+        "msstore", "msix", "msi", "wix", "burn", "nullsoft", "inno", "exe", "portable",
+    ];
+    installer_selection_types(installer)
+        .into_iter()
+        .flatten()
+        .filter_map(|installer_type| PREFERENCE.iter().position(|candidate| *candidate == installer_type))
+        .map(|position| i32::try_from(PREFERENCE.len() - position).unwrap_or(0))
+        .max()
+        .unwrap_or(0)
 }
 
 fn installer_matches_requested(
@@ -10511,7 +10706,7 @@ fn installer_matches_requested(
     system_platform: Option<&str>,
     current_os_version: Option<&str>,
 ) -> bool {
-    matches_optional_ci(installer.installer_type.as_deref(), requested_type)
+    installer_matches_type(installer, requested_type)
         && installer_matches_scope(installer.scope.as_deref(), requested_scope)
         && installer_matches_platform(installer, requested_platform, system_platform)
         && installer_matches_os_version(installer, requested_os_version, current_os_version)
@@ -10623,44 +10818,18 @@ fn installer_unsupported_on_architecture(installer: &Installer, system_architect
         .any(|value| value.trim().eq_ignore_ascii_case(system_architecture))
 }
 
-fn installer_rank(
-    installer: &Installer,
-    requested_locale: Option<&str>,
-    preferred_locales: &[String],
-    requested_architecture: Option<&str>,
-    system_architecture: &str,
-) -> (i32, i32, i32) {
-    let architecture_rank = architecture_rank(
-        installer.architecture.as_deref(),
-        requested_architecture.unwrap_or(system_architecture),
-        requested_architecture.is_some(),
-        system_architecture,
-    );
-    let locale_rank = match requested_locale {
-        Some(_) => locale_rank(installer.locale.as_deref(), requested_locale),
-        None => preferred_locale_rank(installer.locale.as_deref(), preferred_locales),
-    };
-    let command_rank = if installer.commands.is_empty() { 0 } else { 1 };
-    (architecture_rank, locale_rank, command_rank)
-}
-
+/// WinGet `IsApplicableArchitecture`: the requested architecture, else the system's applicable
+/// architectures in preference order (`neutral` last), ranked from the end of that list.
 fn architecture_rank(
     installer_architecture: Option<&str>,
-    preferred_architecture: &str,
-    strict: bool,
+    requested_architecture: Option<&str>,
     system_architecture: &str,
 ) -> i32 {
     let Some(value) = installer_architecture else {
         return 0;
     };
-    if value.eq_ignore_ascii_case(preferred_architecture) {
-        return 5;
-    }
-    if value.eq_ignore_ascii_case("neutral") {
-        return 4;
-    }
-    if strict {
-        return -1;
+    if let Some(requested) = requested_architecture {
+        return if value.eq_ignore_ascii_case(requested) { 1 } else { -1 };
     }
 
     preferred_architectures(system_architecture)
@@ -10682,10 +10851,12 @@ fn manifest_has_compatible_installer(manifest: &Manifest) -> bool {
     select_installer(&manifest.installers, &PackageQuery::default()).is_some()
 }
 
+/// WinGet `CreateApplicableArchitecturesVector`: the native architecture, then the emulated
+/// ones, then `neutral` last.
 fn preferred_architectures(system_architecture: &str) -> &'static [&'static str] {
     match system_architecture {
-        "arm64" => &["arm64", "neutral", "x64", "x86"],
-        "x64" => &["x64", "neutral", "x86"],
+        "arm64" => &["arm64", "x64", "x86", "neutral"],
+        "x64" => &["x64", "x86", "neutral"],
         "x86" => &["x86", "neutral"],
         _ => &["neutral"],
     }
@@ -10791,13 +10962,6 @@ fn locale_rank(installer_locale: Option<&str>, requested_locale: Option<&str>) -
         (Some(_), None) => 1,
         (None, None) => 0,
         _ => -1,
-    }
-}
-
-fn matches_optional_ci(value: Option<&str>, requested: Option<&str>) -> bool {
-    match requested {
-        Some(requested) => value.is_some_and(|value| value.eq_ignore_ascii_case(requested)),
-        None => true,
     }
 }
 
@@ -11022,21 +11186,49 @@ fn is_unknown_version(version: &str) -> bool {
     version.trim().eq_ignore_ascii_case("Unknown")
 }
 
+fn is_latest_version(version: &str) -> bool {
+    version.trim().eq_ignore_ascii_case("Latest")
+}
+
+/// WinGet's approximate version comparator (`< 1.0`, `> 1.0`). With equal base versions it
+/// orders `< 1.0` below `1.0` below `> 1.0` (`Version::ApproximateCompareLessThan`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ApproximateComparator {
+    LessThan,
+    None,
+    GreaterThan,
+}
+
+fn split_approximate_version(value: &str) -> (&str, ApproximateComparator) {
+    let value = value.trim();
+    if let Some(base) = value.strip_prefix('<') {
+        (base.trim(), ApproximateComparator::LessThan)
+    } else if let Some(base) = value.strip_prefix('>') {
+        (base.trim(), ApproximateComparator::GreaterThan)
+    } else {
+        (value, ApproximateComparator::None)
+    }
+}
+
 fn compare_version(left: &str, right: &str) -> Ordering {
+    let (left_base, left_comparator) = split_approximate_version(left);
+    let (right_base, right_comparator) = split_approximate_version(right);
+    compare_base_version(left_base, right_base).then(left_comparator.cmp(&right_comparator))
+}
+
+fn compare_base_version(left: &str, right: &str) -> Ordering {
+    // WinGet sorts `Latest` above every other version and `Unknown` below every known one.
+    match (is_latest_version(left), is_latest_version(right)) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
     match (is_unknown_version(left), is_unknown_version(right)) {
         (true, true) => return Ordering::Equal,
         (true, false) => return Ordering::Less,
         (false, true) => return Ordering::Greater,
         (false, false) => {}
-    }
-
-    let left_less_than = left.trim().strip_prefix('<').map(str::trim);
-    let right_less_than = right.trim().strip_prefix('<').map(str::trim);
-    match (left_less_than, right_less_than) {
-        (Some(left_value), Some(right_value)) => return compare_version(left_value, right_value),
-        (Some(left_value), None) if compare_version(left_value, right) == Ordering::Equal => return Ordering::Less,
-        (None, Some(right_value)) if compare_version(left, right_value) == Ordering::Equal => return Ordering::Greater,
-        _ => {}
     }
 
     let left_parts = tokenize_version(left);
@@ -18472,8 +18664,10 @@ Installers:
 
     #[test]
     fn explicit_tag_filter_uses_exact_match() {
+        // Without --exact a many-search tag filter is a substring match (wave16_tests).
         let query = PackageQuery {
             tag: Some("terminal".to_owned()),
+            exact: true,
             ..PackageQuery::default()
         };
 
@@ -18485,8 +18679,10 @@ Installers:
 
     #[test]
     fn rest_tag_filter_uses_exact_match() {
+        // Without --exact a many-search tag filter is a substring match (wave16_tests).
         let query = PackageQuery {
             tag: Some("terminal".to_owned()),
+            exact: true,
             ..PackageQuery::default()
         };
         let info = RestInformation {
@@ -18602,25 +18798,23 @@ Installers:
 
     #[test]
     fn selects_first_installer_when_rank_ties() {
+        // Equal in every respect but the URL. (A user/machine pair is not a tie: WinGet's
+        // default scope preference is user, see wave16_tests.)
+        let installer = |url: &str| Installer {
+            architecture: Some("x64".to_owned()),
+            installer_type: Some("exe".to_owned()),
+            locale: Some("en-US".to_owned()),
+            scope: Some("machine".to_owned()),
+            url: Some(url.to_owned()),
+            ..Installer::default()
+        };
         let installers = vec![
-            Installer {
-                architecture: Some("x64".to_owned()),
-                installer_type: Some("exe".to_owned()),
-                locale: Some("en-US".to_owned()),
-                scope: Some("machine".to_owned()),
-                ..Installer::default()
-            },
-            Installer {
-                architecture: Some("x64".to_owned()),
-                installer_type: Some("exe".to_owned()),
-                locale: Some("en-US".to_owned()),
-                scope: Some("user".to_owned()),
-                ..Installer::default()
-            },
+            installer("https://example.test/first.exe"),
+            installer("https://example.test/second.exe"),
         ];
 
         let selected = select_installer(&installers, &PackageQuery::default()).expect("selected installer");
-        assert_eq!(selected.scope.as_deref(), Some("machine"));
+        assert_eq!(selected.url.as_deref(), Some("https://example.test/first.exe"));
     }
 
     #[test]
