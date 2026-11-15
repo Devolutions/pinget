@@ -2,12 +2,15 @@
 
 #[cfg_attr(not(windows), allow(unused_imports))]
 use std::io::Write;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use super::*;
 
+#[cfg(windows)]
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(windows)]
 fn unique_name(label: &str) -> String {
     format!(
         "PingetWave19{label}_{}_{}_{}",
@@ -17,10 +20,12 @@ fn unique_name(label: &str) -> String {
     )
 }
 
+#[cfg(windows)]
 struct TempDir {
     path: PathBuf,
 }
 
+#[cfg(windows)]
 impl TempDir {
     fn new(label: &str) -> Self {
         let path = std::env::temp_dir().join(unique_name(label));
@@ -30,6 +35,7 @@ impl TempDir {
     }
 }
 
+#[cfg(windows)]
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
