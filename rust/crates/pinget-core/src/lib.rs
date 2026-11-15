@@ -12,6 +12,8 @@ mod wave10_tests;
 #[cfg(test)]
 mod wave11_tests;
 #[cfg(test)]
+mod wave15_tests;
+#[cfg(test)]
 mod wave1_tests;
 #[cfg(test)]
 mod wave2_tests;
@@ -1089,16 +1091,55 @@ struct RestInfoCache {
 struct RestInformation {
     #[serde(rename = "SourceIdentifier")]
     source_identifier: String,
-    #[serde(rename = "ServerSupportedVersions", default)]
+    #[serde(
+        rename = "ServerSupportedVersions",
+        default,
+        deserialize_with = "lenient_string_list"
+    )]
     server_supported_versions: Vec<String>,
-    #[serde(rename = "RequiredPackageMatchFields", default)]
+    #[serde(
+        rename = "RequiredPackageMatchFields",
+        default,
+        deserialize_with = "lenient_string_list"
+    )]
     required_package_match_fields: Vec<String>,
-    #[serde(rename = "UnsupportedPackageMatchFields", default)]
+    #[serde(
+        rename = "UnsupportedPackageMatchFields",
+        default,
+        deserialize_with = "lenient_string_list"
+    )]
     unsupported_package_match_fields: Vec<String>,
-    #[serde(rename = "RequiredQueryParameters", default)]
+    #[serde(
+        rename = "RequiredQueryParameters",
+        default,
+        deserialize_with = "lenient_string_list"
+    )]
     required_query_parameters: Vec<String>,
-    #[serde(rename = "UnsupportedQueryParameters", default)]
+    #[serde(
+        rename = "UnsupportedQueryParameters",
+        default,
+        deserialize_with = "lenient_string_list"
+    )]
     unsupported_query_parameters: Vec<String>,
+}
+
+/// A JSON string array read the way WinGet's `GetRawStringArrayFromJsonNode` does: `null`
+/// or a non-array is empty and non-string items are skipped, so an optional `/information`
+/// field sent as `null` does not make the whole source unusable.
+fn lenient_string_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<JsonValue>::deserialize(deserializer)? {
+        Some(JsonValue::Array(items)) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                JsonValue::String(value) => Some(value),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3625,31 +3666,64 @@ impl Repository {
 
         let url = format!("{}/manifestSearch", source.arg.trim_end_matches('/'));
         let body = build_rest_search_body(query, &info, semantics)?;
-        let response = self
-            .client
-            .post(url)
-            .header("Version", contract)
-            .header(CONTENT_TYPE, "application/json")
-            .body(serde_json::to_vec(&body).context("failed to serialize REST search request")?)
-            .send()
-            .context("REST search request failed")?;
-        let Some(body) = read_rest_response_body(response, "REST search")? else {
+        if rest_search_body_has_no_criteria(&body) {
+            // Every inclusion named a field the source does not support (WinGet's SearchInternal).
             return Ok(SearchSourceMatches {
                 truncated: false,
                 matches: Vec::new(),
             });
-        };
-        let json = serde_json::from_slice::<JsonValue>(&body).context("failed to parse REST search response")?;
-        let data = json
-            .get("Data")
-            .and_then(JsonValue::as_array)
-            .cloned()
-            .unwrap_or_default();
+        }
+        let body = serde_json::to_vec(&body).context("failed to serialize REST search request")?;
         let max_results = source_fetch_results(query, semantics);
+
+        // Like WinGet's SearchInternal: resend the same body with the `ContinuationToken`
+        // header until the server stops returning one or enough results arrived.
+        let mut data = Vec::new();
+        let mut continuation_token: Option<String> = None;
+        let mut used_tokens = HashSet::new();
+        loop {
+            let mut request = self
+                .client
+                .post(&url)
+                .header("Version", contract)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.clone());
+            if let Some(token) = &continuation_token {
+                request = request.header("ContinuationToken", token.as_str());
+            }
+            let response = request.send().context("REST search request failed")?;
+            let Some(page) = read_rest_response_body(response, "REST search")? else {
+                continuation_token = None;
+                break;
+            };
+            let json = serde_json::from_slice::<JsonValue>(&page).context("failed to parse REST search response")?;
+            let page_data = json
+                .get("Data")
+                .and_then(JsonValue::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if page_data.is_empty() {
+                ensure_rest_search_request_supported(&json)?;
+            }
+            data.extend(page_data);
+            continuation_token = json_string(&json, "ContinuationToken").filter(|token| !token.is_empty());
+            let Some(token) = &continuation_token else {
+                break;
+            };
+            if data.len() >= max_results {
+                break;
+            }
+            if !used_tokens.insert(token.clone()) {
+                bail!("REST source returned a repeated continuation token");
+            }
+        }
 
         let mut results = Vec::new();
         for item in data {
+            // WinGet trims the identifier and version from a REST search response.
             let package_id = json_string(&item, "PackageIdentifier")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow!("REST search result missing PackageIdentifier"))?;
             let package_name =
                 json_string(&item, "PackageName").ok_or_else(|| anyhow!("REST search result missing PackageName"))?;
@@ -3687,8 +3761,10 @@ impl Repository {
             });
         }
 
+        let truncated = continuation_token.is_some() || results.len() >= max_results;
+        results.truncate(max_results);
         Ok(SearchSourceMatches {
-            truncated: results.len() >= max_results,
+            truncated,
             matches: results,
         })
     }
@@ -3976,7 +4052,7 @@ impl Repository {
             .error_for_status()
             .context("REST information request returned an error")?;
 
-        let max_age = cache_control_max_age(&response);
+        let cache_control = cache_control_header(&response);
         let json =
             serde_json::from_slice::<JsonValue>(&response.bytes().context("failed to read REST information response")?)
                 .context("failed to parse REST information response")?;
@@ -3988,11 +4064,20 @@ impl Repository {
             .context("failed to deserialize REST information payload")?;
 
         if persist {
-            let cache = RestInfoCache {
-                expires_at: rest_information_cache_expiry(Utc::now(), max_age),
-                value: info.clone(),
-            };
-            write_json(self.rest_information_cache_path(&source), &cache)?;
+            let cache_path = self.rest_information_cache_path(&source);
+            if cache_control_forbids_caching(cache_control.as_deref()) {
+                // Drop any earlier entry too, so the next lookup asks the server again.
+                let _ = fs::remove_file(&cache_path);
+            } else {
+                let cache = RestInfoCache {
+                    expires_at: rest_information_cache_expiry(
+                        Utc::now(),
+                        parse_cache_control_max_age(cache_control.as_deref()),
+                    ),
+                    value: info.clone(),
+                };
+                write_json(cache_path, &cache)?;
+            }
         }
 
         Ok(info)
@@ -7794,13 +7879,16 @@ fn build_rest_search_body(
             // The REST contract evaluates `(Query || Inclusions...) && Filters...`, so the
             // alternative identity fields must be Inclusions (ORed). As Filters they would be
             // ANDed and only match a package whose id, name and moniker are all equal.
-            let inclusions = vec![
-                rest_filter("PackageIdentifier", value, match_type),
-                rest_filter("PackageName", value, match_type),
-                rest_filter("Moniker", value, match_type),
-            ];
+            // An inclusion on a field the source lists as unsupported is dropped (WinGet's V1_1
+            // GetValidatedSearchRequest); it would otherwise be rejected or misread by the server.
+            let inclusions = ["PackageIdentifier", "PackageName", "Moniker"]
+                .into_iter()
+                .filter(|field| !rest_field_listed(&info.unsupported_package_match_fields, field))
+                .map(|field| rest_filter(field, value, match_type))
+                .collect::<Vec<_>>();
             root.insert("Inclusions".to_owned(), JsonValue::Array(inclusions));
             let mut filters = Vec::new();
+            validate_rest_search_filters(&filters, info)?;
             append_required_rest_filters(&mut filters, info);
             if !filters.is_empty() {
                 root.insert("Filters".to_owned(), JsonValue::Array(filters));
@@ -7840,6 +7928,7 @@ fn build_rest_search_body(
     if let Some(value) = &query.command {
         filters.push(rest_filter("Command", value, tag_match_type));
     }
+    validate_rest_search_filters(&filters, info)?;
     append_required_rest_filters(&mut filters, info);
 
     if !filters.is_empty() {
@@ -7847,6 +7936,74 @@ fn build_rest_search_body(
     }
 
     Ok(JsonValue::Object(root))
+}
+
+fn rest_field_listed(fields: &[String], field: &str) -> bool {
+    fields
+        .iter()
+        .any(|candidate| candidate.trim().eq_ignore_ascii_case(field))
+}
+
+fn rest_filter_field(filter: &JsonValue) -> &str {
+    filter
+        .get("PackageMatchField")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+}
+
+/// WinGet's V1_1 GetValidatedSearchRequest for Filters: every required package match field
+/// other than Market (which is filled in) must be filtered on, and a filter on a field the
+/// source lists as unsupported fails the search instead of being sent and ignored, which
+/// would return packages the filter should have excluded.
+fn validate_rest_search_filters(filters: &[JsonValue], info: &RestInformation) -> Result<()> {
+    for field in &info.required_package_match_fields {
+        let field = field.trim();
+        if field.eq_ignore_ascii_case("Market") {
+            continue;
+        }
+        if !filters
+            .iter()
+            .any(|filter| rest_filter_field(filter).eq_ignore_ascii_case(field))
+        {
+            bail!("the REST source requires the package match field '{field}', which this search does not provide");
+        }
+    }
+    if let Some(filter) = filters
+        .iter()
+        .find(|filter| rest_field_listed(&info.unsupported_package_match_fields, rest_filter_field(filter)))
+    {
+        bail!(
+            "the REST source does not support the package match field '{}'",
+            rest_filter_field(filter)
+        );
+    }
+    Ok(())
+}
+
+/// True when a request had inclusions but every one was dropped as unsupported and there is
+/// no `Query`: WinGet returns no results without contacting the server.
+fn rest_search_body_has_no_criteria(body: &JsonValue) -> bool {
+    body.get("Query").is_none()
+        && body
+            .get("Inclusions")
+            .and_then(JsonValue::as_array)
+            .is_some_and(Vec::is_empty)
+}
+
+/// WinGet's V1_1 GetSearchResult: an empty search response that lists required or
+/// unsupported package match fields means the server rejected the request shape, which is
+/// an error rather than "no packages found".
+fn ensure_rest_search_request_supported(response: &JsonValue) -> Result<()> {
+    let required = json_string_list(response, "RequiredPackageMatchFields");
+    let unsupported = json_string_list(response, "UnsupportedPackageMatchFields");
+    if required.is_empty() && unsupported.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "the REST source does not support this search (required package match fields: [{}]; unsupported package match fields: [{}])",
+        required.join(", "),
+        unsupported.join(", ")
+    )
 }
 
 fn append_required_rest_filters(filters: &mut Vec<JsonValue>, info: &RestInformation) {
@@ -8498,6 +8655,8 @@ fn parse_rest_versions(item: &JsonValue) -> Result<Vec<VersionKey>> {
     let mut result = Vec::new();
     for version in versions {
         let value = json_string(version, "PackageVersion")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("REST version entry missing PackageVersion"))?;
         let channel = json_string(version, "Channel").unwrap_or_default();
         result.push(VersionKey {
@@ -8677,12 +8836,14 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
         .get("Versions")
         .and_then(JsonValue::as_array)
         .ok_or_else(|| anyhow!("REST manifest response missing Versions"))?;
+    // WinGet trims PackageVersion from a REST manifest before matching it against the
+    // requested version, so `"1.2.3 "` is version 1.2.3.
     let selected = versions
         .iter()
         .find(|item| {
             json_string(item, "PackageVersion")
                 .as_deref()
-                .is_some_and(|pv| pv.eq_ignore_ascii_case(version))
+                .is_some_and(|pv| pv.trim().eq_ignore_ascii_case(version.trim()))
                 && json_string(item, "Channel")
                     .unwrap_or_default()
                     .eq_ignore_ascii_case(channel)
@@ -8709,7 +8870,8 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
         })
         .ok_or_else(|| anyhow!("REST manifest response did not contain a version payload for version '{version}'"))?;
     let resolved_version = json_string(selected, "PackageVersion")
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| version.to_owned());
     let resolved_channel = json_string(selected, "Channel").unwrap_or_else(|| channel.to_owned());
 
@@ -10031,10 +10193,13 @@ fn json_installer_switches(value: &JsonValue) -> InstallerSwitches {
         .or_else(|| value.get("Switches"))
         .and_then(JsonValue::as_object);
 
+    // Like WinGet's TryParseInstallerSwitchField, an empty switch is absent, so it neither
+    // hides the version-level default nor the SilentWithProgress/Silent fallback.
     let string = |key: &str| {
         switches
             .and_then(|switches| switches.get(key))
             .and_then(JsonValue::as_str)
+            .filter(|value| !value.is_empty())
             .map(str::to_owned)
     };
 
@@ -10280,28 +10445,41 @@ fn decompress_mszyml_payload(payload: &[u8]) -> Result<String> {
     Ok(output)
 }
 
-fn cache_control_max_age(response: &Response) -> u64 {
-    parse_cache_control_max_age(
-        response
-            .headers()
-            .get(reqwest::header::CACHE_CONTROL)
-            .and_then(|value| value.to_str().ok()),
-    )
+fn cache_control_header(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 /// Seconds to cache a REST `/information` response: the Cache-Control max-age, or
-/// [`REST_INFORMATION_DEFAULT_MAX_AGE_SECONDS`] when absent or unparsable.
+/// [`REST_INFORMATION_DEFAULT_MAX_AGE_SECONDS`] when absent or unparsable. Directive names
+/// are case-insensitive and may have spaces around `=` (`Max-Age = 42`), like WinGet's
+/// `CacheControlPolicy`.
 fn parse_cache_control_max_age(header: Option<&str>) -> u64 {
     header
         .and_then(|header| {
             header.split(',').find_map(|part| {
-                let trimmed = part.trim();
-                trimmed
-                    .strip_prefix("max-age=")
-                    .and_then(|value| value.parse::<u64>().ok())
+                let (name, value) = part.split_once('=')?;
+                if !name.trim().eq_ignore_ascii_case("max-age") {
+                    return None;
+                }
+                value.trim().parse::<u64>().ok()
             })
         })
         .unwrap_or(REST_INFORMATION_DEFAULT_MAX_AGE_SECONDS)
+}
+
+/// True when Cache-Control carries `no-store` or `no-cache`: WinGet's RestInformationCache
+/// does not cache such an `/information` response at all.
+fn cache_control_forbids_caching(header: Option<&str>) -> bool {
+    header.is_some_and(|header| {
+        header.split(',').any(|part| {
+            let directive = part.trim();
+            directive.eq_ignore_ascii_case("no-store") || directive.eq_ignore_ascii_case("no-cache")
+        })
+    })
 }
 
 /// When a REST `/information` cache entry expires. A server-supplied max-age is clamped
