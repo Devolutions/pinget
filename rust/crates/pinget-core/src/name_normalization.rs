@@ -45,6 +45,21 @@ pub(crate) enum Architecture {
     Arm64,
 }
 
+impl Architecture {
+    /// The suffix winget's `NormalizedName::GetNormalizedName(Architecture)`
+    /// appends (`name(X64)`) for the architecture-qualified variant the index
+    /// stores for ARP DisplayNames. `None` when no architecture was found.
+    pub(crate) fn normalized_name_suffix(self) -> Option<&'static str> {
+        match self {
+            Self::Unknown => None,
+            Self::X86 => Some("(X86)"),
+            Self::X64 => Some("(X64)"),
+            Self::Arm => Some("(Arm)"),
+            Self::Arm64 => Some("(Arm64)"),
+        }
+    }
+}
+
 /// One pass over the input — captures both the regex and the replacement
 /// string used. Boundary-preserving patterns use `$1`; all-consuming
 /// patterns use `""`.
@@ -61,10 +76,12 @@ pub(crate) fn normalize_name(value: &str) -> NormalizedName {
     while unwrap(&mut name) {}
 
     // SAP Business Object program names follow a specific pattern that
-    // breaks under the regular flow; winget short-circuits them.
+    // breaks under the regular flow; winget short-circuits them. The value is
+    // still case-folded: winget folds every name before normalizing it, so
+    // the catalog stores these lowercase too.
     if sap_package().is_match(&name).unwrap_or(false) {
         return NormalizedName {
-            name,
+            name: fold_case(&name),
             architecture: Architecture::Unknown,
             locale: String::new(),
         };
@@ -87,7 +104,7 @@ pub(crate) fn normalize_name(value: &str) -> NormalizedName {
     name = nonletters_replaced;
 
     NormalizedName {
-        name: name.to_lowercase(),
+        name: fold_case(&name),
         architecture,
         locale: locale.to_lowercase(),
     }
@@ -110,22 +127,104 @@ pub(crate) fn normalize_publisher(value: &str) -> String {
     let tokens = split_with_legal_suffix_exclusion(publisher_name_split(), &publisher, true);
     publisher = tokens.join("");
     let cleaned = non_letters_and_digits().replace_all(&publisher, "").into_owned();
-    cleaned.to_lowercase()
+    fold_case(&cleaned)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────
 
 fn prepare_for_validation(value: &str) -> String {
-    let mut s = value.trim().to_owned();
+    // winget's `PrepareForValidation` applies Unicode NFKC normalization
+    // before trimming, so compatibility characters (`™` → `TM`, full-width
+    // letters, ligatures) reach the regexes in their plain form.
+    let mut s = normalize_nfkc(value).trim().to_owned();
     // winget supports an `@@`-delimited suffix on internal display names
     // that should be stripped before normalization — keep parity even
-    // though it's unusual in the wild.
-    if let Some(idx) = s.find("@@")
-        && idx >= 3
-    {
-        s.truncate(idx);
+    // though it's unusual in the wild. winget searches with
+    // `find(L"@@", 3)`: from the fourth UTF-16 code unit on, so an `@@`
+    // inside the first three characters doesn't hide a later one.
+    let mut utf16_offset = 0usize;
+    let search_start = s
+        .char_indices()
+        .find_map(|(index, ch)| {
+            if utf16_offset >= 3 {
+                return Some(index);
+            }
+            utf16_offset += ch.len_utf16();
+            None
+        })
+        .unwrap_or(s.len());
+    if let Some(relative) = s[search_start..].find("@@") {
+        s.truncate(search_start + relative);
     }
     s
+}
+
+/// ICU-style full case folding as applied by winget's `FoldCase` (ICU
+/// `U_FOLD_CASE_DEFAULT`), which the catalog's normalized values go through.
+/// `to_lowercase` covers it except for the expansions and final-sigma
+/// mapping that remain after NFKC: `ß`/`ẞ` fold to `ss` and `ς` to `σ`.
+fn fold_case(value: &str) -> String {
+    let lower = value.to_lowercase();
+    if !lower.contains(['ß', 'ς']) {
+        return lower;
+    }
+    lower.replace('ß', "ss").replace('ς', "σ")
+}
+
+/// Unicode NFKC normalization through the same Win32 `NormalizeString` call
+/// winget uses. Falls back to the input when normalization is unavailable.
+#[cfg(windows)]
+fn normalize_nfkc(value: &str) -> String {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
+    use windows_sys::Win32::Globalization::{NormalizationKC, NormalizeString};
+
+    if value.is_ascii() {
+        // ASCII is already in NFKC form.
+        return value.to_owned();
+    }
+    let source = value.encode_utf16().collect::<Vec<_>>();
+    let Ok(source_len) = i32::try_from(source.len()) else {
+        return value.to_owned();
+    };
+    // SAFETY: `source` is valid for `source_len` UTF-16 units; a null
+    // destination with length 0 asks for the required buffer size.
+    let mut estimate =
+        unsafe { NormalizeString(NormalizationKC, source.as_ptr(), source_len, std::ptr::null_mut(), 0) };
+    for _ in 0..8 {
+        let Ok(capacity) = usize::try_from(estimate) else {
+            return value.to_owned();
+        };
+        if capacity == 0 {
+            return value.to_owned();
+        }
+        let mut buffer = vec![0u16; capacity];
+        // SAFETY: `buffer` is valid for `estimate` UTF-16 units.
+        let written = unsafe {
+            NormalizeString(
+                NormalizationKC,
+                source.as_ptr(),
+                source_len,
+                buffer.as_mut_ptr(),
+                estimate,
+            )
+        };
+        if written > 0 {
+            buffer.truncate(usize::try_from(written).unwrap_or(0));
+            return String::from_utf16_lossy(&buffer);
+        }
+        // SAFETY: plain thread-local error query.
+        if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+            return value.to_owned();
+        }
+        // On ERROR_INSUFFICIENT_BUFFER the negated return value is a new estimate.
+        estimate = -written;
+    }
+    value.to_owned()
+}
+
+#[cfg(not(windows))]
+fn normalize_nfkc(value: &str) -> String {
+    value.to_owned()
 }
 
 fn unwrap(value: &mut String) -> bool {

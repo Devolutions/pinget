@@ -4213,17 +4213,30 @@ public class Repository : IDisposable
         Microsoft.Data.Sqlite.SqliteConnection conn,
         InstalledPackage pkg)
     {
-        foreach (var pfn in pkg.PackageFamilyNames)
+        // InstalledDbIdentityTablesPresent only requires one identity table pair: a tracking DB from an older
+        // schema (no upgradecodes before 1.6) must not fail the whole lookup with "no such table".
+        bool PairPresent(string valueTable, string mapTable) => TableExists(conn, valueTable) && TableExists(conn, mapTable);
+
+        if (pkg.PackageFamilyNames.Count > 0 && PairPresent("pfns", "pfns_map"))
         {
-            var hit = LookupInstalledDbIdentityMatch(conn, "pfns", "pfns_map", "pfn", pfn, "PackageFamilyName");
-            if (hit is not null) return hit;
+            foreach (var pfn in pkg.PackageFamilyNames)
+            {
+                var hit = LookupInstalledDbIdentityMatch(conn, "pfns", "pfns_map", "pfn", pfn, "PackageFamilyName");
+                if (hit is not null) return hit;
+            }
         }
 
-        foreach (var code in pkg.UpgradeCodes)
+        if (pkg.UpgradeCodes.Count > 0 && PairPresent("upgradecodes", "upgradecodes_map"))
         {
-            var hit = LookupInstalledDbIdentityMatch(conn, "upgradecodes", "upgradecodes_map", "upgradecode", code, "UpgradeCode");
-            if (hit is not null) return hit;
+            foreach (var code in pkg.UpgradeCodes)
+            {
+                var hit = LookupInstalledDbIdentityMatch(conn, "upgradecodes", "upgradecodes_map", "upgradecode", code, "UpgradeCode");
+                if (hit is not null) return hit;
+            }
         }
+
+        if (pkg.ProductCodes.Count == 0 || !PairPresent("productcodes", "productcodes_map"))
+            return null;
 
         foreach (var code in pkg.ProductCodes)
         {
@@ -4385,12 +4398,12 @@ public class Repository : IDisposable
                     if (pkg.LocalId.StartsWith(@"MSIX\", StringComparison.OrdinalIgnoreCase)) continue;
                     if (string.IsNullOrWhiteSpace(pkg.Publisher)) continue;
 
-                    var normName = NameNormalization.NormalizeName(pkg.Name).Name;
-                    if (string.IsNullOrEmpty(normName)) continue;
+                    var normName = NameNormalization.NormalizeName(pkg.Name);
+                    if (string.IsNullOrEmpty(normName.Name)) continue;
                     var normPub = NameNormalization.NormalizePublisher(pkg.Publisher);
                     if (string.IsNullOrEmpty(normPub)) continue;
 
-                    var rowid = LookupUniqueNormalizedIdentity(conn, normName, normPub);
+                    var rowid = LookupInstalledNormalizedIdentity(conn, normName, normPub);
                     if (rowid is null) continue;
                     var meta = FetchV2PackageMetadata(conn, rowid.Value);
                     if (meta is null) continue;
@@ -4482,6 +4495,37 @@ public class Repository : IDisposable
 
     private static long? LookupUniqueNormalizedIdentity(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
     {
+        var rows = LookupNormalizedIdentityRows(conn, normName, normPublisher);
+        return rows.Count == 1 ? rows[0] : null; // none, or ambiguous
+    }
+
+    internal static long? LookupInstalledNormalizedIdentityForTesting(
+        Microsoft.Data.Sqlite.SqliteConnection conn, NameNormalization.NormalizedName normalizedName, string normPublisher)
+        => LookupInstalledNormalizedIdentity(conn, normalizedName, normPublisher);
+
+    /// <summary>
+    /// WinGet's installed → available NormalizedNameAndPublisher search (SearchPurpose::CorrelationToAvailable):
+    /// when the installed DisplayName carries an architecture, the index is searched first for the
+    /// architecture-qualified name it stores for ARP DisplayNames (<c>foo(X64)</c>), and only when that finds
+    /// nothing for the plain name. This tells "Foo (x64)" apart from "Foo (x86)" packages whose plain normalized
+    /// names collide.
+    /// </summary>
+    private static long? LookupInstalledNormalizedIdentity(
+        Microsoft.Data.Sqlite.SqliteConnection conn, NameNormalization.NormalizedName normalizedName, string normPublisher)
+    {
+        if (NameNormalization.NormalizedNameSuffix(normalizedName.Architecture) is { } suffix)
+        {
+            var rows = LookupNormalizedIdentityRows(conn, normalizedName.Name + suffix, normPublisher);
+            if (rows.Count > 0)
+                return rows.Count == 1 ? rows[0] : null;
+        }
+
+        return LookupUniqueNormalizedIdentity(conn, normalizedName.Name, normPublisher);
+    }
+
+    /// <summary>Up to two distinct catalog packages matching (norm_name, norm_publisher).</summary>
+    private static List<long> LookupNormalizedIdentityRows(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
+    {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
             SELECT DISTINCT n.package FROM norm_names2 n
@@ -4491,10 +4535,10 @@ public class Repository : IDisposable
         cmd.Parameters.AddWithValue("@name", normName);
         cmd.Parameters.AddWithValue("@pub", normPublisher);
         using var reader = cmd.ExecuteReader();
-        if (!reader.Read()) return null;
-        var first = reader.GetInt64(0);
-        if (reader.Read()) return null; // ambiguous
-        return first;
+        var rows = new List<long>();
+        while (reader.Read())
+            rows.Add(reader.GetInt64(0));
+        return rows;
     }
 
     /// <summary>
@@ -4745,6 +4789,9 @@ public class Repository : IDisposable
     private static string NormalizeCorrelationName(string value) =>
         new(value.Where(char.IsAsciiLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
 
+    internal static bool ListPackageMatchesForTesting(InstalledPackage pkg, ListQuery query)
+        => ListPackageMatches(pkg, query);
+
     private static bool ListPackageMatches(InstalledPackage pkg, ListQuery query)
     {
         var correlated = pkg.Correlated;
@@ -4757,7 +4804,11 @@ public class Repository : IDisposable
                 return false;
         }
 
-        if (query.Name is not null && !MatchesText(pkg.Name, query.Name, query.Exact))
+        // Like --id, --name also matches through the correlated catalog package: WinGet's installed search runs
+        // the request against the available sources too and maps those results back to installed rows.
+        if (query.Name is not null &&
+            !MatchesText(pkg.Name, query.Name, query.Exact) &&
+            !(correlated is not null && MatchesText(correlated.Name, query.Name, query.Exact)))
             return false;
 
         if (query.ProductCode is not null &&
@@ -4770,7 +4821,14 @@ public class Repository : IDisposable
 
         if (query.Query is not null)
         {
-            var localMatch = MatchesText(pkg.Name, query.Query, query.Exact) ||
+            // WinGet's query search first looks for an exact (folded) match on the system reference strings —
+            // PackageFamilyName, ProductCode and UpgradeCode — before the Id/Name/Moniker/Command/Tag fields.
+            var systemReferenceMatch = pkg.PackageFamilyNames
+                .Concat(pkg.ProductCodes)
+                .Concat(pkg.UpgradeCodes)
+                .Any(reference => reference.Equals(query.Query, StringComparison.OrdinalIgnoreCase));
+            var localMatch = systemReferenceMatch ||
+                MatchesText(pkg.Name, query.Query, query.Exact) ||
                 MatchesText(pkg.LocalId, query.Query, query.Exact);
             var correlatedMatch = correlated is not null &&
                 (MatchesText(correlated.Id, query.Query, query.Exact) ||

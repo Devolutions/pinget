@@ -39,10 +39,12 @@ internal static partial class NameNormalization
         while (Unwrap(ref name)) { }
 
         // SAP Business Object program names follow a specific pattern that
-        // breaks under the regular flow; winget short-circuits them.
+        // breaks under the regular flow; winget short-circuits them. The value
+        // is still case-folded: winget folds every name before normalizing it,
+        // so the catalog stores these lowercase too.
         if (SapPackage().IsMatch(name))
         {
-            return new NormalizedName(name, Architecture.Unknown, string.Empty);
+            return new NormalizedName(FoldCase(name), Architecture.Unknown, string.Empty);
         }
 
         var architecture = RemoveArchitecture(ref name);
@@ -59,7 +61,7 @@ internal static partial class NameNormalization
         name = string.Concat(tokens);
         name = NonLettersAndDigits().Replace(name, string.Empty);
 
-        return new NormalizedName(name.ToLowerInvariant(), architecture, locale.ToLowerInvariant());
+        return new NormalizedName(FoldCase(name), architecture, locale.ToLowerInvariant());
     }
 
     /// <summary>
@@ -82,23 +84,67 @@ internal static partial class NameNormalization
         var tokens = SplitWithLegalSuffixExclusion(PublisherNameSplit(), publisher, stopOnExclusion: true);
         publisher = string.Concat(tokens);
         publisher = NonLettersAndDigits().Replace(publisher, string.Empty);
-        return publisher.ToLowerInvariant();
+        return FoldCase(publisher);
     }
+
+    /// <summary>
+    /// The suffix winget's NormalizedName::GetNormalizedName(Architecture) appends (<c>name(X64)</c>) for the
+    /// architecture-qualified variant the index stores for ARP DisplayNames; null when no architecture was found.
+    /// </summary>
+    internal static string? NormalizedNameSuffix(Architecture architecture) => architecture switch
+    {
+        Architecture.X86 => "(X86)",
+        Architecture.X64 => "(X64)",
+        Architecture.Arm => "(Arm)",
+        Architecture.Arm64 => "(Arm64)",
+        _ => null,
+    };
 
     // ── Internal helpers ──────────────────────────────────────────────────
 
     private static string PrepareForValidation(string value)
     {
-        var s = value.Trim();
+        // winget's PrepareForValidation applies Unicode NFKC normalization before
+        // trimming, so compatibility characters (™ → TM, full-width letters,
+        // ligatures) reach the regexes in their plain form.
+        var s = NormalizeNfkc(value).Trim();
         // winget supports an `@@`-delimited suffix on internal display names
         // that should be stripped before normalization — keep parity even
-        // though it's unusual in the wild.
-        var idx = s.IndexOf("@@", StringComparison.Ordinal);
-        if (idx >= 3)
+        // though it's unusual in the wild. winget searches with find(L"@@", 3):
+        // from the fourth UTF-16 code unit on, so an `@@` inside the first
+        // three characters doesn't hide a later one.
+        var idx = s.Length >= 3 ? s.IndexOf("@@", 3, StringComparison.Ordinal) : -1;
+        if (idx >= 0)
         {
             s = s[..idx];
         }
         return s;
+    }
+
+    private static string NormalizeNfkc(string value)
+    {
+        try
+        {
+            return value.Normalize(System.Text.NormalizationForm.FormKC);
+        }
+        catch (ArgumentException)
+        {
+            // Invalid UTF-16 (lone surrogates); keep the value as-is.
+            return value;
+        }
+    }
+
+    /// <summary>
+    /// ICU-style full case folding as applied by winget's FoldCase (ICU U_FOLD_CASE_DEFAULT), which the catalog's
+    /// normalized values go through. ToLowerInvariant covers it except for the expansions and final-sigma mapping
+    /// that remain after NFKC: ß/ẞ fold to "ss" and ς to σ.
+    /// </summary>
+    private static string FoldCase(string value)
+    {
+        var lower = value.ToLowerInvariant();
+        if (lower.IndexOfAny(['ß', 'ς']) < 0)
+            return lower;
+        return lower.Replace("ß", "ss", StringComparison.Ordinal).Replace('ς', 'σ');
     }
 
     private static bool Unwrap(ref string value)

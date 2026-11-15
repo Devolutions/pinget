@@ -18,6 +18,8 @@ mod wave14_tests;
 #[cfg(test)]
 mod wave16_tests;
 #[cfg(test)]
+mod wave17_tests;
+#[cfg(test)]
 mod wave1_tests;
 #[cfg(test)]
 mod wave2_tests;
@@ -2064,8 +2066,8 @@ impl Repository {
                     let Some(publisher) = pkg.publisher.as_deref() else {
                         continue;
                     };
-                    let normalized_name = name_normalization::normalize_name(&pkg.name).name;
-                    if normalized_name.is_empty() {
+                    let normalized_name = name_normalization::normalize_name(&pkg.name);
+                    if normalized_name.name.is_empty() {
                         continue;
                     }
                     let normalized_publisher = name_normalization::normalize_publisher(publisher);
@@ -2073,7 +2075,7 @@ impl Repository {
                         continue;
                     }
                     let Some(rowid) =
-                        lookup_unique_normalized_identity(&connection, &normalized_name, &normalized_publisher)?
+                        lookup_installed_normalized_identity(&connection, &normalized_name, &normalized_publisher)?
                     else {
                         continue;
                     };
@@ -4671,8 +4673,12 @@ fn list_package_matches(package: &InstalledPackage, query: &ListQuery) -> bool {
         }
     }
 
+    // Like `--id`, `--name` also matches through the correlated catalog
+    // package: WinGet's installed search runs the request against the
+    // available sources too and maps those results back to installed rows.
     if let Some(value) = &query.name
         && !matches_text(&package.name, value, query.exact)
+        && !correlated.is_some_and(|candidate| matches_text(&candidate.name, value, query.exact))
     {
         return false;
     }
@@ -4693,8 +4699,18 @@ fn list_package_matches(package: &InstalledPackage, query: &ListQuery) -> bool {
     }
 
     if let Some(value) = &query.query {
-        let local_match =
-            matches_text(&package.name, value, query.exact) || matches_text(&package.local_id, value, query.exact);
+        // WinGet's query search first looks for an exact (folded) match on
+        // the system reference strings — PackageFamilyName, ProductCode and
+        // UpgradeCode — before the Id/Name/Moniker/Command/Tag fields.
+        let system_reference_match = package
+            .package_family_names
+            .iter()
+            .chain(&package.product_codes)
+            .chain(&package.upgrade_codes)
+            .any(|reference| reference.eq_ignore_ascii_case(value));
+        let local_match = system_reference_match
+            || matches_text(&package.name, value, query.exact)
+            || matches_text(&package.local_id, value, query.exact);
         let correlated_match = correlated
             .map(|candidate| {
                 matches_text(&candidate.id, value, query.exact) || matches_text(&candidate.name, value, query.exact)
@@ -4977,14 +4993,24 @@ fn lookup_installed_db_identity_match(
     connection: &Connection,
     package: &InstalledPackage,
 ) -> Result<Option<(String, String, &'static str)>> {
-    for pfn in &package.package_family_names {
+    // `installed_db_identity_tables_present` only requires one identity
+    // table pair: a tracking DB from an older schema (no `upgradecodes`
+    // before 1.6) must not fail the whole lookup with "no such table".
+    let pair_present = |value_table: &str, map_table: &str| -> Result<bool> {
+        Ok(table_exists(connection, value_table)? && table_exists(connection, map_table)?)
+    };
+    let pfns_present = !package.package_family_names.is_empty() && pair_present("pfns", "pfns_map")?;
+    let upgrade_codes_present = !package.upgrade_codes.is_empty() && pair_present("upgradecodes", "upgradecodes_map")?;
+    let product_codes_present = !package.product_codes.is_empty() && pair_present("productcodes", "productcodes_map")?;
+
+    for pfn in package.package_family_names.iter().filter(|_| pfns_present) {
         if let Some(hit) =
             lookup_installed_db_identity_match_value(connection, "pfns", "pfns_map", "pfn", pfn, "PackageFamilyName")?
         {
             return Ok(Some(hit));
         }
     }
-    for code in &package.upgrade_codes {
+    for code in package.upgrade_codes.iter().filter(|_| upgrade_codes_present) {
         if let Some(hit) = lookup_installed_db_identity_match_value(
             connection,
             "upgradecodes",
@@ -4996,7 +5022,7 @@ fn lookup_installed_db_identity_match(
             return Ok(Some(hit));
         }
     }
-    for code in &package.product_codes {
+    for code in package.product_codes.iter().filter(|_| product_codes_present) {
         if let Some(hit) = lookup_installed_db_identity_match_value(
             connection,
             "productcodes",
@@ -5121,7 +5147,35 @@ fn lookup_unique_normalized_identity(
     norm_name: &str,
     norm_publisher: &str,
 ) -> Result<Option<i64>> {
-    let rows: Vec<i64> = query_rows(
+    let rows = lookup_normalized_identity_rows(connection, norm_name, norm_publisher)?;
+    if rows.len() == 1 { Ok(Some(rows[0])) } else { Ok(None) }
+}
+
+/// WinGet's installed → available `NormalizedNameAndPublisher` search
+/// (`SearchPurpose::CorrelationToAvailable`): when the installed DisplayName
+/// carries an architecture, the index is searched first for the
+/// architecture-qualified name it stores for ARP DisplayNames
+/// (`foo(X64)`), and only when that finds nothing for the plain name. This
+/// tells `Foo (x64)` apart from `Foo (x86)` packages whose plain normalized
+/// names collide.
+fn lookup_installed_normalized_identity(
+    connection: &Connection,
+    normalized_name: &name_normalization::NormalizedName,
+    norm_publisher: &str,
+) -> Result<Option<i64>> {
+    if let Some(suffix) = normalized_name.architecture.normalized_name_suffix() {
+        let qualified = format!("{}{suffix}", normalized_name.name);
+        let rows = lookup_normalized_identity_rows(connection, &qualified, norm_publisher)?;
+        if !rows.is_empty() {
+            return Ok((rows.len() == 1).then(|| rows[0]));
+        }
+    }
+    lookup_unique_normalized_identity(connection, &normalized_name.name, norm_publisher)
+}
+
+/// Up to two distinct catalog packages matching `(norm_name, norm_publisher)`.
+fn lookup_normalized_identity_rows(connection: &Connection, norm_name: &str, norm_publisher: &str) -> Result<Vec<i64>> {
+    query_rows(
         connection,
         "SELECT DISTINCT n.package FROM norm_names2 n \
          WHERE n.norm_name = ?1 \
@@ -5132,8 +5186,7 @@ fn lookup_unique_normalized_identity(
             SqlValue::Text(norm_publisher.to_owned()),
         ],
         |row| row_i64(row, 0),
-    )?;
-    if rows.len() == 1 { Ok(Some(rows[0])) } else { Ok(None) }
+    )
 }
 
 fn v2_identity_tables_present(connection: &Connection) -> bool {
@@ -5463,9 +5516,10 @@ fn collect_uninstall_view(
             Ok(key) => key,
             Err(_) => continue,
         };
-        if is_arp_flag_set(read_reg_dword(&subkey, "SystemComponent"))
-            || read_reg_string(&subkey, "ParentKeyName").is_some()
-        {
+        // WinGet's ARPHelper only skips SystemComponent entries; entries with
+        // a ParentKeyName (updates/add-ons registered under a parent product)
+        // are still listed.
+        if is_arp_flag_set(read_reg_dword(&subkey, "SystemComponent")) {
             continue;
         }
 
@@ -5588,12 +5642,13 @@ fn collect_appmodel_packages(
             continue;
         }
 
-        let Some(name) = read_reg_string(&subkey, "DisplayName")
+        // Like WinGet's MSIX enumeration, fall back to the package name from
+        // the identity when no display name is available instead of
+        // dropping the package from the list.
+        let name = read_reg_string(&subkey, "DisplayName")
             .or_else(|| read_appmodel_display_name(&subkey))
             .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
+            .unwrap_or_else(|| metadata.name.clone());
 
         let local_id = format!(r"MSIX\{key_name}");
         let dedupe_key = format!(
@@ -5631,6 +5686,7 @@ fn collect_appmodel_packages(
 
 #[cfg(windows)]
 struct ParsedMsixPackageFullName {
+    name: String,
     version: String,
     resource_id: String,
     family_name: String,
@@ -5660,6 +5716,7 @@ fn parse_msix_package_full_name(value: &str) -> Option<ParsedMsixPackageFullName
     let family_name = format!("{name}_{publisher_id}");
 
     Some(ParsedMsixPackageFullName {
+        name,
         version: version.to_owned(),
         resource_id: resource_id.to_owned(),
         family_name,
