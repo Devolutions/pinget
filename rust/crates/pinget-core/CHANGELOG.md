@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1](https://github.com/Devolutions/pinget/compare/pinget-core-v0.15.0...pinget-core-v0.15.1) - 2026-11-15
+
+### Other
+
+- Fix 100 correctness defects in Rust and C# (waves 13–22) ([#73](https://github.com/Devolutions/pinget/pull/73))
+
 ## [0.14.1](https://github.com/Devolutions/pinget/compare/pinget-core-v0.14.0...pinget-core-v0.14.1) - 2026-11-05
 
 ### Other
