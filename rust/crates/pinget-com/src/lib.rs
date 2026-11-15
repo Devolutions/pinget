@@ -276,57 +276,35 @@ unsafe extern "system" fn package_manager_get_default_app_root(
     this: *mut PackageManagerObject,
     value: *mut BSTR,
 ) -> HRESULT {
-    if this.is_null() {
-        return E_POINTER;
-    }
-
-    // SAFETY: this is checked non-null and is a PackageManagerObject for this vtable method.
-    let object = unsafe { &*this };
-    let guard = match object.repository.lock() {
-        Ok(guard) => guard,
-        Err(_) => return E_FAIL,
-    };
-
-    write_bstr(value, &guard.app_root().display().to_string())
+    with_repository_text(this, value, |repository| {
+        Ok(repository.app_root().display().to_string())
+    })
 }
 
 unsafe extern "system" fn package_manager_list_sources_json(
     this: *mut PackageManagerObject,
     value: *mut BSTR,
 ) -> HRESULT {
-    if this.is_null() {
-        return E_POINTER;
-    }
-
-    // SAFETY: this is checked non-null and is a PackageManagerObject for this vtable method.
-    let object = unsafe { &*this };
-    let guard = match object.repository.lock() {
-        Ok(guard) => guard,
-        Err(_) => return E_FAIL,
-    };
-
-    let sources = guard
-        .list_sources()
-        .into_iter()
-        .map(|source| {
-            serde_json::json!({
-                "name": source.name,
-                "argument": source.arg,
-                "type": source_kind_name(source.kind),
-                "trustLevel": source.trust_level,
-                "explicit": source.explicit,
-                "priority": source.priority,
-                "identifier": source.identifier,
-                "lastUpdate": source.last_update.map(|value| value.to_rfc3339()),
-                "sourceVersion": source.source_version,
+    with_repository_json_value(this, value, |repository| {
+        let sources = repository
+            .list_sources()
+            .into_iter()
+            .map(|source| {
+                json!({
+                    "name": source.name,
+                    "argument": source.arg,
+                    "type": source_kind_name(source.kind),
+                    "trustLevel": source.trust_level,
+                    "explicit": source.explicit,
+                    "priority": source.priority,
+                    "identifier": source.identifier,
+                    "lastUpdate": source.last_update.map(|value| value.to_rfc3339()),
+                    "sourceVersion": source.source_version,
+                })
             })
-        })
-        .collect::<Vec<_>>();
-
-    match serde_json::to_string(&sources) {
-        Ok(json) => write_bstr(value, &json),
-        Err(_) => E_FAIL,
-    }
+            .collect::<Vec<_>>();
+        Ok(JsonValue::Array(sources))
+    })
 }
 
 unsafe extern "system" fn package_manager_add_source(
@@ -338,72 +316,34 @@ unsafe extern "system" fn package_manager_add_source(
     explicit: i32,
     priority: i32,
 ) -> HRESULT {
-    if this.is_null() {
-        return E_POINTER;
-    }
+    with_repository_mut(this, |repository| {
+        let name = required_bstr(name).map_err(|_| invalid_argument("A source name is required."))?;
+        let argument = required_bstr(argument).map_err(|_| invalid_argument("A source argument is required."))?;
+        let source_type = optional_bstr(source_type).map_err(|_| invalid_argument("The source type is invalid."))?;
+        let trust_level = optional_bstr(trust_level).map_err(|_| invalid_argument("The trust level is invalid."))?;
+        let source_kind = parse_source_kind(source_type.as_deref()).ok_or_else(|| {
+            invalid_argument(format!(
+                "Unsupported source type: {}",
+                source_type.as_deref().unwrap_or_default()
+            ))
+        })?;
 
-    let name = match required_bstr(name) {
-        Ok(value) => value,
-        Err(hr) => return hr,
-    };
-    let argument = match required_bstr(argument) {
-        Ok(value) => value,
-        Err(hr) => return hr,
-    };
-    let source_type = match optional_bstr(source_type) {
-        Ok(value) => value,
-        Err(hr) => return hr,
-    };
-    let trust_level = match optional_bstr(trust_level) {
-        Ok(value) => value,
-        Err(hr) => return hr,
-    };
-    let source_kind = match parse_source_kind(source_type.as_deref()) {
-        Some(value) => value,
-        None => return E_INVALIDARG,
-    };
-
-    // SAFETY: this is checked non-null and is a PackageManagerObject for this vtable method.
-    let object = unsafe { &*this };
-    let mut guard = match object.repository.lock() {
-        Ok(guard) => guard,
-        Err(_) => return E_FAIL,
-    };
-
-    match guard.add_source_with_metadata(
-        &name,
-        &argument,
-        source_kind,
-        trust_level.as_deref(),
-        explicit != 0,
-        priority,
-    ) {
-        Ok(()) => S_OK,
-        Err(_) => E_FAIL,
-    }
+        repository.add_source_with_metadata(
+            &name,
+            &argument,
+            source_kind,
+            trust_level.as_deref(),
+            explicit != 0,
+            priority,
+        )
+    })
 }
 
 unsafe extern "system" fn package_manager_remove_source(this: *mut PackageManagerObject, name: BSTR) -> HRESULT {
-    if this.is_null() {
-        return E_POINTER;
-    }
-
-    let name = match required_bstr(name) {
-        Ok(value) => value,
-        Err(hr) => return hr,
-    };
-
-    // SAFETY: this is checked non-null and is a PackageManagerObject for this vtable method.
-    let object = unsafe { &*this };
-    let mut guard = match object.repository.lock() {
-        Ok(guard) => guard,
-        Err(_) => return E_FAIL,
-    };
-
-    match guard.remove_source(&name) {
-        Ok(()) => S_OK,
-        Err(_) => E_FAIL,
-    }
+    with_repository_mut(this, |repository| {
+        let name = required_bstr(name).map_err(|_| invalid_argument("A source name is required."))?;
+        repository.remove_source(&name)
+    })
 }
 
 unsafe extern "system" fn package_manager_reset_source(
@@ -411,34 +351,17 @@ unsafe extern "system" fn package_manager_reset_source(
     name: BSTR,
     all: i32,
 ) -> HRESULT {
-    if this.is_null() {
-        return E_POINTER;
-    }
-
-    let name = match optional_bstr(name) {
-        Ok(value) => value,
-        Err(hr) => return hr,
-    };
-
-    // SAFETY: this is checked non-null and is a PackageManagerObject for this vtable method.
-    let object = unsafe { &*this };
-    let mut guard = match object.repository.lock() {
-        Ok(guard) => guard,
-        Err(_) => return E_FAIL,
-    };
-
-    let result = if all != 0 {
-        guard.reset_sources()
-    } else if let Some(name) = name.as_deref() {
-        guard.reset_source(name)
-    } else {
-        return E_INVALIDARG;
-    };
-
-    match result {
-        Ok(()) => S_OK,
-        Err(_) => E_FAIL,
-    }
+    with_repository_mut(this, |repository| {
+        let name = optional_bstr(name).map_err(|_| invalid_argument("The source name is invalid."))?;
+        // Like WinGet's Reset-WinGetSource, a named reset only resets that source; "all" applies without a name.
+        match name.as_deref() {
+            Some(name) => repository.reset_source(name),
+            None if all != 0 => repository.reset_sources(),
+            None => Err(invalid_argument(
+                "A source name is required unless all sources are reset.",
+            )),
+        }
+    })
 }
 
 unsafe extern "system" fn package_manager_edit_source_json(this: *mut PackageManagerObject, request: BSTR) -> HRESULT {
@@ -838,7 +761,7 @@ fn with_repository_mut(this: *mut PackageManagerObject, action: impl FnOnce(&mut
         Ok(()) => S_OK,
         Err(error) => {
             set_last_error(object, error.to_string());
-            E_FAIL
+            error_hresult(&error)
         }
     }
 }
@@ -875,11 +798,64 @@ fn with_repository_json_value(
         Ok(json) => json,
         Err(error) => {
             set_last_error(object, error.to_string());
-            return E_FAIL;
+            return error_hresult(&error);
         }
     };
 
     write_bstr(value, &result)
+}
+
+fn with_repository_text(
+    this: *mut PackageManagerObject,
+    value: *mut BSTR,
+    action: impl FnOnce(&mut Repository) -> Result<String>,
+) -> HRESULT {
+    if this.is_null() {
+        return E_POINTER;
+    }
+
+    // SAFETY: this is checked non-null and is a PackageManagerObject for this vtable method.
+    let object = unsafe { &*this };
+    clear_last_error(object);
+    let mut guard = match object.repository.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            set_last_error(object, "Pinget repository lock was poisoned.");
+            return E_FAIL;
+        }
+    };
+
+    match action(&mut guard) {
+        Ok(text) => write_bstr(value, &text),
+        Err(error) => {
+            set_last_error(object, error.to_string());
+            error_hresult(&error)
+        }
+    }
+}
+
+/// An error caused by a missing or malformed caller argument; reported as `E_INVALIDARG`.
+#[derive(Debug)]
+struct InvalidArgument(String);
+
+impl std::fmt::Display for InvalidArgument {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidArgument {}
+
+fn invalid_argument(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(InvalidArgument(message.into()))
+}
+
+fn error_hresult(error: &anyhow::Error) -> HRESULT {
+    if error.is::<InvalidArgument>() {
+        E_INVALIDARG
+    } else {
+        E_FAIL
+    }
 }
 
 fn clear_last_error(object: &PackageManagerObject) {
@@ -1244,3 +1220,6 @@ pub extern "system" fn PingetPackageManagerIid() -> GUID {
 
 #[cfg(test)]
 mod wave11_com_tests;
+
+#[cfg(test)]
+mod wave22_com_tests;

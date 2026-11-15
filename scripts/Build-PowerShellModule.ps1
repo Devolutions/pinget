@@ -142,7 +142,7 @@ function Get-NativeComDllPath {
         }
     }
 
-    throw "Native COM DLL not found for target $CargoTarget."
+    throw "Native COM DLL not found for target $CargoTarget. Build it with 'cargo build -p pinget-com --manifest-path rust\Cargo.toml --release --target $CargoTarget', run this script without -NoBuild, or pass -SkipWindowsPowerShell."
 }
 
 $nativeComTargets = @(Resolve-NativeComTargets -RequestedRuntimeIdentifiers $NativeComRuntimeIdentifiers)
@@ -165,6 +165,15 @@ if (-not $NoBuild) {
                 Build-NativeComDll -CargoTarget $nativeComTarget.CargoTarget
             }
         }
+    }
+}
+
+# Resolve the native COM DLLs before anything is staged, so a missing DLL cannot leave a
+# half-staged module behind that a later run would pick up as complete.
+$nativeComDllPaths = @{}
+if (-not $SkipWindowsPowerShell) {
+    foreach ($nativeComTarget in $nativeComTargets) {
+        $nativeComDllPaths[$nativeComTarget.Rid] = Get-NativeComDllPath -CargoTarget $nativeComTarget.CargoTarget
     }
 }
 
@@ -201,7 +210,7 @@ if (-not $SkipWindowsPowerShell) {
     Remove-UnusedRuntimeAssets -Root $desktopModuleRoot -RuntimeIdentifiersToKeep $desktopRuntimeIdentifiersToKeep
 
     foreach ($nativeComTarget in $nativeComTargets) {
-        $nativeComDllPath = Get-NativeComDllPath -CargoTarget $nativeComTarget.CargoTarget
+        $nativeComDllPath = $nativeComDllPaths[$nativeComTarget.Rid]
         $nativeComDestination = Join-Path $desktopModuleRoot "runtimes\$($nativeComTarget.Rid)\native"
         New-Item -Path $nativeComDestination -ItemType Directory -Force | Out-Null
         Copy-Item -Path $nativeComDllPath -Destination (Join-Path $nativeComDestination $nativeComPackageDllName) -Force

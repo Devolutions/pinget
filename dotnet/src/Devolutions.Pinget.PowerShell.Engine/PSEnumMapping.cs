@@ -27,4 +27,34 @@ internal static class PSEnumMapping
     /// <summary>Pinget queries are either exact (case-insensitive) or substring matches.</summary>
     internal static bool UsesExactMatch(PSPackageFieldMatchOption matchOption) =>
         matchOption == PSPackageFieldMatchOption.Equals || matchOption == PSPackageFieldMatchOption.EqualsCaseInsensitive;
+
+    /// <summary>
+    /// The cores only match exactly (case-insensitive) or by substring, so WinGet's case-sensitive
+    /// <c>Equals</c> and prefix <c>StartsWithCaseInsensitive</c> are applied here to the results of the
+    /// <c>-Id</c>, <c>-Name</c> and <c>-Moniker</c> filters.
+    /// </summary>
+    internal static IEnumerable<T> FilterByMatchOption<T>(
+        IEnumerable<T> packages,
+        PSPackageFieldMatchOption matchOption,
+        string? id,
+        string? name,
+        string? moniker)
+        where T : PSCatalogPackage
+    {
+        Func<string?, string, bool>? matches = matchOption switch
+        {
+            PSPackageFieldMatchOption.Equals => (value, filter) => string.Equals(value, filter, StringComparison.Ordinal),
+            PSPackageFieldMatchOption.StartsWithCaseInsensitive => (value, filter) =>
+                value is not null && value.StartsWith(filter, StringComparison.OrdinalIgnoreCase),
+            _ => null,
+        };
+
+        if (matches is null)
+            return packages;
+
+        return packages.Where(package =>
+            Passes(package.Id, id) && Passes(package.Name, name) && Passes(package.Moniker, moniker));
+
+        bool Passes(string? value, string? filter) => string.IsNullOrWhiteSpace(filter) || matches(value, filter!);
+    }
 }
