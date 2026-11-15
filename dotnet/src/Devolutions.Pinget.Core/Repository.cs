@@ -3055,8 +3055,12 @@ public class Repository : IDisposable
         {
             foreach (var inst in instList)
             {
-                if (inst is IDictionary<object, object> instDict)
+                if (inst is IDictionary<object, object> rawInstDict)
                 {
+                    // WinGet skips installer keys with an empty (null) value, so they never erase the root default.
+                    IDictionary<object, object> instDict = rawInstDict
+                        .Where(kvp => kvp.Value is not null)
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
                     string? InstStr(string key) => instDict.TryGetValue(key, out var v) ? v?.ToString() : null;
                     List<string> InstArr(string key)
                     {
@@ -3080,20 +3084,32 @@ public class Repository : IDisposable
                         installerDependencies = topDependencies;
                     var markets = instDict.TryGetValue("Markets", out var marketsValue) ? marketsValue : topMarkets;
                     var appsAndFeaturesEntries = ReadAppsAndFeaturesEntries(instDict.TryGetValue("AppsAndFeaturesEntries", out var afeValue) ? afeValue : null);
+
+                    // WinGet stashes the root ProductCode, PackageFamilyName, AppsAndFeaturesEntries and nested-installer
+                    // fields and only restores them for installer types that use them. Explicit installer values win.
+                    var installerType = InstStr("InstallerType") ?? topInstallerType;
+                    var isArchive = string.Equals(installerType?.Trim(), "zip", StringComparison.OrdinalIgnoreCase);
+                    var nestedInstallerType = InstStr("NestedInstallerType") ?? (isArchive ? topNestedInstallerType : null);
+                    var effectiveType = ((isArchive ? nestedInstallerType : installerType) ?? "").Trim().ToLowerInvariant();
+                    if (!instDict.ContainsKey("AppsAndFeaturesEntries") && InstallerTypeWritesArpEntry(effectiveType))
+                        appsAndFeaturesEntries = [.. topAppsAndFeaturesEntries];
+                    var usesPackageFamilyName = InstallerTypeUsesPackageFamilyName(effectiveType) ||
+                        appsAndFeaturesEntries.Any(entry => InstallerTypeUsesPackageFamilyName((entry.InstallerType ?? "").Trim().ToLowerInvariant()));
+
                     installers.Add(new Installer
                     {
                         Architecture = InstStr("Architecture"),
-                        InstallerType = InstStr("InstallerType") ?? topInstallerType,
-                        NestedInstallerType = InstStr("NestedInstallerType") ?? topNestedInstallerType,
-                        NestedInstallerFiles = instDict.ContainsKey("NestedInstallerFiles") ? nestedFiles : [.. topNestedInstallerFiles],
+                        InstallerType = installerType,
+                        NestedInstallerType = nestedInstallerType,
+                        NestedInstallerFiles = instDict.ContainsKey("NestedInstallerFiles") ? nestedFiles : isArchive ? [.. topNestedInstallerFiles] : [],
                         Url = InstStr("InstallerUrl"),
                         Sha256 = InstStr("InstallerSha256"),
-                        ProductCode = InstStr("ProductCode") ?? topProductCode,
+                        ProductCode = InstStr("ProductCode") ?? (InstallerTypeWritesArpEntry(effectiveType) ? topProductCode : null),
                         MSStoreProductIdentifier = InstStr("MSStoreProductIdentifier") ?? topMsStoreProductIdentifier,
                         Locale = InstStr("InstallerLocale") ?? topLocale,
                         Scope = InstStr("Scope") ?? topScope,
                         ReleaseDate = InstStr("ReleaseDate") ?? topReleaseDate,
-                        PackageFamilyName = InstStr("PackageFamilyName") ?? topPackageFamilyName,
+                        PackageFamilyName = InstStr("PackageFamilyName") ?? (usesPackageFamilyName ? topPackageFamilyName : null),
                         UpgradeCode = InstStr("UpgradeCode") ?? topUpgradeCode,
                         Platforms = instDict.ContainsKey("Platform") ? platforms : [.. topPlatforms],
                         MinimumOsVersion = InstStr("MinimumOSVersion") ?? topMinimumOsVersion,
@@ -3111,7 +3127,7 @@ public class Repository : IDisposable
                             ? ReadStringList(unsupportedValue)
                             : [.. topUnsupportedArchitectures],
                         UpgradeBehavior = InstStr("UpgradeBehavior") ?? topUpgradeBehavior,
-                        AppsAndFeaturesEntries = instDict.ContainsKey("AppsAndFeaturesEntries") ? appsAndFeaturesEntries : [.. topAppsAndFeaturesEntries],
+                        AppsAndFeaturesEntries = appsAndFeaturesEntries,
                         InstallerSuccessCodes = instDict.TryGetValue("InstallerSuccessCodes", out var successValue)
                             ? ReadInstallerReturnCodes(successValue)
                             : [.. topSuccessCodes],
@@ -3123,7 +3139,8 @@ public class Repository : IDisposable
             }
         }
 
-        var dependencies = ReadPackageDependencies(dict.TryGetValue("Dependencies", out var depsObj) ? depsObj : null);
+        var dependencies = ReadDependencies(dict.TryGetValue("Dependencies", out var depsObj) ? depsObj : null)
+            .PackageDependencies.Select(dependency => dependency.PackageIdentifier).ToList();
 
         var topLevelRequireExplicit = ReadBool(dict, "RequireExplicitUpgrade");
         var anyInstallerRequireExplicit = installers.Any(i => i.RequireExplicitUpgrade);
@@ -3135,7 +3152,8 @@ public class Repository : IDisposable
             Version = GetStr("PackageVersion"),
             Channel = GetOptStr("Channel") ?? "",
             Publisher = GetOptStr("Publisher"),
-            Description = GetOptStr("Description") ?? GetOptStr("ShortDescription"),
+            // WinGet `show`: an empty Description falls back to ShortDescription.
+            Description = GetOptStr("Description") is { Length: > 0 } description ? description : GetOptStr("ShortDescription"),
             ShortDescription = GetOptStr("ShortDescription"),
             Moniker = GetOptStr("Moniker"),
             PackageUrl = GetOptStr("PackageUrl"),
@@ -3159,6 +3177,14 @@ public class Repository : IDisposable
         };
     }
 
+    /// <summary>WinGet DoesInstallerTypeUseProductCode / DoesInstallerTypeWriteAppsAndFeaturesEntry (lowercase type).</summary>
+    internal static bool InstallerTypeWritesArpEntry(string installerType) =>
+        installerType is "exe" or "inno" or "msi" or "nullsoft" or "wix" or "burn" or "portable";
+
+    /// <summary>WinGet DoesInstallerTypeUsePackageFamilyName (lowercase type; <c>appx</c> is msix).</summary>
+    internal static bool InstallerTypeUsesPackageFamilyName(string installerType) =>
+        installerType is "msix" or "appx" or "msstore";
+
     /// <summary>
     /// Reads every dependency kind of a manifest root or installer <c>Dependencies</c> mapping, like the
     /// Rust yaml_dependencies. <c>MinimumVersion</c> keeps its source text.
@@ -3168,11 +3194,16 @@ public class Repository : IDisposable
         if (dependencies is not IDictionary<object, object> depsDict)
             return new InstallerDependencies();
 
+        // WinGet DependencyList::Add: ids are trimmed and a repeated id (case-insensitive, per kind) is kept once.
         static List<string> List(IDictionary<object, object> source, string key)
         {
             if (!source.TryGetValue(key, out var value) || value is not IList<object> items)
                 return [];
-            return items.Select(item => item?.ToString() ?? "").Where(item => !string.IsNullOrWhiteSpace(item)).ToList();
+            return items
+                .Select(item => item?.ToString()?.Trim() ?? "")
+                .Where(item => item.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
 
         var packages = new List<PackageDependency>();
@@ -3182,13 +3213,28 @@ public class Repository : IDisposable
             {
                 if (dep is IDictionary<object, object> depDict &&
                     depDict.TryGetValue("PackageIdentifier", out var pid) &&
-                    pid?.ToString() is { } packageIdentifier)
+                    pid?.ToString()?.Trim() is { } packageIdentifier)
                 {
                     var minimumVersion = depDict.TryGetValue("MinimumVersion", out var min) ? min?.ToString()?.Trim() : null;
+                    if (string.IsNullOrEmpty(minimumVersion))
+                        minimumVersion = null;
+                    // A repeated id keeps its first position and the highest minimum version.
+                    var index = packages.FindIndex(existing => existing.PackageIdentifier.Equals(packageIdentifier, StringComparison.OrdinalIgnoreCase));
+                    if (index >= 0)
+                    {
+                        var existing = packages[index];
+                        if (minimumVersion is not null &&
+                            (existing.MinimumVersion is null || RestSource.CompareVersionStrings(minimumVersion, existing.MinimumVersion) > 0))
+                        {
+                            packages[index] = existing with { MinimumVersion = minimumVersion };
+                        }
+                        continue;
+                    }
+
                     packages.Add(new PackageDependency
                     {
                         PackageIdentifier = packageIdentifier,
-                        MinimumVersion = string.IsNullOrEmpty(minimumVersion) ? null : minimumVersion,
+                        MinimumVersion = minimumVersion,
                     });
                 }
             }
@@ -3233,27 +3279,6 @@ public class Repository : IDisposable
                 };
             })
             .ToList();
-    }
-
-    /// <summary>
-    /// Reads <c>Dependencies.PackageDependencies[*].PackageIdentifier</c> from a manifest root or
-    /// installer entry, like the Rust yaml_package_dependencies.
-    /// </summary>
-    private static List<string> ReadPackageDependencies(object? dependencies)
-    {
-        var result = new List<string>();
-        if (dependencies is IDictionary<object, object> depsDict &&
-            depsDict.TryGetValue("PackageDependencies", out var pkgDeps) &&
-            pkgDeps is IList<object> pkgDepList)
-        {
-            foreach (var dep in pkgDepList)
-            {
-                if (dep is IDictionary<object, object> depDict &&
-                    depDict.TryGetValue("PackageIdentifier", out var pid))
-                    result.Add(pid?.ToString() ?? "");
-            }
-        }
-        return result;
     }
 
     private static bool ReadBool(IDictionary<string, object?> dict, string key)
@@ -3408,6 +3433,8 @@ public class Repository : IDisposable
             "InstallationNotes",
             "Documentations",
             "Icons",
+            // A merged manifest carries its non-default locales here; keep them in the round trip.
+            "Localization",
         ]);
         defaultLocaleDocument["PackageIdentifier"] = packageIdentifier;
         defaultLocaleDocument["PackageVersion"] = packageVersion;

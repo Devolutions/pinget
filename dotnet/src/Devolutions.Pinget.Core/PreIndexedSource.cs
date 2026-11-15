@@ -721,9 +721,18 @@ internal static class PreIndexedSource
             payload = ckPos >= 0 ? bytes[(ckPos + 2)..] : bytes;
         }
 
+        // Bounded like the framed path (and the Rust reader): a small payload must not inflate without limit.
+        const int maxDecodedSize = 64 * 1024 * 1024;
         using var deflateStream = new DeflateStream(new MemoryStream(payload), CompressionMode.Decompress);
         using var result = new MemoryStream();
-        deflateStream.CopyTo(result);
+        var buffer = new byte[81920];
+        int read;
+        while ((read = deflateStream.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            if (result.Length + read > maxDecodedSize)
+                throw new InvalidDataException("MSZIP payload exceeds the 64 MiB decoded size limit.");
+            result.Write(buffer, 0, read);
+        }
         return System.Text.Encoding.UTF8.GetString(result.ToArray());
     }
 
