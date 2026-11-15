@@ -344,17 +344,24 @@ struct UpgradeArgs {
     silent: bool,
 }
 
+/// WinGet's `hash` file argument is positional but may also be named (`--file`/`-f`).
 #[derive(Args)]
 struct HashArgs {
-    file: String,
-    #[arg(long)]
+    #[arg(required_unless_present = "file_option", conflicts_with = "file_option")]
+    file: Option<String>,
+    #[arg(long = "file", short = 'f', value_name = "FILE")]
+    file_option: Option<String>,
+    #[arg(long, short = 'm')]
     msix: bool,
 }
 
+/// WinGet's export file argument is positional but may also be named (`--output`/`-o`).
 #[derive(Args)]
 struct ExportArgs {
+    #[arg(value_name = "OUTPUT", required_unless_present = "output", conflicts_with = "output")]
+    output_file: Option<String>,
     #[arg(long, short = 'o')]
-    output: String,
+    output: Option<String>,
     #[arg(long, short = 's')]
     source: Option<String>,
     #[arg(long = "include-versions")]
@@ -456,7 +463,8 @@ struct PinListArgs {
 struct PinAddArgs {
     #[command(flatten)]
     query: PinQueryArgs,
-    #[arg(long)]
+    /// Gating version range; WinGet rejects it together with `--blocking` (exclusive set `PinType`).
+    #[arg(long, conflicts_with = "blocking")]
     version: Option<String>,
     #[arg(long)]
     blocking: bool,
@@ -506,7 +514,12 @@ struct InstallArgs {
     location: Option<String>,
     #[arg(long = "skip-dependencies")]
     skip_dependencies: bool,
-    #[arg(long = "dependencies")]
+    /// WinGet's `--dependencies-only`; exclusive with `--skip-dependencies` (`DependenciesConflict`).
+    #[arg(
+        long = "dependencies-only",
+        visible_alias = "dependencies",
+        conflicts_with = "skip_dependencies"
+    )]
     dependencies_only: bool,
     #[arg(long = "accept-package-agreements")]
     accept_package_agreements: bool,
@@ -536,7 +549,8 @@ struct UninstallArgs {
     manifest: Option<PathBuf>,
     #[arg(long = "product-code")]
     product_code: Option<String>,
-    #[arg(long = "all-versions")]
+    /// WinGet rejects `--all-versions` with `--version` (exclusive set `AllAndTargetVersion`).
+    #[arg(long = "all-versions", alias = "all", conflicts_with = "version")]
     all_versions: bool,
     #[arg(long, conflicts_with = "silent")]
     interactive: bool,
@@ -544,7 +558,8 @@ struct UninstallArgs {
     silent: bool,
     #[arg(long = "force")]
     force: bool,
-    #[arg(long = "purge")]
+    /// WinGet rejects `--purge` with `--preserve` (exclusive set `PurgePreserve`).
+    #[arg(long = "purge", conflicts_with = "preserve")]
     purge: bool,
     #[arg(long = "preserve")]
     preserve: bool,
@@ -574,10 +589,17 @@ struct RepairArgs {
     interactive: bool,
 }
 
+/// WinGet's import file argument is positional but may also be named (`--import-file`/`-i`).
 #[derive(Args)]
 struct ImportArgs {
+    #[arg(
+        value_name = "IMPORT_FILE",
+        required_unless_present = "import_file",
+        conflicts_with = "import_file"
+    )]
+    import_file_positional: Option<String>,
     #[arg(short = 'i', long = "import-file")]
-    import_file: String,
+    import_file: Option<String>,
     #[arg(long = "dry-run")]
     dry_run: bool,
     #[arg(long = "ignore-unavailable")]
@@ -678,9 +700,16 @@ struct ListArgs {
     install_scope: Option<String>,
     #[arg(long = "upgrade-available")]
     upgrade: bool,
-    #[arg(long = "include-unknown", short = 'u', visible_alias = "unknown")]
+    /// Only valid with `--upgrade-available`, as in WinGet (`ValidateArgumentDependency`).
+    #[arg(
+        long = "include-unknown",
+        short = 'u',
+        visible_alias = "unknown",
+        requires = "upgrade"
+    )]
     include_unknown: bool,
-    #[arg(long = "include-pinned", visible_alias = "pinned")]
+    /// Only valid with `--upgrade-available`, as in WinGet (`ValidateArgumentDependency`).
+    #[arg(long = "include-pinned", visible_alias = "pinned", requires = "upgrade")]
     include_pinned: bool,
     #[arg(long = "details")]
     details: bool,
@@ -962,7 +991,8 @@ fn run() -> Result<()> {
             }
         }
         Commands::Hash(args) => {
-            print_hash(&args.file, args.msix)?;
+            let file = args.file.or(args.file_option).unwrap_or_default();
+            print_hash(&file, args.msix)?;
         }
         Commands::Export(args) => {
             let mut repository = Repository::open()?;
@@ -1221,7 +1251,7 @@ fn run() -> Result<()> {
             let mut repository = open_repository_with_install_progress()?;
             do_import(
                 &mut repository,
-                &args.import_file,
+                import_file_path(&args),
                 args.dry_run,
                 args.ignore_unavailable,
                 args.ignore_versions,
@@ -2101,12 +2131,23 @@ fn get_os_version() -> String {
 }
 
 fn print_hash(file_path: &str, msix: bool) -> Result<()> {
-    let path = Path::new(file_path);
-    println!("SHA256: {}", file_hash::sha256_file_hex(path)?);
-    if msix {
-        println!("SignatureSha256: {}", file_hash::msix_signature_sha256_hex(path)?);
+    for line in hash_lines(file_path, msix)? {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// The `hash` output, labelled like WinGet's (`InstallerSha256` is also the manifest field name).
+fn hash_lines(file_path: &str, msix: bool) -> Result<Vec<String>> {
+    let path = Path::new(file_path);
+    let mut lines = vec![format!("InstallerSha256: {}", file_hash::sha256_file_hex(path)?)];
+    if msix {
+        lines.push(format!(
+            "SignatureSha256: {}",
+            file_hash::msix_signature_sha256_hex(path)?
+        ));
+    }
+    Ok(lines)
 }
 
 fn do_export(repository: &mut Repository, args: &ExportArgs) -> Result<()> {
@@ -2123,10 +2164,26 @@ fn do_export(repository: &mut Repository, args: &ExportArgs) -> Result<()> {
     );
 
     let json = serde_json::to_string_pretty(&export)?;
-    std::fs::write(&args.output, &json)
-        .map_err(|e| anyhow::anyhow!("failed to write export file '{}': {}", args.output, e))?;
-    println!("Exported {package_count} packages to {}", args.output);
+    let output = export_output_file(args);
+    std::fs::write(output, &json).map_err(|e| anyhow::anyhow!("failed to write export file '{output}': {e}"))?;
+    println!("Exported {package_count} packages to {output}");
     Ok(())
+}
+
+/// The import file, given positionally or with `--import-file`/`-i` (clap requires one).
+fn import_file_path(args: &ImportArgs) -> &str {
+    args.import_file_positional
+        .as_deref()
+        .or(args.import_file.as_deref())
+        .unwrap_or_default()
+}
+
+/// The export destination, given positionally or with `--output`/`-o` (clap requires one).
+fn export_output_file(args: &ExportArgs) -> &str {
+    args.output_file
+        .as_deref()
+        .or(args.output.as_deref())
+        .unwrap_or_default()
 }
 
 const PACKAGES_EXPORT_SCHEMA: &str = "https://aka.ms/winget-packages.schema.2.0.json";
@@ -2161,7 +2218,13 @@ fn build_export_payload(
     let mut package_count = 0usize;
     let export_sources: Vec<serde_json::Value> = groups
         .into_iter()
-        .map(|(source_name, rows)| {
+        .map(|(source_name, mut rows)| {
+            // Like WinGet's SelectVersionsToExport: packages are stably sorted by id, and without
+            // versions side-by-side installs of one package collapse into a single entry.
+            rows.sort_by(|left, right| left.id.cmp(&right.id));
+            if !include_versions {
+                rows.dedup_by(|right, left| right.id == left.id);
+            }
             let record = sources
                 .iter()
                 .find(|source| source.name.eq_ignore_ascii_case(source_name));
@@ -2404,8 +2467,54 @@ fn get_console_width() -> Option<usize> {
     get_console_width_impl()
 }
 
+/// Console columns `value` occupies, as WinGet's `UTF8ColumnWidth` counts them: East Asian Wide
+/// and Fullwidth characters take two columns, combining marks none, everything else one.
 fn display_width(value: &str) -> usize {
-    value.chars().count()
+    value.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    // Combining marks and variation selectors extend the previous character.
+    const ZERO_WIDTH: &[(u32, u32)] = &[
+        (0x0300, 0x036F),
+        (0x1AB0, 0x1AFF),
+        (0x1DC0, 0x1DFF),
+        (0x200D, 0x200D),
+        (0x20D0, 0x20FF),
+        (0xFE00, 0xFE0F),
+        (0xFE20, 0xFE2F),
+        (0xE0100, 0xE01EF),
+    ];
+    // East Asian Width W/F blocks: CJK, kana, Hangul, Yi, fullwidth forms and emoji pictographs.
+    const WIDE: &[(u32, u32)] = &[
+        (0x1100, 0x115F),
+        (0x2E80, 0x303E),
+        (0x3041, 0x33FF),
+        (0x3400, 0x4DBF),
+        (0x4E00, 0x9FFF),
+        (0xA000, 0xA4CF),
+        (0xA960, 0xA97F),
+        (0xAC00, 0xD7A3),
+        (0xF900, 0xFAFF),
+        (0xFE10, 0xFE19),
+        (0xFE30, 0xFE6F),
+        (0xFF00, 0xFF60),
+        (0xFFE0, 0xFFE6),
+        (0x1B000, 0x1B2FF),
+        (0x1F300, 0x1F64F),
+        (0x1F900, 0x1F9FF),
+        (0x20000, 0x2FFFD),
+        (0x30000, 0x3FFFD),
+    ];
+    let code = u32::from(ch);
+    let in_ranges = |ranges: &[(u32, u32)]| ranges.iter().any(|&(start, end)| (start..=end).contains(&code));
+    if in_ranges(ZERO_WIDTH) {
+        0
+    } else if in_ranges(WIDE) {
+        2
+    } else {
+        1
+    }
 }
 
 /// Width of the console attached to stdout, as WinGet's `GetConsoleWidth` reads it: only the
@@ -2445,13 +2554,27 @@ fn get_console_width_impl() -> Option<usize> {
     io::stdout().is_terminal().then_some(120)
 }
 
+/// Fits `value` into `width` columns like WinGet's `TableOutput`: the kept prefix is followed by
+/// `…` (a `.` would read as part of a dotted package id), and a wide character that no longer
+/// fits leaves its column as padding so the result is exactly `width` columns.
 fn truncate(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
+    if display_width(value) <= width {
         return value.to_owned();
     }
 
-    let mut output = value.chars().take(width.saturating_sub(1)).collect::<String>();
-    output.push('.');
+    let budget = width.saturating_sub(1);
+    let mut used = 0;
+    let mut output = String::new();
+    for ch in value.chars() {
+        let ch_width = char_display_width(ch);
+        if used + ch_width > budget {
+            break;
+        }
+        used += ch_width;
+        output.push(ch);
+    }
+    output.push('\u{2026}');
+    output.push_str(&" ".repeat(budget - used));
     output
 }
 
@@ -2880,7 +3003,25 @@ fn print_install_result(result: &InstallResult) {
             target,
             result.exit_code
         ));
-        std::process::exit(result.exit_code);
+    }
+    exit_on_package_action_failure(result);
+}
+
+/// Process exit code for a finished package action: `None` on success or no-op, otherwise the
+/// installer's exit code, or 1 when a failed action reported 0 (as the C# CLI does).
+fn package_action_exit_code(result: &InstallResult) -> Option<i32> {
+    if result.no_op || result.success {
+        None
+    } else if result.exit_code != 0 {
+        Some(result.exit_code)
+    } else {
+        Some(1)
+    }
+}
+
+fn exit_on_package_action_failure(result: &InstallResult) {
+    if let Some(code) = package_action_exit_code(result) {
+        std::process::exit(code);
     }
 }
 
@@ -2900,8 +3041,8 @@ fn print_package_action_result(result: &InstallResult, success_verb: &str, failu
             "Failed to {failure_verb} {target} (exit code: {})",
             result.exit_code
         ));
-        std::process::exit(result.exit_code);
     }
+    exit_on_package_action_failure(result);
 }
 
 fn resolve_source_add_value(positional: Option<&str>, option: Option<&str>, label: &str) -> Result<String> {
@@ -3287,7 +3428,12 @@ fn do_import_from_content<R: ImportRepository>(
             .clone();
 
         for package in &packages {
-            let id = package.get("PackageIdentifier").and_then(|i| i.as_str()).unwrap_or("?");
+            // Schema 2.0 names the package `PackageIdentifier`; schema 1.0 (still read by WinGet) uses `Id`.
+            let id = package
+                .get("PackageIdentifier")
+                .or_else(|| package.get("Id"))
+                .and_then(|i| i.as_str())
+                .unwrap_or("?");
             let version = if ignore_versions {
                 None
             } else {
@@ -3454,6 +3600,8 @@ mod wave10_cli_tests;
 #[cfg(test)]
 mod wave11_cli_tests;
 #[cfg(test)]
+mod wave20_cli_tests;
+#[cfg(test)]
 mod wave2_cli_tests;
 #[cfg(test)]
 mod wave3_cli_tests;
@@ -3474,7 +3622,7 @@ mod tests {
             let cli = Cli::try_parse_from(["pinget", "export", flag, r"C:\tmp\packages.json"]).expect("parse export");
             assert_eq!(resolve_output_format(&cli).expect("format"), OutputFormat::Text);
             match cli.command {
-                Some(Commands::Export(args)) => assert_eq!(args.output, r"C:\tmp\packages.json"),
+                Some(Commands::Export(args)) => assert_eq!(export_output_file(&args), r"C:\tmp\packages.json"),
                 _ => panic!("expected export command"),
             }
         }

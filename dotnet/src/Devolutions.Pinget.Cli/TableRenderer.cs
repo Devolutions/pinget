@@ -31,7 +31,7 @@ internal static class TableRenderer
         var lines = new List<string>();
         if (headers.Length == 0) return lines;
         int cols = headers.Length;
-        var widths = headers.Select(h => h.Length).ToArray();
+        var widths = headers.Select(DisplayWidth).ToArray();
         var hasData = new bool[cols];
 
         foreach (var row in rows)
@@ -39,7 +39,7 @@ internal static class TableRenderer
                 if (!string.IsNullOrEmpty(row[i]))
                 {
                     hasData[i] = true;
-                    widths[i] = Math.Max(widths[i], row[i].Length);
+                    widths[i] = Math.Max(widths[i], DisplayWidth(row[i]));
                 }
 
         for (int i = 0; i < cols; i++)
@@ -82,7 +82,8 @@ internal static class TableRenderer
         {
             if (widths[i] == 0) continue;
             var val = values[i] ?? "";
-            if (val.Length > widths[i])
+            var valWidth = DisplayWidth(val);
+            if (valWidth > widths[i])
             {
                 sb.Append(Truncate(val, widths[i]));
                 if (spaceAfter[i]) sb.Append(' ');
@@ -90,11 +91,74 @@ internal static class TableRenderer
             else
             {
                 sb.Append(val);
-                if (spaceAfter[i]) sb.Append(' ', widths[i] - val.Length + 1);
+                if (spaceAfter[i]) sb.Append(' ', widths[i] - valWidth + 1);
             }
         }
         return sb.ToString().TrimEnd();
     }
 
-    private static string Truncate(string s, int max) => s.Length <= max ? s : s[..(max - 1)] + ".";
+    /// <summary>
+    /// Console columns <paramref name="value"/> occupies, as WinGet's <c>UTF8ColumnWidth</c> counts them:
+    /// East Asian Wide and Fullwidth characters take two columns, combining marks none, everything else one.
+    /// </summary>
+    internal static int DisplayWidth(string value)
+    {
+        int width = 0;
+        foreach (var rune in value.EnumerateRunes())
+            width += RuneWidth(rune);
+        return width;
+    }
+
+    /// <summary>
+    /// Fits <paramref name="value"/> into <paramref name="width"/> columns like WinGet's <c>TableOutput</c>:
+    /// the kept prefix is followed by <c>…</c> (a <c>.</c> would read as part of a dotted package id), and a
+    /// wide character that no longer fits leaves its column as padding so the result is exactly
+    /// <paramref name="width"/> columns.
+    /// </summary>
+    internal static string Truncate(string value, int width)
+    {
+        if (DisplayWidth(value) <= width)
+            return value;
+
+        int budget = Math.Max(0, width - 1);
+        int used = 0;
+        var sb = new StringBuilder();
+        foreach (var rune in value.EnumerateRunes())
+        {
+            int runeWidth = RuneWidth(rune);
+            if (used + runeWidth > budget)
+                break;
+            used += runeWidth;
+            sb.Append(rune.ToString());
+        }
+
+        sb.Append('…');
+        sb.Append(' ', budget - used);
+        return sb.ToString();
+    }
+
+    // Same ranges as the Rust CLI's char_display_width.
+    private static readonly (int Start, int End)[] ZeroWidthRanges =
+    [
+        (0x0300, 0x036F), (0x1AB0, 0x1AFF), (0x1DC0, 0x1DFF), (0x200D, 0x200D),
+        (0x20D0, 0x20FF), (0xFE00, 0xFE0F), (0xFE20, 0xFE2F), (0xE0100, 0xE01EF),
+    ];
+
+    // East Asian Width W/F blocks: CJK, kana, Hangul, Yi, fullwidth forms and emoji pictographs.
+    private static readonly (int Start, int End)[] WideRanges =
+    [
+        (0x1100, 0x115F), (0x2E80, 0x303E), (0x3041, 0x33FF), (0x3400, 0x4DBF),
+        (0x4E00, 0x9FFF), (0xA000, 0xA4CF), (0xA960, 0xA97F), (0xAC00, 0xD7A3),
+        (0xF900, 0xFAFF), (0xFE10, 0xFE19), (0xFE30, 0xFE6F), (0xFF00, 0xFF60),
+        (0xFFE0, 0xFFE6), (0x1B000, 0x1B2FF), (0x1F300, 0x1F64F), (0x1F900, 0x1F9FF),
+        (0x20000, 0x2FFFD), (0x30000, 0x3FFFD),
+    ];
+
+    private static int RuneWidth(Rune rune)
+    {
+        int code = rune.Value;
+        if (ZeroWidthRanges.Any(range => code >= range.Start && code <= range.End))
+            return 0;
+        return WideRanges.Any(range => code >= range.Start && code <= range.End) ? 2 : 1;
+    }
 }

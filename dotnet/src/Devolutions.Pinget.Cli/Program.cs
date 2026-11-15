@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.CommandLine.Builder;
 using System.CommandLine.Parsing;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -176,6 +177,16 @@ var lDetailsOpt = new Option<bool>("--details", "Show details");
 foreach (var o in new Option[] { lqOpt, lidOpt, lnOpt, lmOpt, lsOpt, leOpt, lcOpt, lTagOpt, lCmdOpt, lScopeOpt, lUpgradeOpt, lUnknownOpt, lPinnedOpt, lDetailsOpt })
     listCommand.AddOption(o);
 listCommand.AddArgument(lArg);
+// As in WinGet (ListCommand::ValidateArgumentsInternal), these only apply to --upgrade-available.
+listCommand.AddValidator(result =>
+{
+    if (result.GetValueForOption(lUpgradeOpt))
+        return;
+    if (result.GetValueForOption(lUnknownOpt))
+        result.ErrorMessage = CliValidation.DependencyArgumentMissing("include-unknown", "upgrade-available");
+    else if (result.GetValueForOption(lPinnedOpt))
+        result.ErrorMessage = CliValidation.DependencyArgumentMissing("include-pinned", "upgrade-available");
+});
 
 listCommand.SetHandler((ctx) =>
 {
@@ -570,16 +581,21 @@ cacheWarmCmd.SetHandler((ctx) =>
 
 // ── Hash ──
 var hashCommand = new Command("hash", "Hash a file");
-var hashFileArg = new Argument<string>("file", "File path");
-var hashMsixOpt = new Option<bool>("--msix", "MSIX signature hash");
-hashCommand.AddArgument(hashFileArg); hashCommand.AddOption(hashMsixOpt);
+var hashFileArg = new Argument<string?>("file", () => null, "File path");
+// WinGet's file argument is positional but may also be named (--file/-f).
+var hashFileOpt = new Option<string?>("--file", "File path"); hashFileOpt.AddAlias("-f");
+var hashMsixOpt = new Option<bool>("--msix", "MSIX signature hash"); hashMsixOpt.AddAlias("-m");
+hashCommand.AddArgument(hashFileArg); hashCommand.AddOption(hashFileOpt); hashCommand.AddOption(hashMsixOpt);
+hashCommand.AddValidator(result =>
+    result.ErrorMessage = FileArgumentError(result.GetValueForArgument(hashFileArg), result.GetValueForOption(hashFileOpt), "file"));
 
 hashCommand.SetHandler((ctx) =>
 {
-    var file = ctx.ParseResult.GetValueForArgument(hashFileArg);
+    var file = ctx.ParseResult.GetValueForArgument(hashFileArg) ?? ctx.ParseResult.GetValueForOption(hashFileOpt)!;
     try
     {
-        Console.WriteLine($"SHA256: {FileHasher.Sha256FileHex(file)}");
+        // Labelled like WinGet's output (InstallerSha256 is also the manifest field name).
+        Console.WriteLine($"InstallerSha256: {FileHasher.Sha256FileHex(file)}");
         if (ctx.ParseResult.GetValueForOption(hashMsixOpt))
             Console.WriteLine($"SignatureSha256: {FileHasher.MsixSignatureSha256Hex(file)}");
     }
@@ -592,13 +608,20 @@ hashCommand.SetHandler((ctx) =>
 
 // ── Export ──
 var exportCommand = new Command("export", "Export installed packages");
-var exOutputOpt = new Option<string>("--output", "Output file") { IsRequired = true }; exOutputOpt.AddAlias("-o");
+// WinGet's output file argument is positional but may also be named (--output/-o).
+var exOutputArg = new Argument<string?>("output", () => null, "Output file");
+var exOutputOpt = new Option<string?>("--output", "Output file"); exOutputOpt.AddAlias("-o");
 var exSourceOpt = SourceOpt();
 var exVersionsOpt = new Option<bool>("--include-versions", "Include versions");
-exportCommand.AddOption(exOutputOpt); exportCommand.AddOption(exSourceOpt); exportCommand.AddOption(exVersionsOpt);
+exportCommand.AddArgument(exOutputArg); exportCommand.AddOption(exOutputOpt); exportCommand.AddOption(exSourceOpt); exportCommand.AddOption(exVersionsOpt);
+exportCommand.AddValidator(result =>
+    result.ErrorMessage = FileArgumentError(result.GetValueForArgument(exOutputArg), result.GetValueForOption(exOutputOpt), "output"));
 
-exportCommand.SetHandler((output, source, includeVersions) =>
+exportCommand.SetHandler((ctx) =>
 {
+    var output = ctx.ParseResult.GetValueForArgument(exOutputArg) ?? ctx.ParseResult.GetValueForOption(exOutputOpt)!;
+    var source = ctx.ParseResult.GetValueForOption(exSourceOpt);
+    var includeVersions = ctx.ParseResult.GetValueForOption(exVersionsOpt);
     using var repo = Repository.Open();
     // List everything (plain `list` already correlates installed packages to their source),
     // then filter by source here: `list --source` needs a text query, and any query filters.
@@ -606,7 +629,7 @@ exportCommand.SetHandler((output, source, includeVersions) =>
     var export = ExportPayloadBuilder.Build(listResult.Matches, repo.ListSources(), source, includeVersions, Version);
     File.WriteAllText(output, StructuredOutputSerializer.SerializeJson(export, CliJsonContext.Default.PackagesExportPayload));
     Console.WriteLine($"Exported {export.Sources.Sum(s => s.Packages.Count)} packages to {output}");
-}, exOutputOpt, exSourceOpt, exVersionsOpt);
+});
 
 // ── Error ──
 var errorCommand = new Command("error", "Look up error codes");
@@ -824,6 +847,12 @@ var paInstalledOpt = new Option<bool>("--installed", "Pin a specific installed v
 var paForceOpt = new Option<bool>("--force", "Replace an existing pin");
 pinAddCmd.AddArgument(paArg);
 foreach (var o in new Option[] { paqOpt, paIdOpt, paNameOpt, paMonikerOpt, paSourceOpt, paExactOpt, paTagOpt, paCmdOpt, paVersionOpt, paBlockingOpt, paInstalledOpt, paForceOpt }) pinAddCmd.AddOption(o);
+// WinGet exclusive set PinType: a pin is either gating (--version) or blocking.
+pinAddCmd.AddValidator(result =>
+{
+    if (result.GetValueForOption(paVersionOpt) is not null && result.GetValueForOption(paBlockingOpt))
+        result.ErrorMessage = CliValidation.MultipleExclusiveArguments("version", "blocking");
+});
 
 var pinRemoveCmd = new Command("remove", "Remove pin");
 var prArg = new Argument<string?>("query", () => null, "Package query");
@@ -999,6 +1028,12 @@ var iSilentOpt = new Option<bool>("--silent", "Silent install"); iSilentOpt.AddA
 var iInteractiveOpt = new Option<bool>("--interactive", "Interactive install"); iInteractiveOpt.AddAlias("-i");
 installCommand.AddArgument(iArg);
 foreach (var o in new Option[] { iqOpt, iidOpt, inameOpt, imonikerOpt, isrcOpt, ieOpt, ivOpt, ichannelOpt, ilocaleOpt, itypeOpt, iarchOpt, iplatformOpt, iosVersionOpt, iscopeOpt, imanifestOpt, ilogOpt, icustomOpt, ioverrideOpt, ilocationOpt, iignoreSecurityHashOpt, iskipDepsOpt, idepsOnlyOpt, idependencySourceOpt, iacceptPkgAgreementsOpt, inoUpgradeOpt, iforceOpt, irenameOpt, iuninstallPreviousOpt, iSilentOpt, iInteractiveOpt }) installCommand.AddOption(o);
+// WinGet exclusive set DependenciesConflict.
+installCommand.AddValidator(result =>
+{
+    if (result.GetValueForOption(iskipDepsOpt) && result.GetValueForOption(idepsOnlyOpt))
+        result.ErrorMessage = CliValidation.MultipleExclusiveArguments("skip-dependencies", "dependencies-only");
+});
 
 installCommand.SetHandler((ctx) =>
 {
@@ -1064,6 +1099,14 @@ var uiLogOpt = new Option<string?>("--log", "Uninstaller log path");
 var uiSilentOpt = new Option<bool>("--silent", "Silent uninstall"); uiSilentOpt.AddAlias("-h");
 uninstallCommand.AddArgument(uiArg);
 foreach (var o in new Option[] { uiqOpt, uiidOpt, uinameOpt, uimonikerOpt, uisOpt, uieOpt, uivOpt, uiscopeOpt, uimanifestOpt, uiproductCodeOpt, uiallVersionsOpt, uiInteractiveOpt, uiForceOpt, uiPurgeOpt, uiPreserveOpt, uiLogOpt, uiSilentOpt }) uninstallCommand.AddOption(o);
+// WinGet exclusive sets PurgePreserve and AllAndTargetVersion.
+uninstallCommand.AddValidator(result =>
+{
+    if (result.GetValueForOption(uiPurgeOpt) && result.GetValueForOption(uiPreserveOpt))
+        result.ErrorMessage = CliValidation.MultipleExclusiveArguments("purge", "preserve");
+    else if (result.GetValueForOption(uiallVersionsOpt) && result.GetValueForOption(uivOpt) is not null)
+        result.ErrorMessage = CliValidation.MultipleExclusiveArguments("all-versions", "version");
+});
 
 uninstallCommand.SetHandler((ctx) =>
 {
@@ -1153,17 +1196,22 @@ repairCommand.SetHandler((ctx) =>
 
 // ── Import ──
 var importCommand = new Command("import", "Import packages");
-var imFileOpt = new Option<string>("--import-file", "Import file") { IsRequired = true }; imFileOpt.AddAlias("-i");
+// WinGet's import file argument is positional but may also be named (--import-file/-i).
+var imFileArg = new Argument<string?>("import-file", () => null, "Import file");
+var imFileOpt = new Option<string?>("--import-file", "Import file"); imFileOpt.AddAlias("-i");
 var imDryRunOpt = new Option<bool>("--dry-run", "Dry run only");
 var imIgnoreUnavailableOpt = new Option<bool>("--ignore-unavailable", "Ignore unavailable packages");
 var imIgnoreVersionsOpt = new Option<bool>("--ignore-versions", "Ignore package versions in the import file");
 var imNoUpgradeOpt = new Option<bool>("--no-upgrade", "Skip packages that are already installed");
 var imAcceptPkgAgreementsOpt = new Option<bool>("--accept-package-agreements", "Accept package agreements");
+importCommand.AddArgument(imFileArg);
+importCommand.AddValidator(result =>
+    result.ErrorMessage = FileArgumentError(result.GetValueForArgument(imFileArg), result.GetValueForOption(imFileOpt), "import-file"));
 importCommand.AddOption(imFileOpt); importCommand.AddOption(imDryRunOpt); importCommand.AddOption(imIgnoreUnavailableOpt); importCommand.AddOption(imIgnoreVersionsOpt); importCommand.AddOption(imNoUpgradeOpt); importCommand.AddOption(imAcceptPkgAgreementsOpt);
 
 importCommand.SetHandler((ctx) =>
 {
-    var file = ctx.ParseResult.GetValueForOption(imFileOpt)
+    var file = ctx.ParseResult.GetValueForArgument(imFileArg) ?? ctx.ParseResult.GetValueForOption(imFileOpt)
         ?? throw new InvalidOperationException("import requires --import-file.");
     var dryRun = ctx.ParseResult.GetValueForOption(imDryRunOpt);
     var ignoreUnavailable = ctx.ParseResult.GetValueForOption(imIgnoreUnavailableOpt);
@@ -1241,7 +1289,14 @@ rootCommand.SetHandler((ctx) =>
     }
 });
 
-var parseResult = rootCommand.Parse(args);
+// A bare RootCommand.Parse(...).Invoke() has no middleware: parse errors (unknown arguments, failed
+// validators, missing required options) were ignored and the handler ran anyway, and --help did nothing.
+// Report them with exit code 1 and serve help, like WinGet and the Rust CLI. -h stays --silent's alias.
+var parser = new CommandLineBuilder(rootCommand)
+    .UseHelp("--help", "-?", "/?")
+    .UseParseErrorReporting()
+    .Build();
+var parseResult = parser.Parse(args);
 commonOptions.Apply(parseResult);
 return parseResult.Invoke();
 
@@ -1597,7 +1652,13 @@ static int PrintErrorLookup(string input)
 
 static void PrintWarnings(List<string> warnings) { foreach (var w in warnings) CliSession.WriteWarning(w); }
 static void PrintOpt(string label, string? value) { if (!string.IsNullOrEmpty(value)) Console.WriteLine($"{label}: {value}"); }
-static string Trunc(string s, int max) => s.Length <= max ? s : s[..(max - 1)] + ".";
+static string Trunc(string s, int max) => TableRenderer.Truncate(s, max);
+
+// A WinGet positional argument may also be given by name (--name), but exactly one way.
+static string? FileArgumentError(string? positional, string? named, string name) =>
+    positional is null && named is null ? $"Required argument missing: {name}"
+    : positional is not null && named is not null ? $"The {name} was provided both as an argument and with --{name}."
+    : null;
 
 static string ResolveSourceAddValue(string? positionalValue, string? optionValue, string label)
 {
