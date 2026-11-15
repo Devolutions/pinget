@@ -446,13 +446,10 @@ fn scope_preference_ranks_installers() {
 
 #[test]
 fn rest_search_truncation_needs_more_results_or_a_continuation_token() {
-    let complete = serde_json::json!({ "Data": [] });
-    assert!(!rest_search_truncated(&complete, 50, 50));
-    assert!(!rest_search_truncated(&complete, 3, 50));
-    assert!(rest_search_truncated(&complete, 51, 50));
-
-    let more = serde_json::json!({ "Data": [], "ContinuationToken": "abc" });
-    assert!(rest_search_truncated(&more, 3, 50));
-    let empty_token = serde_json::json!({ "Data": [], "ContinuationToken": "" });
-    assert!(!rest_search_truncated(&empty_token, 3, 50));
+    assert!(!rest_search_truncated(None, 50, 50));
+    assert!(!rest_search_truncated(None, 3, 50));
+    assert!(rest_search_truncated(None, 51, 50));
+    assert!(rest_search_truncated(Some("abc"), 3, 50));
+    assert!(!rest_search_truncated(Some(""), 3, 50));
+    assert!(!rest_search_truncated(Some("  "), 3, 50));
 }

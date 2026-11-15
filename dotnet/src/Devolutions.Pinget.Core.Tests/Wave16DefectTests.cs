@@ -274,13 +274,11 @@ public class Wave16DefectTests
     [Fact]
     public void RestSearchTruncation_NeedsMoreResultsOrAContinuationToken()
     {
-        static JsonElement Parse(string json) => JsonDocument.Parse(json).RootElement.Clone();
-
-        var complete = Parse("""{"Data":[]}""");
-        Assert.False(RestSource.RestSearchTruncated(complete, 50, 50));
-        Assert.False(RestSource.RestSearchTruncated(complete, 3, 50));
-        Assert.True(RestSource.RestSearchTruncated(complete, 51, 50));
-        Assert.True(RestSource.RestSearchTruncated(Parse("""{"Data":[],"ContinuationToken":"abc"}"""), 3, 50));
-        Assert.False(RestSource.RestSearchTruncated(Parse("""{"Data":[],"ContinuationToken":""}"""), 3, 50));
+        Assert.False(RestSource.RestSearchTruncated(null, 50, 50));
+        Assert.False(RestSource.RestSearchTruncated(null, 3, 50));
+        Assert.True(RestSource.RestSearchTruncated(null, 51, 50));
+        Assert.True(RestSource.RestSearchTruncated("abc", 3, 50));
+        Assert.False(RestSource.RestSearchTruncated("", 3, 50));
+        Assert.False(RestSource.RestSearchTruncated("  ", 3, 50));
     }
 }
