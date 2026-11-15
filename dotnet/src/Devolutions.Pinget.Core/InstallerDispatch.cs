@@ -271,6 +271,21 @@ internal static class InstallerDispatch
     /// </summary>
     internal static string BuildCmdUninstallArguments(string uninstallLine) => $"/D /S /C \"{uninstallLine}\"";
 
+    /// <summary>
+    /// The ARP command to run and whether it is the QuietUninstallString. Like WinGet's GetUninstallInfo,
+    /// silent modes prefer QuietUninstallString and interactive prefers UninstallString, each falling back
+    /// to the other. A blank value is ignored: cmd.exe would run nothing and exit 0, reporting an uninstall
+    /// that never happened.
+    /// </summary>
+    internal static (string Command, bool IsQuiet)? SelectArpUninstallCommand(InstallerMode mode, string? quiet, string? standard)
+    {
+        (string, bool)? quietCommand = string.IsNullOrWhiteSpace(quiet) ? null : (quiet, true);
+        (string, bool)? standardCommand = string.IsNullOrWhiteSpace(standard) ? null : (standard, false);
+        return mode == InstallerMode.Interactive
+            ? standardCommand ?? quietCommand
+            : quietCommand ?? standardCommand;
+    }
+
     [SupportedOSPlatform("windows")]
     private static bool TryUninstallArp(ListMatch installed, UninstallRequest request, out int exitCode)
     {
@@ -342,13 +357,13 @@ internal static class InstallerDispatch
             TryRunMsiUninstall(installed, subkeyName, productCode, request, out var msiExitCode))
             return msiExitCode;
 
-        var quietUninstallCmd = subkey.GetValue("QuietUninstallString") as string;
-        var uninstallCmd = (request.Mode == InstallerMode.Interactive
-            ? subkey.GetValue("UninstallString") as string
-            : quietUninstallCmd ?? subkey.GetValue("UninstallString") as string)
+        var (uninstallCmd, isQuietCommand) = SelectArpUninstallCommand(
+            request.Mode,
+            subkey.GetValue("QuietUninstallString") as string,
+            subkey.GetValue("UninstallString") as string)
             ?? throw new InvalidOperationException("No uninstall command found in registry");
 
-        var psi = new ProcessStartInfo(SystemToolPath(CmdExe), BuildCmdUninstallArguments(BuildUninstallCommand(uninstallCmd, request.Mode, quietUninstallCmd is not null, request.LogPath)))
+        var psi = new ProcessStartInfo(SystemToolPath(CmdExe), BuildCmdUninstallArguments(BuildUninstallCommand(uninstallCmd, request.Mode, isQuietCommand, request.LogPath)))
         {
             UseShellExecute = false,
         };
@@ -1558,15 +1573,19 @@ internal static class InstallerDispatch
             return args;
         }
 
-        var experienceSwitch = request.Mode switch
+        // WinGet merges the installer type's default switches into the manifest per switch kind, so the
+        // requested mode's own switch (manifest, then type default) wins; the other silent mode's manifest
+        // switch is only a fallback for types without defaults (e.g. a generic exe).
+        var (requestedSwitch, otherSwitch) = request.Mode switch
         {
-            InstallerMode.Interactive => installer.Switches.Interactive,
-            InstallerMode.SilentWithProgress => installer.Switches.SilentWithProgress ?? installer.Switches.Silent,
-            InstallerMode.Silent => installer.Switches.Silent ?? installer.Switches.SilentWithProgress,
-            _ => null,
+            InstallerMode.Interactive => (installer.Switches.Interactive, null),
+            InstallerMode.SilentWithProgress => (installer.Switches.SilentWithProgress, installer.Switches.Silent),
+            InstallerMode.Silent => (installer.Switches.Silent, installer.Switches.SilentWithProgress),
+            _ => ((string?)null, (string?)null),
         };
-        if (string.IsNullOrWhiteSpace(experienceSwitch))
-            experienceSwitch = DefaultExperienceSwitch(normalizedType, request.Mode);
+        var experienceSwitch = !string.IsNullOrWhiteSpace(requestedSwitch)
+            ? requestedSwitch
+            : DefaultExperienceSwitch(normalizedType, request.Mode) ?? otherSwitch;
 
         AppendSwitch(args, experienceSwitch);
         AppendSwitch(args, ResolveTemplate(installer.Switches.Log, DefaultLogSwitch(normalizedType), request.LogPath, request.InstallLocation));
@@ -1575,7 +1594,10 @@ internal static class InstallerDispatch
         // WinGet appends `Upgrade` after the custom switches when updating an existing installation; the install
         // flow clears it for a fresh install.
         AppendSwitch(args, installer.Switches.Upgrade);
-        AppendInstallLocationSwitch(args, ResolveTemplate(installer.Switches.InstallLocation, DefaultInstallLocationSwitch(normalizedType), request.LogPath, request.InstallLocation));
+        // Like WinGet, the InstallLocation switch is only added when --location is supplied, even when the
+        // manifest's switch has no <INSTALLPATH> token.
+        if (!string.IsNullOrWhiteSpace(request.InstallLocation))
+            AppendInstallLocationSwitch(args, ResolveTemplate(installer.Switches.InstallLocation, DefaultInstallLocationSwitch(normalizedType), request.LogPath, request.InstallLocation));
 
         return args;
     }
@@ -1795,8 +1817,10 @@ internal static class InstallerDispatch
         if (separator <= 0)
             throw new InvalidOperationException($"Invalid MSI property argument: {token}");
 
+        // Like WinGet's ParsePropertyToken: the name starts with a letter, digit, '_' or '%' (environment
+        // variable) and runs to the '=', so names such as MY.PROP are valid.
         var name = token[..separator];
-        if (name.Any(ch => !char.IsAsciiLetterOrDigit(ch) && ch != '_'))
+        if (!(char.IsLetterOrDigit(name[0]) || name[0] is '_' or '%') || name.Any(char.IsWhiteSpace))
             throw new InvalidOperationException($"Invalid MSI property name: {name}");
 
         var value = token[(separator + 1)..];
@@ -1899,6 +1923,11 @@ internal static class InstallerDispatch
         string? productCode,
         ListMatch installed)
     {
+        // An MSIX package has no ARP entry of its own; a same-named ARP entry belongs to another (unpackaged)
+        // install, and running its uninstaller would remove the wrong product.
+        if (installed.LocalId.StartsWith(@"MSIX\", StringComparison.OrdinalIgnoreCase))
+            return false;
+
         var arpSubkeyName = GetArpSubkeyName(installed.LocalId);
         if (!string.IsNullOrWhiteSpace(arpSubkeyName) &&
             subkeyName.Equals(arpSubkeyName, StringComparison.OrdinalIgnoreCase))
