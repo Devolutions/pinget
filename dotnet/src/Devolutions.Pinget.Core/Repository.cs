@@ -5282,7 +5282,9 @@ public class Repository : IDisposable
         RefreshSystemWingetSources();
         var indexes = ResolveSourceIndexes(sourceName);
         var selectedNames = indexes.Select(index => _store.Sources[index].Name).ToList();
-        var detail = SystemWingetSourceStore.UpdateSources(sourceName);
+        // A source may be selected by its identifier, but `winget source update --name`
+        // only knows source names, so hand WinGet the name it was resolved to.
+        var detail = SystemWingetSourceStore.UpdateSources(sourceName is null ? null : selectedNames.FirstOrDefault());
         RefreshSystemWingetSources();
 
         return selectedNames

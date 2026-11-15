@@ -45,7 +45,12 @@ internal static class PreIndexedSource
                     return $"Already up to date from {candidate}";
                 }
 
-                if (!response.IsSuccessStatusCode) continue;
+                if (!response.IsSuccessStatusCode)
+                {
+                    lastError = new InvalidOperationException(
+                        $"candidate {candidate} returned HTTP {(int)response.StatusCode} ({response.StatusCode})");
+                    continue;
+                }
 
                 var headerVersion = response.Headers.TryGetValues("x-ms-meta-sourceversion", out var values)
                     ? values.FirstOrDefault() : null;
@@ -390,8 +395,13 @@ internal static class PreIndexedSource
         if (pathPartId is null) return "";
         var parts = new List<string>();
         long? current = pathPartId;
+        // The index is source data: a parent chain that loops back must not spin forever.
+        var visited = new HashSet<long>();
         while (current is not null)
         {
+            if (!visited.Add(current.Value))
+                throw new InvalidOperationException($"Pathpart {pathPartId} has a parent cycle at pathpart {current.Value}.");
+
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT parent, pathpart FROM pathparts WHERE rowid = @id";
             cmd.Parameters.AddWithValue("@id", current.Value);

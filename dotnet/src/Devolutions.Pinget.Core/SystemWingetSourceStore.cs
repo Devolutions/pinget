@@ -106,8 +106,14 @@ internal static class SystemWingetSourceStore
         if (TryParseJsonSources(trimmed, out var sources))
             return sources;
 
+        // With nothing configured, WinGet's ExportSourceList prints the localized
+        // SourceListNoSources message instead of JSON; that is an empty list, not an error.
+        var lines = output.Replace("\r\n", "\n").Split('\n');
+        if (!lines.Select(line => line.Trim()).Any(line => line.StartsWith('{') || line.StartsWith('[')))
+            return [];
+
         var records = new List<SourceRecord>();
-        foreach (var rawLine in output.Replace("\r\n", "\n").Split('\n'))
+        foreach (var rawLine in lines)
         {
             var line = rawLine.Trim();
             if (line.Length == 0)

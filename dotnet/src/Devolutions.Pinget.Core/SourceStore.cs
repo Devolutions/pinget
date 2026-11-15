@@ -221,7 +221,8 @@ internal static class SourceStoreManager
 
     internal static SourceStore RefreshSystemWingetMirrorStore(string appRoot)
     {
-        var prior = LoadSystemWingetMirrorStore(appRoot) ?? SourceStore.Default();
+        // The prior mirror only contributes cached refresh metadata, so an unreadable one is dropped.
+        var prior = TryLoadSystemWingetMirrorStore(appRoot) ?? SourceStore.Default();
         var exported = SystemWingetSourceStore.Load();
         MergeSourceCacheMetadata(exported, prior);
         SaveSystemWingetMirrorStore(appRoot, exported);
@@ -238,10 +239,24 @@ internal static class SourceStoreManager
 
     private static SourceStore LoadOrRefreshSystemWingetMirrorStore(string appRoot, bool forceRefresh)
     {
-        if (!forceRefresh && LoadSystemWingetMirrorStore(appRoot) is { } cached)
+        // The mirror is only a cache of `winget source export`: an unreadable one (say, cut short
+        // by an interrupted write) is re-exported rather than failing every open from then on.
+        if (!forceRefresh && TryLoadSystemWingetMirrorStore(appRoot) is { } cached)
             return cached;
 
         return RefreshSystemWingetMirrorStore(appRoot);
+    }
+
+    private static SourceStore? TryLoadSystemWingetMirrorStore(string appRoot)
+    {
+        try
+        {
+            return LoadSystemWingetMirrorStore(appRoot);
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     private static SourceStore? LoadSystemWingetMirrorStore(string appRoot)
@@ -260,10 +275,16 @@ internal static class SourceStoreManager
 
     private static void MergeSourceCacheMetadata(SourceStore target, SourceStore prior)
     {
-        var priorByIdentifier = prior.Sources.ToDictionary(source => source.Identifier, StringComparer.OrdinalIgnoreCase);
         foreach (var source in target.Sources)
         {
-            if (!priorByIdentifier.TryGetValue(source.Identifier, out var previous))
+            // Sources may share an identifier (a mirror of the winget CDN carries the same package
+            // family name), so match on the argument too: ETag, Last-Modified and the source version
+            // describe what was fetched from that URL, and a source re-added elsewhere must not
+            // revalidate against them.
+            var previous = prior.Sources.FirstOrDefault(candidate =>
+                string.Equals(candidate.Identifier, source.Identifier, StringComparison.OrdinalIgnoreCase) &&
+                SameSourceArgument(candidate.Arg, source.Arg));
+            if (previous is null)
                 continue;
 
             source.LastUpdate = previous.LastUpdate;
@@ -272,6 +293,9 @@ internal static class SourceStoreManager
             source.LastModified = previous.LastModified;
         }
     }
+
+    private static bool SameSourceArgument(string left, string right) =>
+        string.Equals(left.Trim().TrimEnd('/'), right.Trim().TrimEnd('/'), StringComparison.OrdinalIgnoreCase);
 
     internal static bool UsesSystemWingetSourceCommands(string? appRoot)
     {
@@ -376,10 +400,10 @@ internal static class SourceStoreManager
                 source.LastModified = lastModified;
         }
 
+        // Like WinGet's SourceList (a stable sort on Priority), higher priorities come first and
+        // sources of equal priority keep their listed order.
         store.Sources = sources.Values
-            .OrderBy(source => source.Explicit)
-            .ThenByDescending(source => source.Priority)
-            .ThenBy(source => source.Name, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(source => source.Priority)
             .ToList();
         return store;
     }
@@ -437,6 +461,8 @@ internal static class SourceStoreManager
                 ["Type"] = ToPackagedSourceType(source.Kind),
                 ["Arg"] = source.Arg,
                 ["Data"] = source.Identifier,
+                // WinGet's SourceList reads the identifier from `Identifier`, never from `Data`.
+                ["Identifier"] = source.Identifier,
                 ["TrustLevel"] = ToPackagedTrustLevel(source.TrustLevel),
                 ["Explicit"] = source.Explicit,
                 ["Priority"] = source.Priority,
