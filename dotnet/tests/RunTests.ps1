@@ -41,13 +41,25 @@ catch
 
 if ([string]::IsNullOrWhiteSpace($ModulePath))
 {
-    $ModulePath = Join-Path $PSScriptRoot '..\..\dist\powershell-module\Devolutions.Pinget.Client\Devolutions.Pinget.Client.psd1'
-}
+    # Always restage the module from the current build outputs, so a stale or half-staged dist
+    # module left by an earlier run is never the one under test.
+    $outputRoot = Join-Path $PSScriptRoot '..\..\dist\powershell-module'
+    $buildModuleArguments = @{
+        NoBuild = $true
+        OutputRoot = $outputRoot
+        Clean = $true
+    }
 
-if (-not (Test-Path -Path $ModulePath))
-{
+    # The suite imports the module into this session. PowerShell 7 loads the Core build, so the
+    # Windows PowerShell half (net48 plus the native COM DLL) is only required in Windows PowerShell.
+    if ($PSVersionTable.PSEdition -eq 'Core')
+    {
+        $buildModuleArguments.SkipWindowsPowerShell = $true
+    }
+
     $buildModuleScript = Join-Path $PSScriptRoot '..\..\scripts\Build-PowerShellModule.ps1'
-    & $buildModuleScript -NoBuild -OutputRoot (Join-Path $PSScriptRoot '..\..\dist\powershell-module') -Clean | Out-Null
+    & $buildModuleScript @buildModuleArguments | Out-Null
+    $ModulePath = Join-Path $outputRoot 'Devolutions.Pinget.Client\Devolutions.Pinget.Client.psd1'
 }
 
 $config = New-PesterConfiguration

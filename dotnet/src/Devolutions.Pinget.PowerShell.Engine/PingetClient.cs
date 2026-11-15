@@ -94,14 +94,9 @@ public sealed class PingetClient : IDisposable
         PSPackageFieldMatchOption matchOption)
     {
         var response = _repository.Search(BuildPackageQuery(id, name, moniker, source, query, tag, command, count, matchOption));
+        var items = response.Matches.Select(ToPsFoundPackage);
         return new CollectionResult<PSFoundCatalogPackage>(
-            response.Matches.Select(match => new PSFoundCatalogPackage(
-                match.Id,
-                match.Name,
-                match.SourceName,
-                match.Moniker,
-                match.Version,
-                match.MatchCriteria)).ToList(),
+            PSEnumMapping.FilterByMatchOption(items, matchOption, id, name, moniker).ToList(),
             response.Warnings,
             response.Truncated);
     }
@@ -119,15 +114,8 @@ public sealed class PingetClient : IDisposable
     {
         var response = _repository.List(BuildListQuery(id, name, moniker, source, query, tag, command, count, matchOption));
         return new CollectionResult<PSInstalledCatalogPackage>(
-            response.Matches.Select(match => new PSInstalledCatalogPackage(
-                match.Id,
-                match.Name,
-                match.SourceName ?? string.Empty,
-                null,
-                match.InstalledVersion,
-                string.IsNullOrWhiteSpace(match.AvailableVersion) ? [] : [match.AvailableVersion],
-                match.Publisher,
-                match.Scope)).ToList(),
+            PSEnumMapping.FilterByMatchOption(response.Matches.Select(ToPsInstalledPackage), matchOption, id, name, null)
+                .ToList(),
             response.Warnings,
             response.Truncated);
     }
@@ -155,18 +143,8 @@ public sealed class PingetClient : IDisposable
         var warnings = new List<string>();
         AddDownloadCompatibilityWarnings(warnings, skipDependencies, skipMicrosoftStoreLicense);
 
-        var request = new InstallRequest
-        {
-            Query = BuildPackageQuery(
-                id ?? inputObject?.Id,
-                name ?? inputObject?.Name,
-                moniker ?? inputObject?.Moniker,
-                source ?? inputObject?.Source,
-                query,
-                null,
-                null,
-                0,
-                matchOption) with
+        var request = BuildDownloadRequest(
+            BuildTargetQuery(inputObject, id, name, moniker, source, query, matchOption) with
             {
                 Version = version ?? GetCatalogVersion(inputObject),
                 Locale = locale,
@@ -176,9 +154,8 @@ public sealed class PingetClient : IDisposable
                 Platform = ToInstallerPlatform(platform),
                 OsVersion = Normalize(targetOsVersion),
             },
-            SkipDependencies = skipDependencies,
-            IgnoreSecurityHash = allowHashMismatch,
-        };
+            skipDependencies,
+            allowHashMismatch);
 
         var outputDirectory = string.IsNullOrWhiteSpace(downloadDirectory)
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads")
@@ -295,18 +272,8 @@ public sealed class PingetClient : IDisposable
         var warnings = new List<string>();
         ApplyRequestHeaders(header);
 
-        var request = new InstallRequest
-        {
-            Query = BuildPackageQuery(
-                id ?? inputObject?.Id,
-                name ?? inputObject?.Name,
-                moniker ?? inputObject?.Moniker,
-                source ?? inputObject?.Source,
-                query,
-                null,
-                null,
-                0,
-                matchOption) with
+        var request = BuildInstallRequest(
+            BuildTargetQuery(inputObject, id, name, moniker, source, query, matchOption) with
             {
                 Version = version ?? GetCatalogVersion(inputObject),
                 Locale = locale,
@@ -314,15 +281,14 @@ public sealed class PingetClient : IDisposable
                 InstallerType = installerType == PSPackageInstallerType.Default ? null : installerType.ToString(),
                 InstallScope = PSEnumMapping.ToInstallScope(scope),
             },
-            Override = Normalize(overrideArguments),
-            Custom = Normalize(custom),
-            InstallLocation = Normalize(location),
-            LogPath = Normalize(log),
-            Force = force,
-            SkipDependencies = skipDependencies,
-            IgnoreSecurityHash = allowHashMismatch,
-            Mode = ToInstallerMode(mode),
-        };
+            overrideArguments,
+            custom,
+            location,
+            log,
+            force,
+            skipDependencies,
+            allowHashMismatch,
+            mode);
 
         var result = _repository.Install(request);
         return new CommandResult<PSInstallResult>(ToPsInstallResult(result, request, inputObject), warnings.Concat(result.Warnings).ToList());
@@ -343,16 +309,7 @@ public sealed class PingetClient : IDisposable
     {
         var request = new UninstallRequest
         {
-            Query = BuildPackageQuery(
-                id ?? inputObject?.Id,
-                name ?? inputObject?.Name,
-                moniker ?? inputObject?.Moniker,
-                source ?? inputObject?.Source,
-                query,
-                null,
-                null,
-                0,
-                matchOption) with
+            Query = BuildTargetQuery(inputObject, id, name, moniker, source, query, matchOption) with
             {
                 Version = version ?? GetInstalledVersion(inputObject),
             },
@@ -392,18 +349,7 @@ public sealed class PingetClient : IDisposable
         var warnings = new List<string>();
         ApplyRequestHeaders(header);
 
-        var listQuery = new ListQuery
-        {
-            Id = Normalize(id ?? inputObject?.Id),
-            Name = Normalize(name ?? inputObject?.Name),
-            Moniker = Normalize(moniker ?? inputObject?.Moniker),
-            Source = Normalize(source ?? inputObject?.Source),
-            Query = JoinQuery(query),
-            // -Version is the upgrade target; ListQuery.Version would filter on the installed version.
-            UpgradeOnly = true,
-            IncludeUnknown = includeUnknown,
-            Exact = PSEnumMapping.UsesExactMatch(matchOption),
-        };
+        var listQuery = BuildUpdateListQuery(inputObject, id, name, moniker, source, query, includeUnknown, matchOption);
 
         var matches = _repository.List(listQuery);
         warnings.AddRange(matches.Warnings);
@@ -413,9 +359,8 @@ public sealed class PingetClient : IDisposable
             match => (match.Id, match.Name, match.SourceName),
             match =>
             {
-                var request = new InstallRequest
-                {
-                    Query = new PackageQuery
+                var request = BuildInstallRequest(
+                    new PackageQuery
                     {
                         Id = match.Id,
                         Source = match.SourceName,
@@ -426,27 +371,18 @@ public sealed class PingetClient : IDisposable
                         InstallerType = installerType == PSPackageInstallerType.Default ? null : installerType.ToString(),
                         InstallScope = PSEnumMapping.ToInstallScope(scope),
                     },
-                    Override = Normalize(overrideArguments),
-                    Custom = Normalize(custom),
-                    InstallLocation = Normalize(location),
-                    LogPath = Normalize(log),
-                    Force = force,
-                    SkipDependencies = skipDependencies,
-                    IgnoreSecurityHash = allowHashMismatch,
-                    Mode = ToInstallerMode(mode),
-                };
+                    overrideArguments,
+                    custom,
+                    location,
+                    log,
+                    force,
+                    skipDependencies,
+                    allowHashMismatch,
+                    mode);
 
                 var result = _repository.Install(request);
                 warnings.AddRange(result.Warnings);
-                return ToPsInstallResult(result, request, new PSInstalledCatalogPackage(
-                    match.Id,
-                    match.Name,
-                    match.SourceName ?? string.Empty,
-                    null,
-                    match.InstalledVersion,
-                    string.IsNullOrWhiteSpace(match.AvailableVersion) ? [] : [match.AvailableVersion],
-                    match.Publisher,
-                    match.Scope));
+                return ToPsInstallResult(result, request, ToPsInstalledPackage(match));
             },
             warnings);
 
@@ -470,15 +406,9 @@ public sealed class PingetClient : IDisposable
         var warnings = new List<string>();
         var request = new RepairRequest
         {
-            Query = new PackageQuery
+            Query = BuildTargetQuery(inputObject, id, name, moniker, source, query, matchOption) with
             {
-                Id = Normalize(id ?? inputObject?.Id),
-                Name = Normalize(name ?? inputObject?.Name),
-                Moniker = Normalize(moniker ?? inputObject?.Moniker),
-                Source = Normalize(source ?? inputObject?.Source),
-                Query = JoinQuery(query),
                 Version = Normalize(version) ?? GetInstalledVersion(inputObject),
-                Exact = PSEnumMapping.UsesExactMatch(matchOption),
             },
             IgnoreSecurityHash = allowHashMismatch,
             Force = force,
@@ -550,6 +480,103 @@ public sealed class PingetClient : IDisposable
         };
     }
 
+    // A piped package is identified by its id and source, like WinGet acting on the CatalogPackage itself.
+    // Its display name and moniker are not filters: uninstall/repair/update match the name exactly against
+    // the installed (ARP) name, which rarely equals the catalog name, and a moniker requires correlation.
+    internal static PackageQuery BuildTargetQuery(
+        PSCatalogPackage? inputObject,
+        string? id,
+        string? name,
+        string? moniker,
+        string? source,
+        string[]? query,
+        PSPackageFieldMatchOption matchOption) =>
+        BuildPackageQuery(
+            id ?? inputObject?.Id,
+            name,
+            moniker,
+            source ?? inputObject?.Source,
+            query,
+            null,
+            null,
+            0,
+            matchOption);
+
+    internal static ListQuery BuildUpdateListQuery(
+        PSCatalogPackage? inputObject,
+        string? id,
+        string? name,
+        string? moniker,
+        string? source,
+        string[]? query,
+        bool includeUnknown,
+        PSPackageFieldMatchOption matchOption) => new()
+        {
+            Id = Normalize(id ?? inputObject?.Id),
+            Name = Normalize(name),
+            Moniker = Normalize(moniker),
+            Source = Normalize(source ?? inputObject?.Source),
+            Query = JoinQuery(query),
+            // -Version is the upgrade target; ListQuery.Version would filter on the installed version.
+            UpgradeOnly = true,
+            IncludeUnknown = includeUnknown,
+            Exact = PSEnumMapping.UsesExactMatch(matchOption),
+        };
+
+    internal static InstallRequest BuildInstallRequest(
+        PackageQuery query,
+        string? overrideArguments,
+        string? custom,
+        string? location,
+        string? log,
+        bool force,
+        bool skipDependencies,
+        bool allowHashMismatch,
+        PSPackageInstallMode mode) => new()
+        {
+            Query = query,
+            Override = Normalize(overrideArguments),
+            Custom = Normalize(custom),
+            InstallLocation = Normalize(location),
+            LogPath = Normalize(log),
+            Force = force,
+            SkipDependencies = skipDependencies,
+            IgnoreSecurityHash = allowHashMismatch,
+            Mode = ToInstallerMode(mode),
+            // WinGet's InstallOptions accept package agreements by default and the cmdlets have no switch for it.
+            AcceptPackageAgreements = true,
+        };
+
+    internal static InstallRequest BuildDownloadRequest(PackageQuery query, bool skipDependencies, bool allowHashMismatch) => new()
+    {
+        Query = query,
+        SkipDependencies = skipDependencies,
+        IgnoreSecurityHash = allowHashMismatch,
+        // WinGet's DownloadOptions accept package agreements by default.
+        AcceptPackageAgreements = true,
+    };
+
+    internal static PSFoundCatalogPackage ToPsFoundPackage(SearchMatch match) => new(
+        match.Id,
+        match.Name,
+        match.SourceName,
+        match.Moniker,
+        match.Version,
+        match.MatchCriteria,
+        match.Channel);
+
+    internal static PSInstalledCatalogPackage ToPsInstalledPackage(ListMatch match) => new(
+        match.Id,
+        match.Name,
+        match.SourceName ?? string.Empty,
+        null,
+        match.InstalledVersion,
+        string.IsNullOrWhiteSpace(match.AvailableVersion) ? [] : [match.AvailableVersion],
+        match.Publisher,
+        match.Scope,
+        match.PackageFamilyNames,
+        match.ProductCodes);
+
     private static void AddDownloadCompatibilityWarnings(
         List<string> warnings,
         bool skipDependencies,
@@ -597,11 +624,11 @@ public sealed class PingetClient : IDisposable
     };
 
     // Uninstall and repair act on what is installed: their query version is matched against the
-    // installed version, so a piped installed package must not contribute its available version.
-    private static string? GetInstalledVersion(PSCatalogPackage? inputObject) => inputObject switch
+    // installed version, so a piped package must not contribute an available (catalog) version.
+    internal static string? GetInstalledVersion(PSCatalogPackage? inputObject) => inputObject switch
     {
         PSInstalledCatalogPackage installed => installed.InstalledVersion,
-        _ => GetCatalogVersion(inputObject),
+        _ => null,
     };
 
     private static InstallerMode ToInstallerMode(PSPackageInstallMode mode) => mode switch
