@@ -1216,7 +1216,8 @@ public class Repository : IDisposable
         // install to the upgrade flow). A same-version reinstall (repair, --force) is not.
         var isUpdate = existingMatch is not null && InstallIsUpdate(existingMatch.InstalledVersion, manifest.Version);
         EnsureUpgradeAllowed(selectedInstaller, isUpdate);
-        if (!isUpdate && selectedInstaller.Switches.Upgrade is not null)
+        var uninstallPrevious = UninstallsPreviousVersion(request, selectedInstaller, isUpdate);
+        if (!UpgradeSwitchApplies(isUpdate, uninstallPrevious) && selectedInstaller.Switches.Upgrade is not null)
         {
             // The `Upgrade` switch only applies when updating an existing installation.
             selectedInstaller = selectedInstaller with { Switches = selectedInstaller.Switches with { Upgrade = null } };
@@ -1241,7 +1242,7 @@ public class Repository : IDisposable
         }
 
         var warnings = new List<string>();
-        if ((request.UninstallPrevious || (isUpdate && UpgradeBehaviorIs(selectedInstaller, "uninstallPrevious"))) && existingMatch is not null)
+        if (uninstallPrevious && existingMatch is not null)
         {
             // Remove the installed version that was found above, not whatever the
             // install query (which may pin the *new* version) happens to match.
@@ -1272,7 +1273,44 @@ public class Repository : IDisposable
             installerPath = PrepareInstallerForExecution(installerPath, installerType);
         }
         var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
-        return CompletedInstallResult(manifest, selectedInstaller, installerPath, installerType, exitCode, warnings);
+        var result = CompletedInstallResult(manifest, selectedInstaller, installerPath, installerType, exitCode, warnings);
+        RemoveInstallerAfterSuccess(result);
+        return result;
+    }
+
+    /// <summary>
+    /// WinGet ExecuteInstallerForType: the previous version is uninstalled first only when the install updates
+    /// an existing installation and --uninstall-previous or <c>UpgradeBehavior: uninstallPrevious</c> asks for
+    /// it; a same-version reinstall keeps the installed package.
+    /// </summary>
+    internal static bool UninstallsPreviousVersion(InstallRequest request, Installer installer, bool isUpdate)
+        => isUpdate && (request.UninstallPrevious || UpgradeBehaviorIs(installer, "uninstallPrevious"));
+
+    /// <summary>
+    /// The <c>Upgrade</c> switch applies only to an update that runs over the existing installation. Once the
+    /// previous version has been uninstalled the installer runs as a fresh install (WinGet clears
+    /// InstallerExecutionUseUpdate).
+    /// </summary>
+    internal static bool UpgradeSwitchApplies(bool isUpdate, bool uninstallsPrevious)
+        => isUpdate && !uninstallsPrevious;
+
+    /// <summary>
+    /// Like WinGet's RemoveInstaller, deletes the downloaded installer once it ran successfully so installers
+    /// do not pile up in the temporary directory. A failed run keeps it for diagnosis.
+    /// </summary>
+    internal static void RemoveInstallerAfterSuccess(InstallResult result)
+    {
+        if (!result.Success || string.IsNullOrEmpty(result.InstallerPath) || !File.Exists(result.InstallerPath))
+            return;
+
+        try
+        {
+            File.Delete(result.InstallerPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            result.Warnings.Add($"Could not remove the downloaded installer '{result.InstallerPath}': {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -2800,25 +2838,168 @@ public class Repository : IDisposable
         var systemPlatform = CurrentPlatform();
         var currentOsVersion = CurrentWindowsVersion();
 
-        return installers
+        var preference = new InstallerPreference(
+            requestedLocale,
+            preferredLocales,
+            requestedArchitecture,
+            requestedType,
+            systemArchitecture,
+            string.IsNullOrWhiteSpace(requestedScope) ? "user" : requestedScope.Trim());
+
+        Installer? best = null;
+        foreach (var installer in installers
             .Where(installer => InstallerMatchesRequested(installer, requestedType, requestedScope, requestedPlatform, requestedOsVersion, systemPlatform, currentOsVersion))
             .Where(installer => InstallerMatchesArchitecture(installer, requestedArchitecture, systemArchitecture))
             .Where(installer => !InstallerUnsupportedOnArchitecture(installer, systemArchitecture))
             .Where(installer => InstallerMatchesMarket(installer, market))
-            .Where(installer => InstallerMatchesLocale(installer.Locale, requestedLocale))
-            .Select((installer, index) => new
-            {
-                Installer = installer,
-                Index = index,
-                Rank = InstallerRank(installer, requestedLocale, preferredLocales, requestedArchitecture, systemArchitecture),
-            })
-            .OrderByDescending(item => item.Rank.Architecture)
-            .ThenByDescending(item => item.Rank.Locale)
-            .ThenByDescending(item => item.Rank.Commands)
-            .ThenBy(item => item.Index)
-            .Select(item => item.Installer)
-            .FirstOrDefault();
+            .Where(installer => InstallerMatchesLocale(installer.Locale, requestedLocale)))
+        {
+            if (best is null || InstallerIsBetter(installer, best, preference))
+                best = installer;
+        }
+        return best;
     }
+
+    /// <summary>
+    /// What installer selection prefers, after WinGet's <c>ManifestComparator</c> comparators. <c>PreferredScope</c>
+    /// is the requested scope, else WinGet's default <c>installBehavior.preferences.scope</c> (user).
+    /// </summary>
+    private sealed record InstallerPreference(
+        string? RequestedLocale,
+        IReadOnlyList<string> PreferredLocales,
+        string? RequestedArchitecture,
+        string? RequestedType,
+        string SystemArchitecture,
+        string PreferredScope);
+
+    // One comparator's verdict on two installers: Strong decides at once, otherwise the first Weak verdict (in
+    // comparator priority order) decides.
+    private enum InstallerComparisonStrength { Neither, Weak, Strong }
+
+    private readonly record struct InstallerComparison(InstallerComparisonStrength Strength, bool FirstIsBetter)
+    {
+        public static readonly InstallerComparison Neither = new(InstallerComparisonStrength.Neither, false);
+    }
+
+    private static InstallerComparison RankComparison(int first, int second, bool strong) =>
+        first == second
+            ? InstallerComparison.Neither
+            : new(strong ? InstallerComparisonStrength.Strong : InstallerComparisonStrength.Weak, first > second);
+
+    /// <summary>
+    /// WinGet <c>ManifestComparator::IsFirstBetter</c>: comparators in priority order (locale, scope, architecture,
+    /// installer type, then Pinget's command tie-break); the first strong verdict wins, else the first weak one; a
+    /// full tie keeps the earlier installer. Mirrors the Rust installer_is_better.
+    /// </summary>
+    private static bool InstallerIsBetter(Installer first, Installer second, InstallerPreference preference)
+    {
+        var comparisons = new[]
+        {
+            LocaleComparison(first, second, preference),
+            ScopeComparison(first, second, preference.PreferredScope),
+            ArchitectureComparison(first, second, preference),
+            // A requested installer type is a requirement; the default type preference only orders installers
+            // when no type was requested.
+            preference.RequestedType is null
+                ? RankComparison(InstallerTypeRank(first), InstallerTypeRank(second), strong: false)
+                : InstallerComparison.Neither,
+            RankComparison(first.Commands.Count > 0 ? 1 : 0, second.Commands.Count > 0 ? 1 : 0, strong: false),
+        };
+
+        bool? weak = null;
+        foreach (var comparison in comparisons)
+        {
+            if (comparison.Strength == InstallerComparisonStrength.Strong)
+                return comparison.FirstIsBetter;
+            if (comparison.Strength == InstallerComparisonStrength.Weak)
+                weak ??= comparison.FirstIsBetter;
+        }
+        return weak ?? false;
+    }
+
+    // WinGet LocaleComparator: a better (compatible) locale match is strong; an undeclared locale over one that
+    // matches nothing is weak.
+    private static InstallerComparison LocaleComparison(Installer first, Installer second, InstallerPreference preference)
+    {
+        int Rank(Installer installer) => preference.RequestedLocale is not null
+            ? LocaleRank(installer.Locale, preference.RequestedLocale)
+            : PreferredLocaleRank(installer.Locale, preference.PreferredLocales);
+        // Requested-locale ranks: 3 exact, 2 same language, 1 undeclared. Preferred-language ranks: 4 and up
+        // match a preference, 1 undeclared, 0 no match.
+        var compatibleRank = preference.RequestedLocale is not null ? 2 : 4;
+        var (firstRank, secondRank) = (Rank(first), Rank(second));
+        return RankComparison(firstRank, secondRank, firstRank >= compatibleRank || secondRank >= compatibleRank);
+    }
+
+    private static string? DeclaredInstallerScope(Installer installer) =>
+        string.IsNullOrWhiteSpace(installer.Scope) ? null : installer.Scope.Trim();
+
+    // WinGet ScopeComparator: the preferred scope beats the other scope strongly and an undeclared scope weakly.
+    private static InstallerComparison ScopeComparison(Installer first, Installer second, string preferredScope)
+    {
+        bool Matches(Installer installer) =>
+            DeclaredInstallerScope(installer)?.Equals(preferredScope, StringComparison.OrdinalIgnoreCase) == true;
+        var (firstMatches, secondMatches) = (Matches(first), Matches(second));
+        if (firstMatches == secondMatches)
+            return InstallerComparison.Neither;
+        var loser = firstMatches ? second : first;
+        var strength = DeclaredInstallerScope(loser) is null ? InstallerComparisonStrength.Weak : InstallerComparisonStrength.Strong;
+        return new(strength, firstMatches);
+    }
+
+    // WinGet MachineArchitectureComparator: a better architecture is a strong verdict when it is the requested
+    // (else the system) architecture, a weak one otherwise.
+    private static InstallerComparison ArchitectureComparison(Installer first, Installer second, InstallerPreference preference)
+    {
+        var firstRank = ArchitectureRank(first.Architecture, preference.RequestedArchitecture, preference.SystemArchitecture);
+        var secondRank = ArchitectureRank(second.Architecture, preference.RequestedArchitecture, preference.SystemArchitecture);
+        var better = firstRank >= secondRank ? first : second;
+        var strongArchitecture = preference.RequestedArchitecture ?? preference.SystemArchitecture;
+        var strong = better.Architecture?.Equals(strongArchitecture, StringComparison.OrdinalIgnoreCase) == true;
+        return RankComparison(firstRank, secondRank, strong);
+    }
+
+    /// <summary>
+    /// WinGet <c>ManifestInstaller::EffectiveInstallerType</c>: an archive (<c>zip</c>) installs its nested installer
+    /// type; <c>appx</c> is the same installer type as <c>msix</c>. Returns the base and the effective type.
+    /// </summary>
+    private static IEnumerable<string> InstallerSelectionTypes(Installer installer)
+    {
+        if (installer.InstallerType is null)
+            yield break;
+        var baseType = CanonicalInstallerType(installer.InstallerType);
+        yield return baseType;
+        if (baseType == "zip" && !string.IsNullOrWhiteSpace(installer.NestedInstallerType))
+            yield return CanonicalInstallerType(installer.NestedInstallerType);
+    }
+
+    private static string CanonicalInstallerType(string value)
+    {
+        var canonical = value.Trim().ToLowerInvariant();
+        return canonical == "appx" ? "msix" : canonical;
+    }
+
+    // `--installer-type` matches the base or the effective (nested) installer type, like WinGet's InstallerTypeComparator.
+    private static bool InstallerMatchesType(Installer installer, string? requestedType)
+    {
+        if (requestedType is null)
+            return true;
+        var requested = CanonicalInstallerType(requestedType);
+        return InstallerSelectionTypes(installer).Any(type => type == requested);
+    }
+
+    private static readonly string[] DefaultInstallerTypePreference =
+        ["msstore", "msix", "msi", "wix", "burn", "nullsoft", "inno", "exe", "portable"];
+
+    // WinGet's default installer type preference (used when no type is requested): earlier types rank higher; an
+    // archive ranks by its nested type.
+    internal static int InstallerTypeRank(Installer installer) =>
+        InstallerSelectionTypes(installer)
+            .Select(type => Array.IndexOf(DefaultInstallerTypePreference, type))
+            .Where(position => position >= 0)
+            .Select(position => DefaultInstallerTypePreference.Length - position)
+            .DefaultIfEmpty(0)
+            .Max();
 
     // ── Manifest parsing ──
 
@@ -3055,8 +3236,12 @@ public class Repository : IDisposable
         {
             foreach (var inst in instList)
             {
-                if (inst is IDictionary<object, object> instDict)
+                if (inst is IDictionary<object, object> rawInstDict)
                 {
+                    // WinGet skips installer keys with an empty (null) value, so they never erase the root default.
+                    IDictionary<object, object> instDict = rawInstDict
+                        .Where(kvp => kvp.Value is not null)
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
                     string? InstStr(string key) => instDict.TryGetValue(key, out var v) ? v?.ToString() : null;
                     List<string> InstArr(string key)
                     {
@@ -3080,20 +3265,32 @@ public class Repository : IDisposable
                         installerDependencies = topDependencies;
                     var markets = instDict.TryGetValue("Markets", out var marketsValue) ? marketsValue : topMarkets;
                     var appsAndFeaturesEntries = ReadAppsAndFeaturesEntries(instDict.TryGetValue("AppsAndFeaturesEntries", out var afeValue) ? afeValue : null);
+
+                    // WinGet stashes the root ProductCode, PackageFamilyName, AppsAndFeaturesEntries and nested-installer
+                    // fields and only restores them for installer types that use them. Explicit installer values win.
+                    var installerType = InstStr("InstallerType") ?? topInstallerType;
+                    var isArchive = string.Equals(installerType?.Trim(), "zip", StringComparison.OrdinalIgnoreCase);
+                    var nestedInstallerType = InstStr("NestedInstallerType") ?? (isArchive ? topNestedInstallerType : null);
+                    var effectiveType = ((isArchive ? nestedInstallerType : installerType) ?? "").Trim().ToLowerInvariant();
+                    if (!instDict.ContainsKey("AppsAndFeaturesEntries") && InstallerTypeWritesArpEntry(effectiveType))
+                        appsAndFeaturesEntries = [.. topAppsAndFeaturesEntries];
+                    var usesPackageFamilyName = InstallerTypeUsesPackageFamilyName(effectiveType) ||
+                        appsAndFeaturesEntries.Any(entry => InstallerTypeUsesPackageFamilyName((entry.InstallerType ?? "").Trim().ToLowerInvariant()));
+
                     installers.Add(new Installer
                     {
                         Architecture = InstStr("Architecture"),
-                        InstallerType = InstStr("InstallerType") ?? topInstallerType,
-                        NestedInstallerType = InstStr("NestedInstallerType") ?? topNestedInstallerType,
-                        NestedInstallerFiles = instDict.ContainsKey("NestedInstallerFiles") ? nestedFiles : [.. topNestedInstallerFiles],
+                        InstallerType = installerType,
+                        NestedInstallerType = nestedInstallerType,
+                        NestedInstallerFiles = instDict.ContainsKey("NestedInstallerFiles") ? nestedFiles : isArchive ? [.. topNestedInstallerFiles] : [],
                         Url = InstStr("InstallerUrl"),
                         Sha256 = InstStr("InstallerSha256"),
-                        ProductCode = InstStr("ProductCode") ?? topProductCode,
+                        ProductCode = InstStr("ProductCode") ?? (InstallerTypeWritesArpEntry(effectiveType) ? topProductCode : null),
                         MSStoreProductIdentifier = InstStr("MSStoreProductIdentifier") ?? topMsStoreProductIdentifier,
                         Locale = InstStr("InstallerLocale") ?? topLocale,
                         Scope = InstStr("Scope") ?? topScope,
                         ReleaseDate = InstStr("ReleaseDate") ?? topReleaseDate,
-                        PackageFamilyName = InstStr("PackageFamilyName") ?? topPackageFamilyName,
+                        PackageFamilyName = InstStr("PackageFamilyName") ?? (usesPackageFamilyName ? topPackageFamilyName : null),
                         UpgradeCode = InstStr("UpgradeCode") ?? topUpgradeCode,
                         Platforms = instDict.ContainsKey("Platform") ? platforms : [.. topPlatforms],
                         MinimumOsVersion = InstStr("MinimumOSVersion") ?? topMinimumOsVersion,
@@ -3111,7 +3308,7 @@ public class Repository : IDisposable
                             ? ReadStringList(unsupportedValue)
                             : [.. topUnsupportedArchitectures],
                         UpgradeBehavior = InstStr("UpgradeBehavior") ?? topUpgradeBehavior,
-                        AppsAndFeaturesEntries = instDict.ContainsKey("AppsAndFeaturesEntries") ? appsAndFeaturesEntries : [.. topAppsAndFeaturesEntries],
+                        AppsAndFeaturesEntries = appsAndFeaturesEntries,
                         InstallerSuccessCodes = instDict.TryGetValue("InstallerSuccessCodes", out var successValue)
                             ? ReadInstallerReturnCodes(successValue)
                             : [.. topSuccessCodes],
@@ -3123,7 +3320,8 @@ public class Repository : IDisposable
             }
         }
 
-        var dependencies = ReadPackageDependencies(dict.TryGetValue("Dependencies", out var depsObj) ? depsObj : null);
+        var dependencies = ReadDependencies(dict.TryGetValue("Dependencies", out var depsObj) ? depsObj : null)
+            .PackageDependencies.Select(dependency => dependency.PackageIdentifier).ToList();
 
         var topLevelRequireExplicit = ReadBool(dict, "RequireExplicitUpgrade");
         var anyInstallerRequireExplicit = installers.Any(i => i.RequireExplicitUpgrade);
@@ -3135,7 +3333,8 @@ public class Repository : IDisposable
             Version = GetStr("PackageVersion"),
             Channel = GetOptStr("Channel") ?? "",
             Publisher = GetOptStr("Publisher"),
-            Description = GetOptStr("Description") ?? GetOptStr("ShortDescription"),
+            // WinGet `show`: an empty Description falls back to ShortDescription.
+            Description = GetOptStr("Description") is { Length: > 0 } description ? description : GetOptStr("ShortDescription"),
             ShortDescription = GetOptStr("ShortDescription"),
             Moniker = GetOptStr("Moniker"),
             PackageUrl = GetOptStr("PackageUrl"),
@@ -3159,6 +3358,14 @@ public class Repository : IDisposable
         };
     }
 
+    /// <summary>WinGet DoesInstallerTypeUseProductCode / DoesInstallerTypeWriteAppsAndFeaturesEntry (lowercase type).</summary>
+    internal static bool InstallerTypeWritesArpEntry(string installerType) =>
+        installerType is "exe" or "inno" or "msi" or "nullsoft" or "wix" or "burn" or "portable";
+
+    /// <summary>WinGet DoesInstallerTypeUsePackageFamilyName (lowercase type; <c>appx</c> is msix).</summary>
+    internal static bool InstallerTypeUsesPackageFamilyName(string installerType) =>
+        installerType is "msix" or "appx" or "msstore";
+
     /// <summary>
     /// Reads every dependency kind of a manifest root or installer <c>Dependencies</c> mapping, like the
     /// Rust yaml_dependencies. <c>MinimumVersion</c> keeps its source text.
@@ -3168,11 +3375,16 @@ public class Repository : IDisposable
         if (dependencies is not IDictionary<object, object> depsDict)
             return new InstallerDependencies();
 
+        // WinGet DependencyList::Add: ids are trimmed and a repeated id (case-insensitive, per kind) is kept once.
         static List<string> List(IDictionary<object, object> source, string key)
         {
             if (!source.TryGetValue(key, out var value) || value is not IList<object> items)
                 return [];
-            return items.Select(item => item?.ToString() ?? "").Where(item => !string.IsNullOrWhiteSpace(item)).ToList();
+            return items
+                .Select(item => item?.ToString()?.Trim() ?? "")
+                .Where(item => item.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
 
         var packages = new List<PackageDependency>();
@@ -3182,13 +3394,28 @@ public class Repository : IDisposable
             {
                 if (dep is IDictionary<object, object> depDict &&
                     depDict.TryGetValue("PackageIdentifier", out var pid) &&
-                    pid?.ToString() is { } packageIdentifier)
+                    pid?.ToString()?.Trim() is { } packageIdentifier)
                 {
                     var minimumVersion = depDict.TryGetValue("MinimumVersion", out var min) ? min?.ToString()?.Trim() : null;
+                    if (string.IsNullOrEmpty(minimumVersion))
+                        minimumVersion = null;
+                    // A repeated id keeps its first position and the highest minimum version.
+                    var index = packages.FindIndex(existing => existing.PackageIdentifier.Equals(packageIdentifier, StringComparison.OrdinalIgnoreCase));
+                    if (index >= 0)
+                    {
+                        var existing = packages[index];
+                        if (minimumVersion is not null &&
+                            (existing.MinimumVersion is null || RestSource.CompareVersionStrings(minimumVersion, existing.MinimumVersion) > 0))
+                        {
+                            packages[index] = existing with { MinimumVersion = minimumVersion };
+                        }
+                        continue;
+                    }
+
                     packages.Add(new PackageDependency
                     {
                         PackageIdentifier = packageIdentifier,
-                        MinimumVersion = string.IsNullOrEmpty(minimumVersion) ? null : minimumVersion,
+                        MinimumVersion = minimumVersion,
                     });
                 }
             }
@@ -3233,27 +3460,6 @@ public class Repository : IDisposable
                 };
             })
             .ToList();
-    }
-
-    /// <summary>
-    /// Reads <c>Dependencies.PackageDependencies[*].PackageIdentifier</c> from a manifest root or
-    /// installer entry, like the Rust yaml_package_dependencies.
-    /// </summary>
-    private static List<string> ReadPackageDependencies(object? dependencies)
-    {
-        var result = new List<string>();
-        if (dependencies is IDictionary<object, object> depsDict &&
-            depsDict.TryGetValue("PackageDependencies", out var pkgDeps) &&
-            pkgDeps is IList<object> pkgDepList)
-        {
-            foreach (var dep in pkgDepList)
-            {
-                if (dep is IDictionary<object, object> depDict &&
-                    depDict.TryGetValue("PackageIdentifier", out var pid))
-                    result.Add(pid?.ToString() ?? "");
-            }
-        }
-        return result;
     }
 
     private static bool ReadBool(IDictionary<string, object?> dict, string key)
@@ -3408,6 +3614,8 @@ public class Repository : IDisposable
             "InstallationNotes",
             "Documentations",
             "Icons",
+            // A merged manifest carries its non-default locales here; keep them in the round trip.
+            "Localization",
         ]);
         defaultLocaleDocument["PackageIdentifier"] = packageIdentifier;
         defaultLocaleDocument["PackageVersion"] = packageVersion;
@@ -4032,17 +4240,30 @@ public class Repository : IDisposable
         Microsoft.Data.Sqlite.SqliteConnection conn,
         InstalledPackage pkg)
     {
-        foreach (var pfn in pkg.PackageFamilyNames)
+        // InstalledDbIdentityTablesPresent only requires one identity table pair: a tracking DB from an older
+        // schema (no upgradecodes before 1.6) must not fail the whole lookup with "no such table".
+        bool PairPresent(string valueTable, string mapTable) => TableExists(conn, valueTable) && TableExists(conn, mapTable);
+
+        if (pkg.PackageFamilyNames.Count > 0 && PairPresent("pfns", "pfns_map"))
         {
-            var hit = LookupInstalledDbIdentityMatch(conn, "pfns", "pfns_map", "pfn", pfn, "PackageFamilyName");
-            if (hit is not null) return hit;
+            foreach (var pfn in pkg.PackageFamilyNames)
+            {
+                var hit = LookupInstalledDbIdentityMatch(conn, "pfns", "pfns_map", "pfn", pfn, "PackageFamilyName");
+                if (hit is not null) return hit;
+            }
         }
 
-        foreach (var code in pkg.UpgradeCodes)
+        if (pkg.UpgradeCodes.Count > 0 && PairPresent("upgradecodes", "upgradecodes_map"))
         {
-            var hit = LookupInstalledDbIdentityMatch(conn, "upgradecodes", "upgradecodes_map", "upgradecode", code, "UpgradeCode");
-            if (hit is not null) return hit;
+            foreach (var code in pkg.UpgradeCodes)
+            {
+                var hit = LookupInstalledDbIdentityMatch(conn, "upgradecodes", "upgradecodes_map", "upgradecode", code, "UpgradeCode");
+                if (hit is not null) return hit;
+            }
         }
+
+        if (pkg.ProductCodes.Count == 0 || !PairPresent("productcodes", "productcodes_map"))
+            return null;
 
         foreach (var code in pkg.ProductCodes)
         {
@@ -4204,12 +4425,12 @@ public class Repository : IDisposable
                     if (pkg.LocalId.StartsWith(@"MSIX\", StringComparison.OrdinalIgnoreCase)) continue;
                     if (string.IsNullOrWhiteSpace(pkg.Publisher)) continue;
 
-                    var normName = NameNormalization.NormalizeName(pkg.Name).Name;
-                    if (string.IsNullOrEmpty(normName)) continue;
+                    var normName = NameNormalization.NormalizeName(pkg.Name);
+                    if (string.IsNullOrEmpty(normName.Name)) continue;
                     var normPub = NameNormalization.NormalizePublisher(pkg.Publisher);
                     if (string.IsNullOrEmpty(normPub)) continue;
 
-                    var rowid = LookupUniqueNormalizedIdentity(conn, normName, normPub);
+                    var rowid = LookupInstalledNormalizedIdentity(conn, normName, normPub);
                     if (rowid is null) continue;
                     var meta = FetchV2PackageMetadata(conn, rowid.Value);
                     if (meta is null) continue;
@@ -4301,6 +4522,37 @@ public class Repository : IDisposable
 
     private static long? LookupUniqueNormalizedIdentity(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
     {
+        var rows = LookupNormalizedIdentityRows(conn, normName, normPublisher);
+        return rows.Count == 1 ? rows[0] : null; // none, or ambiguous
+    }
+
+    internal static long? LookupInstalledNormalizedIdentityForTesting(
+        Microsoft.Data.Sqlite.SqliteConnection conn, NameNormalization.NormalizedName normalizedName, string normPublisher)
+        => LookupInstalledNormalizedIdentity(conn, normalizedName, normPublisher);
+
+    /// <summary>
+    /// WinGet's installed → available NormalizedNameAndPublisher search (SearchPurpose::CorrelationToAvailable):
+    /// when the installed DisplayName carries an architecture, the index is searched first for the
+    /// architecture-qualified name it stores for ARP DisplayNames (<c>foo(X64)</c>), and only when that finds
+    /// nothing for the plain name. This tells "Foo (x64)" apart from "Foo (x86)" packages whose plain normalized
+    /// names collide.
+    /// </summary>
+    private static long? LookupInstalledNormalizedIdentity(
+        Microsoft.Data.Sqlite.SqliteConnection conn, NameNormalization.NormalizedName normalizedName, string normPublisher)
+    {
+        if (NameNormalization.NormalizedNameSuffix(normalizedName.Architecture) is { } suffix)
+        {
+            var rows = LookupNormalizedIdentityRows(conn, normalizedName.Name + suffix, normPublisher);
+            if (rows.Count > 0)
+                return rows.Count == 1 ? rows[0] : null;
+        }
+
+        return LookupUniqueNormalizedIdentity(conn, normalizedName.Name, normPublisher);
+    }
+
+    /// <summary>Up to two distinct catalog packages matching (norm_name, norm_publisher).</summary>
+    private static List<long> LookupNormalizedIdentityRows(Microsoft.Data.Sqlite.SqliteConnection conn, string normName, string normPublisher)
+    {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
             SELECT DISTINCT n.package FROM norm_names2 n
@@ -4310,10 +4562,10 @@ public class Repository : IDisposable
         cmd.Parameters.AddWithValue("@name", normName);
         cmd.Parameters.AddWithValue("@pub", normPublisher);
         using var reader = cmd.ExecuteReader();
-        if (!reader.Read()) return null;
-        var first = reader.GetInt64(0);
-        if (reader.Read()) return null; // ambiguous
-        return first;
+        var rows = new List<long>();
+        while (reader.Read())
+            rows.Add(reader.GetInt64(0));
+        return rows;
     }
 
     /// <summary>
@@ -4564,6 +4816,9 @@ public class Repository : IDisposable
     private static string NormalizeCorrelationName(string value) =>
         new(value.Where(char.IsAsciiLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
 
+    internal static bool ListPackageMatchesForTesting(InstalledPackage pkg, ListQuery query)
+        => ListPackageMatches(pkg, query);
+
     private static bool ListPackageMatches(InstalledPackage pkg, ListQuery query)
     {
         var correlated = pkg.Correlated;
@@ -4576,7 +4831,11 @@ public class Repository : IDisposable
                 return false;
         }
 
-        if (query.Name is not null && !MatchesText(pkg.Name, query.Name, query.Exact))
+        // Like --id, --name also matches through the correlated catalog package: WinGet's installed search runs
+        // the request against the available sources too and maps those results back to installed rows.
+        if (query.Name is not null &&
+            !MatchesText(pkg.Name, query.Name, query.Exact) &&
+            !(correlated is not null && MatchesText(correlated.Name, query.Name, query.Exact)))
             return false;
 
         if (query.ProductCode is not null &&
@@ -4589,7 +4848,14 @@ public class Repository : IDisposable
 
         if (query.Query is not null)
         {
-            var localMatch = MatchesText(pkg.Name, query.Query, query.Exact) ||
+            // WinGet's query search first looks for an exact (folded) match on the system reference strings —
+            // PackageFamilyName, ProductCode and UpgradeCode — before the Id/Name/Moniker/Command/Tag fields.
+            var systemReferenceMatch = pkg.PackageFamilyNames
+                .Concat(pkg.ProductCodes)
+                .Concat(pkg.UpgradeCodes)
+                .Any(reference => reference.Equals(query.Query, StringComparison.OrdinalIgnoreCase));
+            var localMatch = systemReferenceMatch ||
+                MatchesText(pkg.Name, query.Query, query.Exact) ||
                 MatchesText(pkg.LocalId, query.Query, query.Exact);
             var correlatedMatch = correlated is not null &&
                 (MatchesText(correlated.Id, query.Query, query.Exact) ||
@@ -4897,7 +5163,7 @@ public class Repository : IDisposable
         string? requestedOsVersion,
         string? systemPlatform,
         string? currentOsVersion) =>
-        MatchesOptionalCaseInsensitive(installer.InstallerType, requestedType) &&
+        InstallerMatchesType(installer, requestedType) &&
         InstallerMatchesScope(installer.Scope, requestedScope) &&
         InstallerMatchesPlatform(installer, requestedPlatform, systemPlatform) &&
         InstallerMatchesOsVersion(installer, requestedOsVersion, currentOsVersion);
@@ -4974,39 +5240,19 @@ public class Repository : IDisposable
         => installer.UnsupportedOSArchitectures.Any(value =>
             value.Trim().Equals(systemArchitecture, StringComparison.OrdinalIgnoreCase));
 
-    private static (int Architecture, int Locale, int Commands) InstallerRank(
-        Installer installer,
-        string? requestedLocale,
-        IReadOnlyList<string> preferredLocales,
-        string? requestedArchitecture,
-        string systemArchitecture)
-    {
-        var architecture = ArchitectureRank(
-            installer.Architecture,
-            requestedArchitecture ?? systemArchitecture,
-            requestedArchitecture is not null,
-            systemArchitecture);
-        var locale = requestedLocale is not null
-            ? LocaleRank(installer.Locale, requestedLocale)
-            : PreferredLocaleRank(installer.Locale, preferredLocales);
-        var commands = installer.Commands.Count == 0 ? 0 : 1;
-        return (architecture, locale, commands);
-    }
-
-    private static int ArchitectureRank(
+    /// <summary>
+    /// WinGet <c>IsApplicableArchitecture</c>: the requested architecture, else the system's applicable architectures
+    /// in preference order (<c>neutral</c> last), ranked from the end of that list.
+    /// </summary>
+    internal static int ArchitectureRank(
         string? installerArchitecture,
-        string preferredArchitecture,
-        bool strict,
+        string? requestedArchitecture,
         string systemArchitecture)
     {
         if (installerArchitecture is null)
             return 0;
-        if (installerArchitecture.Equals(preferredArchitecture, StringComparison.OrdinalIgnoreCase))
-            return 5;
-        if (installerArchitecture.Equals("neutral", StringComparison.OrdinalIgnoreCase))
-            return 4;
-        if (strict)
-            return -1;
+        if (requestedArchitecture is not null)
+            return installerArchitecture.Equals(requestedArchitecture, StringComparison.OrdinalIgnoreCase) ? 1 : -1;
 
         var preferred = PreferredArchitectures(systemArchitecture);
         for (int i = preferred.Length - 1; i >= 0; i--)
@@ -5103,9 +5349,6 @@ public class Repository : IDisposable
         return 0;
     }
 
-    private static bool MatchesOptionalCaseInsensitive(string? value, string? requested) =>
-        requested is null || (value is not null && value.Equals(requested, StringComparison.OrdinalIgnoreCase));
-
     /// <summary>Parses a dotted numeric version of any length, like the Rust parse_dotted_version.</summary>
     private static bool TryParseDottedVersion(string value, out ulong[] version)
     {
@@ -5155,10 +5398,11 @@ public class Repository : IDisposable
     private static string? CurrentWindowsVersion() =>
         OperatingSystem.IsWindows() ? Environment.OSVersion.Version.ToString() : null;
 
+    // WinGet CreateApplicableArchitecturesVector: the native architecture, then the emulated ones, then neutral last.
     private static string[] PreferredArchitectures(string systemArchitecture) => systemArchitecture switch
     {
-        "arm64" => ["arm64", "neutral", "x64", "x86"],
-        "x64" => ["x64", "neutral", "x86"],
+        "arm64" => ["arm64", "x64", "x86", "neutral"],
+        "x64" => ["x64", "x86", "neutral"],
         "x86" => ["x86", "neutral"],
         _ => ["neutral"],
     };
@@ -5282,7 +5526,9 @@ public class Repository : IDisposable
         RefreshSystemWingetSources();
         var indexes = ResolveSourceIndexes(sourceName);
         var selectedNames = indexes.Select(index => _store.Sources[index].Name).ToList();
-        var detail = SystemWingetSourceStore.UpdateSources(sourceName);
+        // A source may be selected by its identifier, but `winget source update --name`
+        // only knows source names, so hand WinGet the name it was resolved to.
+        var detail = SystemWingetSourceStore.UpdateSources(sourceName is null ? null : selectedNames.FirstOrDefault());
         RefreshSystemWingetSources();
 
         return selectedNames

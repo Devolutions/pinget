@@ -96,10 +96,12 @@ public sealed class PingetClient : IDisposable
                 RequiredString(match, "SourceName"),
                 OptionalString(match, "Moniker"),
                 OptionalString(match, "Version"),
-                OptionalString(match, "MatchCriteria")))
-            .ToList();
+                OptionalString(match, "MatchCriteria"),
+                OptionalString(match, "Channel")));
 
-        return new CollectionResult<PSFoundCatalogPackage>(items, WarningsFrom(response), Bool(response, "Truncated"));
+        items = PSEnumMapping.FilterByMatchOption(items, matchOption, id, name, moniker);
+
+        return new CollectionResult<PSFoundCatalogPackage>(items.ToList(), WarningsFrom(response), Bool(response, "Truncated"));
     }
 
     public CollectionResult<PSInstalledCatalogPackage> GetInstalledPackages(
@@ -126,10 +128,11 @@ public sealed class PingetClient : IDisposable
                 OptionalString(match, "Publisher"),
                 OptionalString(match, "Scope"),
                 StringArray(match, "PackageFamilyNames"),
-                StringArray(match, "ProductCodes")))
-            .ToList();
+                StringArray(match, "ProductCodes")));
 
-        return new CollectionResult<PSInstalledCatalogPackage>(items, WarningsFrom(response), Bool(response, "Truncated"));
+        items = PSEnumMapping.FilterByMatchOption(items, matchOption, id, name, null);
+
+        return new CollectionResult<PSInstalledCatalogPackage>(items.ToList(), WarningsFrom(response), Bool(response, "Truncated"));
     }
 
     public CommandResult<PSDownloadResult> DownloadPackage(
@@ -154,16 +157,7 @@ public sealed class PingetClient : IDisposable
     {
         var warnings = new List<string>();
         AddDownloadCompatibilityWarnings(warnings, skipDependencies, skipMicrosoftStoreLicense);
-        var queryObject = BuildPackageQuery(
-            id ?? inputObject?.Id,
-            name ?? inputObject?.Name,
-            moniker ?? inputObject?.Moniker,
-            source ?? inputObject?.Source,
-            query,
-            null,
-            null,
-            0,
-            matchOption);
+        var queryObject = BuildTargetQuery(inputObject, id, name, moniker, source, query, matchOption);
         SetIfNotNull(queryObject, "version", version ?? GetCatalogVersion(inputObject));
         SetIfNotNull(queryObject, "locale", locale);
         SetIfNotNull(queryObject, "installer_architecture", architecture == PSProcessorArchitecture.Default ? null : architecture.ToString());
@@ -177,6 +171,8 @@ public sealed class PingetClient : IDisposable
             ["query"] = queryObject,
             ["skip_dependencies"] = skipDependencies,
             ["ignore_security_hash"] = allowHashMismatch,
+            // WinGet's DownloadOptions accept package agreements by default.
+            ["accept_package_agreements"] = true,
         };
         var outputDirectory = string.IsNullOrWhiteSpace(downloadDirectory)
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads")
@@ -314,16 +310,7 @@ public sealed class PingetClient : IDisposable
     {
         var request = new JsonObject
         {
-            ["query"] = BuildPackageQuery(
-                id ?? inputObject?.Id,
-                name ?? inputObject?.Name,
-                moniker ?? inputObject?.Moniker,
-                source ?? inputObject?.Source,
-                query,
-                null,
-                null,
-                0,
-                matchOption),
+            ["query"] = BuildTargetQuery(inputObject, id, name, moniker, source, query, matchOption),
             ["force"] = force,
             ["mode"] = ToInstallerMode(mode),
         };
@@ -362,8 +349,8 @@ public sealed class PingetClient : IDisposable
         var listQuery = new JsonObject
         {
             ["id"] = Normalize(id ?? inputObject?.Id),
-            ["name"] = Normalize(name ?? inputObject?.Name),
-            ["moniker"] = Normalize(moniker ?? inputObject?.Moniker),
+            ["name"] = Normalize(name),
+            ["moniker"] = Normalize(moniker),
             ["source"] = Normalize(source ?? inputObject?.Source),
             ["query"] = JoinQuery(query),
             // -Version is the upgrade target; a list "version" would filter on the installed version.
@@ -435,16 +422,7 @@ public sealed class PingetClient : IDisposable
     {
         var request = new JsonObject
         {
-            ["query"] = BuildPackageQuery(
-                id ?? inputObject?.Id,
-                name ?? inputObject?.Name,
-                moniker ?? inputObject?.Moniker,
-                source ?? inputObject?.Source,
-                query,
-                null,
-                null,
-                0,
-                matchOption),
+            ["query"] = BuildTargetQuery(inputObject, id, name, moniker, source, query, matchOption),
             ["ignore_security_hash"] = allowHashMismatch,
             ["force"] = force,
             ["mode"] = ToInstallerMode(mode),
@@ -489,6 +467,19 @@ public sealed class PingetClient : IDisposable
         result["exact"] = PSEnumMapping.UsesExactMatch(matchOption);
         return result;
     }
+
+    // A piped package is identified by its id and source, like WinGet acting on the CatalogPackage itself.
+    // Its display name and moniker are not filters: uninstall/repair/update match the name exactly against
+    // the installed (ARP) name, which rarely equals the catalog name, and a moniker requires correlation.
+    private static JsonObject BuildTargetQuery(
+        PSCatalogPackage? inputObject,
+        string? id,
+        string? name,
+        string? moniker,
+        string? source,
+        string[]? query,
+        PSPackageFieldMatchOption matchOption) =>
+        BuildPackageQuery(id ?? inputObject?.Id, name, moniker, source ?? inputObject?.Source, query, null, null, 0, matchOption);
 
     private static JsonObject BuildListQuery(
         string? id,
@@ -537,16 +528,7 @@ public sealed class PingetClient : IDisposable
         PSPackageInstallerType installerType,
         PSPackageFieldMatchOption matchOption)
     {
-        var queryObject = BuildPackageQuery(
-            id ?? inputObject?.Id,
-            name ?? inputObject?.Name,
-            moniker ?? inputObject?.Moniker,
-            source ?? inputObject?.Source,
-            query,
-            null,
-            null,
-            0,
-            matchOption);
+        var queryObject = BuildTargetQuery(inputObject, id, name, moniker, source, query, matchOption);
         SetIfNotNull(queryObject, "version", version ?? GetCatalogVersion(inputObject));
         SetIfNotNull(queryObject, "locale", locale);
         SetIfNotNull(queryObject, "installer_architecture", architecture == PSProcessorArchitecture.Default ? null : architecture.ToString());
@@ -560,6 +542,8 @@ public sealed class PingetClient : IDisposable
             ["skip_dependencies"] = skipDependencies,
             ["ignore_security_hash"] = allowHashMismatch,
             ["mode"] = ToInstallerMode(mode),
+            // WinGet's InstallOptions accept package agreements by default and the cmdlets have no switch for it.
+            ["accept_package_agreements"] = true,
         };
         SetIfNotNull(request, "override_args", Normalize(overrideArguments));
         SetIfNotNull(request, "custom", Normalize(custom));
@@ -704,12 +688,12 @@ public sealed class PingetClient : IDisposable
     }
 
     // Uninstall and repair act on what is installed: their query version is matched against the
-    // installed version, so a piped installed package must not contribute its available version.
+    // installed version, so a piped package must not contribute an available (catalog) version.
     private static string? GetInstalledVersion(PSCatalogPackage? inputObject)
     {
         if (inputObject is PSInstalledCatalogPackage installed)
             return installed.InstalledVersion;
-        return GetCatalogVersion(inputObject);
+        return null;
     }
 
     private static string? GetCatalogVersion(PSCatalogPackage? inputObject)

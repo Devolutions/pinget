@@ -37,7 +37,12 @@ internal static class ExportPayloadBuilder
                     _ => "Microsoft.PreIndexed.Package",
                 },
                 Identifier: record?.Identifier ?? "");
-            var packages = group
+            // Like WinGet's SelectVersionsToExport: packages are stably sorted by id, and without
+            // versions side-by-side installs of one package collapse into a single entry.
+            IEnumerable<ListMatch> ordered = group.OrderBy(match => match.Id, StringComparer.Ordinal);
+            if (!includeVersions)
+                ordered = ordered.DistinctBy(match => match.Id, StringComparer.Ordinal);
+            var packages = ordered
                 .Select(match => new PackageExportEntry(
                     PackageIdentifier: match.Id,
                     Version: includeVersions ? match.InstalledVersion : null))

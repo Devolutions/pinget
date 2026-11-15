@@ -100,7 +100,7 @@ internal static partial class ManifestScanner
             string? locale = OptionalString(model, "PackageLocale");
             if (type is "defaultLocale" or "locale")
             {
-                if (string.IsNullOrWhiteSpace(locale) || !LocalePattern().IsMatch(locale))
+                if (string.IsNullOrWhiteSpace(locale) || !IsValidLocale(locale))
                     throw new PublisherException($"Invalid or missing PackageLocale in {relativePath}.");
             }
 
@@ -192,8 +192,8 @@ internal static partial class ManifestScanner
                 throw new PublisherException("Manifest mapping keys must be non-empty strings.");
             if (result.ContainsKey(key.Value))
                 throw new PublisherException($"Duplicate YAML mapping key '{key.Value}'.");
-            result.Add(key.Value, IsStringField(key.Value)
-                ? ConvertStringNode(pair.Value, depth) : ConvertNode(pair.Value, depth));
+            result.Add(key.Value, IsStringSequenceField(key.Value) ? ConvertStringSequence(key.Value, pair.Value)
+                : IsStringField(key.Value) ? ConvertStringNode(pair.Value, depth) : ConvertNode(pair.Value, depth));
         }
 
         return result;
@@ -230,7 +230,34 @@ internal static partial class ManifestScanner
             or "InvocationParameter" or "ReturnResponse" or "AllowedMarkets" or "ExcludedMarkets"
             or "UnsupportedOSArchitectures" or "UnsupportedArguments" or "ElevationRequirement"
             or "RepairBehavior" or "InstallerIdentifier" or "ProductId" or "StoreProductId"
-            or "Author" or "InstallationNotes" or "Upgrade";
+            or "Author" or "InstallationNotes" or "Upgrade" or "Agreement" or "AgreementLabel";
+
+    /// <summary>Schema string-list fields; the Rust publisher reads them as sequences of strings.</summary>
+    private static bool IsStringSequenceField(string key) =>
+        key is "Commands" or "Tags" or "FileExtensions" or "Protocols" or "Capabilities" or "RestrictedCapabilities"
+            or "InstallModes" or "Platform" or "WindowsFeatures" or "WindowsLibraries" or "ExternalDependencies"
+            or "AllowedMarkets" or "ExcludedMarkets" or "UnsupportedOSArchitectures" or "UnsupportedArguments";
+
+    /// <summary>
+    /// Converts a string-list field like the Rust publisher: a null value is an empty list, anything other
+    /// than a sequence of scalars is rejected (WinGet fails to parse such a manifest).
+    /// </summary>
+    private static JsonArray ConvertStringSequence(string key, YamlNode node)
+    {
+        if (node is YamlScalarNode { Style: YamlDotNet.Core.ScalarStyle.Plain or YamlDotNet.Core.ScalarStyle.Any } scalar
+            && scalar.Value is null or "" or "~" or "null" or "Null" or "NULL")
+            return [];
+        if (node is not YamlSequenceNode sequence)
+            throw new PublisherException($"Manifest field '{key}' must be a sequence of strings.");
+        var result = new JsonArray();
+        foreach (var child in sequence.Children)
+        {
+            if (child is not YamlScalarNode item)
+                throw new PublisherException($"Manifest field '{key}' must be a sequence of strings.");
+            result.Add(JsonValue.Create(item.Value ?? string.Empty));
+        }
+        return result;
+    }
 
     /// <summary>
     /// Types an untyped scalar exactly like the Rust publisher (serde_yaml 0.9 core schema):
@@ -403,7 +430,7 @@ internal static partial class ManifestScanner
                 var singletonModel = (JsonObject)singleton[0].Model.DeepClone();
                 var locale = OptionalString(singletonModel, "PackageLocale")
                     ?? throw new PublisherException($"Singleton manifest is missing PackageLocale: {singleton[0].Path}");
-                if (!LocalePattern().IsMatch(locale))
+                if (!IsValidLocale(locale))
                     throw new PublisherException($"Invalid PackageLocale '{locale}' in {singleton[0].Path}.");
                 AddMerged(result, entry.Key.Id, entry.Key.Version, locale, locale, singletonModel);
                 continue;
@@ -491,7 +518,12 @@ internal static partial class ManifestScanner
             var sidecarYaml = BuildVersionData(all);
             var compressed = MsZipCompressor.Compress(sidecarYaml);
             var tags = Values(all, "Tags");
-            var commands = Values(all, "Commands");
+            // Root Commands are a default that an installer's own Commands replace
+            // (Manifest::GetAggregatedCommands over the populated installers).
+            var commands = DistinctTerms(all.SelectMany(manifest => EffectiveInstallers(manifest.Model)
+                .SelectMany(installer => StringValues(installer.Installer.ContainsKey("Commands")
+                    ? installer.Installer["Commands"]
+                    : manifest.Model["Commands"]))));
             var pfns = new List<string>();
             var products = new List<string>();
             var upgradeCodes = new List<string>();
@@ -511,7 +543,14 @@ internal static partial class ManifestScanner
                     foreach (var entry in installer.Entries)
                     {
                         if (OptionalString(entry, "DisplayName") is { } displayName)
+                        {
                             normalizedNames.Add(NormalizeName(displayName));
+                            // WinGet also indexes ARP display names with their architecture
+                            // (Interface_1_2 GetNormalizedNames, NormalizationField::Architecture).
+                            var normalized = Devolutions.Pinget.Core.NameNormalization.NormalizeName(displayName);
+                            if (normalized.Architecture != Devolutions.Pinget.Core.NameNormalization.Architecture.Unknown)
+                                normalizedNames.Add($"{normalized.Name}({normalized.Architecture})");
+                        }
                         if (OptionalString(entry, "Publisher") is { } entryPublisher)
                             normalizedPublishers.Add(NormalizePublisher(entryPublisher));
                         products.AddRange(StringValues(entry["ProductCode"]));
@@ -531,10 +570,13 @@ internal static partial class ManifestScanner
 
             // WinGet fills the package row's ARP bounds from the latest version only (Interface_2_0 PrepareForPackaging).
             var latestArpRange = ArpVersionRange(latest.Model);
+            // WinGet trims PackageName and Moniker and stores no moniker rather than an empty one
+            // (ManifestYamlPopulator, Interface_2_0 PrepareForPackaging addIfPresent).
+            var moniker = OptionalString(latest.Model, "Moniker")?.Trim(WinGetSpaceChars);
             packages.Add(new IndexedPackage(
                 group.Key,
-                RequiredString(latest.Model, "PackageName", latest.RelativePath),
-                OptionalString(latest.Model, "Moniker"),
+                RequiredString(latest.Model, "PackageName", latest.RelativePath).Trim(WinGetSpaceChars),
+                string.IsNullOrEmpty(moniker) ? null : moniker,
                 latestVersion,
                 all,
                 tags,
@@ -607,17 +649,24 @@ internal static partial class ManifestScanner
                     yield return item;
     }
 
+    /// <summary>WinGet <c>AICLI_SPACE_CHARS</c>, the characters <c>Utility::Trim</c> strips.</summary>
+    private static readonly char[] WinGetSpaceChars = [' ', '\f', '\n', '\r', '\t', '\v'];
+
+    /// <summary>
+    /// Catalog strings trimmed like WinGet's manifest populator, which trims Tags, Commands and the
+    /// ARP entry codes before they are indexed.
+    /// </summary>
     private static IEnumerable<string> StringValues(JsonNode? value)
     {
         if (value is JsonArray array)
         {
             foreach (var item in array)
                 if (item is JsonValue json && json.TryGetValue<string>(out var text) && text is not null)
-                    yield return text;
+                    yield return text.Trim(WinGetSpaceChars);
         }
         else if (value is JsonValue scalar && scalar.TryGetValue<string>(out var text) && text is not null)
         {
-            yield return text;
+            yield return text.Trim(WinGetSpaceChars);
         }
     }
 
@@ -697,7 +746,7 @@ internal static partial class ManifestScanner
         var versions = EffectiveInstallers(model)
             .Where(installer => InstallerTypeSupportsArpVersionRange(installer.InstallerType))
             .SelectMany(installer => installer.Entries)
-            .Select(entry => OptionalString(entry, "DisplayVersion"))
+            .Select(entry => OptionalString(entry, "DisplayVersion")?.Trim(WinGetSpaceChars))
             .Where(value => !string.IsNullOrWhiteSpace(value))
             .Cast<string>()
             .OrderBy(value => value, VersionComparer.Instance)
@@ -976,6 +1025,9 @@ internal static partial class ManifestScanner
 
     [GeneratedRegex(@"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$", RegexOptions.CultureInvariant)]
     private static partial Regex VersionPattern();
+
+    /// <summary>The Rust publisher's PackageLocale rule: the BCP 47-like pattern and at most 35 characters.</summary>
+    private static bool IsValidLocale(string locale) => locale.Length <= 35 && LocalePattern().IsMatch(locale);
 
     [GeneratedRegex(@"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$", RegexOptions.CultureInvariant)]
     private static partial Regex LocalePattern();

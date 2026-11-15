@@ -54,25 +54,15 @@ internal static class RestSource
         // The REST response wraps data in a "Data" property
         var data = json.TryGetProperty("Data", out var d) ? d : json;
 
-        var info = new RestInformation
+        var info = ParseInformation(data);
+
+        // WinGet's RestInformationCache does not cache a response marked no-store or no-cache;
+        // drop any earlier entry too, so the next lookup asks the server again.
+        if (response.Headers.CacheControl is { NoStore: true } or { NoCache: true })
         {
-            SourceIdentifier = data.TryGetProperty("SourceIdentifier", out var si) ? si.GetString() ?? "" : "",
-            ServerSupportedVersions = data.TryGetProperty("ServerSupportedVersions", out var sv)
-                ? sv.EnumerateArray().Select(v => v.GetString() ?? "").ToList()
-                : [],
-            RequiredPackageMatchFields = data.TryGetProperty("RequiredPackageMatchFields", out var rpmf)
-                ? rpmf.EnumerateArray().Select(v => v.GetString() ?? "").ToList()
-                : [],
-            UnsupportedPackageMatchFields = data.TryGetProperty("UnsupportedPackageMatchFields", out var upmf)
-                ? upmf.EnumerateArray().Select(v => v.GetString() ?? "").ToList()
-                : [],
-            RequiredQueryParameters = data.TryGetProperty("RequiredQueryParameters", out var rqp)
-                ? rqp.EnumerateArray().Select(v => v.GetString() ?? "").ToList()
-                : [],
-            UnsupportedQueryParameters = data.TryGetProperty("UnsupportedQueryParameters", out var uqp)
-                ? uqp.EnumerateArray().Select(v => v.GetString() ?? "").ToList()
-                : [],
-        };
+            try { File.Delete(cachePath); } catch (IOException) { }
+            return info;
+        }
 
         var cacheEntry = new RestInfoCache
         {
@@ -83,6 +73,32 @@ internal static class RestSource
 
         return info;
     }
+
+    internal static RestInformation ParseInformation(JsonElement data) => new()
+    {
+        SourceIdentifier = data.TryGetProperty("SourceIdentifier", out var si) && si.ValueKind == JsonValueKind.String
+            ? si.GetString() ?? ""
+            : "",
+        ServerSupportedVersions = StringArray(data, "ServerSupportedVersions"),
+        RequiredPackageMatchFields = StringArray(data, "RequiredPackageMatchFields"),
+        UnsupportedPackageMatchFields = StringArray(data, "UnsupportedPackageMatchFields"),
+        RequiredQueryParameters = StringArray(data, "RequiredQueryParameters"),
+        UnsupportedQueryParameters = StringArray(data, "UnsupportedQueryParameters"),
+    };
+
+    /// <summary>
+    /// A JSON string array read the way WinGet's <c>GetRawStringArrayFromJsonNode</c> does:
+    /// <c>null</c> or a non-array is empty and non-string items are skipped.
+    /// </summary>
+    private static List<string> StringArray(JsonElement element, string propertyName) =>
+        element.ValueKind == JsonValueKind.Object &&
+        element.TryGetProperty(propertyName, out var value) &&
+        value.ValueKind == JsonValueKind.Array
+            ? value.EnumerateArray()
+                .Where(item => item.ValueKind == JsonValueKind.String)
+                .Select(item => item.GetString()!)
+                .ToList()
+            : [];
 
     // Cache lifetime for /information without a usable Cache-Control max-age.
     internal static readonly TimeSpan DefaultInformationCacheLifetime = TimeSpan.FromSeconds(60);
@@ -125,34 +141,69 @@ internal static class RestSource
 
         var url = $"{source.Arg.TrimEnd('/')}/manifestSearch";
         var body = BuildSearchBody(query, info, semantics);
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, url);
-        request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
-        request.Headers.Add("Version", contract);
-
-        using var response = client.SendAsync(request).GetAwaiter().GetResult();
-        var responseBody = ReadResponseBody(response);
-        if (responseBody is null)
+        if (SearchBodyHasNoCriteria(body))
+        {
+            // Every inclusion named a field the source does not support (WinGet's SearchInternal).
             return ([], false);
-
-        using var document = JsonDocument.Parse(responseBody);
-        var json = document.RootElement;
-
-        var data = json.TryGetProperty("Data", out var d) && d.ValueKind == JsonValueKind.Array
-            ? d.EnumerateArray().ToList()
-            : [];
+        }
 
         int maxResults = SourceFetchResults(query, semantics);
+
+        // Like WinGet's SearchInternal: resend the same body with the ContinuationToken header
+        // until the server stops returning one or enough results arrived.
+        var data = new List<JsonElement>();
+        string? continuationToken = null;
+        var usedTokens = new HashSet<string>(StringComparer.Ordinal);
+        while (true)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, url);
+            request.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            request.Headers.Add("Version", contract);
+            if (continuationToken is not null)
+                request.Headers.TryAddWithoutValidation("ContinuationToken", continuationToken);
+
+            using var response = client.SendAsync(request).GetAwaiter().GetResult();
+            var responseBody = ReadResponseBody(response);
+            if (responseBody is null)
+            {
+                continuationToken = null;
+                break;
+            }
+
+            using var document = JsonDocument.Parse(responseBody);
+            var json = document.RootElement;
+            var pageData = json.TryGetProperty("Data", out var d) && d.ValueKind == JsonValueKind.Array
+                ? d.EnumerateArray().Select(item => item.Clone()).ToList()
+                : [];
+            if (pageData.Count == 0)
+                EnsureSearchRequestSupported(json);
+            data.AddRange(pageData);
+
+            continuationToken = json.TryGetProperty("ContinuationToken", out var ct) && ct.ValueKind == JsonValueKind.String &&
+                                ct.GetString() is { } token && !string.IsNullOrWhiteSpace(token)
+                ? token
+                : null;
+            if (continuationToken is null || data.Count >= maxResults)
+                break;
+            if (!usedTokens.Add(continuationToken))
+                throw new InvalidOperationException("REST source returned a repeated continuation token.");
+        }
+
         var results = new List<RestMatchResult>();
 
         foreach (var item in data)
         {
-            var packageId = item.GetProperty("PackageIdentifier").GetString() ?? "";
+            // WinGet trims the identifier and version from a REST search response, and rejects a
+            // package without versions instead of inventing one.
+            var packageId = item.GetProperty("PackageIdentifier").GetString()?.Trim() ?? "";
+            if (packageId.Length == 0)
+                throw new InvalidOperationException("REST search result missing PackageIdentifier.");
             var packageName = item.TryGetProperty("PackageName", out var pn) ? pn.GetString() ?? "" : packageId;
             var versions = ParseVersions(item);
             var (packageFamilyNames, productCodes, upgradeCodes) = ParseVersionIdentities(item);
             SortVersionsDesc(versions);
-            var latest = versions.FirstOrDefault() ?? new VersionKey { Version = "?", Channel = "" };
+            var latest = versions.FirstOrDefault()
+                ?? throw new InvalidOperationException($"REST search result for '{packageId}' had no versions.");
 
             results.Add(new RestMatchResult
             {
@@ -168,8 +219,45 @@ internal static class RestSource
             });
         }
 
-        return (results, results.Count >= maxResults);
+        var truncated = RestSearchTruncated(continuationToken, results.Count, maxResults);
+        if (results.Count > maxResults)
+            results.RemoveRange(maxResults, results.Count - maxResults);
+        return (results, truncated);
     }
+
+    /// <summary>
+    /// True when a request had inclusions but every one was dropped as unsupported and there is
+    /// no Query: WinGet returns no results without contacting the server.
+    /// </summary>
+    internal static bool SearchBodyHasNoCriteria(string body)
+    {
+        var node = JsonNode.Parse(body)!.AsObject();
+        return !node.ContainsKey("Query") && node["Inclusions"] is JsonArray { Count: 0 };
+    }
+
+    /// <summary>
+    /// WinGet's V1_1 GetSearchResult: an empty search response that lists required or
+    /// unsupported package match fields means the server rejected the request shape, which is an
+    /// error rather than "no packages found".
+    /// </summary>
+    internal static void EnsureSearchRequestSupported(JsonElement response)
+    {
+        var required = StringArray(response, "RequiredPackageMatchFields");
+        var unsupported = StringArray(response, "UnsupportedPackageMatchFields");
+        if (required.Count == 0 && unsupported.Count == 0)
+            return;
+        throw new InvalidOperationException(
+            $"The REST source does not support this search (required package match fields: [{string.Join(", ", required)}]; " +
+            $"unsupported package match fields: [{string.Join(", ", unsupported)}]).");
+    }
+
+    /// <summary>
+    /// WinGet's RestInterface marks a search truncated only when the server returned more than
+    /// <c>MaximumResults</c> matches or a <c>ContinuationToken</c> says more are available; exactly
+    /// <c>MaximumResults</c> matches with no token is the complete result. Mirrors the Rust rest_search_truncated.
+    /// </summary>
+    internal static bool RestSearchTruncated(string? continuationToken, int resultCount, int maxResults) =>
+        resultCount > maxResults || !string.IsNullOrWhiteSpace(continuationToken);
 
     public static (Manifest Manifest, object StructuredDocuments) FetchManifestWithDocuments(HttpClient client, SourceRecord source,
         RestInformation info, string packageId, string version, string channel)
@@ -265,35 +353,66 @@ internal static class RestSource
             // The REST contract evaluates `(Query || Inclusions...) && Filters...`, so the
             // alternative identity fields must be Inclusions (ORed). As Filters they would be
             // ANDed and only match a package whose id, name and moniker are all equal.
+            // An inclusion on a field the source lists as unsupported is dropped (WinGet's V1_1
+            // GetValidatedSearchRequest); it would otherwise be rejected or misread by the server.
             var inclusions = new JsonArray();
-            inclusions.Add((JsonNode?)PackageMatchFilter("PackageIdentifier", query.Query, matchType));
-            inclusions.Add((JsonNode?)PackageMatchFilter("PackageName", query.Query, matchType));
-            inclusions.Add((JsonNode?)PackageMatchFilter("Moniker", query.Query, matchType));
+            foreach (var field in new[] { "PackageIdentifier", "PackageName", "Moniker" })
+            {
+                if (!FieldListed(info.UnsupportedPackageMatchFields, field))
+                    inclusions.Add((JsonNode?)PackageMatchFilter(field, query.Query, matchType));
+            }
             obj["Inclusions"] = inclusions;
-            AppendRequiredFilters(filters, info);
-            if (filters.Count > 0)
-                obj["Filters"] = filters;
-            return obj.ToJsonString();
+        }
+        else if (query.Query is not null)
+        {
+            obj["Query"] = new JsonObject { ["KeyWord"] = query.Query, ["MatchType"] = matchType };
         }
 
-        if (query.Query is not null)
-            obj["Query"] = new JsonObject { ["KeyWord"] = query.Query, ["MatchType"] = matchType };
-
+        // Every filter uses the request's match type, like WinGet's SearchSourceApplyFilters
+        // (a many-search tag or command filter is a substring match unless --exact is given).
         if (query.Id is not null) AddFilter("PackageIdentifier", query.Id, matchType);
         if (query.Name is not null) AddFilter("PackageName", query.Name, matchType);
         if (query.Moniker is not null) AddFilter("Moniker", query.Moniker, matchType);
-        // Tag and command filters stay exact for many-search; a single lookup uses the
-        // single-lookup match type like WinGet's SearchSourceApplyFilters.
-        string tagMatchType = semantics == SearchSemantics.Single ? matchType : "Exact";
-        if (query.Tag is not null) AddFilter("Tag", query.Tag, tagMatchType);
-        if (query.Command is not null) AddFilter("Command", query.Command, tagMatchType);
+        if (query.Tag is not null) AddFilter("Tag", query.Tag, matchType);
+        if (query.Command is not null) AddFilter("Command", query.Command, matchType);
 
+        ValidateSearchFilters(filters, info);
         AppendRequiredFilters(filters, info);
 
         if (filters.Count > 0)
             obj["Filters"] = filters;
 
         return obj.ToJsonString();
+    }
+
+    private static bool FieldListed(IEnumerable<string> fields, string field) =>
+        fields.Any(candidate => candidate.Trim().Equals(field, StringComparison.OrdinalIgnoreCase));
+
+    private static string FilterField(JsonNode? filter) =>
+        filter?["PackageMatchField"]?.GetValue<string>() ?? "";
+
+    /// <summary>
+    /// WinGet's V1_1 GetValidatedSearchRequest for Filters: every required package match field
+    /// other than Market (which is filled in) must be filtered on, and a filter on a field the
+    /// source lists as unsupported fails the search instead of being sent and ignored, which would
+    /// return packages the filter should have excluded.
+    /// </summary>
+    private static void ValidateSearchFilters(JsonArray filters, RestInformation info)
+    {
+        foreach (var required in info.RequiredPackageMatchFields)
+        {
+            var field = required.Trim();
+            if (field.Equals("Market", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!filters.Any(filter => FilterField(filter).Equals(field, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException(
+                    $"The REST source requires the package match field '{field}', which this search does not provide.");
+        }
+
+        var unsupported = filters.FirstOrDefault(filter => FieldListed(info.UnsupportedPackageMatchFields, FilterField(filter)));
+        if (unsupported is not null)
+            throw new InvalidOperationException(
+                $"The REST source does not support the package match field '{FilterField(unsupported)}'.");
     }
 
     private static void AppendRequiredFilters(JsonArray filters, RestInformation info)
@@ -395,10 +514,12 @@ internal static class RestSource
         return versionsArr.EnumerateArray()
             .Select(v => new VersionKey
             {
-                Version = v.TryGetProperty("PackageVersion", out var pv) ? pv.GetString() ?? "" : "",
+                Version = v.TryGetProperty("PackageVersion", out var pv) && pv.ValueKind == JsonValueKind.String &&
+                          pv.GetString()?.Trim() is { Length: > 0 } packageVersion
+                    ? packageVersion
+                    : throw new InvalidOperationException("REST version entry missing PackageVersion."),
                 Channel = v.TryGetProperty("Channel", out var ch) ? ch.GetString() ?? "" : ""
             })
-            .Where(v => !string.IsNullOrEmpty(v.Version))
             .ToList();
     }
 
@@ -448,11 +569,13 @@ internal static class RestSource
         JsonElement? versionData = null;
         if (versionsArr.ValueKind == JsonValueKind.Array)
         {
+            // WinGet trims PackageVersion from a REST manifest before matching it against the
+            // requested version, so "1.2.3 " is version 1.2.3.
             foreach (var v in versionsArr.EnumerateArray())
             {
-                var pv = v.TryGetProperty("PackageVersion", out var pvVal) ? pvVal.GetString() : null;
+                var pv = v.TryGetProperty("PackageVersion", out var pvVal) ? pvVal.GetString()?.Trim() : null;
                 var ch = v.TryGetProperty("Channel", out var chVal) ? chVal.GetString() ?? "" : "";
-                if (string.Equals(pv, version, StringComparison.OrdinalIgnoreCase) &&
+                if (string.Equals(pv, version.Trim(), StringComparison.OrdinalIgnoreCase) &&
                     string.Equals(ch, channel, StringComparison.OrdinalIgnoreCase))
                 {
                     versionData = v;
@@ -493,7 +616,7 @@ internal static class RestSource
 
         var resolvedVersion = versionData is { } svVer &&
                               svVer.TryGetProperty("PackageVersion", out var resolvedPv) &&
-                              resolvedPv.GetString() is { Length: > 0 } actualVersion
+                              resolvedPv.GetString()?.Trim() is { Length: > 0 } actualVersion
             ? actualVersion
             : version;
         var resolvedChannel = versionData is { } svCh &&
@@ -568,9 +691,12 @@ internal static class RestSource
             if (switches.ValueKind != JsonValueKind.Object)
                 return new InstallerSwitches();
 
+            // Like WinGet's TryParseInstallerSwitchField, an empty switch is absent, so it neither
+            // hides the version-level default nor the SilentWithProgress/Silent fallback.
             string? GetSwitch(string name) =>
-                switches.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
-                    ? value.GetString()
+                switches.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String &&
+                value.GetString() is { Length: > 0 } text
+                    ? text
                     : null;
 
             return new InstallerSwitches
@@ -831,7 +957,7 @@ internal static class RestSource
             Version = resolvedVersion,
             Channel = resolvedChannel,
             Publisher = GetOptStr(defaultLocale, "Publisher"),
-            Description = GetOptStr(defaultLocale, "Description") ?? GetOptStr(defaultLocale, "ShortDescription"),
+            Description = GetOptStr(defaultLocale, "Description") is { Length: > 0 } description ? description : GetOptStr(defaultLocale, "ShortDescription"),
             ShortDescription = GetOptStr(defaultLocale, "ShortDescription"),
             Moniker = GetOptStr(defaultLocale, "Moniker") ?? GetOptStr(data, "Moniker"),
             PackageUrl = GetOptStr(defaultLocale, "PackageUrl"),
@@ -961,23 +1087,47 @@ internal static class RestSource
     internal static bool IsUnknownVersion(string? version) =>
         version is not null && version.Trim().Equals("Unknown", StringComparison.OrdinalIgnoreCase);
 
+    internal static bool IsLatestVersion(string? version) =>
+        version is not null && version.Trim().Equals("Latest", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Compares versions like WinGet's <c>Version</c>, including its approximate comparators: with equal base
+    /// versions <c>&lt; 1.0</c> sorts below <c>1.0</c>, which sorts below <c>&gt; 1.0</c>. Mirrors the Rust
+    /// compare_version.
+    /// </summary>
     internal static int CompareVersionStrings(string a, string b)
     {
+        var (baseA, comparatorA) = SplitApproximateVersion(a);
+        var (baseB, comparatorB) = SplitApproximateVersion(b);
+        var cmp = CompareBaseVersionStrings(baseA, baseB);
+        return cmp != 0 ? cmp : comparatorA.CompareTo(comparatorB);
+    }
+
+    // -1 for "< x", 0 for a plain version, 1 for "> x".
+    private static (string Base, int Comparator) SplitApproximateVersion(string value)
+    {
+        var trimmed = value.Trim();
+        if (trimmed.StartsWith('<'))
+            return (trimmed[1..].Trim(), -1);
+        if (trimmed.StartsWith('>'))
+            return (trimmed[1..].Trim(), 1);
+        return (trimmed, 0);
+    }
+
+    private static int CompareBaseVersionStrings(string a, string b)
+    {
+        // WinGet sorts `Latest` above every other version and `Unknown` below every known one.
+        bool aLatest = IsLatestVersion(a);
+        bool bLatest = IsLatestVersion(b);
+        if (aLatest || bLatest)
+            return aLatest == bLatest ? 0 : aLatest ? 1 : -1;
+
         bool aUnknown = IsUnknownVersion(a);
         bool bUnknown = IsUnknownVersion(b);
         if (aUnknown != bUnknown)
             return aUnknown ? -1 : 1;
         if (aUnknown)
             return 0;
-
-        var aLessThan = StripLessThanPrefix(a);
-        var bLessThan = StripLessThanPrefix(b);
-        if (aLessThan is not null && bLessThan is not null)
-            return CompareVersionStrings(aLessThan, bLessThan);
-        if (aLessThan is not null && CompareVersionStrings(aLessThan, b) == 0)
-            return -1;
-        if (bLessThan is not null && CompareVersionStrings(a, bLessThan) == 0)
-            return 1;
 
         var partsA = TokenizeVersion(a);
         var partsB = TokenizeVersion(b);
@@ -1080,12 +1230,6 @@ internal static class RestSource
         var digit = trimmed.AsSpan().IndexOfAnyInRange('0', '9');
         var split = trimmed.IndexOf('.');
         return digit >= 0 && (split < 0 || digit < split) ? trimmed[digit..] : trimmed;
-    }
-
-    private static string? StripLessThanPrefix(string value)
-    {
-        var trimmed = value.TrimStart();
-        return trimmed.StartsWith('<') ? trimmed[1..].TrimStart() : null;
     }
 
     internal record RestMatchResult
