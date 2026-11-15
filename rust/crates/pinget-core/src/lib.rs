@@ -24,6 +24,8 @@ mod wave17_tests;
 #[cfg(test)]
 mod wave18_tests;
 #[cfg(test)]
+mod wave19_tests;
+#[cfg(test)]
 mod wave1_tests;
 #[cfg(test)]
 mod wave2_tests;
@@ -12497,6 +12499,11 @@ fn nested_archive_installer_target(installer: &Installer) -> Result<(String, Str
         .nested_installer_files
         .first()
         .ok_or_else(|| anyhow!("the zip installer does not declare NestedInstallerFiles"))?;
+    // Like WinGet (ArchiveFlow.cpp), only portable archives may name several nested files;
+    // silently running the first of several installers would skip the rest.
+    if installer.nested_installer_files.len() > 1 {
+        bail!("multiple NestedInstallerFiles are not supported for NestedInstallerType {nested_type}");
+    }
     let relative = normalize_portable_relative_path(&nested_file.relative_file_path)?;
     Ok((nested_type, relative))
 }
@@ -13991,32 +13998,36 @@ fn try_run_msi_uninstall(
 
 #[cfg(windows)]
 fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest, warnings: &mut Vec<String>) -> Result<i32> {
-    let (existing_entry, recorded_links) = match read_portable_entry_for_installed(installed)? {
-        Some(record) => (Some(record.entry), record.symlinks),
-        None => (None, Vec::new()),
+    let (existing_entry, recorded_links, directory_on_path) = match read_portable_entry_for_installed(installed)? {
+        Some(record) => (
+            Some(record.entry),
+            record.symlinks,
+            record.install_directory_added_to_path,
+        ),
+        None => (None, Vec::new(), false),
     };
     let known_symlink = existing_entry
         .as_ref()
         .and_then(|entry| entry.portable_symlink_full_path.as_ref())
         .map(|path| path.to_string_lossy().to_string());
 
-    let Some(location) = installed.install_location.as_deref() else {
-        if request.force {
-            try_remove_portable_symlinks(
-                known_symlink.as_deref().map(Path::new),
-                None,
-                installed_portable_scope(installed)?,
-                warnings,
-            );
-            if let Err(error) = remove_portable_registry_entry(installed) {
-                warnings.push(format!("Could not remove the portable registry entry: {error:#}"));
-            }
-            return Ok(0);
-        }
-        bail!(
-            "Portable package '{}' does not expose an install location.",
-            installed.name
+    // Like WinGet (PortableInstaller.cpp Uninstall), a package whose install location is
+    // unknown or already gone is still unregistered: there are no files left to remove.
+    let Some(location) = installed
+        .install_location
+        .as_deref()
+        .filter(|location| !location.trim().is_empty())
+    else {
+        try_remove_portable_symlinks(
+            known_symlink.as_deref().map(Path::new),
+            None,
+            installed_portable_scope(installed)?,
+            warnings,
         );
+        if let Err(error) = remove_portable_registry_entry(installed) {
+            warnings.push(format!("Could not remove the portable registry entry: {error:#}"));
+        }
+        return Ok(0);
     };
 
     let path = Path::new(location);
@@ -14031,7 +14042,8 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest, warning
         fs::remove_file(path)?;
         true
     } else {
-        false
+        // The directory is already gone; only the registration is left to remove.
+        fs::symlink_metadata(path).is_err()
     };
 
     if removed || request.force {
@@ -14054,6 +14066,14 @@ fn uninstall_portable(installed: &ListMatch, request: &UninstallRequest, warning
             scope,
             warnings,
         );
+        if directory_on_path
+            && path.is_absolute()
+            && let Err(error) = try_remove_directory_from_path(scope, path, warnings)
+        {
+            warnings.push(format!(
+                "Could not remove the portable install directory from PATH: {error:#}"
+            ));
+        }
         if let Err(error) = remove_portable_registry_entry(installed) {
             warnings.push(format!("Could not remove the portable registry entry: {error:#}"));
         }
@@ -14172,6 +14192,7 @@ fn read_portable_entry_for_installed(installed: &ListMatch) -> Result<Option<Exi
             symlinks: portable_symlinks_from_registry(&subkey, &entry),
             entry,
             registry_32: candidate.machine && candidate.wow64_32,
+            install_directory_added_to_path: portable_install_directory_added_to_path(&subkey),
         }));
     }
     Ok(None)
@@ -14391,13 +14412,19 @@ fn install_portable(
     scope: PortableScope,
     warnings: &mut Vec<String>,
 ) -> Result<i32> {
-    let source_identifier = portable_source_identifier(&request.query);
+    let source_identifier = portable_install_source_identifier(request);
     let x86_machine_layout = portable_uses_x86_machine_layout(scope, installer);
-    let (existing_entry, previous_links, registry_32) = match read_existing_portable_entry(&manifest.id, scope)? {
-        // Upgrade in place: keep the registry view the existing entry lives in.
-        Some(record) => (Some(record.entry), record.symlinks, record.registry_32),
-        None => (None, Vec::new(), x86_machine_layout),
-    };
+    let (existing_entry, previous_links, registry_32, previous_directory_on_path) =
+        match read_existing_portable_entry(&manifest.id, scope)? {
+            // Upgrade in place: keep the registry view the existing entry lives in.
+            Some(record) => (
+                Some(record.entry),
+                record.symlinks,
+                record.registry_32,
+                record.install_directory_added_to_path,
+            ),
+            None => (None, Vec::new(), x86_machine_layout, false),
+        };
     // Reuse the existing subkey name on upgrade so we don't orphan the prior
     // entry by writing to a different one.
     let subkey_name = existing_entry
@@ -14517,28 +14544,41 @@ fn install_portable(
     // the dir already existed this round.
     let install_directory_created = !dir_existed || prev_dir_created;
 
-    let portable_target_full_path: PathBuf = if is_zip {
-        let file = fs::File::open(installer_path)
-            .with_context(|| format!("failed to open installer zip: {}", installer_path.display()))?;
-        let mut archive = ZipArchive::new(file).context("failed to read installer zip")?;
-        archive
-            .extract(&target_dir)
-            .with_context(|| format!("failed to extract zip into: {}", target_dir.display()))?;
-        // For nested-portable zips the binary lives at the RelativeFilePath the
-        // manifest declares. We record the first one as PortableTargetFullPath so
-        // winget's portable uninstall workflow can identify which file to remove.
-        nested_path
-            .as_deref()
-            .map(|path| target_dir.join(path))
-            .unwrap_or_else(|| target_dir.clone())
-    } else {
-        // Standalone portable: copy the downloaded file into target_dir under
-        // its original (URL-derived) name; like WinGet, `--rename` names the
-        // command alias, not the binary.
-        let copied = target_dir.join(standalone_file_name);
-        fs::copy(installer_path, &copied)
-            .with_context(|| format!("failed to copy portable binary into: {}", target_dir.display()))?;
-        copied
+    let placed = (|| -> Result<PathBuf> {
+        if is_zip {
+            let file = fs::File::open(installer_path)
+                .with_context(|| format!("failed to open installer zip: {}", installer_path.display()))?;
+            let mut archive = ZipArchive::new(file).context("failed to read installer zip")?;
+            archive
+                .extract(&target_dir)
+                .with_context(|| format!("failed to extract zip into: {}", target_dir.display()))?;
+            // For nested-portable zips the binary lives at the RelativeFilePath the
+            // manifest declares. We record the first one as TargetFullPath so
+            // winget's portable uninstall workflow can identify which file to remove.
+            Ok(nested_path
+                .as_deref()
+                .map(|path| target_dir.join(path))
+                .unwrap_or_else(|| target_dir.clone()))
+        } else {
+            // Standalone portable: copy the downloaded file into target_dir under
+            // its original (URL-derived) name; like WinGet, `--rename` names the
+            // command alias, not the binary.
+            let copied = target_dir.join(standalone_file_name);
+            fs::copy(installer_path, &copied)
+                .with_context(|| format!("failed to copy portable binary into: {}", target_dir.display()))?;
+            Ok(copied)
+        }
+    })();
+    let portable_target_full_path = match placed {
+        Ok(path) => path,
+        Err(error) => {
+            // Like WinGet (PortableFlow.cpp PortableInstallImpl), a failed fresh install is
+            // rolled back instead of leaving a partial payload behind.
+            if existing_entry.is_none() {
+                rollback_failed_portable_install(&target_dir, dir_existed, &payload, &created_directories, warnings);
+            }
+            return Err(error);
+        }
     };
 
     if same_existing_location {
@@ -14593,17 +14633,11 @@ fn install_portable(
     }
 
     // Add the scope's links directory to PATH when a command link exists.
-    let added_to_path = if symlink_full_path.is_some() {
-        match try_add_links_dir_to_path(scope, warnings) {
-            Ok(added) => added,
-            Err(error) => {
-                warnings.push(format!("Could not add the portable links directory to PATH: {error:#}"));
-                false
-            }
-        }
-    } else {
-        false
-    };
+    if symlink_full_path.is_some()
+        && let Err(error) = try_add_links_dir_to_path(scope, warnings)
+    {
+        warnings.push(format!("Could not add the portable links directory to PATH: {error:#}"));
+    }
 
     write_portable_arp_entry(
         &PortableArpEntry {
@@ -14613,18 +14647,45 @@ fn install_portable(
             portable_symlink_full_path: symlink_full_path.as_deref(),
             symlinks: &symlinks,
             install_directory_created,
-            added_to_path,
+            // An install directory WinGet put on PATH stays there while the package lives in it.
+            install_directory_added_to_path: same_existing_location && previous_directory_on_path,
             files: &payload.files,
             directories: &created_directories,
             source_identifier: &source_identifier,
             registry_32,
             manifest,
+            installer,
         },
         scope,
     )?;
 
     cleanup_previous_portable_install(existing_entry.as_ref(), &target_dir, warnings);
     Ok(0)
+}
+
+/// Removes what a failed fresh portable install placed: the whole directory when the install
+/// created it, otherwise only the payload files and directories, which did not exist before
+/// (`plan_portable_payload` refuses conflicts with existing files).
+#[cfg(windows)]
+fn rollback_failed_portable_install(
+    target_dir: &Path,
+    dir_existed: bool,
+    payload: &PortablePayload,
+    created_directories: &[String],
+    warnings: &mut Vec<String>,
+) {
+    let result = if dir_existed {
+        remove_tracked_portable_files(target_dir, &payload.files, created_directories)
+    } else {
+        ensure_not_portable_reparse_point(target_dir)
+            .and_then(|()| fs::remove_dir_all(target_dir).with_context(|| format!("removing {}", target_dir.display())))
+    };
+    if let Err(error) = result {
+        warnings.push(format!(
+            "Could not roll back the failed portable install in '{}': {error:#}",
+            target_dir.display()
+        ));
+    }
 }
 
 #[cfg(windows)]
@@ -14804,11 +14865,19 @@ fn normalize_portable_relative_path(path: &str) -> Result<String> {
 #[cfg(any(windows, test))]
 fn is_reserved_portable_name(part: &str) -> bool {
     let name = part.split('.').next().unwrap_or_default().to_ascii_uppercase();
-    matches!(name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (name.len() == 4
-            && (name.starts_with("COM") || name.starts_with("LPT"))
-            && name.as_bytes()[3].is_ascii_digit()
-            && name.as_bytes()[3] != b'0')
+    if matches!(name.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    // COM1-9 / LPT1-9, and (like WinGet's MakeSuitablePathPart) the superscript-digit
+    // forms COM¹ COM² COM³ / LPT¹ LPT² LPT³, which Windows also reserves as devices.
+    let Some(suffix) = name.strip_prefix("COM").or_else(|| name.strip_prefix("LPT")) else {
+        return false;
+    };
+    let mut chars = suffix.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+    )
 }
 
 #[cfg(windows)]
@@ -14957,12 +15026,13 @@ struct PortableArpEntry<'a> {
     portable_symlink_full_path: Option<&'a Path>,
     symlinks: &'a [PathBuf],
     install_directory_created: bool,
-    added_to_path: bool,
+    install_directory_added_to_path: bool,
     files: &'a [String],
     directories: &'a [String],
     source_identifier: &'a str,
     registry_32: bool,
     manifest: &'a Manifest,
+    installer: &'a Installer,
 }
 
 /// One `Links\<alias>.exe` command link a portable install creates.
@@ -14991,6 +15061,11 @@ fn determine_portable_links(
         (!value.is_empty()).then(|| value.to_owned())
     };
     if is_archive {
+        // Like WinGet (ArchiveFlow.cpp EnsureValidNestedInstallerMetadataForArchiveInstall), an
+        // archive portable must name its files; otherwise nothing would be linked or tracked.
+        if installer.nested_installer_files.is_empty() {
+            bail!("the portable archive does not declare NestedInstallerFiles");
+        }
         return installer
             .nested_installer_files
             .iter()
@@ -15273,22 +15348,7 @@ fn prepare_portable_path_update(
     expand: impl Fn(&str) -> String,
 ) -> Result<Option<winreg::reg_value::RegValue>> {
     let (existing_path, value_type) = match existing {
-        Some(raw) => {
-            if raw.vtype != REG_SZ && raw.vtype != REG_EXPAND_SZ {
-                bail!("the existing PATH registry value has an unsupported type");
-            }
-            if raw.bytes.len() % 2 != 0 {
-                bail!("the existing PATH registry value has invalid UTF-16 data");
-            }
-            let value = OsString::from_reg_value(&raw)
-                .context("decoding the PATH registry value")?
-                .into_string()
-                .map_err(|_| anyhow!("the existing PATH registry value has invalid UTF-16 data"))?;
-            if value.contains('\0') {
-                bail!("the existing PATH registry value contains an embedded null");
-            }
-            (value, raw.vtype)
-        }
+        Some(raw) => decode_path_registry_value(&raw)?,
         None => (String::new(), REG_EXPAND_SZ),
     };
     let expandable = value_type == REG_EXPAND_SZ;
@@ -15304,6 +15364,104 @@ fn prepare_portable_path_update(
     let mut raw = new_path.to_reg_value();
     raw.vtype = value_type;
     Ok(Some(raw))
+}
+
+#[cfg(windows)]
+fn decode_path_registry_value(raw: &winreg::reg_value::RegValue) -> Result<(String, RegType)> {
+    if raw.vtype != REG_SZ && raw.vtype != REG_EXPAND_SZ {
+        bail!("the existing PATH registry value has an unsupported type");
+    }
+    if !raw.bytes.len().is_multiple_of(2) {
+        bail!("the existing PATH registry value has invalid UTF-16 data");
+    }
+    let value = OsString::from_reg_value(raw)
+        .context("decoding the PATH registry value")?
+        .into_string()
+        .map_err(|_| anyhow!("the existing PATH registry value has invalid UTF-16 data"))?;
+    if value.contains('\0') {
+        bail!("the existing PATH registry value contains an embedded null");
+    }
+    Ok((value, raw.vtype.clone()))
+}
+
+/// Drops every PATH component that names `directory` (compared like
+/// [`append_portable_links_path`]: expanded, unquoted, case-insensitive, ignoring trailing
+/// separators), keeping every other component as written. `None` when nothing matched.
+#[cfg(windows)]
+fn remove_portable_path_entry(existing: &str, directory: &str, expand: impl Fn(&str) -> String) -> Option<String> {
+    let normalize = |value: &str| value.trim_end_matches(['\\', '/']).to_lowercase();
+    let target = normalize(directory);
+    if target.is_empty() {
+        return None;
+    }
+    let components: Vec<&str> = existing.split(';').collect();
+    let kept: Vec<&str> = components
+        .iter()
+        .copied()
+        .filter(|component| normalize(&expand(component.trim().trim_matches('"'))) != target)
+        .collect();
+    (kept.len() != components.len()).then(|| kept.join(";"))
+}
+
+/// The PATH registry value with `directory` removed, keeping the value's type; `None` when
+/// PATH is missing or does not contain it.
+#[cfg(windows)]
+fn prepare_portable_path_removal(
+    existing: Option<winreg::reg_value::RegValue>,
+    directory: &str,
+    expand: impl Fn(&str) -> String,
+) -> Result<Option<winreg::reg_value::RegValue>> {
+    let Some(raw) = existing else {
+        return Ok(None);
+    };
+    let (existing_path, value_type) = decode_path_registry_value(&raw)?;
+    let expandable = value_type == REG_EXPAND_SZ;
+    let Some(new_path) = remove_portable_path_entry(&existing_path, directory, |component| {
+        if expandable {
+            expand(component)
+        } else {
+            component.to_owned()
+        }
+    }) else {
+        return Ok(None);
+    };
+    let mut raw = new_path.to_reg_value();
+    raw.vtype = value_type;
+    Ok(Some(raw))
+}
+
+/// Like WinGet (PortableInstaller.cpp Uninstall), removes an install directory that was put on
+/// PATH (`InstallDirectoryAddedToPath`) from the scope's PATH.
+#[cfg(windows)]
+fn try_remove_directory_from_path(scope: PortableScope, directory: &Path, warnings: &mut Vec<String>) -> Result<bool> {
+    let (hive, key_path) = match scope {
+        PortableScope::User => (RegKey::predef(HKEY_CURRENT_USER), r"Environment"),
+        PortableScope::Machine => (
+            RegKey::predef(HKEY_LOCAL_MACHINE),
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    };
+    let env_key = hive
+        .open_subkey_with_flags(key_path, KEY_READ | KEY_WRITE)
+        .with_context(|| format!("opening the {scope:?} environment registry key"))?;
+    let existing = match env_key.get_raw_value("Path") {
+        Ok(raw) => Some(raw),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("reading the PATH registry value"),
+    };
+    let Some(update) = prepare_portable_path_removal(existing, &directory.to_string_lossy(), expand_environment_path)?
+    else {
+        return Ok(false);
+    };
+    env_key
+        .set_raw_value("Path", &update)
+        .context("writing the PATH registry value")?;
+    if let Err(error) = broadcast_environment_change() {
+        warnings.push(format!(
+            "PATH was updated, but the environment-change notification failed: {error:#}"
+        ));
+    }
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -15353,9 +15511,36 @@ fn portable_source_identifier(query: &PackageQuery) -> String {
     }
 }
 
+/// WinGet's source identifier for a package installed from a local manifest (`--manifest`),
+/// which comes from no source (PortableFlow.cpp `s_DefaultSource`).
+#[cfg(windows)]
+const PORTABLE_LOCAL_MANIFEST_SOURCE: &str = "*DefaultSource";
+
+/// The source identifier recorded for a portable install. Like WinGet (PortableFlow.cpp
+/// GetPortableProductCode), a local manifest install is attributed to `*DefaultSource`, not to
+/// the community source it never came from.
+#[cfg(windows)]
+fn portable_install_source_identifier(request: &InstallRequest) -> String {
+    if request.manifest_path.is_some() {
+        return PORTABLE_LOCAL_MANIFEST_SOURCE.to_owned();
+    }
+    portable_source_identifier(&request.query)
+}
+
+/// The ARP subkey (WinGet product code) of a portable: `<id>_<source>`, made suitable as a path
+/// part the way WinGet's MakeSuitablePathPart does (illegal characters become `_`).
 #[cfg(windows)]
 fn portable_subkey_name(package_id: &str, source_identifier: &str) -> String {
     format!("{package_id}_{source_identifier}")
+        .chars()
+        .map(|ch| {
+            if ch < ' ' || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -15376,6 +15561,9 @@ struct ExistingPortableRecord {
     entry: ExistingPortableEntry,
     symlinks: Vec<PathBuf>,
     registry_32: bool,
+    /// WinGet's `InstallDirectoryAddedToPath`: the install directory itself was put on PATH
+    /// (symlink creation failed, or `ArchiveBinariesDependOnPath`).
+    install_directory_added_to_path: bool,
 }
 
 /// Registry views searched for an existing portable entry. HKCU is shared between views; a
@@ -15428,6 +15616,7 @@ fn read_existing_portable_entry(package_id: &str, scope: PortableScope) -> Resul
                 symlinks: portable_symlinks_from_registry(&subkey, &entry),
                 entry,
                 registry_32,
+                install_directory_added_to_path: portable_install_directory_added_to_path(&subkey),
             }));
         }
     }
@@ -15456,6 +15645,22 @@ fn portable_symlinks_from_registry(subkey: &RegKey, entry: &ExistingPortableEntr
     links
 }
 
+/// WinGet's portable ARP value names (PortableARPEntry.cpp).
+#[cfg(windows)]
+const PORTABLE_TARGET_VALUE: &str = "TargetFullPath";
+#[cfg(windows)]
+const PORTABLE_SYMLINK_VALUE: &str = "SymlinkFullPath";
+/// The value names earlier pinget versions wrote instead of WinGet's.
+#[cfg(windows)]
+const LEGACY_PORTABLE_TARGET_VALUE: &str = "PortableTargetFullPath";
+#[cfg(windows)]
+const LEGACY_PORTABLE_SYMLINK_VALUE: &str = "PortableSymlinkFullPath";
+
+#[cfg(windows)]
+fn portable_install_directory_added_to_path(subkey: &RegKey) -> bool {
+    is_arp_flag_set(read_reg_dword(subkey, "InstallDirectoryAddedToPath"))
+}
+
 #[cfg(windows)]
 fn portable_entry_from_registry(subkey: &RegKey, subkey_name: String) -> ExistingPortableEntry {
     let read_paths = |name| -> Option<Vec<String>> {
@@ -15467,8 +15672,14 @@ fn portable_entry_from_registry(subkey: &RegKey, subkey_name: String) -> Existin
     ExistingPortableEntry {
         install_location: read_reg_string(subkey, "InstallLocation").map(PathBuf::from),
         install_directory_created: read_reg_dword(subkey, "InstallDirectoryCreated"),
-        portable_target_full_path: read_reg_string(subkey, "PortableTargetFullPath").map(PathBuf::from),
-        portable_symlink_full_path: read_reg_string(subkey, "PortableSymlinkFullPath").map(PathBuf::from),
+        // WinGet names these `TargetFullPath` / `SymlinkFullPath` (PortableARPEntry.cpp); earlier
+        // pinget versions wrote `Portable`-prefixed names, which are still honored.
+        portable_target_full_path: read_reg_string(subkey, PORTABLE_TARGET_VALUE)
+            .or_else(|| read_reg_string(subkey, LEGACY_PORTABLE_TARGET_VALUE))
+            .map(PathBuf::from),
+        portable_symlink_full_path: read_reg_string(subkey, PORTABLE_SYMLINK_VALUE)
+            .or_else(|| read_reg_string(subkey, LEGACY_PORTABLE_SYMLINK_VALUE))
+            .map(PathBuf::from),
         files: read_paths("PingetPortableFiles"),
         directories: read_paths("PingetPortableDirectories"),
         subkey_name,
@@ -15579,16 +15790,31 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>, scope: PortableScope) 
     subkey.set_value("WinGetSourceIdentifier", &entry.source_identifier.to_owned())?;
     subkey.set_value("WinGetInstallerType", &"portable".to_owned())?;
     subkey.set_value("InstallLocation", &install_location_str)?;
+    // WinGet's value names (PortableARPEntry.cpp), plus the target's SHA256, which WinGet checks
+    // before it removes the file on uninstall or upgrade.
     subkey.set_value(
-        "PortableTargetFullPath",
+        PORTABLE_TARGET_VALUE,
         &entry.portable_target_full_path.to_string_lossy().to_string(),
     )?;
+    if entry.portable_target_full_path.is_file() {
+        subkey.set_value(
+            "SHA256",
+            &sha256_file_hex(entry.portable_target_full_path)?.to_ascii_lowercase(),
+        )?;
+    }
     if let Some(symlink_path) = entry.portable_symlink_full_path {
-        subkey.set_value("PortableSymlinkFullPath", &symlink_path.to_string_lossy().to_string())?;
-    } else if let Err(error) = subkey.delete_value("PortableSymlinkFullPath")
+        subkey.set_value(PORTABLE_SYMLINK_VALUE, &symlink_path.to_string_lossy().to_string())?;
+    } else if let Err(error) = subkey.delete_value(PORTABLE_SYMLINK_VALUE)
         && error.kind() != std::io::ErrorKind::NotFound
     {
         return Err(error).context("removing the previous portable symlink registry value");
+    }
+    for legacy in [LEGACY_PORTABLE_TARGET_VALUE, LEGACY_PORTABLE_SYMLINK_VALUE] {
+        if let Err(error) = subkey.delete_value(legacy)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error).context("removing a legacy portable registry value");
+        }
     }
     let symlinks: Vec<String> = entry
         .symlinks
@@ -15596,9 +15822,15 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>, scope: PortableScope) 
         .map(|path| path.to_string_lossy().to_string())
         .collect();
     subkey.set_value("PingetPortableSymlinks", &symlinks)?;
+    // Like WinGet, this flag means the install directory itself is on PATH; adding the shared
+    // Links directory to PATH does not set it.
     subkey.set_value(
         "InstallDirectoryAddedToPath",
-        &(if entry.added_to_path { 1u32 } else { 0u32 }),
+        &(if entry.install_directory_added_to_path {
+            1u32
+        } else {
+            0u32
+        }),
     )?;
     subkey.set_value(
         "InstallDirectoryCreated",
@@ -15606,17 +15838,31 @@ fn write_portable_arp_entry(entry: &PortableArpEntry<'_>, scope: PortableScope) 
     )?;
     subkey.set_value("PingetPortableFiles", &entry.files.to_vec())?;
     subkey.set_value("PingetPortableDirectories", &entry.directories.to_vec())?;
-    subkey.set_value(
-        "DisplayName",
-        &if manifest.name.is_empty() {
+    // Like WinGet (PortableInstaller.cpp SetAppsAndFeaturesMetadata), the installer's first
+    // AppsAndFeaturesEntries entry wins over the manifest's name, version and publisher, so the
+    // entry matches the ARP identity the manifest declares for version mapping.
+    let arp = entry.installer.apps_and_features_entries.first();
+    let arp_value = |select: fn(&AppsAndFeaturesEntry) -> Option<&String>| {
+        arp.and_then(select)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let display_name = arp_value(|arp| arp.display_name.as_ref()).unwrap_or_else(|| {
+        if manifest.name.is_empty() {
             manifest.id.clone()
         } else {
             manifest.name.clone()
-        },
-    )?;
-    subkey.set_value("DisplayVersion", &manifest.version)?;
-    if let Some(publisher) = manifest.publisher.as_ref() {
-        subkey.set_value("Publisher", publisher)?;
+        }
+    });
+    subkey.set_value("DisplayName", &display_name)?;
+    let display_version = arp_value(|arp| arp.display_version.as_ref()).unwrap_or_else(|| manifest.version.clone());
+    subkey.set_value("DisplayVersion", &display_version)?;
+    if let Some(publisher) = arp_value(|arp| arp.publisher.as_ref()).or_else(|| manifest.publisher.clone()) {
+        subkey.set_value("Publisher", &publisher)?;
+    }
+    if let Some(help_link) = manifest.publisher_support_url.as_ref() {
+        subkey.set_value("HelpLink", help_link)?;
     }
     subkey.set_value(
         "UninstallString",
