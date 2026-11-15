@@ -46,7 +46,10 @@ internal static class ImportCommandHandler
 
                 foreach (var entry in entries.EnumerateArray())
                 {
-                    var id = entry.ValueKind == JsonValueKind.Object ? GetJsonString(entry, "PackageIdentifier") : null;
+                    // Schema 2.0 names the package `PackageIdentifier`; schema 1.0 (still read by WinGet) uses `Id`.
+                    var id = entry.ValueKind == JsonValueKind.Object
+                        ? GetJsonString(entry, "PackageIdentifier") ?? GetJsonString(entry, "Id")
+                        : null;
                     if (string.IsNullOrWhiteSpace(id))
                         throw new InvalidDataException("Invalid import file: package entry is missing 'PackageIdentifier'");
 
