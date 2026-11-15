@@ -27,7 +27,11 @@ const CODE_SIGNING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5
 /// Locates `psign-tool` from an explicit path, `PATH`, or the .NET global tool directory.
 pub(crate) fn find_psign_tool(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = explicit {
-        return path.is_file().then(|| path.to_path_buf());
+        // `Command` searches PATH (not the current directory) for a bare file name, so run the
+        // file that was actually checked.
+        return path
+            .is_file()
+            .then(|| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
     }
     let names: &[&str] = if cfg!(windows) {
         &["psign-tool.exe", "psign-tool.cmd"]

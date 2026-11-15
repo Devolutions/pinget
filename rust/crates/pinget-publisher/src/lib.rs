@@ -30,6 +30,8 @@ mod review_b_tests;
 #[cfg(test)]
 mod wave12_tests;
 #[cfg(test)]
+mod wave21_tests;
+#[cfg(test)]
 mod wave6_tests;
 
 // Includes all upstream WinGet frozen manifest versions (plus 1.11.0/1.8.0/1.3.0 minor slots accepted for compatibility).
@@ -455,8 +457,9 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport> {
                     row.get(0)
                 })?;
             let old: BTreeMap<String, String> = serde_json::from_str(&old_inventory)?;
-            if old == inventory.files {
-                let snapshot = state.join("builds").join(&build_id);
+            let snapshot = state.join("builds").join(&build_id);
+            // A removed snapshot directory is rebuilt below instead of failing every later build.
+            if old == inventory.files && fs::symlink_metadata(&snapshot).is_ok() {
                 verify_snapshot_path(&snapshot)?;
                 let metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
                 validate_recorded_snapshot(&connection, &metadata)?;
@@ -1165,13 +1168,20 @@ fn build_snapshot(
         let (arp_min_version, arp_max_version) = arp_version_range(std::slice::from_ref(&latest))?.unzip();
         let row_id =
             i64::try_from(row_index + 1).map_err(|_| PublisherError::Invalid("too many package rows".to_owned()))?;
+        // WinGet trims PackageName and Moniker and stores no moniker rather than an empty one
+        // (ManifestYamlPopulator, Interface_2_0 PrepareForPackaging `addIfPresent`).
+        let moniker = latest
+            .moniker
+            .as_deref()
+            .map(winget_trim)
+            .filter(|moniker| !moniker.is_empty());
         transaction.execute(
             "INSERT INTO packages(rowid,id,name,moniker,latest_version,arp_min_version,arp_max_version,hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 row_id,
                 latest.id,
-                latest.name,
-                latest.moniker,
+                winget_trim(&latest.name),
+                moniker,
                 latest.version,
                 arp_min_version,
                 arp_max_version,
@@ -1307,8 +1317,12 @@ fn scan_directory(
         let content = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
         let deserializer = serde_yaml::Deserializer::from_slice(content);
         let mut any_document = false;
+        let mut document_count = 0usize;
         for document in deserializer {
-            if any_document {
+            // Empty documents count too: WinGet reads only the first document of a file, so a
+            // manifest that follows an empty `---` document would be invisible to it.
+            document_count += 1;
+            if document_count > 1 {
                 return Err(PublisherError::Invalid(format!(
                     "expected one YAML document in {}",
                     path.display()
@@ -1600,6 +1614,8 @@ fn is_manifest_string_field(key: &str) -> bool {
                 | "InstallerIdentifier"
                 | "ProductId"
                 | "StoreProductId"
+                | "Agreement"
+                | "AgreementLabel"
         )
 }
 
@@ -1794,7 +1810,6 @@ fn catalog_fields_all(packages: &[PackageManifest]) -> Result<CatalogFields> {
     for document in packages.iter().flat_map(|package| &package.locale_docs) {
         let map = as_mapping(&document.document)?;
         extend_strings(&mut tags, map, "Tags");
-        extend_strings(&mut commands, map, "Commands");
         let mut scopes = vec![map];
         for key in ["Localization", "Installers"] {
             if let Some(values) = map_get(map, key).and_then(Value::as_sequence) {
@@ -1803,7 +1818,6 @@ fn catalog_fields_all(packages: &[PackageManifest]) -> Result<CatalogFields> {
         }
         for nested in scopes {
             extend_strings(&mut tags, nested, "Tags");
-            extend_strings(&mut commands, nested, "Commands");
             if let Some(value) = optional_string(nested, "PackageName") {
                 let normalized = pinget_core::normalize_catalog_name(&value);
                 if !normalized.name.is_empty() {
@@ -1823,9 +1837,22 @@ fn catalog_fields_all(packages: &[PackageManifest]) -> Result<CatalogFields> {
             pfns.extend(installer.package_family_name);
             product_codes.extend(installer.product_code);
             extend_strings(&mut upgrade_codes, installer.installer, "UpgradeCode");
+            // Root `Commands` are a default that an installer's own `Commands` replace
+            // (Manifest::GetAggregatedCommands over the populated installers).
+            let command_scope = if map_get(installer.installer, "Commands").is_some() {
+                installer.installer
+            } else {
+                map
+            };
+            extend_strings(&mut commands, command_scope, "Commands");
             for entry in installer.entries {
                 if let Some(value) = optional_string(entry, "DisplayName") {
                     let normalized = pinget_core::normalize_catalog_name(&value);
+                    // WinGet also indexes ARP display names with their architecture
+                    // (Interface_1_2 GetNormalizedNames, NormalizationField::Architecture).
+                    if let Some(architecture) = winget_architecture_name(&normalized.architecture) {
+                        normalized_names.insert(format!("{}({architecture})", normalized.name));
+                    }
                     if !normalized.name.is_empty() {
                         normalized_names.insert(normalized.name);
                     }
@@ -1967,6 +1994,7 @@ fn arp_version_range(packages: &[PackageManifest]) -> Result<Option<(String, Str
                         .entries
                         .iter()
                         .filter_map(|entry| optional_string(entry, "DisplayVersion"))
+                        .map(|value| winget_trim(&value).to_owned())
                         .filter(|value| !value.trim().is_empty()),
                 );
             }
@@ -4024,15 +4052,38 @@ fn json_quote(value: &str) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 
+/// Collects catalog strings trimmed like WinGet's manifest populator, which trims `Tags`,
+/// `Commands` and the ARP entry codes before they are indexed.
 fn extend_strings(target: &mut BTreeSet<String>, mapping: &Mapping, key: &str) {
     match map_get(mapping, key) {
         Some(Value::String(value)) => {
-            target.insert(value.clone());
+            target.insert(winget_trim(value).to_owned());
         }
         Some(Value::Sequence(values)) => {
-            target.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+            target.extend(
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|value| winget_trim(value).to_owned()),
+            );
         }
         _ => {}
+    }
+}
+
+/// WinGet `Utility::Trim`: strips `AICLI_SPACE_CHARS` (space, `\f`, `\n`, `\r`, `\t`, `\v`).
+fn winget_trim(value: &str) -> &str {
+    value.trim_matches([' ', '\x0c', '\n', '\r', '\t', '\x0b'])
+}
+
+/// WinGet `ToString(Architecture)` for a normalizer-detected architecture; `None` when unknown.
+fn winget_architecture_name(architecture: &str) -> Option<&'static str> {
+    match architecture {
+        "x86" => Some("X86"),
+        "x64" => Some("X64"),
+        "arm" => Some("Arm"),
+        "arm64" => Some("Arm64"),
+        _ => None,
     }
 }
 
