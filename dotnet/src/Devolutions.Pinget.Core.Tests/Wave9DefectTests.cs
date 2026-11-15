@@ -251,7 +251,8 @@ public class Wave9DefectTests
         Assert.All(MatchTypes(exact, "Inclusions"), pair => Assert.Equal("Exact", pair.MatchType));
 
         var many = SearchBody(new PackageQuery { Id = "Contoso", Tag = "cli" }, SearchSemantics.Many);
-        Assert.Equal([("PackageIdentifier", "Substring"), ("Tag", "Exact")], MatchTypes(many, "Filters"));
+        // WinGet's SearchSourceApplyFilters gives the tag filter the request's match type too.
+        Assert.Equal([("PackageIdentifier", "Substring"), ("Tag", "Substring")], MatchTypes(many, "Filters"));
     }
 
     // ── R9-8 / R9-11: packaged layout YAML ──

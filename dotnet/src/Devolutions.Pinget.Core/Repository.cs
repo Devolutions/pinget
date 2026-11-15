@@ -2800,25 +2800,168 @@ public class Repository : IDisposable
         var systemPlatform = CurrentPlatform();
         var currentOsVersion = CurrentWindowsVersion();
 
-        return installers
+        var preference = new InstallerPreference(
+            requestedLocale,
+            preferredLocales,
+            requestedArchitecture,
+            requestedType,
+            systemArchitecture,
+            string.IsNullOrWhiteSpace(requestedScope) ? "user" : requestedScope.Trim());
+
+        Installer? best = null;
+        foreach (var installer in installers
             .Where(installer => InstallerMatchesRequested(installer, requestedType, requestedScope, requestedPlatform, requestedOsVersion, systemPlatform, currentOsVersion))
             .Where(installer => InstallerMatchesArchitecture(installer, requestedArchitecture, systemArchitecture))
             .Where(installer => !InstallerUnsupportedOnArchitecture(installer, systemArchitecture))
             .Where(installer => InstallerMatchesMarket(installer, market))
-            .Where(installer => InstallerMatchesLocale(installer.Locale, requestedLocale))
-            .Select((installer, index) => new
-            {
-                Installer = installer,
-                Index = index,
-                Rank = InstallerRank(installer, requestedLocale, preferredLocales, requestedArchitecture, systemArchitecture),
-            })
-            .OrderByDescending(item => item.Rank.Architecture)
-            .ThenByDescending(item => item.Rank.Locale)
-            .ThenByDescending(item => item.Rank.Commands)
-            .ThenBy(item => item.Index)
-            .Select(item => item.Installer)
-            .FirstOrDefault();
+            .Where(installer => InstallerMatchesLocale(installer.Locale, requestedLocale)))
+        {
+            if (best is null || InstallerIsBetter(installer, best, preference))
+                best = installer;
+        }
+        return best;
     }
+
+    /// <summary>
+    /// What installer selection prefers, after WinGet's <c>ManifestComparator</c> comparators. <c>PreferredScope</c>
+    /// is the requested scope, else WinGet's default <c>installBehavior.preferences.scope</c> (user).
+    /// </summary>
+    private sealed record InstallerPreference(
+        string? RequestedLocale,
+        IReadOnlyList<string> PreferredLocales,
+        string? RequestedArchitecture,
+        string? RequestedType,
+        string SystemArchitecture,
+        string PreferredScope);
+
+    // One comparator's verdict on two installers: Strong decides at once, otherwise the first Weak verdict (in
+    // comparator priority order) decides.
+    private enum InstallerComparisonStrength { Neither, Weak, Strong }
+
+    private readonly record struct InstallerComparison(InstallerComparisonStrength Strength, bool FirstIsBetter)
+    {
+        public static readonly InstallerComparison Neither = new(InstallerComparisonStrength.Neither, false);
+    }
+
+    private static InstallerComparison RankComparison(int first, int second, bool strong) =>
+        first == second
+            ? InstallerComparison.Neither
+            : new(strong ? InstallerComparisonStrength.Strong : InstallerComparisonStrength.Weak, first > second);
+
+    /// <summary>
+    /// WinGet <c>ManifestComparator::IsFirstBetter</c>: comparators in priority order (locale, scope, architecture,
+    /// installer type, then Pinget's command tie-break); the first strong verdict wins, else the first weak one; a
+    /// full tie keeps the earlier installer. Mirrors the Rust installer_is_better.
+    /// </summary>
+    private static bool InstallerIsBetter(Installer first, Installer second, InstallerPreference preference)
+    {
+        var comparisons = new[]
+        {
+            LocaleComparison(first, second, preference),
+            ScopeComparison(first, second, preference.PreferredScope),
+            ArchitectureComparison(first, second, preference),
+            // A requested installer type is a requirement; the default type preference only orders installers
+            // when no type was requested.
+            preference.RequestedType is null
+                ? RankComparison(InstallerTypeRank(first), InstallerTypeRank(second), strong: false)
+                : InstallerComparison.Neither,
+            RankComparison(first.Commands.Count > 0 ? 1 : 0, second.Commands.Count > 0 ? 1 : 0, strong: false),
+        };
+
+        bool? weak = null;
+        foreach (var comparison in comparisons)
+        {
+            if (comparison.Strength == InstallerComparisonStrength.Strong)
+                return comparison.FirstIsBetter;
+            if (comparison.Strength == InstallerComparisonStrength.Weak)
+                weak ??= comparison.FirstIsBetter;
+        }
+        return weak ?? false;
+    }
+
+    // WinGet LocaleComparator: a better (compatible) locale match is strong; an undeclared locale over one that
+    // matches nothing is weak.
+    private static InstallerComparison LocaleComparison(Installer first, Installer second, InstallerPreference preference)
+    {
+        int Rank(Installer installer) => preference.RequestedLocale is not null
+            ? LocaleRank(installer.Locale, preference.RequestedLocale)
+            : PreferredLocaleRank(installer.Locale, preference.PreferredLocales);
+        // Requested-locale ranks: 3 exact, 2 same language, 1 undeclared. Preferred-language ranks: 4 and up
+        // match a preference, 1 undeclared, 0 no match.
+        var compatibleRank = preference.RequestedLocale is not null ? 2 : 4;
+        var (firstRank, secondRank) = (Rank(first), Rank(second));
+        return RankComparison(firstRank, secondRank, firstRank >= compatibleRank || secondRank >= compatibleRank);
+    }
+
+    private static string? DeclaredInstallerScope(Installer installer) =>
+        string.IsNullOrWhiteSpace(installer.Scope) ? null : installer.Scope.Trim();
+
+    // WinGet ScopeComparator: the preferred scope beats the other scope strongly and an undeclared scope weakly.
+    private static InstallerComparison ScopeComparison(Installer first, Installer second, string preferredScope)
+    {
+        bool Matches(Installer installer) =>
+            DeclaredInstallerScope(installer)?.Equals(preferredScope, StringComparison.OrdinalIgnoreCase) == true;
+        var (firstMatches, secondMatches) = (Matches(first), Matches(second));
+        if (firstMatches == secondMatches)
+            return InstallerComparison.Neither;
+        var loser = firstMatches ? second : first;
+        var strength = DeclaredInstallerScope(loser) is null ? InstallerComparisonStrength.Weak : InstallerComparisonStrength.Strong;
+        return new(strength, firstMatches);
+    }
+
+    // WinGet MachineArchitectureComparator: a better architecture is a strong verdict when it is the requested
+    // (else the system) architecture, a weak one otherwise.
+    private static InstallerComparison ArchitectureComparison(Installer first, Installer second, InstallerPreference preference)
+    {
+        var firstRank = ArchitectureRank(first.Architecture, preference.RequestedArchitecture, preference.SystemArchitecture);
+        var secondRank = ArchitectureRank(second.Architecture, preference.RequestedArchitecture, preference.SystemArchitecture);
+        var better = firstRank >= secondRank ? first : second;
+        var strongArchitecture = preference.RequestedArchitecture ?? preference.SystemArchitecture;
+        var strong = better.Architecture?.Equals(strongArchitecture, StringComparison.OrdinalIgnoreCase) == true;
+        return RankComparison(firstRank, secondRank, strong);
+    }
+
+    /// <summary>
+    /// WinGet <c>ManifestInstaller::EffectiveInstallerType</c>: an archive (<c>zip</c>) installs its nested installer
+    /// type; <c>appx</c> is the same installer type as <c>msix</c>. Returns the base and the effective type.
+    /// </summary>
+    private static IEnumerable<string> InstallerSelectionTypes(Installer installer)
+    {
+        if (installer.InstallerType is null)
+            yield break;
+        var baseType = CanonicalInstallerType(installer.InstallerType);
+        yield return baseType;
+        if (baseType == "zip" && !string.IsNullOrWhiteSpace(installer.NestedInstallerType))
+            yield return CanonicalInstallerType(installer.NestedInstallerType);
+    }
+
+    private static string CanonicalInstallerType(string value)
+    {
+        var canonical = value.Trim().ToLowerInvariant();
+        return canonical == "appx" ? "msix" : canonical;
+    }
+
+    // `--installer-type` matches the base or the effective (nested) installer type, like WinGet's InstallerTypeComparator.
+    private static bool InstallerMatchesType(Installer installer, string? requestedType)
+    {
+        if (requestedType is null)
+            return true;
+        var requested = CanonicalInstallerType(requestedType);
+        return InstallerSelectionTypes(installer).Any(type => type == requested);
+    }
+
+    private static readonly string[] DefaultInstallerTypePreference =
+        ["msstore", "msix", "msi", "wix", "burn", "nullsoft", "inno", "exe", "portable"];
+
+    // WinGet's default installer type preference (used when no type is requested): earlier types rank higher; an
+    // archive ranks by its nested type.
+    internal static int InstallerTypeRank(Installer installer) =>
+        InstallerSelectionTypes(installer)
+            .Select(type => Array.IndexOf(DefaultInstallerTypePreference, type))
+            .Where(position => position >= 0)
+            .Select(position => DefaultInstallerTypePreference.Length - position)
+            .DefaultIfEmpty(0)
+            .Max();
 
     // ── Manifest parsing ──
 
@@ -4897,7 +5040,7 @@ public class Repository : IDisposable
         string? requestedOsVersion,
         string? systemPlatform,
         string? currentOsVersion) =>
-        MatchesOptionalCaseInsensitive(installer.InstallerType, requestedType) &&
+        InstallerMatchesType(installer, requestedType) &&
         InstallerMatchesScope(installer.Scope, requestedScope) &&
         InstallerMatchesPlatform(installer, requestedPlatform, systemPlatform) &&
         InstallerMatchesOsVersion(installer, requestedOsVersion, currentOsVersion);
@@ -4974,39 +5117,19 @@ public class Repository : IDisposable
         => installer.UnsupportedOSArchitectures.Any(value =>
             value.Trim().Equals(systemArchitecture, StringComparison.OrdinalIgnoreCase));
 
-    private static (int Architecture, int Locale, int Commands) InstallerRank(
-        Installer installer,
-        string? requestedLocale,
-        IReadOnlyList<string> preferredLocales,
-        string? requestedArchitecture,
-        string systemArchitecture)
-    {
-        var architecture = ArchitectureRank(
-            installer.Architecture,
-            requestedArchitecture ?? systemArchitecture,
-            requestedArchitecture is not null,
-            systemArchitecture);
-        var locale = requestedLocale is not null
-            ? LocaleRank(installer.Locale, requestedLocale)
-            : PreferredLocaleRank(installer.Locale, preferredLocales);
-        var commands = installer.Commands.Count == 0 ? 0 : 1;
-        return (architecture, locale, commands);
-    }
-
-    private static int ArchitectureRank(
+    /// <summary>
+    /// WinGet <c>IsApplicableArchitecture</c>: the requested architecture, else the system's applicable architectures
+    /// in preference order (<c>neutral</c> last), ranked from the end of that list.
+    /// </summary>
+    internal static int ArchitectureRank(
         string? installerArchitecture,
-        string preferredArchitecture,
-        bool strict,
+        string? requestedArchitecture,
         string systemArchitecture)
     {
         if (installerArchitecture is null)
             return 0;
-        if (installerArchitecture.Equals(preferredArchitecture, StringComparison.OrdinalIgnoreCase))
-            return 5;
-        if (installerArchitecture.Equals("neutral", StringComparison.OrdinalIgnoreCase))
-            return 4;
-        if (strict)
-            return -1;
+        if (requestedArchitecture is not null)
+            return installerArchitecture.Equals(requestedArchitecture, StringComparison.OrdinalIgnoreCase) ? 1 : -1;
 
         var preferred = PreferredArchitectures(systemArchitecture);
         for (int i = preferred.Length - 1; i >= 0; i--)
@@ -5103,9 +5226,6 @@ public class Repository : IDisposable
         return 0;
     }
 
-    private static bool MatchesOptionalCaseInsensitive(string? value, string? requested) =>
-        requested is null || (value is not null && value.Equals(requested, StringComparison.OrdinalIgnoreCase));
-
     /// <summary>Parses a dotted numeric version of any length, like the Rust parse_dotted_version.</summary>
     private static bool TryParseDottedVersion(string value, out ulong[] version)
     {
@@ -5155,10 +5275,11 @@ public class Repository : IDisposable
     private static string? CurrentWindowsVersion() =>
         OperatingSystem.IsWindows() ? Environment.OSVersion.Version.ToString() : null;
 
+    // WinGet CreateApplicableArchitecturesVector: the native architecture, then the emulated ones, then neutral last.
     private static string[] PreferredArchitectures(string systemArchitecture) => systemArchitecture switch
     {
-        "arm64" => ["arm64", "neutral", "x64", "x86"],
-        "x64" => ["x64", "neutral", "x86"],
+        "arm64" => ["arm64", "x64", "x86", "neutral"],
+        "x64" => ["x64", "x86", "neutral"],
         "x86" => ["x86", "neutral"],
         _ => ["neutral"],
     };
