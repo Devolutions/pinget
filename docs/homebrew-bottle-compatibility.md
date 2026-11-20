@@ -76,4 +76,9 @@ gates remain necessary; Linux success alone does not establish them.
 The approved hosted run
 [44815970690](https://github.com/Devolutions/pinget/actions/runs/44815970690)
 exposed non-root relocation and macOS trust setup failures; its results do not
-establish macOS execution or Windows/macOS publishing acceptance.
+establish macOS execution or Windows/macOS publishing acceptance. Both
+implementations now temporarily grant owner read/write access during
+relocation and restore file modes on success or failure; all 16 real-bottle
+acceptance checks pass as an unprivileged Linux user. The follow-up hosted run
+[44833201971](https://github.com/Devolutions/pinget/actions/runs/44833201971)
+requires approval before its platform jobs can execute.

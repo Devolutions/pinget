@@ -1,13 +1,6 @@
 name: Homebrew prototype acceptance
 
 on:
-  push:
-    branches: [copilot/scaling-chainsaw]
-    paths:
-      - 'rust/**'
-      - 'dotnet/**'
-      - 'tests/homebrew/**'
-      - '.github/workflows/homebrew-prototype.yml'
   workflow_dispatch:
   workflow_call:
 
