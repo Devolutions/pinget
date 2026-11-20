@@ -1,4 +1,9 @@
+#[cfg(test)]
+mod homebrew_tests;
+#[cfg(test)]
+mod homebrew_source_tests;
 mod name_normalization;
+mod homebrew_source;
 #[cfg(test)]
 mod portable_payload_tests;
 #[cfg(test)]
@@ -167,6 +172,8 @@ const REST_SUPPORTED_CONTRACTS: &[&str] = &[
 pub enum SourceKind {
     #[serde(rename = "PreIndexed", alias = "preIndexed")]
     PreIndexed,
+    #[serde(rename = "HomebrewPreIndexed", alias = "homebrewPreIndexed")]
+    HomebrewPreIndexed,
     #[serde(rename = "Rest", alias = "rest")]
     Rest,
 }
@@ -175,8 +182,15 @@ impl Display for SourceKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             SourceKind::PreIndexed => f.write_str("preindexed"),
+            SourceKind::HomebrewPreIndexed => f.write_str("homebrew-preindexed"),
             SourceKind::Rest => f.write_str("rest"),
         }
+    }
+}
+
+impl SourceKind {
+    fn is_preindexed(self) -> bool {
+        matches!(self, Self::PreIndexed | Self::HomebrewPreIndexed)
     }
 }
 
@@ -204,6 +218,10 @@ pub struct SourceRecord {
     pub etag: Option<String>,
     #[serde(default, alias = "last_modified")]
     pub last_modified: Option<String>,
+    #[serde(default)]
+    pub publisher: Option<String>,
+    #[serde(default)]
+    pub trusted_ca: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +245,8 @@ impl Default for SourceStore {
                     source_version: None,
                     etag: None,
                     last_modified: None,
+                    publisher: None,
+                    trusted_ca: Vec::new(),
                 },
                 SourceRecord {
                     name: "msstore".to_owned(),
@@ -240,6 +260,8 @@ impl Default for SourceStore {
                     source_version: None,
                     etag: None,
                     last_modified: None,
+                    publisher: None,
+                    trusted_ca: Vec::new(),
                 },
             ],
         }
@@ -445,6 +467,81 @@ pub struct VersionKey {
     pub channel: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct HomebrewFormulaMetadata {
+    pub schema_version: u32,
+    pub formula: String,
+    pub tap: String,
+    pub upstream_version: String,
+    pub revision: u32,
+    pub version_scheme: u32,
+    pub aliases: Vec<String>,
+    pub old_names: Vec<String>,
+    pub keg_only: bool,
+    pub bottles: Vec<HomebrewBottleMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct HomebrewBottleMetadata {
+    pub url: String,
+    pub sha256: String,
+    pub target_os: String,
+    pub architecture: String,
+    pub bottle_tag: String,
+    pub rebuild: u32,
+    pub relocation: String,
+    pub minimum_os_version: Option<String>,
+    pub maximum_os_version: Option<String>,
+    pub minimum_glibc: Option<String>,
+    pub loader: Option<String>,
+}
+
+/// Creates a stable Pinget identifier from the exact Homebrew tap and formula names.
+///
+/// The formula slug fits WinGet's 32-character segment limit; a digest of the
+/// normalized, fully qualified identity distinguishes separators and taps.
+pub fn homebrew_package_identifier(tap: &str, formula: &str) -> Result<String> {
+    let tap_parts = tap.split('/').collect::<Vec<_>>();
+    if tap_parts.len() != 2
+        || tap_parts.iter().any(|part| {
+            part.trim().is_empty()
+                || *part != part.trim()
+                || !part.is_ascii()
+                || part.chars().any(char::is_whitespace)
+                || !part.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        })
+        || formula.trim().is_empty()
+        || formula != formula.trim()
+        || !formula.is_ascii()
+        || formula.chars().any(char::is_whitespace)
+        || !formula.bytes().any(|byte| byte.is_ascii_alphanumeric())
+    {
+        bail!("Homebrew package identity requires a formula name and fully qualified tap");
+    }
+
+    let identity = format!("{tap}/{formula}").to_ascii_lowercase();
+    let mut slug = String::new();
+    for character in formula.to_ascii_lowercase().chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug
+        .trim_matches('-')
+        .chars()
+        .take(15)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    let digest = Sha256::digest(identity.as_bytes());
+    let suffix = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    Ok(format!("Pinget.Homebrew.{slug}-{suffix}"))
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Manifest {
     pub id: String,
@@ -471,6 +568,8 @@ pub struct Manifest {
     pub documentation: Vec<Documentation>,
     pub icons: Vec<PackageIcon>,
     pub installers: Vec<Installer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub homebrew: Option<HomebrewFormulaMetadata>,
     // `RequireExplicitUpgrade: true` opts a package out of bulk
     // `pinget upgrade` output (winget parity). Users can still upgrade by
     // explicit `id`. Set at top-level or per-installer; treated as true
@@ -1182,6 +1281,7 @@ pub struct Repository {
     app_root: PathBuf,
     user_agent: String,
     client: Client,
+    homebrew_client: Client,
     store: SourceStore,
     source_mode: EffectiveSourceMode,
     install_progress: Option<fn(&InstallProgress)>,
@@ -1254,10 +1354,17 @@ impl Repository {
             .timeout(StdDuration::from_secs(30 * 60))
             .build()
             .context("failed to build HTTP client")?;
+        let homebrew_client = Client::builder()
+            .user_agent(&options.user_agent)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(StdDuration::from_secs(30 * 60))
+            .build()
+            .context("failed to build non-redirecting Homebrew source HTTP client")?;
         Ok(Self {
             app_root: options.app_root,
             user_agent: options.user_agent,
             client,
+            homebrew_client,
             store,
             source_mode,
             install_progress: options.install_progress,
@@ -1303,6 +1410,9 @@ impl Repository {
         priority: i32,
     ) -> Result<()> {
         validate_source_argument(arg)?;
+        if kind == SourceKind::HomebrewPreIndexed {
+            bail!("Homebrew static sources require an expected publisher and explicit trust configuration.");
+        }
         if self.uses_system_winget_sources() {
             system_winget_add_source(name, arg, kind, &normalize_source_trust_level(trust_level)?, explicit)?;
             self.refresh_system_winget_sources()?;
@@ -1328,10 +1438,67 @@ impl Repository {
             source_version: None,
             etag: None,
             last_modified: None,
+            publisher: None,
+            trusted_ca: Vec::new(),
         });
         if self.source_mode != EffectiveSourceMode::SystemWingetDirect {
             self.save_store()?;
         }
+        Ok(())
+    }
+
+    pub fn add_homebrew_source(
+        &mut self,
+        name: &str,
+        arg: &str,
+        publisher: &str,
+        trusted_ca: &[PathBuf],
+    ) -> Result<()> {
+        if cfg!(windows) {
+            bail!("Homebrew sources are only supported on native macOS and Linux clients.");
+        }
+        if self.uses_system_winget_sources() {
+            bail!("Homebrew sources require Pinget's private source store, not WinGet source management.");
+        }
+        validate_homebrew_source_base_url(arg)?;
+        let normalized_arg = arg.trim().trim_end_matches('/');
+        if publisher.trim().is_empty() || publisher.len() > 1024 || publisher.chars().any(char::is_control) {
+            bail!("expected MSIX publisher must be a nonempty distinguished name of at most 1024 characters.");
+        }
+        let trusted_ca = trusted_ca
+            .iter()
+            .map(|path| {
+                let path = path.canonicalize().with_context(|| {
+                    format!("trusted CA does not exist: {}", path.display())
+                })?;
+                if !path.is_file() {
+                    bail!("trusted CA must be a file: {}", path.display());
+                }
+                Ok(path.to_string_lossy().into_owned())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if self.store.sources.iter().any(|source| source.name.eq_ignore_ascii_case(name)) {
+            bail!("A source with name '{name}' already exists.");
+        }
+        if self.store.sources.iter().any(|source| source.arg == normalized_arg) {
+            bail!("A source with argument '{arg}' already exists.");
+        }
+        self.store.sources.push(SourceRecord {
+            name: name.to_owned(),
+            kind: SourceKind::HomebrewPreIndexed,
+            arg: normalized_arg.to_owned(),
+            identifier: name.to_owned(),
+            trust_level: "Trusted".to_owned(),
+            explicit: false,
+            priority: 0,
+            last_update: None,
+            source_version: None,
+            etag: None,
+            last_modified: None,
+            publisher: Some(publisher.to_owned()),
+            trusted_ca,
+        });
+        self.save_store()?;
         Ok(())
     }
 
@@ -1569,6 +1736,7 @@ impl Repository {
         for index in indexes {
             let outcome = match self.store.sources[index].kind {
                 SourceKind::PreIndexed => self.update_preindexed(index),
+                SourceKind::HomebrewPreIndexed => self.update_homebrew_preindexed(index),
                 SourceKind::Rest => self.update_rest(index),
             };
             let (success, detail) = match outcome {
@@ -1837,7 +2005,7 @@ impl Repository {
                 let Some((id, name, matched_by)) = lookup_installed_db_identity_match(&connection, package)? else {
                     continue;
                 };
-                let (id, name, moniker, version) = if source.kind == SourceKind::PreIndexed {
+                let (id, name, moniker, version) = if source.kind.is_preindexed() {
                     match self
                         .open_preindexed_connection(source_index)
                         .and_then(|index_connection| {
@@ -1972,7 +2140,7 @@ impl Repository {
             .iter()
             .enumerate()
             .filter(|(_, source)| {
-                source.kind == SourceKind::PreIndexed
+                source.kind.is_preindexed()
                     && match requested_source {
                         Some(name) => source.name.eq_ignore_ascii_case(name),
                         None => true,
@@ -2078,7 +2246,7 @@ impl Repository {
             .iter()
             .enumerate()
             .filter(|(_, source)| {
-                source.kind == SourceKind::PreIndexed
+                source.kind.is_preindexed()
                     && match requested_source {
                         Some(name) => source.name.eq_ignore_ascii_case(name),
                         None => true,
@@ -2208,7 +2376,7 @@ impl Repository {
             .iter()
             .enumerate()
             .filter(|(_, source)| {
-                source.kind == SourceKind::PreIndexed
+                source.kind.is_preindexed()
                     && match requested_source {
                         Some(name) => source.name.eq_ignore_ascii_case(name),
                         None => true,
@@ -2498,7 +2666,11 @@ impl Repository {
     }
 
     fn preindexed_package_path(&self, source: &SourceRecord) -> PathBuf {
-        self.source_state_dir(source).join("source.msix")
+        self.source_state_dir(source).join(if source.kind == SourceKind::HomebrewPreIndexed {
+            "brew.msix"
+        } else {
+            "source.msix"
+        })
     }
 
     fn preindexed_index_path(&self, source: &SourceRecord) -> PathBuf {
@@ -3382,7 +3554,9 @@ impl Repository {
         semantics: SearchSemantics,
     ) -> Result<SearchSourceMatches> {
         match self.store.sources[source_index].kind {
-            SourceKind::PreIndexed => self.search_preindexed(source_index, query, semantics),
+            SourceKind::PreIndexed | SourceKind::HomebrewPreIndexed => {
+                self.search_preindexed(source_index, query, semantics)
+            }
             SourceKind::Rest => self.search_rest(source_index, query, semantics),
         }
     }
@@ -4012,6 +4186,93 @@ impl Repository {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("no preindexed source candidate succeeded")))
+    }
+
+    fn update_homebrew_preindexed(&mut self, source_index: usize) -> Result<String> {
+        if cfg!(windows) {
+            bail!("Homebrew static sources are only supported on native macOS and Linux clients.");
+        }
+        let source_snapshot = self.store.sources[source_index].clone();
+        if source_snapshot
+            .publisher
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            bail!("Homebrew source has no expected publisher configured");
+        }
+        validate_homebrew_source_base_url(&source_snapshot.arg)?;
+        let state_dir = self.source_state_dir(&source_snapshot);
+        fs::create_dir_all(&state_dir).context("failed to create Homebrew source state directory")?;
+        let url = format!("{}/brew.msix", source_snapshot.arg.trim_end_matches('/'));
+        let response = self
+            .homebrew_client
+            .get(&url)
+            .send()
+            .with_context(|| format!("failed to download Homebrew source package from {url}"))?
+            .error_for_status()
+            .with_context(|| format!("Homebrew source request failed for {url}"))?;
+        const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+        if response.content_length().is_some_and(|length| length > MAX_SOURCE_BYTES) {
+            bail!("Homebrew source MSIX exceeds the 2 GiB size limit");
+        }
+        let headers = response.headers().clone();
+        let stamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let package_temp = state_dir.join(format!("brew.{stamp}.tmp"));
+        let index_temp = state_dir.join(format!("index.{stamp}.tmp"));
+        let result = (|| {
+            let mut package_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&package_temp)
+                .context("failed to create temporary Homebrew source package")?;
+            let copied = std::io::copy(&mut response.take(MAX_SOURCE_BYTES + 1), &mut package_file)
+                .context("failed to read Homebrew source package")?;
+            if copied > MAX_SOURCE_BYTES {
+                bail!("Homebrew source MSIX exceeds the 2 GiB size limit");
+            }
+            package_file.sync_all().context("failed to flush temporary Homebrew source package")?;
+            drop(package_file);
+
+            let index_bytes = homebrew_source::verify_msix(&package_temp, &source_snapshot, None)?;
+            let mut index_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&index_temp)
+                .context("failed to create temporary verified Homebrew source index")?;
+            index_file
+                .write_all(&index_bytes)
+                .context("failed to persist temporary verified Homebrew source index")?;
+            index_file.sync_all().context("failed to flush temporary verified Homebrew source index")?;
+            drop(index_file);
+
+            let connection = Self::open_sqlite_connection(index_temp.clone())?;
+            query_v2_matches(&connection, &PackageQuery::default(), SearchSemantics::Many)
+                .context("verified Homebrew source index has an unsupported schema")?;
+            drop(connection);
+
+            let index_path = self.preindexed_index_path(&source_snapshot);
+            replace_file(&index_temp, &index_path)
+                .context("failed to activate verified Homebrew source index")?;
+            remove_sqlite_sidecars(&index_path);
+            replace_file(&package_temp, &self.preindexed_package_path(&source_snapshot))
+                .context("failed to persist verified Homebrew source package")?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&package_temp);
+            let _ = fs::remove_file(&index_temp);
+            return Err(error);
+        }
+
+        let source = &mut self.store.sources[source_index];
+        source.last_update = Some(Utc::now());
+        source.source_version = headers
+            .get("x-ms-meta-sourceversion")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        update_preindexed_http_validators(source, &headers);
+        Ok("downloaded and verified brew.msix".to_owned())
     }
 
     fn try_skip_unchanged_preindexed_by_source_version(
@@ -6153,6 +6414,26 @@ fn validate_source_argument(arg: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_homebrew_source_base_url(arg: &str) -> Result<()> {
+    validate_source_argument(arg)?;
+    let base_url = reqwest::Url::parse(arg.trim()).context("invalid Homebrew source base URL")?;
+    let raw_path = arg
+        .trim()
+        .split_once("://")
+        .and_then(|(_, remainder)| remainder.split_once('/').map(|(_, path)| path))
+        .unwrap_or_default();
+    if !base_url.username().is_empty()
+        || base_url.password().is_some()
+        || base_url.query().is_some()
+        || base_url.fragment().is_some()
+        || arg.contains('%')
+        || raw_path.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        bail!("Homebrew source base URL must not contain credentials, query strings, fragments, escapes, or dot segments.");
+    }
+    Ok(())
+}
+
 /// Per-identifier source file caches under [`cache_root`].
 const SOURCE_FILE_CACHE_BUCKETS: [&str; 4] = ["REST_M", "V1_M", "V2_M", "V2_PVD"];
 
@@ -6795,6 +7076,8 @@ fn parse_system_winget_source_record(value: &JsonValue) -> Result<SourceRecord> 
         source_version: None,
         etag: None,
         last_modified: None,
+        publisher: None,
+        trusted_ca: Vec::new(),
     })
 }
 
@@ -7079,12 +7362,16 @@ fn map_packaged_source_entry(entry: &BTreeMap<String, Option<String>>) -> Option
         source_version: None,
         etag: None,
         last_modified: None,
+        publisher: None,
+        trusted_ca: Vec::new(),
     })
 }
 
 fn parse_packaged_source_kind(value: &str) -> Option<SourceKind> {
     if value.eq_ignore_ascii_case("Microsoft.PreIndexed.Package") {
         Some(SourceKind::PreIndexed)
+    } else if value.eq_ignore_ascii_case("Pinget.PreIndexed.Homebrew") {
+        Some(SourceKind::HomebrewPreIndexed)
     } else if value.eq_ignore_ascii_case("Microsoft.Rest") {
         Some(SourceKind::Rest)
     } else {
@@ -7323,6 +7610,7 @@ fn cache_root(app_root: &Path) -> PathBuf {
 fn packaged_source_type(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::PreIndexed => "Microsoft.PreIndexed.Package",
+        SourceKind::HomebrewPreIndexed => "Pinget.PreIndexed.Homebrew",
         SourceKind::Rest => "Microsoft.Rest",
     }
 }
@@ -8496,7 +8784,7 @@ fn search_match_sort_score(candidate: &SearchMatch, query: &PackageQuery) -> usi
         score = score.max(score_text_match(matched_value, value, query.exact, 155, 145, 135));
     }
 
-    if matches!(candidate.source_kind, SourceKind::PreIndexed) {
+    if candidate.source_kind.is_preindexed() {
         score += 5;
     }
     if search_match_has_unknown_version(candidate) {
@@ -8896,6 +9184,8 @@ fn parse_yaml_manifest_bundle_parts<B: AsRef<[u8]>>(parts: &[B]) -> Result<(Mani
     let name = yaml_localized_string(&merged, "PackageName").ok_or_else(|| anyhow!("manifest missing PackageName"))?;
 
     let installers = parse_yaml_installers(&merged);
+    let homebrew = yaml_homebrew_metadata(&merged)?;
+    validate_homebrew_bottle_installers(homebrew.as_ref(), &installers)?;
     let top_level_require_explicit = yaml_scalar_bool(&merged, "RequireExplicitUpgrade");
     let any_installer_require_explicit = installers.iter().any(|i| i.require_explicit_upgrade);
 
@@ -8928,6 +9218,7 @@ fn parse_yaml_manifest_bundle_parts<B: AsRef<[u8]>>(parts: &[B]) -> Result<(Mani
             documentation: yaml_documentation_list(&merged),
             icons: yaml_icon_list(&merged),
             installers,
+            homebrew,
             require_explicit_upgrade: top_level_require_explicit || any_installer_require_explicit,
         },
         collapse_structured_document(&JsonValue::Array(documents)),
@@ -8952,6 +9243,258 @@ fn yaml_manifest_merge_rank(mapping: &YamlMapping) -> Option<u8> {
     } else {
         Some(3)
     }
+}
+
+fn yaml_homebrew_metadata(root: &YamlMapping) -> Result<Option<HomebrewFormulaMetadata>> {
+    let Some(pinget) = root.get(YamlValue::from("Pinget")) else {
+        return Ok(None);
+    };
+    let Some(pinget) = pinget.as_mapping() else {
+        bail!("Pinget manifest extension must be a mapping");
+    };
+    let Some(homebrew) = pinget.get(YamlValue::from("Homebrew")) else {
+        return Ok(None);
+    };
+    let Some(homebrew) = homebrew.as_mapping() else {
+        bail!("Pinget.Homebrew manifest extension must be a mapping");
+    };
+
+    let required = |mapping: &YamlMapping, key: &str| -> Result<String> {
+        let value = yaml_string(mapping, key)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("Pinget.Homebrew.{key} is required"))?;
+        Ok(value)
+    };
+    let integer = |mapping: &YamlMapping, key: &str| -> Result<u32> {
+        required(mapping, key)?
+            .parse::<u32>()
+            .with_context(|| format!("Pinget.Homebrew.{key} must be an unsigned integer"))
+    };
+    let schema_version = integer(homebrew, "SchemaVersion")?;
+    if schema_version != 1 {
+        bail!("unsupported Pinget.Homebrew.SchemaVersion {schema_version}");
+    }
+
+    let formula = required(homebrew, "Formula")?;
+    let tap = required(homebrew, "Tap")?;
+    let upstream_version = required(homebrew, "UpstreamVersion")?;
+    let tap_parts = tap.split('/').collect::<Vec<_>>();
+    if tap_parts.len() != 2 || tap_parts.iter().any(|part| part.trim().is_empty()) {
+        bail!("Pinget.Homebrew.Tap must be a fully qualified tap such as homebrew/core");
+    }
+    let expected_package_id = homebrew_package_identifier(&tap, &formula)?;
+    if yaml_string(root, "PackageIdentifier").as_deref() != Some(expected_package_id.as_str()) {
+        bail!("PackageIdentifier must equal Homebrew-derived identifier '{expected_package_id}'");
+    }
+    let revision = integer(homebrew, "Revision")?;
+    let expected_package_version = if revision == 0 {
+        upstream_version.clone()
+    } else {
+        format!("{upstream_version}_{revision}")
+    };
+    if yaml_string(root, "PackageVersion").as_deref() != Some(expected_package_version.as_str()) {
+        bail!("PackageVersion must equal Homebrew stable pkg_version '{expected_package_version}'");
+    }
+    let version_scheme = integer(homebrew, "VersionScheme")?;
+    if version_scheme > 5 {
+        bail!("unsupported Homebrew version scheme {version_scheme}");
+    }
+    let keg_only = match homebrew.get(YamlValue::from("KegOnly")) {
+        Some(YamlValue::Bool(value)) => *value,
+        Some(YamlValue::String(value)) if value.eq_ignore_ascii_case("true") => true,
+        Some(YamlValue::String(value)) if value.eq_ignore_ascii_case("false") => false,
+        _ => bail!("Pinget.Homebrew.KegOnly must be true or false"),
+    };
+
+    let bottle_values = homebrew
+        .get(YamlValue::from("Bottles"))
+        .and_then(YamlValue::as_sequence)
+        .ok_or_else(|| anyhow!("Pinget.Homebrew.Bottles must be a sequence"))?;
+    if bottle_values.is_empty() {
+        bail!("Pinget.Homebrew.Bottles must contain at least one target");
+    }
+    let mut bottles = Vec::with_capacity(bottle_values.len());
+    for (index, value) in bottle_values.iter().enumerate() {
+        let bottle = value
+            .as_mapping()
+            .ok_or_else(|| anyhow!("Pinget.Homebrew.Bottles[{index}] must be a mapping"))?;
+        let bottle_required = |key: &str| -> Result<String> {
+            yaml_string(bottle, key)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("Pinget.Homebrew.Bottles[{index}].{key} is required"))
+        };
+        let url = bottle_required("Url")?;
+        let sha256 = bottle_required("Sha256")?.to_ascii_lowercase();
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("Pinget.Homebrew.Bottles[{index}].Sha256 must be a 64-digit SHA-256");
+        }
+        let target_os = bottle_required("TargetOS")?;
+        if !matches!(target_os.as_str(), "macOS" | "Linux") {
+            bail!("unsupported Homebrew bottle target OS '{target_os}'");
+        }
+        let architecture = bottle_required("Architecture")?;
+        if !matches!(architecture.as_str(), "x64" | "arm64") {
+            bail!("unsupported Homebrew bottle architecture '{architecture}'");
+        }
+        let bottle_tag = bottle_required("BottleTag")?;
+        let Some((tag_target_os, tag_architecture)) = map_homebrew_bottle_tag(&bottle_tag) else {
+            bail!("unsupported Homebrew bottle tag '{bottle_tag}'");
+        };
+        if target_os != tag_target_os || architecture != tag_architecture {
+            bail!(
+                "Homebrew bottle tag '{bottle_tag}' maps to {tag_target_os}/{tag_architecture}, not {target_os}/{architecture}"
+            );
+        }
+        let rebuild = bottle_required("Rebuild")?
+            .parse::<u32>()
+            .with_context(|| format!("Pinget.Homebrew.Bottles[{index}].Rebuild must be an unsigned integer"))?;
+        let relocation = bottle_required("Relocation")?;
+        if !matches!(relocation.as_str(), "any" | "any_skip_relocation" | "fixed") {
+            bail!("unsupported Homebrew bottle relocation value '{relocation}'");
+        }
+        let minimum_os_version = yaml_string(bottle, "MinimumOSVersion");
+        let maximum_os_version = yaml_string(bottle, "MaximumOSVersion");
+        let minimum_glibc = yaml_string(bottle, "MinimumGlibc");
+        let loader = yaml_string(bottle, "Loader");
+        match target_os.as_str() {
+            "macOS" if minimum_glibc.is_some() || loader.is_some() => {
+                bail!("Linux ABI fields cannot be used for a macOS bottle target")
+            }
+            "Linux" if minimum_os_version.is_some() || maximum_os_version.is_some() => {
+                bail!("macOS product-version fields cannot be used for a Linux bottle target")
+            }
+            _ => {}
+        }
+        bottles.push(HomebrewBottleMetadata {
+            url,
+            sha256,
+            target_os,
+            architecture,
+            bottle_tag,
+            rebuild,
+            relocation,
+            minimum_os_version,
+            maximum_os_version,
+            minimum_glibc,
+            loader,
+        });
+    }
+
+    Ok(Some(HomebrewFormulaMetadata {
+        schema_version,
+        formula,
+        tap,
+        upstream_version,
+        revision,
+        version_scheme,
+        aliases: yaml_homebrew_string_list(homebrew, "Aliases")?,
+        old_names: yaml_homebrew_string_list(homebrew, "OldNames")?,
+        keg_only,
+        bottles,
+    }))
+}
+
+fn map_homebrew_bottle_tag(tag: &str) -> Option<(&'static str, &'static str)> {
+    const MACOS_RELEASES: &[&str] = &[
+        "tahoe",
+        "sequoia",
+        "sonoma",
+        "ventura",
+        "monterey",
+        "big_sur",
+        "catalina",
+        "mojave",
+        "high_sierra",
+        "sierra",
+        "el_capitan",
+        "yosemite",
+    ];
+
+    if let Some(release) = tag.strip_prefix("arm64_")
+        && MACOS_RELEASES.contains(&release)
+    {
+        return Some(("macOS", "arm64"));
+    }
+    if MACOS_RELEASES.contains(&tag) {
+        return Some(("macOS", "x64"));
+    }
+    match tag {
+        "x86_64_linux" => Some(("Linux", "x64")),
+        "aarch64_linux" => Some(("Linux", "arm64")),
+        _ => None,
+    }
+}
+
+fn yaml_homebrew_string_list(root: &YamlMapping, key: &str) -> Result<Vec<String>> {
+    let Some(value) = root.get(YamlValue::from(key)) else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_sequence()
+        .ok_or_else(|| anyhow!("Pinget.Homebrew.{key} must be a sequence of strings"))?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| match item {
+            YamlValue::String(value) if !value.trim().is_empty() => Ok(value.clone()),
+            _ => bail!("Pinget.Homebrew.{key}[{index}] must be a non-empty string"),
+        })
+        .collect()
+}
+
+fn validate_homebrew_bottle_installers(
+    metadata: Option<&HomebrewFormulaMetadata>,
+    installers: &[Installer],
+) -> Result<()> {
+    let homebrew_installers = installers
+        .iter()
+        .filter(|installer| {
+            installer
+                .installer_type
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("homebrew-bottle"))
+        })
+        .collect::<Vec<_>>();
+    let Some(metadata) = metadata else {
+        if !homebrew_installers.is_empty() {
+            bail!("InstallerType homebrew-bottle requires Pinget.Homebrew metadata");
+        }
+        return Ok(());
+    };
+    if homebrew_installers.len() != installers.len() {
+        bail!("all installers in a Pinget.Homebrew manifest must use InstallerType homebrew-bottle");
+    }
+
+    for bottle in &metadata.bottles {
+        let matches = homebrew_installers
+            .iter()
+            .filter(|installer| {
+                installer.url.as_deref() == Some(bottle.url.as_str())
+                    && installer
+                        .sha256
+                        .as_deref()
+                        .is_some_and(|sha256| sha256.eq_ignore_ascii_case(&bottle.sha256))
+            })
+            .collect::<Vec<_>>();
+        let [installer] = matches.as_slice() else {
+            bail!(
+                "Pinget.Homebrew bottle '{}' must match exactly one homebrew-bottle installer by URL and SHA-256",
+                bottle.bottle_tag
+            );
+        };
+        if installer.architecture.as_deref() != Some(bottle.architecture.as_str())
+            || !installer.platforms.iter().any(|platform| platform == &bottle.target_os)
+        {
+            bail!(
+                "Pinget.Homebrew bottle '{}' target must match its installer Platform and Architecture",
+                bottle.bottle_tag
+            );
+        }
+    }
+    if metadata.bottles.len() != homebrew_installers.len() {
+        bail!("each homebrew-bottle installer must have exactly one Pinget.Homebrew.Bottles entry");
+    }
+    Ok(())
 }
 
 fn parse_yaml_manifest(bytes: &[u8]) -> Result<Manifest> {
@@ -9143,6 +9686,7 @@ fn parse_rest_manifest(bytes: &[u8], package_id: &str, version: &str, channel: &
         documentation: json_documentation_list(default_locale),
         icons,
         installers,
+        homebrew: None,
         require_explicit_upgrade: top_level_require_explicit || any_installer_require_explicit,
     };
 
@@ -15917,6 +16461,7 @@ mod tests {
             documentation: Vec::new(),
             icons: Vec::new(),
             installers: Vec::new(),
+            homebrew: None,
             require_explicit_upgrade: false,
         }
     }
@@ -16292,6 +16837,8 @@ mod tests {
             source_version: None,
             etag: None,
             last_modified: None,
+            publisher: None,
+            trusted_ca: Vec::new(),
         };
 
         assert_eq!(store_path(&app_root), app_root.join("sources.json"));
@@ -17183,6 +17730,7 @@ mod tests {
                     expected_return_codes: Vec::new(),
                     ..Installer::default()
                 }],
+                homebrew: None,
                 require_explicit_upgrade: false,
             },
             selected_installer: Some(Installer {
@@ -17640,6 +18188,7 @@ Installers:
             documentation: Vec::new(),
             icons: Vec::new(),
             installers,
+            homebrew: None,
             require_explicit_upgrade: false,
         }
     }
@@ -17966,6 +18515,7 @@ Installers:
             documentation: Vec::new(),
             icons: Vec::new(),
             installers: Vec::new(),
+            homebrew: None,
             require_explicit_upgrade: false,
         };
         let existing = ListMatch {
@@ -18028,6 +18578,7 @@ Installers:
             documentation: Vec::new(),
             icons: Vec::new(),
             installers: Vec::new(),
+            homebrew: None,
             require_explicit_upgrade: false,
         };
         let existing = ListMatch {
@@ -18199,6 +18750,7 @@ Installers:
             documentation: Vec::new(),
             icons: Vec::new(),
             installers: Vec::new(),
+            homebrew: None,
             require_explicit_upgrade: false,
         };
 
@@ -18271,6 +18823,7 @@ Installers:
             documentation: Vec::new(),
             icons: Vec::new(),
             installers: Vec::new(),
+            homebrew: None,
             require_explicit_upgrade: false,
         };
         let mut progress_request = InstallRequest::new(PackageQuery::default());
@@ -18432,6 +18985,7 @@ Installers:
             documentation: Vec::new(),
             icons: Vec::new(),
             installers: Vec::new(),
+            homebrew: None,
             require_explicit_upgrade: false,
         };
         let mut request = InstallRequest::new(PackageQuery::default());
@@ -18532,6 +19086,7 @@ Installers:
                     documentation: Vec::new(),
                     icons: Vec::new(),
                     installers: Vec::new(),
+                    homebrew: None,
                     require_explicit_upgrade: false,
                 },
                 Path::new(r"C:\temp\node.msi"),
@@ -18584,6 +19139,7 @@ Installers:
                     documentation: Vec::new(),
                     icons: Vec::new(),
                     installers: Vec::new(),
+                    homebrew: None,
                     require_explicit_upgrade: false,
                 },
                 Path::new(r"C:\temp\test.msi"),
@@ -20802,6 +21358,8 @@ Installers:
             source_version: None,
             etag: None,
             last_modified: None,
+            publisher: None,
+            trusted_ca: Vec::new(),
         }
     }
 
@@ -21511,6 +22069,8 @@ Installers:
             source_version: None,
             etag: None,
             last_modified: None,
+            publisher: None,
+            trusted_ca: Vec::new(),
         }];
 
         let item = list_match_from_installed(package, &sources);
@@ -21582,6 +22142,8 @@ Installers:
             source_version: None,
             etag: None,
             last_modified: None,
+            publisher: None,
+            trusted_ca: Vec::new(),
         }];
 
         let item = list_match_from_installed(package, &sources);
@@ -21623,6 +22185,8 @@ Installers:
                 source_version: None,
                 etag: None,
                 last_modified: None,
+                publisher: None,
+                trusted_ca: Vec::new(),
             },
             SourceRecord {
                 name: "short".to_owned(),
@@ -21636,6 +22200,8 @@ Installers:
                 source_version: None,
                 etag: None,
                 last_modified: None,
+                publisher: None,
+                trusted_ca: Vec::new(),
             },
         ];
 

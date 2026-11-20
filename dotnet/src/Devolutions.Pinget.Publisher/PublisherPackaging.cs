@@ -60,6 +60,7 @@ public static partial class PublisherPackaging
         var interruptedSwap = marker["pendingCommit"] is JsonObject;
         marker = ResolvePendingCommit(destination, marker)
             ?? throw new PublisherException("The first publication to this destination was interrupted before it was committed; publish again.");
+        _ = PackageFileName(marker);
         var inventory = marker["artifacts"] as JsonObject
             ?? throw new PublisherException("Publisher ownership marker has no artifact inventory.");
         var directories = new Stack<string>();
@@ -106,9 +107,10 @@ public static partial class PublisherPackaging
                 throw new PublisherException($"Published artifact hash mismatch: {item.Key}");
         }
 
-        var packagePath = Path.Combine(destination, "source2.msix");
+        var packageFileName = PackageFileName(marker);
+        var packagePath = Path.Combine(destination, packageFileName);
         if (!File.Exists(packagePath))
-            throw new PublisherException("Published source2.msix is missing.");
+            throw new PublisherException($"Published {packageFileName} is missing.");
         VerifyMsixContents(packagePath, marker);
         var unsigned = marker["unsignedDevelopment"]?.GetValue<bool>() ?? false;
         if (!unsigned)
@@ -169,6 +171,10 @@ public static partial class PublisherPackaging
         var buildPath = Path.Combine(state, "builds", buildId);
         var snapshotArtifacts = ReadSnapshotArtifacts(buildPath);
         var expectedIndexHash = ReadSnapshotIndexHash(buildPath);
+        var profile = PublisherWorkspace.SnapshotProfile(buildPath);
+        var packageFileName = profile == "homebrew" ? "brew.msix" : "source2.msix";
+        if (profile == "homebrew" && !string.Equals(Path.GetFileName(msixFullPath), packageFileName, StringComparison.Ordinal))
+            throw new PublisherException("Homebrew profile requires the package output file to be named brew.msix.");
 
         if (destination is not null && Directory.Exists(destination))
         {
@@ -303,6 +309,10 @@ public static partial class PublisherPackaging
         var buildPath = Path.Combine(state, "builds", buildId);
         var snapshotArtifacts = ReadSnapshotArtifacts(buildPath);
         var expectedIndexHash = ReadSnapshotIndexHash(buildPath);
+        var profile = PublisherWorkspace.SnapshotProfile(buildPath);
+        var packageFileName = profile == "homebrew" ? "brew.msix" : "source2.msix";
+        if (profile == "homebrew" && !string.Equals(Path.GetFileName(msixFullPath), packageFileName, StringComparison.Ordinal))
+            throw new PublisherException("Homebrew profile requires the signed package file to be named brew.msix.");
 
         var stagingRoot = Path.Combine(state, $".publish-{Guid.NewGuid():N}");
         Directory.CreateDirectory(stagingRoot);
@@ -311,7 +321,7 @@ public static partial class PublisherPackaging
         var promoted = false;
         try
         {
-            var stagedPackage = Path.Combine(stagingRoot, "source2.msix");
+            var stagedPackage = Path.Combine(stagingRoot, packageFileName);
             EnsureSafePathOrAncestors(msixFullPath);
             if (Directory.Exists(msixFullPath) || !File.Exists(msixFullPath))
                 throw new PublisherException($"Source MSIX does not exist: {msixFullPath}");
@@ -358,6 +368,10 @@ public static partial class PublisherPackaging
                 if (!string.Equals(existingIdentity, packageName, StringComparison.Ordinal)
                     || !string.Equals(existingPublisher, publisher, StringComparison.Ordinal))
                     throw new PublisherException("The destination is already owned by a different source package identity or publisher.");
+                if (!string.Equals(PackageFileName(marker), packageFileName, StringComparison.Ordinal))
+                    throw new PublisherException("The destination is already owned by a different source package file name.");
+                if (!string.Equals(marker["profile"]?.GetValue<string>() ?? "windows", profile, StringComparison.Ordinal))
+                    throw new PublisherException("The destination is already owned by a different publisher profile.");
                 if (oldVersionText is null || !Version.TryParse(oldVersionText, out var oldVersion))
                     throw new PublisherException("Existing publisher marker has an invalid source package version.");
                 var comparison = version.CompareTo(oldVersion);
@@ -410,7 +424,7 @@ public static partial class PublisherPackaging
 
             afterCopy?.Invoke(destination, stagedPackage);
             var packageHash = HashFile(stagedPackage);
-            existingArtifacts["source2.msix"] = packageHash;
+            existingArtifacts[packageFileName] = packageHash;
             var updatedMarker = new JsonObject
             {
                 ["schemaVersion"] = 1,
@@ -418,6 +432,8 @@ public static partial class PublisherPackaging
                 ["packageName"] = packageName,
                 ["publisher"] = publisher,
                 ["packageVersion"] = version.ToString(),
+                ["profile"] = profile,
+                ["packageFileName"] = packageFileName,
                 ["buildId"] = buildId,
                 ["indexHash"] = expectedIndexHash,
                 ["unsignedDevelopment"] = options.UnsignedDevelopment,
@@ -435,7 +451,7 @@ public static partial class PublisherPackaging
             onCommitStep?.Invoke(CommitStep.BeforePackageSwap, destination);
             try
             {
-                CopyAtomically(stagedPackage, Path.Combine(destination, "source2.msix"));
+                CopyAtomically(stagedPackage, Path.Combine(destination, packageFileName));
             }
             catch
             {
@@ -487,7 +503,7 @@ public static partial class PublisherPackaging
     }
 
     /// <summary>
-    /// Resolves a marker left by an interrupted package swap. When <c>source2.msix</c> is the package the
+    /// Resolves a marker left by an interrupted package swap. When the marked MSIX is the package the
     /// marker records, the swap happened and the marker is committed; otherwise the previous marker is
     /// restored, keeping the interrupted publication's fully copied feed artifacts as owned files.
     /// Returns <see langword="null"/> when an interrupted first publication never swapped its package in.
@@ -498,10 +514,11 @@ public static partial class PublisherPackaging
             return marker;
         var artifacts = marker["artifacts"] as JsonObject
             ?? throw new PublisherException("Publisher ownership marker has no artifact inventory.");
-        var packagePath = Path.Combine(destination, "source2.msix");
+        var packageFileName = PackageFileName(marker);
+        var packagePath = Path.Combine(destination, packageFileName);
         var packageHash = File.Exists(packagePath) ? HashFile(packagePath) : null;
         if (packageHash is not null
-            && string.Equals(packageHash, artifacts["source2.msix"]?.GetValue<string>(), StringComparison.Ordinal))
+            && string.Equals(packageHash, artifacts[packageFileName]?.GetValue<string>(), StringComparison.Ordinal))
         {
             var committed = (JsonObject)marker.DeepClone();
             committed.Remove("pendingCommit");
@@ -516,7 +533,7 @@ public static partial class PublisherPackaging
             ?? throw new PublisherException("Publisher ownership marker has no artifact inventory.");
         foreach (var item in artifacts)
         {
-            if (item.Key == "source2.msix" || previousArtifacts.ContainsKey(item.Key))
+            if (item.Key == packageFileName || previousArtifacts.ContainsKey(item.Key))
                 continue;
             var path = PublisherWorkspace.ResolveContained(destination, item.Key);
             var expected = item.Value?.GetValue<string>();
@@ -635,9 +652,36 @@ public static partial class PublisherPackaging
 
     /// <summary>Temporary files written by the .NET or Rust publisher while publishing.</summary>
     private static bool IsPublicationTemporaryName(string name, bool atRoot) =>
-        (atRoot && (name == MarkerName + ".new" || (name.StartsWith(".source2.", StringComparison.Ordinal)
+        (atRoot && (name == MarkerName + ".new"
+            || (name.StartsWith(".pinget-msix-", StringComparison.Ordinal) && name.EndsWith(".new", StringComparison.Ordinal))
+            || (name.StartsWith(".source2.", StringComparison.Ordinal)
             && name.EndsWith(".new", StringComparison.Ordinal) && name.Length > ".source2..new".Length)))
         || DotNetAtomicTemporaryPattern().IsMatch(name);
+
+    private static string PackageFileName(JsonObject marker)
+    {
+        var name = marker["packageFileName"]?.GetValue<string>() ?? "source2.msix";
+        ValidateMsixFileName(name);
+        var profile = marker["profile"]?.GetValue<string>() ?? "windows";
+        if (profile is not ("windows" or "homebrew"))
+            throw new PublisherException($"Unsupported publisher profile '{profile}'.");
+        var expectedName = profile == "homebrew" ? "brew.msix" : "source2.msix";
+        if (!string.Equals(name, expectedName, StringComparison.Ordinal))
+            throw new PublisherException("Publisher ownership marker package name does not match its profile.");
+        var artifacts = marker["artifacts"] as JsonObject
+            ?? throw new PublisherException("Publisher ownership marker has no artifact inventory.");
+        if (!artifacts.ContainsKey(name))
+            throw new PublisherException("Publisher ownership marker does not list its root MSIX.");
+        return name;
+    }
+
+    private static void ValidateMsixFileName(string name)
+    {
+        if (!name.EndsWith(".msix", StringComparison.Ordinal)
+            || name.Length is < 6 or > 105
+            || !name[..^5].All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))
+            throw new PublisherException("Source MSIX file name must be a simple ASCII .msix name.");
+    }
 
     /// <summary>
     /// Removes temporaries an interrupted publish (.NET or Rust) left in an owned destination, so they
@@ -749,7 +793,7 @@ public static partial class PublisherPackaging
         {
             using var archive = ZipFile.OpenRead(packagePath);
             if (marker["unsignedDevelopment"]?.GetValue<bool>() == true && HasSignatureArtifacts(archive))
-                throw new PublisherException("Unsigned development destination contains a signed source2.msix.");
+                throw new PublisherException($"Unsigned development destination contains a signed {PackageFileName(marker)}.");
             var (packageName, publisher, versionText, actualIndexHash) = ReadMsixPayload(archive);
             if (!string.Equals(actualIndexHash, marker["indexHash"]?.GetValue<string>(), StringComparison.Ordinal))
                 throw new PublisherException("MSIX contains a v2 index different from the published build.");

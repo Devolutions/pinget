@@ -1,0 +1,35 @@
+{
+  "name": "tinytool",
+  "full_name": "tinytool",
+  "tap": "homebrew/core",
+  "desc": "Small dependency-free test utility",
+  "homepage": "https://tinytool.example.invalid/",
+  "versions": { "stable": "1.2.3" },
+  "revision": 1,
+  "version_scheme": 0,
+  "license": "MIT",
+  "keg_only": true,
+  "aliases": ["tiny", "tiny", "small"],
+  "oldnames": ["tiny-old"],
+  "dependencies": [],
+  "recommended_dependencies": [],
+  "optional_dependencies": [],
+  "uses_from_macos": [],
+  "requirements": [],
+  "conflicts_with": [],
+  "variations": {},
+  "disabled": false,
+  "deprecated": false,
+  "bottle": {
+    "stable": {
+      "rebuild": 3,
+      "files": {
+        "arm64_sonoma": {
+          "cellar": "any_skip_relocation",
+          "url": "https://bottles.example.invalid/tinytool-1.2.3_1.arm64_sonoma.bottle.tar.gz",
+          "sha256": "deb230b21e0d7ef6a0a2d65a19599d4251b5f08888a5155882fbef2ef71e1e11"
+        }
+      }
+    }
+  }
+}

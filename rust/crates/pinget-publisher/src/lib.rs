@@ -12,6 +12,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
+#[cfg(not(windows))]
+use flate2::Compression;
+#[cfg(not(windows))]
+use flate2::write::DeflateEncoder;
 use quick_xml::NsReader;
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
@@ -23,6 +27,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zip::ZipArchive;
 
+pub mod homebrew;
 mod msix;
 mod psign;
 #[cfg(test)]
@@ -288,6 +293,8 @@ struct SnapshotMetadata {
     #[serde(default)]
     artifact_format_version: u32,
     build_id: String,
+    #[serde(default)]
+    profile: PublisherProfile,
     created_utc: String,
     manifest_count: usize,
     package_count: usize,
@@ -296,6 +303,30 @@ struct SnapshotMetadata {
     inventory: BTreeMap<String, String>,
     #[serde(serialize_with = "serialize_inventory")]
     artifacts: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PublisherProfile {
+    #[default]
+    Windows,
+    Homebrew,
+}
+
+impl PublisherProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::Homebrew => "homebrew",
+        }
+    }
+
+    fn package_file_name(self) -> &'static str {
+        match self {
+            Self::Windows => "source2.msix",
+            Self::Homebrew => "brew.msix",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +362,149 @@ struct ManifestDocument {
 }
 
 type ManifestGroups = BTreeMap<(String, String), Vec<ManifestDocument>>;
+
+fn profile_for_manifests(groups: &ManifestGroups) -> Result<PublisherProfile> {
+    let mut has_homebrew = false;
+    let mut has_windows = false;
+    for documents in groups.values() {
+        let package_is_homebrew = documents.iter().any(|document| {
+            document.id.starts_with("Pinget.Homebrew.")
+                || document
+                    .document
+                    .get("Pinget")
+                    .and_then(|pinget| pinget.get("Homebrew"))
+                    .is_some()
+                || document
+                    .document
+                    .get("Installers")
+                    .and_then(Value::as_sequence)
+                    .is_some_and(|installers| {
+                        installers.iter().any(|installer| {
+                            installer
+                                .get("InstallerType")
+                                .and_then(Value::as_str)
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("homebrew-bottle"))
+                        })
+                    })
+        });
+        if package_is_homebrew {
+            has_homebrew = true;
+        } else {
+            has_windows = true;
+        }
+    }
+    if has_homebrew && has_windows {
+        return Err(PublisherError::Invalid(
+            "a publisher snapshot cannot mix Homebrew and Windows package profiles".to_owned(),
+        ));
+    }
+    Ok(if has_homebrew {
+        PublisherProfile::Homebrew
+    } else {
+        PublisherProfile::Windows
+    })
+}
+
+fn collect_bottle_assets(input: &Path, inventory: &mut Inventory) -> Result<Vec<String>> {
+    let root = input.join("bottles");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    reject_reparse_components(&root)?;
+    if !root.is_dir() {
+        return Err(PublisherError::Invalid("bottles must be a directory".to_owned()));
+    }
+    let mut assets = Vec::new();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            return Err(PublisherError::Invalid(
+                "bottles/ may contain only regular content-addressed bottle files".to_owned(),
+            ));
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(expected_hash) = name.strip_suffix(".tar.gz") else {
+            return Err(PublisherError::Invalid(format!("invalid bottle mirror filename: {name}")));
+        };
+        if expected_hash.len() != 64
+            || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(PublisherError::Invalid(format!("invalid bottle mirror filename: {name}")));
+        }
+        if sha256_file(&path)? != expected_hash {
+            return Err(PublisherError::Invalid(format!("bottle mirror hash does not match filename: {name}")));
+        }
+        let relative = format!("bottles/{name}");
+        inventory.files.insert(relative.clone(), expected_hash.to_owned());
+        assets.push(relative);
+    }
+    assets.sort();
+    Ok(assets)
+}
+
+fn validate_homebrew_bottle_assets(
+    groups: &ManifestGroups,
+    inventory: &BTreeMap<String, String>,
+) -> Result<()> {
+    for documents in groups.values() {
+        for document in documents {
+            let Some(installers) = document.document.get("Installers").and_then(Value::as_sequence) else {
+                continue;
+            };
+            for installer in installers {
+                if !installer
+                    .get("InstallerType")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("homebrew-bottle"))
+                {
+                    continue;
+                }
+                let sha256 = installer
+                    .get("InstallerSha256")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| PublisherError::Invalid("Homebrew installer is missing InstallerSha256".to_owned()))?
+                    .to_ascii_lowercase();
+                let url = installer
+                    .get("InstallerUrl")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| PublisherError::Invalid("Homebrew installer is missing InstallerUrl".to_owned()))?;
+                let rest = url
+                    .strip_prefix("https://")
+                    .ok_or_else(|| PublisherError::Invalid("Homebrew bottle URL must be an HTTPS static URL".to_owned()))?;
+                let (authority, path) = rest
+                    .split_once('/')
+                    .ok_or_else(|| PublisherError::Invalid("Homebrew bottle URL must include a static path".to_owned()))?;
+                if authority.is_empty() || authority.contains('@') {
+                    return Err(PublisherError::Invalid("Homebrew bottle URL has an invalid authority".to_owned()));
+                }
+                if path.contains(['?', '#', '%']) || path.split('/').any(|part| matches!(part, "." | "..")) {
+                    return Err(PublisherError::Invalid("Homebrew bottle URL contains unsupported path syntax".to_owned()));
+                }
+                let segments: Vec<_> = path.split('/').collect();
+                if segments.len() < 2 || segments[segments.len() - 2] != "bottles" {
+                    return Err(PublisherError::Invalid(
+                        "Homebrew bottle URL must end in /bottles/<sha256>.tar.gz".to_owned(),
+                    ));
+                }
+                let filename = format!("{sha256}.tar.gz");
+                if segments.last().copied() != Some(filename.as_str()) || sha256.len() != 64 {
+                    return Err(PublisherError::Invalid(
+                        "Homebrew bottle URL and InstallerSha256 do not identify a content-addressed mirror file"
+                            .to_owned(),
+                    ));
+                }
+                if inventory.get(&format!("bottles/{filename}")) != Some(&sha256) {
+                    return Err(PublisherError::Invalid(format!(
+                        "Homebrew bottle is missing from the bottles/ mirror inventory: {filename}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 struct PackageManifest {
@@ -410,8 +584,8 @@ struct WriterLock {
 
 /// Builds a complete, self-contained v2 index snapshot from manifest files.
 ///
-/// The input and state roots must not overlap. On Windows, version data is
-/// compressed using the native MSZIP implementation used by WinGet.
+/// The input and state roots must not overlap. MSZIP sidecars use the native
+/// Windows encoder on Windows and portable compatible framing elsewhere.
 ///
 /// # Errors
 ///
@@ -436,12 +610,21 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport> {
     }
     let _lock = acquire_lock(&state)?;
 
-    let (inventory, groups) = scan_manifests(&input)?;
+    let (mut inventory, groups) = scan_manifests(&input)?;
     if groups.is_empty() {
         return Err(PublisherError::Invalid(format!(
             "no supported manifest YAML files found under {}",
             input.display()
         )));
+    }
+    let profile = profile_for_manifests(&groups)?;
+    let bottle_assets = collect_bottle_assets(&input, &mut inventory)?;
+    if profile == PublisherProfile::Homebrew {
+        validate_homebrew_bottle_assets(&groups, &inventory.files)?;
+    } else if !bottle_assets.is_empty() {
+        return Err(PublisherError::Invalid(
+            "bottles/ assets are only supported by the Homebrew publisher profile".to_owned(),
+        ));
     }
     let mut previous: Option<BTreeMap<String, String>> = None;
     if state.join("publisher.db").is_file() {
@@ -463,6 +646,11 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport> {
                 verify_snapshot_path(&snapshot)?;
                 let metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
                 validate_recorded_snapshot(&connection, &metadata)?;
+                if metadata.profile != profile {
+                    return Err(PublisherError::Invalid(
+                        "snapshot profile does not match the scanned manifests".to_owned(),
+                    ));
+                }
                 return report_from_snapshot(&snapshot, &build_id, (0, 0));
             }
             previous = Some(old);
@@ -485,6 +673,11 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport> {
     if snapshot.exists() {
         verify_snapshot_path(&snapshot)?;
         let snapshot_data: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
+        if snapshot_data.profile != profile {
+            return Err(PublisherError::Invalid(
+                "snapshot profile does not match the scanned manifests".to_owned(),
+            ));
+        }
         record_build(&state, &build_id, &snapshot_data)?;
         return report_from_snapshot(&snapshot, &build_id, changes);
     }
@@ -494,8 +687,8 @@ pub fn build(options: &BuildOptions) -> Result<BuildReport> {
     }
     fs::create_dir(&staging)?;
     let result = (|| {
-        build_snapshot(&staging, groups, &build_id)?;
-        let snapshot_data = snapshot_metadata(&staging, &inventory, &build_id)?;
+        build_snapshot(&staging, groups, &build_id, &input, &bottle_assets)?;
+        let snapshot_data = snapshot_metadata(&staging, &inventory, &build_id, profile)?;
         write_json(&staging.join("snapshot.json"), &snapshot_data)?;
         Ok::<_, PublisherError>(snapshot_data)
     })();
@@ -700,7 +893,8 @@ pub fn verify_published_destination(
     )
 }
 
-/// Builds an unsigned `source2.msix` from an immutable snapshot for external signing.
+/// Builds an unsigned source MSIX from an immutable snapshot for external signing.
+/// The snapshot profile selects `source2.msix` (Windows) or `brew.msix` (Homebrew).
 ///
 /// # Errors
 ///
@@ -758,6 +952,13 @@ pub fn package(options: &PackageOptions) -> Result<PackageReport> {
     verify_snapshot_path(&snapshot)?;
     let snapshot_metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
     validate_recorded_snapshot(&connection, &snapshot_metadata)?;
+    if snapshot_metadata.profile == PublisherProfile::Homebrew
+        && options.msix.file_name().and_then(|name| name.to_str()) != Some("brew.msix")
+    {
+        return Err(PublisherError::Invalid(
+            "Homebrew profile requires the package output file to be named brew.msix".to_owned(),
+        ));
+    }
 
     if let Some(dest) = destination_abs.filter(|path| path.exists()) {
         let dest = fs::canonicalize(&dest)?;
@@ -855,9 +1056,9 @@ pub fn publish(options: &PublishOptions) -> Result<PublishReport> {
 /// destination exactly as a process killed at that point would leave it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitStep {
-    /// The pending marker is written and the package is staged; `source2.msix` is not yet replaced.
+    /// The pending marker is written and the package is staged; the root MSIX is not yet replaced.
     BeforePackageSwap,
-    /// `source2.msix` is replaced; the pending record is not yet dropped.
+    /// The root MSIX is replaced; the pending record is not yet dropped.
     AfterPackageSwap,
 }
 
@@ -903,6 +1104,14 @@ fn publish_with_hooks(
     verify_snapshot_path(&snapshot)?;
     let snapshot_metadata: SnapshotMetadata = serde_json::from_slice(&fs::read(snapshot.join("snapshot.json"))?)?;
     validate_recorded_snapshot(&connection, &snapshot_metadata)?;
+    let msix_name = snapshot_metadata.profile.package_file_name();
+    if snapshot_metadata.profile == PublisherProfile::Homebrew
+        && options.msix.file_name().and_then(|name| name.to_str()) != Some(msix_name)
+    {
+        return Err(PublisherError::Invalid(
+            "Homebrew profile requires the signed package file to be named brew.msix".to_owned(),
+        ));
+    }
 
     // Stage `--msix` into private state immediately so all inspection, verification, hashing,
     // and promotion run against an immutable copy rather than a caller-mutable path.
@@ -912,7 +1121,7 @@ fn publish_with_hooks(
     }
     fs::create_dir(&temporary)?;
     let result = (|| -> Result<PublishReport> {
-        let staged_msix = temporary.join("source2.msix");
+        let staged_msix = temporary.join(msix_name);
         fs::copy(&msix_abs, &staged_msix)?;
         let parsed_msix = parse_source_msix(&staged_msix)?;
         validate_package_identity(&parsed_msix.package_name, &parsed_msix.publisher)?;
@@ -1044,6 +1253,7 @@ fn publish_with_hooks(
             &parsed_msix.publisher,
             &canonical_version,
             &build_id,
+            msix_name,
             prior,
             after_copy,
             on_commit_step,
@@ -1057,9 +1267,14 @@ fn build_snapshot(
     staging: &Path,
     groups: BTreeMap<(String, String), Vec<ManifestDocument>>,
     build_id: &str,
+    input: &Path,
+    bottle_assets: &[String],
 ) -> Result<()> {
     let feed = staging.join("feed");
     fs::create_dir_all(&feed)?;
+    for relative in bottle_assets {
+        copy_bottle_asset(input, &feed, relative)?;
+    }
     fs::create_dir_all(staging.join("Public"))?;
     let mut db = Connection::open(staging.join("Public").join("index.db"))?;
     db.execute_batch(INDEX_SCHEMA)?;
@@ -2112,7 +2327,12 @@ fn insert_correlations(
     Ok(())
 }
 
-fn snapshot_metadata(staging: &Path, inventory: &Inventory, build_id: &str) -> Result<SnapshotMetadata> {
+fn snapshot_metadata(
+    staging: &Path,
+    inventory: &Inventory,
+    build_id: &str,
+    profile: PublisherProfile,
+) -> Result<SnapshotMetadata> {
     let artifacts = hash_tree(&staging.join("feed"))?;
     let index_path = staging.join("Public").join("index.db");
     let index_hash = sha256_hex(&fs::read(&index_path)?);
@@ -2123,6 +2343,7 @@ fn snapshot_metadata(staging: &Path, inventory: &Inventory, build_id: &str) -> R
         schema_version: 1,
         artifact_format_version: PUBLISHER_FORMAT_VERSION,
         build_id: build_id.to_owned(),
+        profile,
         created_utc: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         manifest_count,
         package_count: usize::try_from(package_count)
@@ -2335,6 +2556,7 @@ fn record_build(state: &Path, build_id: &str, snapshot: &SnapshotMetadata) -> Re
     let summary = serde_json::json!({
         "manifestCount": snapshot.manifest_count,
         "packageCount": snapshot.package_count,
+        "profile": snapshot.profile.as_str(),
         "createdUtc": snapshot.created_utc,
         "snapshot": format!("builds/{build_id}"),
     });
@@ -2455,6 +2677,7 @@ fn validate_recorded_snapshot(connection: &Connection, snapshot: &SnapshotMetada
     let inventory: BTreeMap<String, String> = serde_json::from_str(&inventory)?;
     let summary: serde_json::Value = serde_json::from_str(&summary)?;
     if inventory != snapshot.inventory
+        || summary["profile"].as_str().unwrap_or("windows") != snapshot.profile.as_str()
         || json_count(&summary, "manifestCount")? != snapshot.manifest_count
         || json_count(&summary, "packageCount")? != snapshot.package_count
         || summary["createdUtc"].as_str() != Some(snapshot.created_utc.as_str())
@@ -2531,6 +2754,7 @@ fn remove_stale_publication_temporaries(destination: &Path, tracked: &BTreeMap<S
 fn is_publication_temporary_name(name: &str, at_root: bool) -> bool {
     let rust_temporary = at_root
         && (name == ".pinget-publisher.json.new"
+            || (name.starts_with(".pinget-msix-") && name.ends_with(".new"))
             || (name.starts_with(".source2.") && name.ends_with(".new") && name.len() > ".source2..new".len()));
     rust_temporary || is_dotnet_atomic_temporary_name(name)
 }
@@ -2738,14 +2962,37 @@ struct OwnerMarker {
     package_name: String,
     publisher: String,
     package_version: String,
+    #[serde(default)]
+    profile: PublisherProfile,
+    #[serde(default = "default_package_file_name")]
+    package_file_name: String,
     build_id: String,
     index_hash: String,
     unsigned_development: bool,
     published_utc: String,
     artifacts: BTreeMap<String, String>,
-    /// Present while `source2.msix` is being replaced; see [`resolve_pending_commit`].
+    /// Present while the profile-selected root MSIX is being replaced; see [`resolve_pending_commit`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_commit: Option<PendingCommit>,
+}
+
+fn default_package_file_name() -> String {
+    "source2.msix".to_owned()
+}
+
+fn validate_msix_file_name(name: &str) -> Result<()> {
+    let stem = name.strip_suffix(".msix").unwrap_or_default();
+    if stem.is_empty()
+        || stem.len() > 100
+        || !stem
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(PublisherError::Invalid(
+            "source MSIX file name must be a simple ASCII .msix name".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Commit record written before the package swap: the marker describes the new publication, and
@@ -2805,6 +3052,7 @@ fn promote_staged_package(
     publisher: &str,
     package_version: &str,
     build_id: &str,
+    package_file_name: &str,
     prior: Option<OwnerMarker>,
     after_copy: impl FnOnce(&Path) -> Result<()>,
     mut on_commit_step: impl FnMut(CommitStep, &Path),
@@ -2818,6 +3066,8 @@ fn promote_staged_package(
         package_name: package_name.to_owned(),
         publisher: publisher.to_owned(),
         package_version: package_version.to_owned(),
+        profile: metadata.profile,
+        package_file_name: package_file_name.to_owned(),
         build_id: build_id.to_owned(),
         index_hash: metadata.index_hash.clone(),
         unsigned_development,
@@ -2825,7 +3075,18 @@ fn promote_staged_package(
         artifacts: BTreeMap::new(),
         pending_commit: None,
     });
+    if marker.package_file_name != package_file_name {
+        return Err(PublisherError::Invalid(
+            "publication destination is already owned by a different source package file name".to_owned(),
+        ));
+    }
+    if marker.profile != metadata.profile || package_file_name != metadata.profile.package_file_name() {
+        return Err(PublisherError::Invalid(
+            "published package profile does not match the immutable snapshot".to_owned(),
+        ));
+    }
     marker.package_version = package_version.to_owned();
+    marker.profile = metadata.profile;
     marker.build_id = build_id.to_owned();
     marker.index_hash = metadata.index_hash.clone();
     marker.unsigned_development = unsigned_development;
@@ -2881,21 +3142,22 @@ fn promote_staged_package(
         }
     }
     after_copy(destination)?;
-    let target_msix = destination.join("source2.msix");
+    let target_msix = destination.join(package_file_name);
 
     marker.owner = "Pinget.Publisher".to_owned();
     marker.package_name = package_name.to_owned();
     marker.publisher = publisher.to_owned();
     marker.package_version = package_version.to_owned();
+    marker.package_file_name = package_file_name.to_owned();
     marker.build_id = build_id.to_owned();
     marker.index_hash = metadata.index_hash;
     marker.unsigned_development = unsigned_development;
     marker.published_utc = Utc::now().to_rfc3339();
     marker.artifacts = published_inventory(destination)?;
-    marker.artifacts.insert("source2.msix".to_owned(), package_hash);
+    marker.artifacts.insert(package_file_name.to_owned(), package_hash);
     marker.pending_commit = None;
     // Three-step commit: (1) the marker records the new publication plus the marker to restore,
-    // (2) the package is staged next to `source2.msix` and swapped in, (3) the pending record is
+    // (2) the package is staged next to the root MSIX and swapped in, (3) the pending record is
     // dropped. A run interrupted between the steps is completed or rolled back by the next publish
     // (`finalize_pending_commit`); the staged package only exists while the record is pending.
     let pending_marker = OwnerMarker {
@@ -2905,7 +3167,7 @@ fn promote_staged_package(
         ..marker.clone()
     };
     replace_owner_marker(destination, &pending_marker)?;
-    let swapped = stage_package(staged_msix, destination, build_id).and_then(|staged_package| {
+    let swapped = stage_package(staged_msix, destination, build_id, package_file_name).and_then(|staged_package| {
         on_commit_step(CommitStep::BeforePackageSwap, destination);
         atomic_replace(&staged_package, &target_msix).inspect_err(|_| {
             let _ = fs::remove_file(&staged_package);
@@ -2943,12 +3205,15 @@ fn promote_staged_package(
     })
 }
 
-fn stage_package(source: &Path, destination: &Path, build_id: &str) -> Result<PathBuf> {
+fn stage_package(source: &Path, destination: &Path, build_id: &str, package_file_name: &str) -> Result<PathBuf> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| PublisherError::Invalid(format!("system clock is before Unix epoch: {error}")))?
         .as_nanos();
-    let staged = destination.join(format!(".source2.{build_id}.{}.{}.new", std::process::id(), timestamp));
+    let staged = destination.join(format!(
+        ".pinget-msix-{package_file_name}-{build_id}-{}-{timestamp}.new",
+        std::process::id()
+    ));
     let mut output = OpenOptions::new().write(true).create_new(true).open(&staged)?;
     let result = (|| -> Result<()> {
         let mut input = File::open(source)?;
@@ -3288,7 +3553,7 @@ fn verify_msix_contents(package_path: &Path, marker: &OwnerMarker) -> Result<()>
     }
     if marker.unsigned_development && parsed.has_signature_parts {
         return Err(PublisherError::Invalid(
-            "unsigned development destination contains a signed source2.msix".to_owned(),
+            format!("unsigned development destination contains a signed {}", marker.package_file_name),
         ));
     }
     Ok(())
@@ -3386,12 +3651,13 @@ fn verify_destination_with_tool(
             "publisher marker contains an invalid index hash".to_owned(),
         ));
     }
-    verify_msix_contents(&destination.join("source2.msix"), &marker)?;
+    let package_path = destination.join(&marker.package_file_name);
+    verify_msix_contents(&package_path, &marker)?;
     if !marker.unsigned_development {
         let psign_tool = psign::require_psign_tool(psign_tool)?;
         psign::verify(
             &psign_tool,
-            &destination.join("source2.msix"),
+            &package_path,
             &marker.publisher,
             trusted_ca,
             policy,
@@ -3405,7 +3671,7 @@ fn verify_destination_with_tool(
     })
 }
 
-/// Resolves a marker left by an interrupted package swap. When `source2.msix` is the package the
+/// Resolves a marker left by an interrupted package swap. When the marked MSIX is the package the
 /// marker records, the swap happened and the marker is committed; otherwise the previous marker
 /// is restored, keeping the interrupted publication's fully copied feed artifacts as owned files.
 /// Returns `None` when an interrupted first publication never swapped its package in.
@@ -3413,12 +3679,12 @@ fn resolve_pending_commit(destination: &Path, marker: OwnerMarker) -> Result<Opt
     let Some(pending) = marker.pending_commit.clone() else {
         return Ok(Some(marker));
     };
-    let package_hash = match fs::read(destination.join("source2.msix")) {
+    let package_hash = match fs::read(destination.join(&marker.package_file_name)) {
         Ok(bytes) => Some(sha256_hex(&bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    if package_hash.as_ref() == marker.artifacts.get("source2.msix") {
+    if package_hash.as_ref() == marker.artifacts.get(&marker.package_file_name) {
         return Ok(Some(OwnerMarker {
             pending_commit: None,
             ..marker
@@ -3429,7 +3695,7 @@ fn resolve_pending_commit(destination: &Path, marker: OwnerMarker) -> Result<Opt
     };
     let mut previous = *previous;
     for (relative, expected) in &marker.artifacts {
-        if relative == "source2.msix" || previous.artifacts.contains_key(relative) {
+        if relative == &marker.package_file_name || previous.artifacts.contains_key(relative) {
             continue;
         }
         if fs::read(safe_join(destination, relative)?).is_ok_and(|bytes| sha256_hex(&bytes) == *expected) {
@@ -3535,6 +3801,12 @@ fn validate_owner_marker(marker: &OwnerMarker) -> Result<()> {
             "publisher ownership marker identity is invalid".to_owned(),
         ));
     }
+    validate_msix_file_name(&marker.package_file_name)?;
+    if marker.package_file_name != marker.profile.package_file_name() {
+        return Err(PublisherError::Invalid(
+            "publisher ownership marker package name does not match its profile".to_owned(),
+        ));
+    }
     validate_build_id(&marker.build_id)?;
     validate_msix_version(&marker.package_version)?;
     for (relative, hash) in &marker.artifacts {
@@ -3545,9 +3817,9 @@ fn validate_owner_marker(marker: &OwnerMarker) -> Result<()> {
             ));
         }
     }
-    if !marker.artifacts.contains_key("source2.msix") {
+    if !marker.artifacts.contains_key(&marker.package_file_name) {
         return Err(PublisherError::Invalid(
-            "publisher ownership marker does not list source2.msix".to_owned(),
+            "publisher ownership marker does not list its root MSIX".to_owned(),
         ));
     }
     Ok(())
@@ -4134,9 +4406,49 @@ fn hash_tree(root: &Path) -> Result<BTreeMap<String, String>> {
             .strip_prefix(root)
             .map_err(|_| PublisherError::Invalid(format!("file escaped inventory root: {}", path.display())))?;
         let key = relative.to_string_lossy().replace('\\', "/");
-        inventory.insert(key, sha256_hex(&fs::read(path)?));
+        inventory.insert(key, sha256_file(&path)?);
     }
     Ok(inventory)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn copy_bottle_asset(input: &Path, feed: &Path, relative: &str) -> Result<()> {
+    let source = safe_join(input, relative)?;
+    reject_reparse_components(&source)?;
+    let target = safe_join(feed, relative)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| PublisherError::Invalid("invalid bottle asset path".to_owned()))?;
+    fs::create_dir_all(parent)?;
+    let mut source_file = File::open(&source)?;
+    let mut target_file = OpenOptions::new().write(true).create_new(true).open(&target)?;
+    std::io::copy(&mut source_file, &mut target_file)?;
+    target_file.sync_all()?;
+    drop(target_file);
+    let expected_hash = Path::new(relative)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".tar.gz"))
+        .ok_or_else(|| PublisherError::Invalid("invalid bottle asset name".to_owned()))?;
+    if sha256_file(&target)? != expected_hash {
+        return Err(PublisherError::Invalid(format!(
+            "bottle changed while creating immutable snapshot: {relative}"
+        )));
+    }
+    Ok(())
 }
 
 fn reject_reparse_components(path: &Path) -> Result<()> {
@@ -4522,10 +4834,35 @@ fn validate_mszip_size(input: &[u8]) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn compress_mszip(_input: &[u8]) -> Result<Vec<u8>> {
-    Err(PublisherError::Tool(
-        "native WinGet MSZIP compression is currently supported only on Windows".to_owned(),
-    ))
+fn compress_mszip(input: &[u8]) -> Result<Vec<u8>> {
+    const HEADER_SIZE: usize = 24;
+    const BLOCK_SIZE: usize = 32 * 1024;
+    const SIGNATURE: [u8; 4] = [0x0a, 0x51, 0xe5, 0xc0];
+
+    if input.len() > MAX_MSZIP_SIZE {
+        return Err(PublisherError::Invalid(
+            "MSZIP payload exceeds the 64 MiB limit".to_owned(),
+        ));
+    }
+
+    let mut output = vec![0; HEADER_SIZE];
+    output[..4].copy_from_slice(&SIGNATURE);
+    output[8..16].copy_from_slice(&(input.len() as u64).to_le_bytes());
+    output[16..24].copy_from_slice(&(BLOCK_SIZE as u64).to_le_bytes());
+    for block in input.chunks(BLOCK_SIZE) {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(block)?;
+        let compressed = encoder.finish()?;
+        let framed_len = compressed
+            .len()
+            .checked_add(2)
+            .and_then(|length| u32::try_from(length).ok())
+            .ok_or_else(|| PublisherError::Invalid("MSZIP compressed block is too large".to_owned()))?;
+        output.extend_from_slice(&framed_len.to_le_bytes());
+        output.extend_from_slice(b"CK");
+        output.extend_from_slice(&compressed);
+    }
+    Ok(output)
 }
 
 #[cfg(not(windows))]
@@ -4870,6 +5207,23 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[test]
+    fn portable_mszip_writer_roundtrips_empty_single_and_multiblock_payloads() {
+        for input in [
+            Vec::new(),
+            b"small sidecar".to_vec(),
+            (0..200_000u32)
+                .flat_map(|value| format!("  - v: \"{}\"\n", value % 977).into_bytes())
+                .collect(),
+        ] {
+            let compressed = compress_mszip(&input).expect("MSZIP compression");
+            assert_eq!(
+                pinget_core::decompress_mszip_buffer(&compressed).expect("portable decode"),
+                input
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn portable_mszip_decoder_reads_native_compressor_output() {
@@ -4891,6 +5245,7 @@ mod tests {
             schema_version: 1,
             artifact_format_version: PUBLISHER_FORMAT_VERSION,
             build_id: "1".repeat(64),
+            profile: PublisherProfile::Windows,
             created_utc: "now".to_owned(),
             manifest_count: 1,
             package_count: 1,
@@ -5114,6 +5469,8 @@ mod tests {
             package_name: "Pinget.Test.Other".to_owned(),
             publisher: "CN=Other".to_owned(),
             package_version: "9.9.9.9".to_owned(),
+            profile: PublisherProfile::Windows,
+            package_file_name: "source2.msix".to_owned(),
             build_id: "0".repeat(64),
             index_hash: "0".repeat(64),
             unsigned_development: true,

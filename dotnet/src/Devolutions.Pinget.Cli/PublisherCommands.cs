@@ -10,6 +10,22 @@ internal static class PublisherCommands
     public static Command Create(Option<string?> outputOption)
     {
         var root = new Command("repository", "Build and publish WinGet v2 preindexed sources");
+        var importHomebrew = new Command("import-homebrew",
+            "Import one pinned local formula/bottle offline; no downloads or dependency resolution. Only arm64_sonoma/macOS/arm64 is supported.");
+        var importOptions = new[] { "formula-json", "bottle-archive", "manifest-output", "bottle-mirror", "tag", "target-os", "architecture", "base-url" }
+            .ToDictionary(name => name, name => new Option<string>($"--{name}",
+                name == "base-url" ? "Public HTTPS mirror URL without credentials, query, fragment or escapes" : $"Explicit {name} input") { IsRequired = true });
+        foreach (var option in importOptions.Values)
+            importHomebrew.AddOption(option);
+        importHomebrew.SetHandler(context => Run(context, outputOption, () =>
+        {
+            string Value(string name) => context.ParseResult.GetValueForOption(importOptions[name])!;
+            var result = HomebrewImporter.Import(new HomebrewImportOptions(
+                Value("formula-json"), Value("bottle-archive"), Value("manifest-output"), Value("bottle-mirror"),
+                Value("tag"), Value("target-os"), Value("architecture"), Value("base-url")));
+            return (result, $"Imported {result["packageIdentifier"]} {result["packageVersion"]} ({result["bottleTag"]}); report: {result["manifestFile"]}.import.json");
+        }));
+        root.AddCommand(importHomebrew);
 
         var stateBuild = new Option<string>("--state", "Publisher working directory") { IsRequired = true };
         var inputBuild = InputOption();

@@ -593,6 +593,12 @@ internal static class SourceStoreManager
             return true;
         }
 
+        if (string.Equals(type, "Pinget.PreIndexed.Homebrew", StringComparison.OrdinalIgnoreCase))
+        {
+            kind = SourceKind.HomebrewPreIndexed;
+            return true;
+        }
+
         if (string.Equals(type, "Microsoft.Rest", StringComparison.OrdinalIgnoreCase))
         {
             kind = SourceKind.Rest;
@@ -606,6 +612,7 @@ internal static class SourceStoreManager
     private static string ToPackagedSourceType(SourceKind kind) => kind switch
     {
         SourceKind.PreIndexed => "Microsoft.PreIndexed.Package",
+        SourceKind.HomebrewPreIndexed => "Pinget.PreIndexed.Homebrew",
         SourceKind.Rest => "Microsoft.Rest",
         _ => throw new InvalidOperationException($"Unsupported source kind: {kind}"),
     };

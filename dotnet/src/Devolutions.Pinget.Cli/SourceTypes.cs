@@ -16,6 +16,12 @@ internal static class SourceTypes
             return SourceKind.Rest;
         }
 
+        if (string.Equals(value, "homebrew", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(value, "Pinget.PreIndexed.Homebrew", StringComparison.OrdinalIgnoreCase))
+        {
+            return SourceKind.HomebrewPreIndexed;
+        }
+
         if (string.IsNullOrWhiteSpace(value) ||
             string.Equals(value, "preindexed", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(value, "Microsoft.PreIndexed.Package", StringComparison.OrdinalIgnoreCase))

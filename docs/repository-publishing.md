@@ -33,12 +33,12 @@ URLs; the build does not download or execute them.
   Signing, Azure Key Vault, or HSM), and a publisher distinguished name
   matching that certificate's subject.
 
-Building requires Windows because sidecars are compressed with the native
-Windows Compression API. `package`, `publish`, `verify`, `status` and `diff`
-also run on Linux and macOS, so a snapshot built on Windows can be packaged,
-signed and published elsewhere. Do not infer building support from the
-availability of the CLI on a platform. A missing verification tool or unsigned
-MSIX fails `publish` unless `--unsigned-development` is explicitly passed.
+Build, package, verify, status, diff and publish run on Windows, macOS and
+Linux. Windows uses the native Windows Compression API for MSZIP output;
+macOS and Linux use a portable raw-deflate encoder with the same WinGet v2
+MSZIP framing. The resulting sidecars are readable by the existing client
+decoder. A missing verification tool or unsigned MSIX fails `publish` unless
+`--unsigned-development` is explicitly passed.
 
 ## Build, package, sign and publish
 
@@ -151,20 +151,37 @@ Copy the **entire published directory**, maintaining relative paths:
 
 | Published file | Purpose |
 | --- | --- |
-| `source2.msix` | Signed source package containing `Public/index.db` |
+| `source2.msix` / `brew.msix` | Signed source package containing `Public/index.db` |
 | `manifests/<sha256>.yaml` | Merged manifest bytes referenced by version data |
 | `packages/<id>/<hash-prefix>/versionData.mszyml` | Compressed version metadata referenced by the index |
+| `bottles/<sha256>.tar.gz` | Unchanged Homebrew bottle bytes, present only in Homebrew snapshots |
+
+The builder records a `windows` or `homebrew` profile in each immutable
+snapshot. A snapshot is Homebrew-only when its manifests use the
+`Pinget.Homebrew.*` ID namespace, `Pinget.Homebrew` extension, or
+`homebrew-bottle` installer type; mixing Homebrew and ordinary Windows
+packages in one snapshot is rejected. For the Homebrew profile, `repository
+package --msix` and the signed input to `repository publish --msix` must be
+named `brew.msix`; the publisher selects that root name from the snapshot
+profile. The ownership marker records the profile and root name, and recovery
+verifies both. Older snapshots and ownership markers without a profile field
+continue to mean `windows` / `source2.msix`. The `Pinget.PreIndexed.Homebrew`
+client source consumes only `brew.msix` and verifies it before cache
+activation; successful signed-feed acceptance and native bottle lifecycle
+support remain outstanding.
 
 A static website, reverse proxy, object-storage HTTPS endpoint or CDN can serve
 these files. Enable `GET` and `HEAD`; retain `ETag`/`Last-Modified` metadata and
 conditional requests. Ensure the host serves `.msix`, `.mszyml` and `.yaml`
 rather than rejecting unknown extensions or rewriting them to a website page.
 Use `application/octet-stream` when no more specific type is configured.
-Range requests for large source packages are useful.
+Range requests for large source packages are useful. Apply the same cache
+policy to whichever root package name is selected.
 
-Use a short cache lifetime or revalidation for `source2.msix`. Hash-addressed
-manifests and sidecars may be cached for a long time. A CDN must not serve a
-new root package before its referenced objects are readable through that CDN.
+Use a short cache lifetime or revalidation for the selected root MSIX.
+Hash-addressed manifests, sidecars, and bottle archives may be cached for a
+long time. A CDN must not serve a new root package before its referenced
+objects are readable through that CDN.
 
 The local publisher promotes new immutable metadata **before** replacing
 `source2.msix`. A later cloud upload is a separate operation: upload new

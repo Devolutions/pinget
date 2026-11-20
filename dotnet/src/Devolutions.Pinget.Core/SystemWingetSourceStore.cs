@@ -458,6 +458,7 @@ internal static class SystemWingetSourceStore
     private static string FormatSourceType(SourceKind kind) => kind switch
     {
         SourceKind.PreIndexed => "Microsoft.PreIndexed.Package",
+        SourceKind.HomebrewPreIndexed => "Pinget.PreIndexed.Homebrew",
         SourceKind.Rest => "Microsoft.Rest",
         _ => throw new InvalidOperationException($"Unsupported source kind '{kind}'."),
     };

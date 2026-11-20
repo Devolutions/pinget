@@ -10,7 +10,9 @@ internal sealed record SourceExportEntry(
     string Identifier,
     string TrustLevel,
     bool Explicit,
-    int Priority);
+    int Priority,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Publisher = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<string>? TrustedCa = null);
 
 internal sealed record SourceExportPayload(List<SourceExportEntry> Sources);
 

@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(not(windows))]
-use pinget_publisher::PublisherError;
 use pinget_publisher::{BuildOptions, build, diff, status, verify};
 #[cfg(windows)]
 use pinget_publisher::{PackageOptions, PublishOptions, package, publish, verify_published_destination};
@@ -388,60 +387,22 @@ fn diff_reports_raw_content_additions_changes_and_removals() {
 
 #[cfg(not(windows))]
 #[test]
-fn non_windows_build_rejects_native_compression_while_diff_succeeds() {
+fn non_windows_builds_portable_mszip_and_diff_succeeds() {
     let temp = TempDirectory::new();
     let input = copy_fixture("multi", &temp.path.join("manifests"));
-    let failed_state = temp.path.join("native-state");
-    let error = build(&BuildOptions {
+    let state = temp.path.join("portable-state");
+    let report = build(&BuildOptions {
         input: input.clone(),
-        state: failed_state.clone(),
-    })
-    .expect_err("native writer must not claim support on a non-Windows host");
-    match error {
-        PublisherError::Tool(message) => {
-            assert!(message.contains("native WinGet MSZIP compression"));
-            assert!(message.contains("only on Windows"));
-        }
-        other => panic!("expected native capability error, got {other}"),
-    }
-    assert!(
-        !failed_state.join("publisher.db").exists(),
-        "failed native build must not record a snapshot"
-    );
-    assert_eq!(
-        fs::read_dir(failed_state.join("builds"))
-            .expect("snapshot directory")
-            .count(),
-        0,
-        "failed native build must clean private staging"
-    );
-    let state = temp.path.join("inventory-state");
-    create_empty_state(&state);
-    let original = fs::read(state.join("publisher.db")).expect("inventory state");
-    let changes = diff(&BuildOptions {
-        input,
         state: state.clone(),
     })
-    .expect("diff must not call native compression");
-    assert_eq!(
-        changes.added,
-        [
-            "Pinget.Test.Matrix_1.10.0.installer.yaml",
-            "Pinget.Test.Matrix_1.10.0.locale.en-US.yaml",
-            "Pinget.Test.Matrix_1.10.0.locale.fr-FR.yaml",
-            "Pinget.Test.Matrix_1.10.0.version.yaml",
-            "Pinget.Test.Matrix_1.9.0.yaml",
-        ]
-    );
+    .expect("portable MSZIP writer must build on non-Windows hosts");
+    verify(&state, Some(&report.build_id), None).expect("portable sidecars must verify");
+    let changes = diff(&BuildOptions { input, state }).expect("diff should work after a portable build");
+    assert!(changes.added.is_empty());
     assert!(changes.changed.is_empty());
     assert!(changes.removed.is_empty());
-    assert_eq!(changes.last_build_id, None);
+    assert_eq!(changes.last_build_id.as_deref(), Some(report.build_id.as_str()));
     assert!(!changes.last_build_published);
-    assert_eq!(
-        fs::read(state.join("publisher.db")).expect("inventory state preserved"),
-        original
-    );
-    assert!(!state.join("builds").exists());
 }
 
 #[test]

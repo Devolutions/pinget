@@ -252,6 +252,24 @@ public sealed class MsixPackageWriterTests
     }
 
     [Fact]
+    public void PortableMsZipWriter_RoundTripsEmptyBoundaryAndMultiblockPayloads()
+    {
+        var inputs = new[]
+        {
+            Array.Empty<byte>(),
+            Enumerable.Repeat((byte)7, 32 * 1024).ToArray(),
+            Encoding.UTF8.GetBytes(string.Concat(
+                Enumerable.Range(0, 200_000).Select(value => $"  - v: \"{value % 977}\"\n"))),
+        };
+
+        foreach (var input in inputs)
+        {
+            var compressed = MsZipCompressor.CompressPortable(input);
+            Assert.Equal(input, MsZipCompressor.DecompressPortable(compressed));
+        }
+    }
+
+    [Fact]
     public void PortableMsZipDecoder_ReadsNativeCompressorOutput()
     {
         if (!OperatingSystem.IsWindows())
