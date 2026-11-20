@@ -84,6 +84,39 @@ pinget uninstall jq
 pinget uninstall oniguruma
 ```
 
+## Reproducing the real-bottle gate
+
+`tests/homebrew/run-native-acceptance.py` pins jq/oniguruma OCI indexes,
+authenticates metadata and bottle digests, creates disposable signing/TLS
+credentials, and checks both publisher/consumer directions against a static
+HTTPS host. Linux/macOS additionally check native execution, rebuild-only
+upgrade, cross-runtime repair, dependency-protected uninstall, and tampered
+source cache preservation. The rebuild transition is synthetic; bottle bytes
+are unchanged. Windows checks publishing and signed source consumption only.
+
+The `Homebrew prototype acceptance` workflow runs these gates on Linux,
+macOS arm64/x64, and Windows and uploads only a non-secret JSON report. Its
+prototype-branch push trigger is temporary; `workflow_call` is the reusable
+entry point. A queued workflow is not evidence of platform success.
+
+Local Linux runs require built CLIs, Psign, `patchelf`, OpenSSL, Python, and
+an explicit private temporary parent:
+
+```sh
+python tests/homebrew/run-native-acceptance.py \
+  --rust-cli rust/target/debug/pinget \
+  --dotnet-assembly dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.dll \
+  --psign-tool /absolute/path/to/psign-tool \
+  --work-root /absolute/private/temporary/parent \
+  --report /absolute/path/to/report.json
+```
+
+Linux uses process-local TLS trust, without modifying host certificate stores.
+macOS/Windows trust changes are guarded to disposable GitHub-hosted runners
+and remove the explicit test certificate afterward. Temporary keys, packages,
+client state, and the loopback server are cleaned up; no private key is an
+artifact or a repository fixture.
+
 In PowerShell, use `Add-PingetSource` with the same `-Type`, `-Publisher`, and
 one or more `-TrustedCa` values. Do not register the Homebrew feed as
 `Microsoft.PreIndexed.Package`: that source type fetches `source2.msix` /
