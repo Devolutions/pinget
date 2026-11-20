@@ -842,7 +842,7 @@ fn run() -> Result<()> {
             } else {
                 Repository::open()?
             };
-            if do_install && !cfg!(windows) {
+            if do_install && !cfg!(windows) && !repository.has_homebrew_packages()? {
                 print_warnings(&[UPGRADE_UNSUPPORTED_WARNING.to_owned()]);
                 println!("No changes were made.");
                 return Ok(());
@@ -974,9 +974,10 @@ fn run() -> Result<()> {
                     let arg = resolve_source_add_value(args.arg.as_deref(), args.arg_option.as_deref(), "argument")?;
                     let kind = parse_source_kind(&args.kind)?;
                     if kind == SourceKind::HomebrewPreIndexed {
-                        let publisher = args.publisher.as_deref().ok_or_else(|| {
-                            anyhow!("--publisher is required for Pinget Homebrew sources")
-                        })?;
+                        let publisher = args
+                            .publisher
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("--publisher is required for Pinget Homebrew sources"))?;
                         if args.trust_level.is_some() || args.explicit {
                             bail!("--trust-level and --explicit are not supported for Pinget Homebrew sources");
                         }
@@ -2407,22 +2408,20 @@ fn print_source_export(repository: &Repository) -> Result<()> {
                 "Explicit": s.explicit,
                 "Priority": s.priority
             });
-            if s.kind == SourceKind::HomebrewPreIndexed {
-                if let Some(object) = item.as_object_mut() {
-                    object.insert(
-                        "Publisher".to_owned(),
-                        s.publisher
-                            .clone()
-                            .map(serde_json::Value::String)
-                            .unwrap_or(serde_json::Value::Null),
-                    );
-                    object.insert(
-                        "TrustedCa".to_owned(),
-                        serde_json::Value::Array(
-                            s.trusted_ca.iter().cloned().map(serde_json::Value::String).collect(),
-                        ),
-                    );
-                }
+            if s.kind == SourceKind::HomebrewPreIndexed
+                && let Some(object) = item.as_object_mut()
+            {
+                object.insert(
+                    "Publisher".to_owned(),
+                    s.publisher
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                object.insert(
+                    "TrustedCa".to_owned(),
+                    serde_json::Value::Array(s.trusted_ca.iter().cloned().map(serde_json::Value::String).collect()),
+                );
             }
             item
         })
@@ -3140,9 +3139,7 @@ fn resolve_source_add_value(positional: Option<&str>, option: Option<&str>, labe
 fn parse_source_kind(value: &str) -> Result<SourceKind> {
     if value.eq_ignore_ascii_case("rest") || value.eq_ignore_ascii_case("Microsoft.Rest") {
         Ok(SourceKind::Rest)
-    } else if value.eq_ignore_ascii_case("homebrew")
-        || value.eq_ignore_ascii_case("Pinget.PreIndexed.Homebrew")
-    {
+    } else if value.eq_ignore_ascii_case("homebrew") || value.eq_ignore_ascii_case("Pinget.PreIndexed.Homebrew") {
         Ok(SourceKind::HomebrewPreIndexed)
     } else if value.eq_ignore_ascii_case("preindexed") || value.eq_ignore_ascii_case("Microsoft.PreIndexed.Package") {
         Ok(SourceKind::PreIndexed)

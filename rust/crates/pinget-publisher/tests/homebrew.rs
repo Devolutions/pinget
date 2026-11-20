@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 
 const FORMULA: &str = include_str!("../../../../tests/homebrew/formula.json");
 const BOTTLE: &str = include_str!("../../../../tests/homebrew/bottle.base64");
-const WINDOWS_MANIFEST: &str = include_str!("../../../../tests/publisher/fixtures/singleton/Pinget.Contract.Singleton.yaml");
+const WINDOWS_MANIFEST: &str =
+    include_str!("../../../../tests/publisher/fixtures/singleton/Pinget.Contract.Singleton.yaml");
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
@@ -41,7 +42,9 @@ impl Fixture {
         fs::write(&options.formula_json, FORMULA).expect("write pinned formula");
         fs::write(
             &options.bottle_archive,
-            base64::engine::general_purpose::STANDARD.decode(BOTTLE.trim()).expect("decode pinned bottle"),
+            base64::engine::general_purpose::STANDARD
+                .decode(BOTTLE.trim())
+                .expect("decode pinned bottle"),
         )
         .expect("write pinned bottle");
         Self { root, options }
@@ -50,7 +53,11 @@ impl Fixture {
     fn change(&self, mutate: impl FnOnce(&mut Value)) {
         let mut formula: Value = serde_json::from_str(FORMULA).expect("pinned formula JSON");
         mutate(&mut formula);
-        fs::write(&self.options.formula_json, serde_json::to_vec(&formula).expect("serialize formula")).expect("write formula");
+        fs::write(
+            &self.options.formula_json,
+            serde_json::to_vec(&formula).expect("serialize formula"),
+        )
+        .expect("write formula");
     }
 
     fn reject(&self, message: &str) {
@@ -75,7 +82,10 @@ fn publisher_input(fixture: &Fixture) -> PathBuf {
     fs::create_dir_all(&bottles).expect("bottle bundle directory");
     for entry in fs::read_dir(&fixture.options.manifest_output).expect("read generated manifests") {
         let path = entry.expect("manifest entry").path();
-        if path.extension().is_some_and(|extension| matches!(extension.to_str(), Some("yaml" | "yml"))) {
+        if path
+            .extension()
+            .is_some_and(|extension| matches!(extension.to_str(), Some("yaml" | "yml")))
+        {
             fs::copy(&path, manifests.join(path.file_name().expect("manifest filename"))).expect("bundle manifest");
         }
     }
@@ -84,6 +94,48 @@ fn publisher_input(fixture: &Fixture) -> PathBuf {
         fs::copy(&path, bottles.join(path.file_name().expect("bottle filename"))).expect("bundle bottle");
     }
     input
+}
+
+#[test]
+fn maps_linux_runtime_dependencies_and_distinguishes_bottle_rebuilds() {
+    let mut fixture = Fixture::new();
+    fixture.options.tag = "x86_64_linux".into();
+    fixture.options.target_os = "Linux".into();
+    fixture.options.architecture = "x64".into();
+    fixture.change(|value| {
+        let mut bottle = value["bottle"]["stable"]["files"]["arm64_sonoma"].clone();
+        bottle["url"] = json!(format!(
+            "https://ghcr.io/v2/homebrew/core/tinytool/blobs/sha256:{}",
+            bottle["sha256"].as_str().expect("hash")
+        ));
+        bottle["minimum_glibc"] = json!("2.35");
+        bottle["loader"] = json!("glibc");
+        value["bottle"]["stable"]["files"] = json!({"x86_64_linux": bottle});
+        value["dependencies"] = json!(["oniguruma"]);
+        value["pinget_runtime_dependencies"] =
+            json!([{"full_name":"oniguruma","pkg_version":"6.9.10","bottle_rebuild":0}]);
+    });
+    let first = import(&fixture.options).expect("import Linux dependency metadata");
+    let bytes = fs::read(fixture.options.manifest_output.join(&first.manifest_file)).expect("manifest");
+    let parsed: Value = serde_yaml::from_slice(&bytes).expect("native manifest");
+    assert_eq!(parsed["Installers"][0]["Architecture"], "x64");
+    assert_eq!(first.runtime_dependencies[0]["MinimumVersion"], "6.9.10.bottle.0");
+    assert_eq!(
+        first.runtime_dependencies[0]["PackageIdentifier"],
+        pinget_core::homebrew_package_identifier("homebrew/core", "oniguruma").expect("dependency ID")
+    );
+    let mut updated: Value = serde_json::from_slice(&fs::read(&fixture.options.formula_json).expect("current formula"))
+        .expect("current formula JSON");
+    updated["bottle"]["stable"]["rebuild"] = json!(4);
+    fs::write(
+        &fixture.options.formula_json,
+        serde_json::to_vec(&updated).expect("updated formula JSON"),
+    )
+    .expect("write rebuild-only metadata");
+    let next = import(&fixture.options).expect("import rebuild-only update");
+    assert_eq!(next.package_version, "1.2.3_1.bottle.4");
+    assert_ne!(first.manifest_file, next.manifest_file);
+    assert_eq!(first.bottle_file, next.bottle_file);
 }
 
 #[test]
@@ -97,7 +149,7 @@ fn pinned_import_mirrors_exact_bytes_and_emits_deterministic_manifest_and_report
         report.package_identifier,
         pinget_core::homebrew_package_identifier("homebrew/core", "tinytool").expect("formula ID")
     );
-    assert_eq!(report.package_version, "1.2.3_1");
+    assert_eq!(report.package_version, "1.2.3_1.bottle.3");
     assert_eq!(manifest["ManifestType"], "singleton");
     assert_eq!(manifest["Installers"][0]["InstallerType"], "homebrew-bottle");
     assert_eq!(manifest["PackageUrl"], "https://tinytool.example.invalid/");
@@ -136,10 +188,9 @@ fn pinned_import_mirrors_exact_bytes_and_emits_deterministic_manifest_and_report
     .expect("generated Homebrew manifest builds into a v2 source snapshot");
     assert_eq!(build.packages, 1);
     assert_eq!(build.manifests, 1);
-    let snapshot: Value = serde_json::from_slice(
-        &fs::read(build.snapshot_directory.join("snapshot.json")).expect("snapshot metadata"),
-    )
-    .expect("parse snapshot metadata");
+    let snapshot: Value =
+        serde_json::from_slice(&fs::read(build.snapshot_directory.join("snapshot.json")).expect("snapshot metadata"))
+            .expect("parse snapshot metadata");
     assert_eq!(snapshot["profile"], "homebrew");
     let mirrored_file = fixture.options.bottle_mirror.join(&report.bottle_file);
     let snapshot_bottle = build
@@ -192,9 +243,8 @@ fn pinned_import_mirrors_exact_bytes_and_emits_deterministic_manifest_and_report
 }
 
 #[test]
-fn rejects_runtime_dependencies_requirements_and_variations_without_outputs() {
+fn rejects_optional_dependencies_requirements_and_variations_without_outputs() {
     for field in [
-        "dependencies",
         "recommended_dependencies",
         "optional_dependencies",
         "uses_from_macos",
@@ -246,7 +296,10 @@ fn publisher_requires_valid_mirrored_bottles_for_homebrew_manifests() {
         state: fixture.root.join("missing-state"),
     })
     .expect_err("missing bottle must fail");
-    assert!(error.to_string().contains("missing from the bottles/ mirror"), "{error}");
+    assert!(
+        error.to_string().contains("missing from the bottles/ mirror"),
+        "{error}"
+    );
 
     let fixture = Fixture::new();
     import(&fixture.options).expect("import pinned formula");
@@ -299,7 +352,7 @@ fn rejects_bad_identity_version_bottle_and_hash_metadata_without_outputs() {
     }
     let fixture = Fixture::new();
     fixture.change(|v| v["bottle"]["stable"]["files"] = json!({}));
-    fixture.reject("no arm64_sonoma bottle");
+    fixture.reject("no selected bottle");
 }
 
 #[test]
@@ -318,11 +371,21 @@ fn rejects_unsupported_targets_overlap_and_secret_urls() {
     ] {
         fixture.options.base_url = url.into();
         fixture.reject("base URL");
-        assert!(!import(&fixture.options).expect_err("secret URL rejected").to_string().contains("secret"));
+        assert!(
+            !import(&fixture.options)
+                .expect_err("secret URL rejected")
+                .to_string()
+                .contains("secret")
+        );
     }
     fixture.options.base_url = "https://example.invalid/bottles".into();
     fixture.options.manifest_output = fixture.root.clone();
-    assert!(import(&fixture.options).expect_err("overlapping inputs rejected").to_string().contains("disjoint"));
+    assert!(
+        import(&fixture.options)
+            .expect_err("overlapping inputs rejected")
+            .to_string()
+            .contains("disjoint")
+    );
     fixture.options.manifest_output = fixture.root.join("out");
     fixture.options.bottle_mirror = fixture.root.join("out/bottles");
     fixture.reject("disjoint");
@@ -358,5 +421,10 @@ fn rejects_symlink_destinations() {
     std::os::unix::fs::symlink(&real, &link).expect("symlink");
     fixture.options.manifest_output = link.join("manifests");
     fixture.reject("symbolic links");
-    assert!(fs::read_dir(real).expect("real directory remains empty").next().is_none());
+    assert!(
+        fs::read_dir(real)
+            .expect("real directory remains empty")
+            .next()
+            .is_none()
+    );
 }

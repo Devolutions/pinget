@@ -6,18 +6,20 @@ using Devolutions.Pinget.Core;
 
 namespace Pinget.Publisher;
 
-/// <summary>Explicit local inputs; this importer never downloads or resolves dependencies.</summary>
+/// <summary>Explicit local inputs; dependency identities are mapped without downloading packages.</summary>
 public sealed record HomebrewImportOptions(
     string FormulaJson, string BottleArchive, string ManifestOutput, string BottleMirror,
     string Tag, string TargetOS, string Architecture, string BaseUrl);
 
-/// <summary>Bounded, offline import of one dependency-free arm64_sonoma formula bottle.</summary>
+/// <summary>Bounded offline import of one native formula bottle target.</summary>
 public static class HomebrewImporter
 {
     public static JsonObject Import(HomebrewImportOptions options)
     {
-        if (options.Tag != "arm64_sonoma" || options.TargetOS != "macOS" || options.Architecture != "arm64")
-            throw Invalid("unsupported target: this offline slice requires --tag arm64_sonoma --target-os macOS --architecture arm64");
+        if ((options.Tag, options.TargetOS, options.Architecture) is not
+            (("arm64_sonoma", "macOS", "arm64") or ("sonoma", "macOS", "x64") or
+             ("x86_64_linux", "Linux", "x64") or ("aarch64_linux", "Linux", "arm64")))
+            throw Invalid("unsupported target: select a Sonoma macOS or native glibc Linux bottle with its matching architecture");
         if (!PublicUrl(options.BaseUrl))
             throw Invalid("base URL must be a public HTTPS URL without credentials, escapes, query, fragment, or dot segments");
         var formulaPath = SafePath(options.FormulaJson);
@@ -60,13 +62,47 @@ public static class HomebrewImporter
         var fullName = Text(formula, "full_name");
         if (fullName != $"{tap}/{name}" && !(tap == "homebrew/core" && fullName == name))
             throw Invalid("formula full_name does not match name and tap");
-        foreach (var field in new[] { "dependencies", "recommended_dependencies", "optional_dependencies", "uses_from_macos", "requirements", "conflicts_with" })
+        foreach (var field in new[] { "recommended_dependencies", "optional_dependencies", "uses_from_macos", "requirements", "conflicts_with" })
         {
             if (formula[field] is JsonArray { Count: 0 })
                 continue;
-            if (!formula.ContainsKey(field) && field != "dependencies")
+            if (!formula.ContainsKey(field))
                 continue;
-            throw Invalid($"unsupported {field}: dependency closure and requirements are not implemented; provide a dependency-free formula with empty arrays");
+            throw Invalid($"unsupported {field}: optional dependencies, platform requirements and conflicts require explicit curation");
+        }
+        if (formula["dependencies"] is not JsonArray dependencyNames)
+            throw Invalid("formula dependencies must be an array of runtime formula names");
+        var dependencies = new SortedDictionary<string, JsonObject>(StringComparer.Ordinal);
+        foreach (var value in dependencyNames)
+        {
+            if (value is not JsonValue dependencyValue || !dependencyValue.TryGetValue<string>(out var dependency))
+                throw Invalid("runtime dependency must be a formula name");
+            var parts = dependency.Split('/');
+            var dependencyTap = "homebrew/core";
+            string dependencyName;
+            if (parts.Length == 1 && Token(parts[0], "@+._-"))
+                dependencyName = parts[0];
+            else if (parts.Length == 3 && Token(parts[0], "._-") && Token(parts[1], "._-") && Token(parts[2], "@+._-"))
+            {
+                dependencyTap = parts[0] + "/" + parts[1];
+                dependencyName = parts[2];
+            }
+            else
+                throw Invalid("runtime dependency must be an exact formula or owner/tap/formula identity");
+            var id = HomebrewPackageIds.Create(dependencyTap, dependencyName);
+            var mapped = new JsonObject { ["PackageIdentifier"] = id };
+            if (formula.ContainsKey("pinget_runtime_dependencies"))
+            {
+                if (formula["pinget_runtime_dependencies"] is not JsonArray pins)
+                    throw Invalid("pinget_runtime_dependencies must be an array");
+                var pin = pins.FirstOrDefault(pin => pin?["full_name"]?.GetValue<string>() == dependency)
+                    ?? throw Invalid("curated runtime dependency metadata must cover every dependency");
+                var version = Text(pin, "pkg_version");
+                if (!Token(version, ".+_-"))
+                    throw Invalid("invalid runtime dependency pkg_version");
+                mapped["MinimumVersion"] = $"{version}.bottle.{Integer(pin, "bottle_rebuild")}";
+            }
+            dependencies[id] = mapped;
         }
         if (formula.ContainsKey("variations") && formula["variations"] is not JsonObject { Count: 0 })
             throw Invalid("target-specific formula variations are unsupported; provide a pinned formula without variations");
@@ -78,8 +114,8 @@ public static class HomebrewImporter
             throw Invalid("stable version must be a safe nonempty version token");
         var revision = Integer(formula, "revision");
         var versionScheme = Integer(formula, "version_scheme");
-        if (versionScheme > 5)
-            throw Invalid("unsupported formula version_scheme; v1 supports 0 through 5");
+        if (versionScheme != 0)
+            throw Invalid("offline native import currently supports version_scheme 0 only");
         if (formula["keg_only"] is not JsonValue kegValue || !kegValue.TryGetValue<bool>(out var kegOnly))
             throw Invalid("formula keg_only must be boolean");
         var aliases = Names(formula, "aliases");
@@ -88,7 +124,7 @@ public static class HomebrewImporter
         var rebuild = Integer(bottle, "rebuild");
         var selected = (bottle?["files"] as JsonObject)?[options.Tag] as JsonObject;
         if (selected is null)
-            throw Invalid("pinned formula has no arm64_sonoma bottle; provide JSON containing the selected target");
+            throw Invalid("pinned formula has no selected bottle; provide JSON containing the selected target");
         var sha256 = Text(selected, "sha256").ToLowerInvariant();
         if (sha256.Length != 64 || !sha256.All(char.IsAsciiHexDigit))
             throw Invalid("selected bottle sha256 must have 64 hexadecimal digits");
@@ -105,7 +141,8 @@ public static class HomebrewImporter
         if (license is not null && !license.All(c => char.IsAsciiLetterOrDigit(c) || " .-+()".Contains(c)))
             throw Invalid("formula license must be an SPDX expression");
         var packageIdentifier = HomebrewPackageIds.Create(tap, name);
-        var packageVersion = revision == 0 ? upstream : $"{upstream}_{revision}";
+        var kegVersion = revision == 0 ? upstream : $"{upstream}_{revision}";
+        var packageVersion = $"{kegVersion}.bottle.{rebuild}";
         using var archive = File.OpenRead(archivePath);
         if (archive.Length == 0)
             throw Invalid("bottle archive must be a nonempty regular file");
@@ -125,25 +162,54 @@ public static class HomebrewImporter
             ["ManifestVersion"] = "1.10.0",
             ["Installers"] = new JsonArray(new JsonObject
             {
-                ["Architecture"] = "arm64", ["Platform"] = new JsonArray("macOS"),
-                ["InstallerType"] = "homebrew-bottle", ["InstallerUrl"] = url, ["InstallerSha256"] = sha256,
+                ["Architecture"] = options.Architecture,
+                ["Platform"] = new JsonArray(options.TargetOS),
+                ["InstallerType"] = "homebrew-bottle",
+                ["InstallerUrl"] = url,
+                ["InstallerSha256"] = sha256,
             }),
             ["Pinget"] = new JsonObject
             {
                 ["Homebrew"] = new JsonObject
                 {
-                    ["SchemaVersion"] = 1, ["Formula"] = name, ["Tap"] = tap,
-                    ["UpstreamVersion"] = upstream, ["Revision"] = revision, ["VersionScheme"] = versionScheme,
-                    ["KegOnly"] = kegOnly, ["Aliases"] = aliases, ["OldNames"] = oldNames,
+                    ["SchemaVersion"] = 1,
+                    ["Formula"] = name,
+                    ["Tap"] = tap,
+                    ["UpstreamVersion"] = upstream,
+                    ["Revision"] = revision,
+                    ["VersionScheme"] = versionScheme,
+                    ["KegOnly"] = kegOnly,
+                    ["Aliases"] = aliases,
+                    ["OldNames"] = oldNames,
                     ["Bottles"] = new JsonArray(new JsonObject
                     {
-                        ["Url"] = url, ["Sha256"] = sha256, ["TargetOS"] = "macOS", ["Architecture"] = "arm64",
-                        ["BottleTag"] = options.Tag, ["Rebuild"] = rebuild, ["Relocation"] = cellar,
-                        ["MinimumOSVersion"] = "14.0",
+                        ["Url"] = url,
+                        ["Sha256"] = sha256,
+                        ["TargetOS"] = options.TargetOS,
+                        ["Architecture"] = options.Architecture,
+                        ["BottleTag"] = options.Tag,
+                        ["Rebuild"] = rebuild,
+                        ["Relocation"] = cellar,
                     }),
                 },
             },
         };
+        var bottleManifest = manifest["Pinget"]!["Homebrew"]!["Bottles"]![0]!.AsObject();
+        if (options.TargetOS == "Linux")
+        {
+            var minimum = Text(selected, "minimum_glibc");
+            if (!Version.TryParse(minimum, out _) || Text(selected, "loader") != "glibc")
+                throw Invalid("Linux bottle requires curated minimum_glibc and loader=glibc from its OCI receipt metadata");
+            bottleManifest["MinimumGlibc"] = minimum;
+            bottleManifest["Loader"] = "glibc";
+        }
+        else
+            bottleManifest["MinimumOSVersion"] = "14.0";
+        if (dependencies.Count > 0)
+            manifest["Installers"]![0]!["Dependencies"] = new JsonObject
+            {
+                ["PackageDependencies"] = new JsonArray(dependencies.Values.Select(value => (JsonNode)value.DeepClone()).ToArray()),
+            };
         if (description is not null)
             manifest["ShortDescription"] = description;
         if (homepage is not null)
@@ -162,7 +228,8 @@ public static class HomebrewImporter
             ["bottleTag"] = options.Tag,
             ["bottleFile"] = bottleFile,
             ["manifestFile"] = manifestFile,
-            ["dependencyPolicy"] = "rejected-runtime-dependencies",
+            ["dependencyPolicy"] = "mapped-runtime-dependencies",
+            ["runtimeDependencies"] = new JsonArray(dependencies.Values.Select(value => (JsonNode)value.DeepClone()).ToArray()),
         };
         var reportBytes = Encoding.UTF8.GetBytes(report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n");
         var manifestPath = Path.Combine(output, manifestFile);
@@ -244,7 +311,7 @@ public static class HomebrewImporter
             && authority[0].Split('.').All(p => Token(p, "-") && !p.StartsWith('-') && !p.EndsWith('-'))
             && (authority.Length == 1 || (ushort.TryParse(authority[1], System.Globalization.NumberStyles.None,
                 System.Globalization.CultureInfo.InvariantCulture, out var port) && port > 0))
-            && path.All(c => char.IsAsciiLetterOrDigit(c) || "-._~/".Contains(c))
+            && path.All(c => char.IsAsciiLetterOrDigit(c) || "-._~/:".Contains(c))
             && !path.Split('/').Any(p => p is "." or "..");
     }
 

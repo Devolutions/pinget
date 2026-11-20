@@ -42,11 +42,7 @@ pub(super) fn find_psign_tool() -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-pub(super) fn verify_msix(
-    path: &Path,
-    source: &SourceRecord,
-    explicit_tool: Option<&Path>,
-) -> Result<Vec<u8>> {
+pub(super) fn verify_msix(path: &Path, source: &SourceRecord, explicit_tool: Option<&Path>) -> Result<Vec<u8>> {
     let publisher = source
         .publisher
         .as_deref()
@@ -84,7 +80,11 @@ pub(super) fn verify_msix(
         );
     }
 
-    run_psign(&tool, "MSIX digest verification", &["portable", "verify-msix", path_to_str(path)?])?;
+    run_psign(
+        &tool,
+        "MSIX digest verification",
+        &["portable", "verify-msix", path_to_str(path)?],
+    )?;
     let mut trust_args = vec![
         "portable".to_owned(),
         "trust-verify-msix".to_owned(),
@@ -106,11 +106,7 @@ pub(super) fn verify_msix(
     let output = run_psign(
         &tool,
         "MSIX signature inspection",
-        &[
-            "portable",
-            "inspect-pkcs7",
-            path_to_str(&signature_path)?,
-        ],
+        &["portable", "inspect-pkcs7", path_to_str(&signature_path)?],
     )?;
     let report: serde_json::Value =
         serde_json::from_slice(&output).context("psign-tool returned an unreadable signature report")?;
@@ -128,18 +124,15 @@ pub(super) fn verify_msix(
         .context("verified Homebrew source MSIX has no usable Public/index.db")
 }
 
-fn read_member<R: Read + std::io::Seek>(
-    archive: &mut ZipArchive<R>,
-    name: &str,
-    max_bytes: u64,
-) -> Result<Vec<u8>> {
+fn read_member<R: Read + std::io::Seek>(archive: &mut ZipArchive<R>, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
     let entry = archive
         .by_name(name)
         .map_err(|_| anyhow!("source MSIX is missing {name}"))?;
     if entry.size() > max_bytes {
         bail!("source MSIX member {name} exceeds the {max_bytes}-byte limit");
     }
-    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    let capacity = usize::try_from(entry.size()).context("MSIX member exceeds the host address space")?;
+    let mut bytes = Vec::with_capacity(capacity);
     entry
         .take(max_bytes + 1)
         .read_to_end(&mut bytes)
@@ -159,9 +152,7 @@ fn parse_identity(manifest: &[u8]) -> Result<(String, String)> {
             .read_event_into(&mut buffer)
             .context("could not parse source AppxManifest.xml")?
         {
-            Event::Start(element) | Event::Empty(element)
-                if element.local_name().as_ref() == b"Identity" =>
-            {
+            Event::Start(element) | Event::Empty(element) if element.local_name().as_ref() == b"Identity" => {
                 let mut name = None;
                 let mut publisher = None;
                 for attribute in element.attributes() {
@@ -189,8 +180,7 @@ fn parse_identity(manifest: &[u8]) -> Result<(String, String)> {
 }
 
 fn verify_signer_identity(der: &[u8], publisher: &str) -> Result<()> {
-    let certificate =
-        Certificate::from_der(der).context("Homebrew source signer certificate could not be parsed")?;
+    let certificate = Certificate::from_der(der).context("Homebrew source signer certificate could not be parsed")?;
     let tbs = &certificate.tbs_certificate;
     let subject = windows_name(&tbs.subject);
     if !subject.eq_ignore_ascii_case(publisher) {
@@ -293,7 +283,11 @@ fn run_psign(tool: &Path, operation: &str, arguments: &[&str]) -> Result<Vec<u8>
         .with_context(|| format!("could not start psign-tool at {}", tool.display()))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
-        bail!("{operation} with psign-tool failed ({}): {}", output.status, detail.trim());
+        bail!(
+            "{operation} with psign-tool failed ({}): {}",
+            output.status,
+            detail.trim()
+        );
     }
     Ok(output.stdout)
 }

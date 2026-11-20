@@ -1,4 +1,4 @@
-//! Offline, single-target Homebrew formula import. No dependency resolution or downloads.
+//! Offline Homebrew formula import with runtime dependency identities and mirrored bottles.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -35,6 +35,7 @@ pub struct ImportReport {
     pub bottle_file: String,
     pub manifest_file: String,
     pub dependency_policy: String,
+    pub runtime_dependencies: Vec<Value>,
 }
 
 fn invalid(message: &str) -> PublisherError {
@@ -53,7 +54,9 @@ fn optional_text<'a>(value: &'a Value, field: &str, max_len: usize) -> Result<Op
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) if text.is_empty() => Ok(None),
         Some(Value::String(text)) if text.len() <= max_len && !text.chars().any(char::is_control) => Ok(Some(text)),
-        _ => Err(invalid(&format!("formula JSON field must be a string of at most {max_len} bytes: {field}"))),
+        _ => Err(invalid(&format!(
+            "formula JSON field must be a string of at most {max_len} bytes: {field}"
+        ))),
     }
 }
 
@@ -83,9 +86,13 @@ fn public_url(value: &str) -> bool {
         && host
             .split('.')
             .all(|label| token(label, b"-") && !label.starts_with('-') && !label.ends_with('-'))
-        && port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n != 0))
+        && port.is_none_or(|p| {
+            !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n != 0)
+        })
         && parts.next().is_none()
-        && path.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~/".contains(&b))
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~/:".contains(&b))
         && !path.split('/').any(|p| matches!(p, "." | ".."))
 }
 
@@ -148,11 +155,21 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Import one dependency-free `arm64_sonoma` bottle from pinned local files.
+/// Import one native target bottle from pinned local files.
 pub fn import(options: &ImportOptions) -> Result<ImportReport> {
-    if options.tag != "arm64_sonoma" || options.target_os != "macOS" || options.architecture != "arm64" {
+    if !matches!(
+        (
+            options.tag.as_str(),
+            options.target_os.as_str(),
+            options.architecture.as_str()
+        ),
+        ("arm64_sonoma", "macOS", "arm64")
+            | ("sonoma", "macOS", "x64")
+            | ("x86_64_linux", "Linux", "x64")
+            | ("aarch64_linux", "Linux", "arm64")
+    ) {
         return Err(invalid(
-            "unsupported target: this offline slice requires --tag arm64_sonoma --target-os macOS --architecture arm64",
+            "unsupported target: select a Sonoma macOS or native glibc Linux bottle with its matching architecture",
         ));
     }
     if !public_url(&options.base_url) {
@@ -199,7 +216,6 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
         return Err(invalid("formula full_name does not match name and tap"));
     }
     for field in [
-        "dependencies",
         "recommended_dependencies",
         "optional_dependencies",
         "uses_from_macos",
@@ -208,14 +224,55 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
     ] {
         match formula.get(field) {
             Some(Value::Array(values)) if values.is_empty() => {}
-            None if field != "dependencies" => {}
+            None => {}
             _ => {
                 return Err(invalid(&format!(
-                    "unsupported {field}: dependency closure and requirements are not implemented; provide a dependency-free formula with empty arrays"
+                    "unsupported {field}: optional dependencies, platform requirements and conflicts require explicit curation"
                 )));
             }
         }
     }
+    let dependency_names = formula["dependencies"]
+        .as_array()
+        .ok_or_else(|| invalid("formula dependencies must be an array of runtime formula names"))?;
+    let mut dependencies = Vec::new();
+    for value in dependency_names {
+        let dependency = value
+            .as_str()
+            .ok_or_else(|| invalid("runtime dependency must be a formula name"))?;
+        let parts: Vec<_> = dependency.split('/').collect();
+        let (dependency_tap, dependency_name) = match parts.as_slice() {
+            [name] if token(name, b"@+._-") => ("homebrew/core".to_owned(), *name),
+            [owner, tap, name] if token(owner, b"._-") && token(tap, b"._-") && token(name, b"@+._-") => {
+                (format!("{owner}/{tap}"), *name)
+            }
+            _ => {
+                return Err(invalid(
+                    "runtime dependency must be an exact formula or owner/tap/formula identity",
+                ));
+            }
+        };
+        let id = pinget_core::homebrew_package_identifier(&dependency_tap, dependency_name)
+            .map_err(|_| invalid("invalid runtime dependency identity"))?;
+        let mut mapped = json!({"PackageIdentifier": id});
+        if let Some(pins) = formula.get("pinget_runtime_dependencies") {
+            let pins = pins
+                .as_array()
+                .ok_or_else(|| invalid("pinget_runtime_dependencies must be an array"))?;
+            let pin = pins
+                .iter()
+                .find(|pin| pin["full_name"].as_str() == Some(dependency))
+                .ok_or_else(|| invalid("curated runtime dependency metadata must cover every dependency"))?;
+            let version = text(pin, "pkg_version")?;
+            if !token(version, b".+_-") {
+                return Err(invalid("invalid runtime dependency pkg_version"));
+            }
+            mapped["MinimumVersion"] = json!(format!("{version}.bottle.{}", integer(pin, "bottle_rebuild")?));
+        }
+        dependencies.push(mapped);
+    }
+    dependencies.sort_by(|a, b| a["PackageIdentifier"].as_str().cmp(&b["PackageIdentifier"].as_str()));
+    dependencies.dedup();
     if formula
         .get("variations")
         .is_some_and(|v| v.as_object().is_none_or(|m| !m.is_empty()))
@@ -235,8 +292,10 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
     }
     let revision = integer(&formula, "revision")?;
     let version_scheme = integer(&formula, "version_scheme")?;
-    if version_scheme > 5 {
-        return Err(invalid("unsupported formula version_scheme; v1 supports 0 through 5"));
+    if version_scheme != 0 {
+        return Err(invalid(
+            "offline native import currently supports version_scheme 0 only",
+        ));
     }
     let keg_only = formula["keg_only"]
         .as_bool()
@@ -258,7 +317,9 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
     let rebuild = integer(bottle, "rebuild")?;
     let selected = &bottle["files"][&options.tag];
     if !selected.is_object() {
-        return Err(invalid("pinned formula has no arm64_sonoma bottle; provide JSON containing the selected target"));
+        return Err(invalid(
+            "pinned formula has no selected bottle; provide JSON containing the selected target",
+        ));
     }
     let sha256 = text(selected, "sha256")?.to_ascii_lowercase();
     if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -278,7 +339,9 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
     let description = optional_text(&formula, "desc", 4096)?;
     let homepage = optional_text(&formula, "homepage", 2048)?;
     if homepage.is_some_and(|url| !public_url(url)) {
-        return Err(invalid("formula homepage must be public HTTPS without credentials, escapes, query, fragment, or dot segments"));
+        return Err(invalid(
+            "formula homepage must be public HTTPS without credentials, escapes, query, fragment, or dot segments",
+        ));
     }
     let license = optional_text(&formula, "license", 256)?;
     if license.is_some_and(|license| {
@@ -290,11 +353,12 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
     }
     let package_identifier = pinget_core::homebrew_package_identifier(tap, name)
         .map_err(|_| invalid("invalid Homebrew formula/tap identity"))?;
-    let package_version = if revision == 0 {
+    let keg_version = if revision == 0 {
         upstream.to_owned()
     } else {
         format!("{upstream}_{revision}")
     };
+    let package_version = format!("{keg_version}.bottle.{rebuild}");
     let mut archive = File::open(archive_path)?;
     if !archive.metadata()?.is_file() || archive.metadata()?.len() == 0 {
         return Err(invalid("bottle archive must be a nonempty regular file"));
@@ -311,14 +375,34 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
         "PackageIdentifier": package_identifier, "PackageVersion": package_version,
         "PackageName": name, "Publisher": "Unknown",
         "PackageLocale": "en-US", "ManifestType": "singleton", "ManifestVersion": "1.10.0",
-        "Installers": [{"Architecture": "arm64", "Platform": ["macOS"], "InstallerType": "homebrew-bottle",
+        "Installers": [{"Architecture": options.architecture, "Platform": [options.target_os], "InstallerType": "homebrew-bottle",
             "InstallerUrl": url, "InstallerSha256": sha256}],
         "Pinget": {"Homebrew": {"SchemaVersion": 1, "Formula": name, "Tap": tap,
             "UpstreamVersion": upstream, "Revision": revision, "VersionScheme": version_scheme,
             "KegOnly": keg_only, "Aliases": lists[0], "OldNames": lists[1],
-            "Bottles": [{"Url": url, "Sha256": sha256, "TargetOS": "macOS", "Architecture": "arm64",
-                "BottleTag": options.tag, "Rebuild": rebuild, "Relocation": cellar, "MinimumOSVersion": "14.0"}]}}
+            "Bottles": [{"Url": url, "Sha256": sha256, "TargetOS": options.target_os, "Architecture": options.architecture,
+                "BottleTag": options.tag, "Rebuild": rebuild, "Relocation": cellar}]}}
     });
+    if options.target_os == "Linux" {
+        let minimum = text(selected, "minimum_glibc")?;
+        if minimum.split('.').count() < 2
+            || minimum
+                .split('.')
+                .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+            || text(selected, "loader")? != "glibc"
+        {
+            return Err(invalid(
+                "Linux bottle requires curated minimum_glibc and loader=glibc from its OCI receipt metadata",
+            ));
+        }
+        manifest["Pinget"]["Homebrew"]["Bottles"][0]["MinimumGlibc"] = json!(minimum);
+        manifest["Pinget"]["Homebrew"]["Bottles"][0]["Loader"] = json!("glibc");
+    } else {
+        manifest["Pinget"]["Homebrew"]["Bottles"][0]["MinimumOSVersion"] = json!("14.0");
+    }
+    if !dependencies.is_empty() {
+        manifest["Installers"][0]["Dependencies"] = json!({"PackageDependencies": dependencies});
+    }
     if let Some(description) = description {
         manifest["ShortDescription"] = json!(description);
     }
@@ -338,7 +422,8 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
         bottle_tag: options.tag.clone(),
         bottle_file,
         manifest_file,
-        dependency_policy: "rejected-runtime-dependencies".to_owned(),
+        dependency_policy: "mapped-runtime-dependencies".to_owned(),
+        runtime_dependencies: dependencies,
     };
     let mut report_bytes = serde_json::to_vec_pretty(&report)?;
     report_bytes.push(b'\n');

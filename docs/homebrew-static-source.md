@@ -1,16 +1,17 @@
 # Homebrew static source prototype
 
-The publisher can create a Homebrew-profile static feed, and the native
-Rust/.NET clients can register its dedicated source type and attempt to verify
-and consume `brew.msix`. A successful signed-feed acceptance and bottle
-installation have not yet been demonstrated; this remains a partial prototype,
-not an end-to-end install procedure.
+Both publishers create a fully static Homebrew-profile feed. Native clients
+verify its signed `brew.msix`, activate the enclosed preindexed database, then
+download manifests and unchanged bottle bytes from the static host. No REST
+server, Homebrew, or Ruby runs on clients. Real Linux jq/oniguruma installation
+has been exercised through both CLIs; see the separate platform and
+[compatibility limits](homebrew-bottle-compatibility.md).
 
 ## Build the artifacts
 
 Prepare pinned formula JSON and the exact bottle archive outside the output
-directories. The current importer accepts only a dependency-free
-`arm64_sonoma` formula and performs no network access:
+directories. Import each member of a pinned runtime dependency closure; the
+importer performs no network access:
 
 ```sh
 pinget repository import-homebrew \
@@ -23,6 +24,10 @@ pinget repository import-homebrew \
 ```
 
 Keep `manifests/` and `bottles/` as siblings under the publisher input root.
+For Linux x64 use `--tag x86_64_linux --target-os Linux --architecture x64`
+with explicit OCI-derived ABI metadata. Import jq and oniguruma into the same
+input root. Imports are single-target; use separate target feed directories,
+or explicitly author a combined manifest with matching installer/bottle entries.
 Keep publisher state, staging output, and the published destination in
 separate directories. Then build and package a Homebrew-only snapshot:
 
@@ -65,12 +70,18 @@ MSIX digest, signer, and trust verification. Supply the expected certificate
 subject and explicit trust anchors. For the CLI:
 
 ```sh
-pinget source add --name homebrew --argument https://packages.example.com \
+pinget source add --name homebrew --arg https://packages.example.com \
   --type Pinget.PreIndexed.Homebrew \
   --publisher 'CN=Example Source Publisher' \
   --trusted-ca /path/to/test-root.cer
-pinget source update --name homebrew
+pinget source update homebrew
 pinget search jq --source homebrew
+pinget install jq --source homebrew --silent --accept-package-agreements
+pinget list
+pinget upgrade jq --source homebrew
+pinget repair --id Pinget.Homebrew.jq-929958fef124d633 --source homebrew
+pinget uninstall jq
+pinget uninstall oniguruma
 ```
 
 In PowerShell, use `Add-PingetSource` with the same `-Type`, `-Publisher`, and
@@ -78,13 +89,21 @@ one or more `-TrustedCa` values. Do not register the Homebrew feed as
 `Microsoft.PreIndexed.Package`: that source type fetches `source2.msix` /
 `source.msix` and does not enforce the Homebrew-specific verification boundary.
 
-The client activates its cache only after verification and schema validation,
-and retains the previous cache when an update fails. However, the available
-tests currently cover failure paths only: no successful disposable-PKI
-signature/trust run has proved this boundary end to end. Native bottle
-download/install/list/upgrade/uninstall is not implemented.
+The client activates its cache only after signature/trust/signer identity and
+schema validation, retaining the previous cache when an update fails.
+Successful signing, publication, client verification, native dependency
+installation, execution, and receipt listing have been demonstrated on Linux.
+Use an increasing four-part MSIX package version for each changed publication.
 
-The importer is also an offline single-formula prototype: it rejects runtime
-dependencies and does not inspect receipts or resolve target-specific bottle
-variants. See [bottle compatibility](homebrew-bottle-compatibility.md) for
-the exact support matrix and outstanding acceptance requirements.
+The default private prefix is `<AppRoot>/homebrew`; add its `bin` directory to
+your own command environment if desired. Do not point it at an existing
+Homebrew installation. ELF relocation needs `patchelf`; macOS relocation uses
+the native developer-tool binaries and ad-hoc signing. Psign verifies the source
+on clients as well as publishers. Its portable PFX signing backend does not use
+the separate `--rust-sip` option.
+
+Receipts and links are shared between Rust and .NET. Upgrade/repair replace the
+managed keg, and uninstall honors the managed dependency graph. The prototype
+fails closed on unsupported archives, ABI constraints, and unowned/modified
+paths. macOS execution and Windows/macOS publishing need their own acceptance
+gates; this workflow does not imply general Homebrew compatibility.

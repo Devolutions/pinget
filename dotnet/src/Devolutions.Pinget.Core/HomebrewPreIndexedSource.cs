@@ -32,7 +32,8 @@ internal static class HomebrewPreIndexedSource
             throw new InvalidOperationException("Homebrew source MSIX exceeds the 2 GiB size limit.");
 
         var nonce = Guid.NewGuid().ToString("N");
-        var stagedPackage = Path.Combine(stateDir, $"brew.{nonce}.tmp");
+        // Psign chooses its MSIX verifier from the file extension.
+        var stagedPackage = Path.Combine(stateDir, $"brew.{nonce}.tmp.msix");
         var stagedIndex = Path.Combine(stateDir, $"index.{nonce}.tmp");
         try
         {

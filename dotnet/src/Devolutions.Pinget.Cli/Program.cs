@@ -303,7 +303,7 @@ upgradeCommand.SetHandler((ctx) =>
     };
 
     using var repo = doInstall ? OpenRepositoryForPackageAction() : Repository.Open();
-    if (doInstall && !OperatingSystem.IsWindows())
+    if (doInstall && !OperatingSystem.IsWindows() && !repo.HasHomebrewPackages)
     {
         PrintWarnings([UpgradeUnsupportedWarning]);
         Console.WriteLine("No changes were made.");
@@ -1149,18 +1149,28 @@ uninstallCommand.SetHandler((ctx) =>
     if (silent && interactive)
         throw new InvalidOperationException("--silent and --interactive cannot be used together.");
     using var repo = Repository.Open();
-    var result = repo.Uninstall(new UninstallRequest
+    InstallResult result;
+    try
     {
-        Query = query,
-        ManifestPath = ctx.ParseResult.GetValueForOption(uimanifestOpt),
-        ProductCode = ctx.ParseResult.GetValueForOption(uiproductCodeOpt),
-        Mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress,
-        AllVersions = ctx.ParseResult.GetValueForOption(uiallVersionsOpt),
-        Force = ctx.ParseResult.GetValueForOption(uiForceOpt),
-        Purge = ctx.ParseResult.GetValueForOption(uiPurgeOpt),
-        Preserve = ctx.ParseResult.GetValueForOption(uiPreserveOpt),
-        LogPath = ctx.ParseResult.GetValueForOption(uiLogOpt),
-    });
+        result = repo.Uninstall(new UninstallRequest
+        {
+            Query = query,
+            ManifestPath = ctx.ParseResult.GetValueForOption(uimanifestOpt),
+            ProductCode = ctx.ParseResult.GetValueForOption(uiproductCodeOpt),
+            Mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress,
+            AllVersions = ctx.ParseResult.GetValueForOption(uiallVersionsOpt),
+            Force = ctx.ParseResult.GetValueForOption(uiForceOpt),
+            Purge = ctx.ParseResult.GetValueForOption(uiPurgeOpt),
+            Preserve = ctx.ParseResult.GetValueForOption(uiPreserveOpt),
+            LogPath = ctx.ParseResult.GetValueForOption(uiLogOpt),
+        });
+    }
+    catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+    {
+        Console.Error.WriteLine($"error: {ex.Message}");
+        ctx.ExitCode = 1;
+        return;
+    }
     ctx.ExitCode = PrintPackageActionResult(result, "uninstall", "uninstalled");
 });
 

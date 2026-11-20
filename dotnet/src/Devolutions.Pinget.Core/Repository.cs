@@ -726,7 +726,9 @@ public class Repository : IDisposable
             warnings.Add(sourceRefreshWarning);
 
         var installed = InstalledPackages.Collect(query.InstallScope);
-        if (!OperatingSystem.IsWindows())
+        var nativeInstalled = HomebrewKegStore.InstalledPackages(_appRoot, query.InstallScope);
+        installed.AddRange(nativeInstalled);
+        if (!OperatingSystem.IsWindows() && nativeInstalled.Count == 0)
             warnings.Add(InstalledStateUnsupportedWarning);
 
         // Even plain `list` should canonicalize installed package ids and
@@ -1245,6 +1247,8 @@ public class Repository : IDisposable
     public InstallResult Install(InstallRequest request)
         => InstallCore(request, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
 
+    public bool HasHomebrewPackages => HomebrewKegStore.ReadAll(_appRoot).Count > 0;
+
     /// <summary>
     /// <paramref name="visited"/> holds the ids of every package already on the current dependency
     /// chain or already handled, shared across the whole recursion so a dependency cycle (or a
@@ -1257,7 +1261,7 @@ public class Repository : IDisposable
         EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
         request = ApplyInstallScope(request);
         var manifest = ResolveManifestForInstall(request);
-        if (!OperatingSystem.IsWindows())
+        if (!OperatingSystem.IsWindows() && manifest.Homebrew is null)
         {
             var unsupportedInstallerType = (SelectInstaller(manifest.Installers, request.Query)?.InstallerType ?? "install")
                 .ToLowerInvariant();
@@ -1276,11 +1280,33 @@ public class Repository : IDisposable
         var selectedInstaller = SelectInstaller(manifest.Installers, request.Query)
             ?? throw new InvalidOperationException("No applicable installer found");
 
+        HomebrewKegSpec? nativeSpec = null;
+        if (manifest.Homebrew is not null)
+        {
+            if (request.IgnoreSecurityHash || request.Query.InstallScope == "machine")
+                throw new InvalidOperationException("Homebrew bottles require verified hashes and a user-scoped private prefix.");
+            if (request.InstallLocation is not null || request.Rename is not null ||
+                request.Custom is not null || request.Override is not null)
+                throw new InvalidOperationException("Homebrew bottles do not support installer arguments, custom locations, or renamed commands.");
+            var sourceIdentifier = "local-manifest";
+            var sourceName = "local-manifest";
+            if (string.IsNullOrWhiteSpace(request.ManifestPath))
+            {
+                var (located, _, _) = FindSingleMatch(request.Query);
+                var source = _store.Sources[located.SourceIndex];
+                sourceIdentifier = source.Identifier;
+                sourceName = source.Name;
+            }
+            nativeSpec = HomebrewKegStore.Spec(manifest, selectedInstaller, sourceIdentifier, sourceName);
+        }
+
         // Installing a different version over an existing installation is an update (WinGet converts such an
         // install to the upgrade flow). A same-version reinstall (repair, --force) is not.
         var isUpdate = existingMatch is not null && InstallIsUpdate(existingMatch.InstalledVersion, manifest.Version);
         EnsureUpgradeAllowed(selectedInstaller, isUpdate);
         var uninstallPrevious = UninstallsPreviousVersion(request, selectedInstaller, isUpdate);
+        if (nativeSpec is not null && uninstallPrevious)
+            throw new InvalidOperationException("Homebrew upgrades replace the managed keg transactionally; uninstall-previous is unsupported.");
         if (!UpgradeSwitchApplies(isUpdate, uninstallPrevious) && selectedInstaller.Switches.Upgrade is not null)
         {
             // The `Upgrade` switch only applies when updating an existing installation.
@@ -1313,7 +1339,7 @@ public class Repository : IDisposable
             int previousExitCode;
             try
             {
-                previousExitCode = InstallerDispatch.Uninstall(existingMatch, CreateUninstallPreviousRequest(existingMatch), warnings);
+                previousExitCode = UninstallInstalled(existingMatch, CreateUninstallPreviousRequest(existingMatch), warnings);
             }
             catch (InvalidOperationException ex)
             {
@@ -1330,13 +1356,28 @@ public class Repository : IDisposable
         }
         else
         {
-            var tempDir = Path.Combine(Path.GetTempPath(), "pinget-install");
+            var tempDir = nativeSpec is not null
+                ? Path.Combine(_appRoot, "homebrew-downloads")
+                : Path.Combine(Path.GetTempPath(), "pinget-install");
             // Like WinGet, --rename never names the installer an install downloads: it only names a
             // portable's command alias (see InstallerDispatch.DeterminePortableLinks).
             installerPath = FetchInstaller(request, manifest, selectedInstaller, rename: null, tempDir);
             installerPath = PrepareInstallerForExecution(installerPath, installerType);
         }
-        var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
+        int exitCode;
+        if (nativeSpec is not null)
+        {
+            HomebrewKegStore.Install(_appRoot, installerPath, nativeSpec, warnings);
+            exitCode = 0;
+        }
+        else if (OperatingSystem.IsWindows())
+        {
+            exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
+        }
+        else
+        {
+            throw new PlatformNotSupportedException("This installer requires Windows.");
+        }
         var result = CompletedInstallResult(manifest, selectedInstaller, installerPath, installerType, exitCode, warnings);
         RemoveInstallerAfterSuccess(result);
         return result;
@@ -1469,7 +1510,8 @@ public class Repository : IDisposable
     public InstallResult Repair(RepairRequest request)
     {
         EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
-        if (string.IsNullOrWhiteSpace(request.ManifestPath) && !OperatingSystem.IsWindows())
+        if (string.IsNullOrWhiteSpace(request.ManifestPath) && !OperatingSystem.IsWindows() &&
+            HomebrewKegStore.ReadAll(_appRoot).Count == 0)
         {
             var packageId = request.Query.Id ??
                 request.Query.Name ??
@@ -1535,7 +1577,7 @@ public class Repository : IDisposable
 
     public InstallResult Uninstall(UninstallRequest request)
     {
-        if (!OperatingSystem.IsWindows())
+        if (!OperatingSystem.IsWindows() && HomebrewKegStore.ReadAll(_appRoot).Count == 0)
         {
             var (packageId, version) = DescribeUninstallTarget(request);
             return CreateUnsupportedActionResult(packageId, version, "uninstall", UninstallUnsupportedWarning);
@@ -1544,9 +1586,7 @@ public class Repository : IDisposable
         var matches = ResolveUninstallMatches(request);
         var warnings = new List<string>();
         var exitCode = InstallerDispatch.UninstallEachMatch(matches, request.AllVersions,
-            installed => OperatingSystem.IsWindows()
-                ? InstallerDispatch.Uninstall(installed, request, warnings)
-                : throw new PlatformNotSupportedException("Uninstalling packages is only supported on Windows"));
+            installed => UninstallInstalled(installed, request, warnings));
 
         var primary = matches[0];
         return new InstallResult
@@ -1560,6 +1600,18 @@ public class Repository : IDisposable
             NoOp = false,
             Warnings = warnings,
         };
+    }
+
+    private int UninstallInstalled(ListMatch installed, UninstallRequest request, List<string> warnings)
+    {
+        if (installed.InstallerCategory == "homebrew-bottle")
+        {
+            HomebrewKegStore.Uninstall(_appRoot, installed.Id, request.Force, warnings);
+            return 0;
+        }
+        if (OperatingSystem.IsWindows())
+            return InstallerDispatch.Uninstall(installed, request, warnings);
+        throw new PlatformNotSupportedException("This installer requires Windows.");
     }
 
     private Manifest ResolveManifestForInstall(InstallRequest request)
@@ -2912,6 +2964,7 @@ public class Repository : IDisposable
 
         Installer? best = null;
         foreach (var installer in installers
+            .Where(HomebrewKegStore.InstallerMatchesHost)
             .Where(installer => InstallerMatchesRequested(installer, requestedType, requestedScope, requestedPlatform, requestedOsVersion, systemPlatform, currentOsVersion))
             .Where(installer => InstallerMatchesArchitecture(installer, requestedArchitecture, systemArchitecture))
             .Where(installer => !InstallerUnsupportedOnArchitecture(installer, systemArchitecture))
@@ -3524,8 +3577,6 @@ public class Repository : IDisposable
         var upstreamVersion = RequiredString(homebrew, "UpstreamVersion", prefix);
         var revision = RequiredUInt32(homebrew, "Revision", prefix);
         var expectedPackageVersion = revision == 0 ? upstreamVersion : $"{upstreamVersion}_{revision}";
-        if (!string.Equals(packageVersion, expectedPackageVersion, StringComparison.Ordinal))
-            throw new InvalidDataException($"PackageVersion must equal Homebrew stable pkg_version '{expectedPackageVersion}'.");
 
         var versionScheme = RequiredUInt32(homebrew, "VersionScheme", prefix);
         if (versionScheme > 5)
@@ -3588,6 +3639,10 @@ public class Repository : IDisposable
                 Loader = loader,
             });
         }
+        var rebuiltVersion = $"{expectedPackageVersion}.bottle.{bottles[0].Rebuild}";
+        if (packageVersion != expectedPackageVersion &&
+            (packageVersion != rebuiltVersion || bottles.Any(bottle => bottle.Rebuild != bottles[0].Rebuild)))
+            throw new InvalidDataException($"PackageVersion must equal Homebrew stable pkg_version '{expectedPackageVersion}' or its matching .bottle.Rebuild version.");
 
         return new HomebrewFormulaMetadata
         {

@@ -15,14 +15,19 @@ pinget repository import-homebrew \
 Inputs must be pinned local files supplied by the operator. **No API calls,
 downloads, DNS, authentication, or other network behavior is implemented.**
 The importer accepts one formula object, not a bulk API list or cask.
-Only `arm64_sonoma` / `macOS` / `arm64` is supported in this first slice.
-The bottle tag implies macOS 14.0 as the minimum product version.
+Supported triples are `arm64_sonoma` / `macOS` / `arm64`, `sonoma` / `macOS` /
+`x64`, `x86_64_linux` / `Linux` / `x64`, and `aarch64_linux` / `Linux` / `arm64`.
+Sonoma implies macOS product version 14.0. Linux inputs must augment the
+selected bottle file with `minimum_glibc` and `loader: "glibc"` derived from
+pinned OCI metadata; those are curated Pinget input fields, not claimed
+formula API fields.
 
 The importer validates name/tap/full-name identity, stable version, unsigned
 revision/version-scheme/rebuild, aliases, keg-only state, selected bottle
 metadata, and the archive SHA-256 against the selected formula bottle.
 It reuses the shared collision-resistant Homebrew package-ID helper.
-`PackageVersion` includes a nonzero formula revision, not the bottle rebuild.
+`PackageVersion` is `<pkg_version>.bottle.<rebuild>`, distinct from the archive's
+`<formula>/<pkg_version>/` root. Version scheme zero is currently required.
 Formula `desc`, `homepage`, and SPDX `license` populate `ShortDescription`,
 `PackageUrl`, and `License` when present. Because the formula API does not
 provide an upstream author and the manifest publisher field is required by the
@@ -32,9 +37,16 @@ Only `any` and `any_skip_relocation` bottles are accepted; no relocation or
 installation is performed. The archive is treated as opaque bytes, not
 extracted, inspected, or repacked.
 
-Dependency closure is **not implemented**. Nonempty runtime, recommended,
-optional, macOS-provided dependency lists, requirements, conflicts, and
-target-specific variations are rejected rather than discarded. Build/test
+Runtime `dependencies` names map to exact derived Pinget IDs. Import every
+member of the curated closure before publishing. Optional
+`pinget_runtime_dependencies` input rows contain `full_name`, `pkg_version`,
+and `bottle_rebuild`, copied from pinned OCI `sh.brew.tab` runtime metadata;
+they establish matching catalog `MinimumVersion` values. When supplied, they
+must cover every dependency. The client resolves those IDs from the static
+source and installs dependencies before the dependent.
+
+Nonempty recommended, optional, macOS-provided dependency lists, requirements,
+conflicts, and target-specific variations are rejected rather than discarded. Build/test
 dependency lists do not describe the runtime bottle and are not imported.
 Disabled/deprecated formulas, fixed-cellar bottles, unsupported version schemes
 and targets are rejected. Formula aliases are sorted/deduplicated in metadata;
@@ -55,7 +67,7 @@ Outputs:
   with the [Pinget.Homebrew v1 extension](homebrew-manifest-mapping.md).
 - Report beside the manifest: `<manifest-name>.import.json`, containing formula
   JSON hash, verified bottle hash, package identity/version, selected tag,
-  relative output names, and the explicit dependency rejection policy.
+  relative output names, and mapped runtime dependency identities/minima.
   No timestamps, local paths, raw input JSON, or upstream URLs are recorded.
 
 Identical inputs/options give deterministic output. Existing identical files
@@ -63,8 +75,7 @@ are reused; conflicting output bytes fail without overwriting existing files.
 All validation and conflict checks precede output creation. Files are created
 exclusively, but the three output writes are not a transactional publication;
 an interrupted write may require a clean output directory. This does not publish
-a source, verify Homebrew signatures, implement upgrades, or enable bottle
-installation. SHA-256 verifies consistency with the operator's pinned JSON,
+a source or authenticate Homebrew metadata. SHA-256 verifies consistency with the operator's pinned JSON,
 not the authenticity of that JSON.
 
 For a publisher snapshot, keep the generated `manifests/` and `bottles/`
@@ -78,8 +89,13 @@ name both the unsigned package output and the signed input `brew.msix`.
 Publishing still uses the external `psign-tool` flow documented in
 `repository-publishing.md`. This creates publisher artifacts for the
 `Pinget.PreIndexed.Homebrew` source type. The client update path verifies
-`brew.msix` before cache activation, but successful signed-feed acceptance and
-bottle installation are not yet demonstrated.
+`brew.msix` before cache activation. Both CLIs have installed and executed a
+real jq/oniguruma chain from a signed static feed on Linux.
+
+Curated OCI adaptations must be labelled as such: retain pinned OCI digests,
+upstream source references, and the provenance of ABI/dependency fields.
+OCI does not publish a cellar classification; do not present an operator's
+verified relocation policy as an authentic historical formula API snapshot.
 
 `tests/homebrew/` contains a synthetic dependency-free pinned formula and a
 base64-encoded empty tar.gz bottle used by both implementations' offline tests;

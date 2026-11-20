@@ -1,38 +1,41 @@
 # Homebrew bottle compatibility
 
-This document records the exact boundary of the current Pinget Homebrew
-prototype. It is not a claim of general Homebrew compatibility. The current
-code imports and publishes a narrow manifest/archive slice and implements a
-dedicated `brew.msix` source update path; successful signed-source acceptance
-and bottle installation have not been demonstrated.
+This is a curated formula-bottle prototype, not general Homebrew compatibility.
+Both CLIs have verified a signed static `brew.msix`, installed real jq 1.8.1
+and oniguruma 6.9.10 bottles on Linux x64, and executed jq arithmetic/regex
+using the private bottle libraries rather than system substitutes.
+Both publishers have been consumed by the opposite runtime. Actual CLI checks
+also cover a labelled synthetic rebuild-only upgrade, bidirectional
+cross-runtime repair, dependency-protected uninstall, and rejection of
+tampered signed source updates without changing the active cache.
 
 ## Current support matrix
 
 | Area | Supported now | Explicitly not supported |
 | --- | --- | --- |
-| Formula input | One pinned local formula JSON object | API fetching, bulk import, casks, Ruby evaluation |
-| Bottle target | `arm64_sonoma` / macOS / arm64; minimum product version 14.0 | Other tags, Linux, x64, platform-independent targets |
-| Formula metadata | Identity, stable version, revision, version scheme, aliases, old names, keg-only, description, homepage, SPDX license | Runtime dependency closure, `uses_from_macos`, requirements, conflicts, target variations |
+| Formula input | One pinned local formula JSON object per import; explicitly labelled OCI adaptations | API fetching, automatic tap curation, casks, Ruby evaluation |
+| Bottle target | Sonoma macOS x64/arm64 and glibc Linux x64/arm64 metadata; native architecture only | Other importer tags, emulation, musl, platform-independent targets |
+| Formula metadata | Identity, stable version, revision, aliases, old names, keg-only, description, homepage, SPDX license, runtime dependency identities/minima | Nonzero version schemes, `uses_from_macos`, requirements, conflicts, optional dependencies, variations |
 | Bottle classes | `any` and `any_skip_relocation` are preserved as distinct metadata values | Fixed-cellar bottles |
-| Archive handling | Verify the selected archive SHA-256 and mirror its bytes unchanged under a content-addressed name | Extraction, inspection of `INSTALL_RECEIPT.json`, relocation, execution |
-| Static publishing | Homebrew-only immutable snapshots, mirrored bottle files, `brew.msix`, external signing and publisher verification | Native Windows/macOS signing and publishing acceptance |
-| Source update | Dedicated source type fetches `brew.msix` only, disables redirects, verifies signature/trust/identity, validates index schema before cache activation | Successful real signed-feed acceptance; native bottle lifecycle |
-| Client operations | Manifest parsing and catalog metadata support | Native download/install/list/upgrade/uninstall, receipts, dependency ordering, rollback |
+| Archive handling | Digest verification, unchanged mirroring, bounded extraction, contained regular files/directories/links, executable modes | Traversal, escaping/dangling/chained links, special devices/FIFOs, hooks |
+| Relocation | UTF-8 text/placeholders; ELF RUNPATH and host interpreter; Mach-O dependency names, rpaths, IDs and ad-hoc signing | Arbitrary embedded binary paths, application bundles, general formula-specific patching |
+| Static publishing | Homebrew-only snapshots, mirrored bytes, preindexed DB in signed `brew.msix`, external Psign verification | REST serving; Windows/macOS publisher acceptance not established by Linux checks |
+| Source update | `brew.msix` only, no redirects, digest/trust/signer identity/EKU checks before index activation | Unsigned sources, implicit private root installation, acceptance of failed updates |
+| Client operations | Native install/list/upgrade/repair/uninstall, shared receipts, dependency ordering, normal-failure rollback, ownership checks | Homebrew/Ruby, system-prefix installation, arbitrary installer arguments, uninstall-previous, durable crash recovery |
 
-The tag mappings in the manifest contract are validation/mapping knowledge,
-not evidence that the publisher accepts every tag or that a native client can
-install for it. In particular, the current offline importer is deliberately
-restricted to one dependency-free macOS arm64 target. It does not retrieve
-historical bottles or demonstrate a real package.
+Manifest readers recognize more historical tags than the importer. That does
+not claim those targets or arbitrary bottles are installable. Linux x64 real
+execution is verified; macOS runtime and other platform publisher execution
+must be checked separately.
 
 ## Import and publication checks
 
-The importer requires the operator to provide the exact formula JSON and
-archive. It verifies the archive digest against the selected bottle metadata,
-rejects unsupported dependency/requirement fields, and writes deterministic
-manifests plus an audit report. It does not authenticate the provenance of the
-pinned formula JSON; the hash establishes consistency between those inputs,
-not upstream authenticity.
+The importer verifies supplied archive bytes against pinned metadata, maps
+runtime dependencies, rejects unsupported requirements, and writes deterministic
+manifests/reports. It does not authenticate a formula JSON snapshot. The real
+acceptance inputs are labelled OCI adaptations, with OCI digest/receipt
+provenance and an operator-verified relocation policy; they are not claimed
+historical API snapshots.
 
 The publisher requires each Homebrew installer URL and hash to identify one
 flat, lowercase SHA-256-named `.tar.gz` file in the sibling `bottles/` input
@@ -40,22 +43,33 @@ directory. It rechecks the digest, includes the unchanged bytes in the
 immutable snapshot and published destination, and selects `brew.msix` for the
 Homebrew-only profile. Mixed Homebrew/Windows snapshots are rejected. The
 source update path requires `psign-tool` and explicit publisher/trust
-configuration. Its failure-path tests do not establish successful
-cryptographic acceptance.
+configuration. Successful cryptographic acceptance has been exercised using
+a disposable code-signing PKI and a loopback static HTTPS host.
 
-No client has unpacked a bottle in this prototype, so archive path traversal,
-link escape, special-file, relocation, loader, permissions, and installed-file
-ownership behavior have not been implemented or acceptance-tested. Do not
-install these manifests as if `homebrew-bottle` were a supported installer.
+## Native lifecycle limits
+
+The private prefix is `<AppRoot>/homebrew`; downloads use the same private app
+root. Normal failures roll back keg/link changes. Receipts record package/source
+identity, catalog version, actual archive keg version, dependencies, and owned
+links. Modified/unowned links and kegs are not overwritten or removed.
+Dependency removal is refused while dependents remain unless explicitly forced.
+
+Extraction limits are 100,000 entries and 2 GiB expanded bytes; relocation
+rejects files over 256 MiB. Only contained, already resolvable link targets are
+accepted. This deliberately rejects some legitimate Homebrew archives.
+Linux requires `getconf`, glibc, and `patchelf`; macOS requires `sw_vers`,
+`otool`, `install_name_tool`, and `codesign`. No formula hooks execute.
+
+An exclusive `operations.lock` prevents concurrent lifecycle operations.
+There is no durable crash journal: a killed process can leave its lock/staging
+data. Operator inspection and recovery are required before another operation;
+do not blindly remove locks while an operation may still run. Installing an
+entire dependency closure is not one atomic transaction.
 
 ## Required acceptance before claiming support
 
-The remaining compatibility work includes API-backed import, exact bottle
-dependency resolution and receipt inspection, a real formula dependency chain,
-and a signed static source that the Pinget client successfully verifies before
-activating its cache. The client must then install, run, list, upgrade (including
-rebuild-only changes), and uninstall a real package in an isolated prefix.
-Those lifecycle operations need bounded archive extraction, target and ABI
-preflight, relocation for the curated set, atomic receipts/links, and recovery
-tests. Native Windows and macOS publisher/signature interoperability gates are
-also outstanding; Linux checks alone do not prove them.
+Keep real signed-source and lifecycle checks distinct from synthetic unit
+fixtures. Rebuild-only transitions must use increasing catalog rebuild versions
+and must not be described as authentic upstream rebuilds when synthesized for
+a test. Native macOS and Windows/macOS publisher/signature interoperability
+gates remain necessary; Linux success alone does not establish them.

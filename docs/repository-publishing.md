@@ -167,8 +167,9 @@ profile. The ownership marker records the profile and root name, and recovery
 verifies both. Older snapshots and ownership markers without a profile field
 continue to mean `windows` / `source2.msix`. The `Pinget.PreIndexed.Homebrew`
 client source consumes only `brew.msix` and verifies it before cache
-activation; successful signed-feed acceptance and native bottle lifecycle
-support remain outstanding.
+activation. Both clients have consumed a signed real-bottle source on Linux;
+platform acceptance and the native compatibility limits are documented in
+[Homebrew static source](homebrew-static-source.md).
 
 A static website, reverse proxy, object-storage HTTPS endpoint or CDN can serve
 these files. Enable `GET` and `HEAD`; retain `ETag`/`Last-Modified` metadata and

@@ -1,9 +1,11 @@
-#[cfg(test)]
-mod homebrew_tests;
+mod homebrew_bottle;
+mod homebrew_keg;
+mod homebrew_source;
 #[cfg(test)]
 mod homebrew_source_tests;
+#[cfg(test)]
+mod homebrew_tests;
 mod name_normalization;
-mod homebrew_source;
 #[cfg(test)]
 mod portable_payload_tests;
 #[cfg(test)]
@@ -1468,16 +1470,21 @@ impl Repository {
         let trusted_ca = trusted_ca
             .iter()
             .map(|path| {
-                let path = path.canonicalize().with_context(|| {
-                    format!("trusted CA does not exist: {}", path.display())
-                })?;
+                let path = path
+                    .canonicalize()
+                    .with_context(|| format!("trusted CA does not exist: {}", path.display()))?;
                 if !path.is_file() {
                     bail!("trusted CA must be a file: {}", path.display());
                 }
                 Ok(path.to_string_lossy().into_owned())
             })
             .collect::<Result<Vec<_>>>()?;
-        if self.store.sources.iter().any(|source| source.name.eq_ignore_ascii_case(name)) {
+        if self
+            .store
+            .sources
+            .iter()
+            .any(|source| source.name.eq_ignore_ascii_case(name))
+        {
             bail!("A source with name '{name}' already exists.");
         }
         if self.store.sources.iter().any(|source| source.arg == normalized_arg) {
@@ -1811,10 +1818,12 @@ impl Repository {
 
         let mut warnings = Vec::new();
         warnings.extend(source_refresh_warning);
-        if !installed_package_discovery_supported() {
+        let native_installed = homebrew_keg::installed_packages(&self.app_root, query.install_scope.as_deref())?;
+        if !installed_package_discovery_supported() && native_installed.is_empty() {
             warnings.push(INSTALLED_STATE_UNSUPPORTED_WARNING.to_owned());
         }
         let mut installed = collect_installed_packages(query.install_scope.as_deref())?;
+        installed.extend(native_installed);
 
         // Plain `list` should still correlate installed packages back to their
         // catalog identities so callers see canonical package ids/source names.
@@ -2666,11 +2675,12 @@ impl Repository {
     }
 
     fn preindexed_package_path(&self, source: &SourceRecord) -> PathBuf {
-        self.source_state_dir(source).join(if source.kind == SourceKind::HomebrewPreIndexed {
-            "brew.msix"
-        } else {
-            "source.msix"
-        })
+        self.source_state_dir(source)
+            .join(if source.kind == SourceKind::HomebrewPreIndexed {
+                "brew.msix"
+            } else {
+                "source.msix"
+            })
     }
 
     fn preindexed_index_path(&self, source: &SourceRecord) -> PathBuf {
@@ -2808,6 +2818,10 @@ impl Repository {
         self.install_request_with_visited(request, &mut HashSet::new())
     }
 
+    pub fn has_homebrew_packages(&self) -> Result<bool> {
+        Ok(!homebrew_keg::read_all(&self.app_root)?.is_empty())
+    }
+
     /// `visited` holds the lowercased ids of every package already on the current dependency
     /// chain or already handled, shared across the whole recursion so a dependency cycle (or a
     /// self-dependency) is skipped instead of recursing forever, as WinGet's dependency graph does.
@@ -2827,7 +2841,7 @@ impl Repository {
             package_id: manifest.id.clone(),
             version: manifest.version.clone(),
         });
-        if !package_actions_supported() {
+        if !package_actions_supported() && manifest.homebrew.is_none() {
             let installer_type = select_installer(&manifest.installers, &request.query)
                 .and_then(|installer| installer.installer_type)
                 .unwrap_or_else(|| "install".to_owned())
@@ -2856,6 +2870,34 @@ impl Repository {
         let mut installer = select_installer(&manifest.installers, &request.query)
             .ok_or_else(|| anyhow!("No applicable installer found"))?;
 
+        let native_spec = if manifest.homebrew.is_some() {
+            if request.ignore_security_hash || request.query.install_scope.as_deref() == Some("machine") {
+                bail!("Homebrew bottles require verified hashes and a user-scoped private prefix");
+            }
+            if request.install_location.is_some()
+                || request.rename.is_some()
+                || request.custom.is_some()
+                || request.override_args.is_some()
+            {
+                bail!("Homebrew bottles do not support installer arguments, custom locations, or renamed commands");
+            }
+            let (source_identifier, source_name) = if request.manifest_path.is_some() {
+                ("local-manifest".to_owned(), "local-manifest".to_owned())
+            } else {
+                let (located, _) = self.find_single_match(&request.query)?;
+                let source = &self.store.sources[located.source_index];
+                (source.identifier.clone(), source.name.clone())
+            };
+            Some(homebrew_keg::spec(
+                &manifest,
+                &installer,
+                source_identifier,
+                source_name,
+            )?)
+        } else {
+            None
+        };
+
         // Installing a different version over an existing installation is an update (WinGet converts
         // such an install to the upgrade flow). A same-version reinstall (repair, --force) is not.
         let is_update = existing_match
@@ -2863,6 +2905,9 @@ impl Repository {
             .is_some_and(|existing| install_is_update(&existing.installed_version, &manifest.version));
         ensure_upgrade_allowed(&installer, is_update)?;
         let uninstall_previous = uninstalls_previous_version(request, &installer, is_update);
+        if native_spec.is_some() && uninstall_previous {
+            bail!("Homebrew upgrades replace the managed keg transactionally; uninstall-previous is unsupported");
+        }
         if !upgrade_switch_applies(is_update, uninstall_previous) {
             // The `Upgrade` switch only applies when updating an existing installation.
             installer.switches.upgrade = None;
@@ -2891,7 +2936,8 @@ impl Repository {
         if uninstall_previous && let Some(previous) = existing_match.as_ref() {
             // Remove the installed version that was found above, not whatever the
             // install query (which may pin the *new* version) happens to match.
-            let exit_code = uninstall_package(previous, &create_uninstall_previous_request(previous), &mut warnings)
+            let exit_code = self
+                .uninstall_installed(previous, &create_uninstall_previous_request(previous), &mut warnings)
                 .with_context(|| format!("Failed to uninstall the previous version of {}", manifest.id))?;
             ensure_previous_version_uninstalled(&manifest.id, exit_code)?;
         }
@@ -2905,7 +2951,11 @@ impl Repository {
                 .unwrap_or(&manifest.id);
             (PathBuf::new(), PathBuf::from(store_target))
         } else {
-            let temp_dir = std::env::temp_dir().join("pinget-install");
+            let temp_dir = if native_spec.is_some() {
+                self.app_root.join("homebrew-downloads")
+            } else {
+                std::env::temp_dir().join("pinget-install")
+            };
             // Like WinGet, `--rename` never names the installer an install downloads: it only
             // names a portable's command alias (see `determine_portable_links`).
             let fetched_path = self.fetch_installer_for_request(request, &manifest, &installer, None, &temp_dir)?;
@@ -2920,14 +2970,19 @@ impl Repository {
         self.emit_install_progress(InstallProgress::WaitingForInstaller {
             installer_type: installer_type.clone(),
         });
-        let exit_code = dispatch_installer(
-            &installer_path,
-            &installer_type,
-            request,
-            &manifest,
-            &installer,
-            &mut warnings,
-        )?;
+        let exit_code = if let Some(spec) = native_spec {
+            homebrew_keg::install(&self.app_root, &installer_path, spec, &mut warnings)?;
+            0
+        } else {
+            dispatch_installer(
+                &installer_path,
+                &installer_type,
+                request,
+                &manifest,
+                &installer,
+                &mut warnings,
+            )?
+        };
         self.emit_install_progress(InstallProgress::InstallerFinished { exit_code });
         let mut result = completed_install_result(
             &manifest,
@@ -3041,7 +3096,10 @@ impl Repository {
 
     pub fn repair(&mut self, request: &RepairRequest) -> Result<InstallResult> {
         self.ensure_hash_override_allowed(request.ignore_security_hash)?;
-        if request.manifest_path.is_none() && !package_actions_supported() {
+        if request.manifest_path.is_none()
+            && !package_actions_supported()
+            && homebrew_keg::read_all(&self.app_root)?.is_empty()
+        {
             let package_id = request
                 .query
                 .id
@@ -3117,7 +3175,7 @@ impl Repository {
     }
 
     pub fn uninstall_request(&mut self, request: &UninstallRequest) -> Result<InstallResult> {
-        if !package_actions_supported() {
+        if !package_actions_supported() && homebrew_keg::read_all(&self.app_root)?.is_empty() {
             let (package_id, version) = if let Some(path) = &request.manifest_path {
                 let manifest = self.load_manifest_from_path(path)?;
                 (manifest.id, request.query.version.clone().unwrap_or(manifest.version))
@@ -3147,7 +3205,7 @@ impl Repository {
         let matches = self.resolve_uninstall_matches(request)?;
         let mut warnings = Vec::new();
         let exit_code = uninstall_each_match(&matches, request.all_versions, |installed| {
-            uninstall_package(installed, request, &mut warnings)
+            self.uninstall_installed(installed, request, &mut warnings)
         })?;
 
         let installed = matches
@@ -3165,6 +3223,20 @@ impl Repository {
             reboot_required: false,
             warnings,
         })
+    }
+
+    fn uninstall_installed(
+        &self,
+        installed: &ListMatch,
+        request: &UninstallRequest,
+        warnings: &mut Vec<String>,
+    ) -> Result<i32> {
+        if installed.installer_category.as_deref() == Some("homebrew-bottle") {
+            homebrew_keg::uninstall(&self.app_root, &installed.id, request.force, warnings)?;
+            Ok(0)
+        } else {
+            uninstall_package(installed, request, warnings)
+        }
     }
 
     fn resolve_manifest_for_install(&mut self, request: &InstallRequest) -> Result<Manifest> {
@@ -4213,12 +4285,16 @@ impl Repository {
             .error_for_status()
             .with_context(|| format!("Homebrew source request failed for {url}"))?;
         const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-        if response.content_length().is_some_and(|length| length > MAX_SOURCE_BYTES) {
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_SOURCE_BYTES)
+        {
             bail!("Homebrew source MSIX exceeds the 2 GiB size limit");
         }
         let headers = response.headers().clone();
         let stamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
-        let package_temp = state_dir.join(format!("brew.{stamp}.tmp"));
+        // Psign chooses its MSIX verifier from the file extension.
+        let package_temp = state_dir.join(format!("brew.{stamp}.tmp.msix"));
         let index_temp = state_dir.join(format!("index.{stamp}.tmp"));
         let result = (|| {
             let mut package_file = OpenOptions::new()
@@ -4231,7 +4307,9 @@ impl Repository {
             if copied > MAX_SOURCE_BYTES {
                 bail!("Homebrew source MSIX exceeds the 2 GiB size limit");
             }
-            package_file.sync_all().context("failed to flush temporary Homebrew source package")?;
+            package_file
+                .sync_all()
+                .context("failed to flush temporary Homebrew source package")?;
             drop(package_file);
 
             let index_bytes = homebrew_source::verify_msix(&package_temp, &source_snapshot, None)?;
@@ -4243,7 +4321,9 @@ impl Repository {
             index_file
                 .write_all(&index_bytes)
                 .context("failed to persist temporary verified Homebrew source index")?;
-            index_file.sync_all().context("failed to flush temporary verified Homebrew source index")?;
+            index_file
+                .sync_all()
+                .context("failed to flush temporary verified Homebrew source index")?;
             drop(index_file);
 
             let connection = Self::open_sqlite_connection(index_temp.clone())?;
@@ -4252,8 +4332,7 @@ impl Repository {
             drop(connection);
 
             let index_path = self.preindexed_index_path(&source_snapshot);
-            replace_file(&index_temp, &index_path)
-                .context("failed to activate verified Homebrew source index")?;
+            replace_file(&index_temp, &index_path).context("failed to activate verified Homebrew source index")?;
             remove_sqlite_sidecars(&index_path);
             replace_file(&package_temp, &self.preindexed_package_path(&source_snapshot))
                 .context("failed to persist verified Homebrew source package")?;
@@ -6429,7 +6508,9 @@ fn validate_homebrew_source_base_url(arg: &str) -> Result<()> {
         || arg.contains('%')
         || raw_path.split('/').any(|part| matches!(part, "." | ".."))
     {
-        bail!("Homebrew source base URL must not contain credentials, query strings, fragments, escapes, or dot segments.");
+        bail!(
+            "Homebrew source base URL must not contain credentials, query strings, fragments, escapes, or dot segments."
+        );
     }
     Ok(())
 }
@@ -9292,9 +9373,6 @@ fn yaml_homebrew_metadata(root: &YamlMapping) -> Result<Option<HomebrewFormulaMe
     } else {
         format!("{upstream_version}_{revision}")
     };
-    if yaml_string(root, "PackageVersion").as_deref() != Some(expected_package_version.as_str()) {
-        bail!("PackageVersion must equal Homebrew stable pkg_version '{expected_package_version}'");
-    }
     let version_scheme = integer(homebrew, "VersionScheme")?;
     if version_scheme > 5 {
         bail!("unsupported Homebrew version scheme {version_scheme}");
@@ -9378,6 +9456,16 @@ fn yaml_homebrew_metadata(root: &YamlMapping) -> Result<Option<HomebrewFormulaMe
             minimum_glibc,
             loader,
         });
+    }
+    let rebuilt_version = format!("{expected_package_version}.bottle.{}", bottles[0].rebuild);
+    let package_version = yaml_string(root, "PackageVersion");
+    if package_version.as_deref() != Some(expected_package_version.as_str())
+        && (package_version.as_deref() != Some(rebuilt_version.as_str())
+            || bottles.iter().any(|bottle| bottle.rebuild != bottles[0].rebuild))
+    {
+        bail!(
+            "PackageVersion must equal Homebrew stable pkg_version '{expected_package_version}' or its matching .bottle.Rebuild version"
+        );
     }
 
     Ok(Some(HomebrewFormulaMetadata {
@@ -11388,6 +11476,7 @@ fn select_installer_for_system(
     installers
         .iter()
         .enumerate()
+        .filter(|(_, installer)| homebrew_keg::installer_matches_host(installer))
         .filter(|(_, installer)| {
             installer_matches_requested(
                 installer,

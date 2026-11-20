@@ -105,10 +105,8 @@ fn rejects_unknown_schema_and_mismatched_target_constraints() {
             .contains("unsupported Homebrew bottle tag 'arm64_unknown'")
     );
 
-    let mismatched_package_id = VALID_HOME_BREW_MANIFEST.replace(
-        "Pinget.Homebrew.jq-929958fef124d633",
-        "Pinget.Homebrew.jq",
-    );
+    let mismatched_package_id =
+        VALID_HOME_BREW_MANIFEST.replace("Pinget.Homebrew.jq-929958fef124d633", "Pinget.Homebrew.jq");
     assert!(
         parse_yaml_manifest(mismatched_package_id.as_bytes())
             .expect_err("package id must be derived from exact formula identity")

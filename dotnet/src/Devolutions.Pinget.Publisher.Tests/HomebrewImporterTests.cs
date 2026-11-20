@@ -8,6 +8,37 @@ namespace Devolutions.Pinget.Publisher.Tests;
 public sealed class HomebrewImporterTests
 {
     [Fact]
+    public void MapsLinuxRuntimeDependenciesAndDistinguishesBottleRebuilds()
+    {
+        using var fixture = new Fixture();
+        fixture.Options = fixture.Options with { Tag = "x86_64_linux", TargetOS = "Linux", Architecture = "x64" };
+        fixture.Change(value =>
+        {
+            var bottle = value["bottle"]!["stable"]!["files"]!["arm64_sonoma"]!.DeepClone();
+            bottle["url"] = "https://ghcr.io/v2/homebrew/core/tinytool/blobs/sha256:" + bottle["sha256"]!.GetValue<string>();
+            bottle["minimum_glibc"] = "2.35";
+            bottle["loader"] = "glibc";
+            value["bottle"]!["stable"]!["files"] = new JsonObject { ["x86_64_linux"] = bottle };
+            value["dependencies"] = new JsonArray("oniguruma");
+            value["pinget_runtime_dependencies"] = JsonNode.Parse("""[{"full_name":"oniguruma","pkg_version":"6.9.10","bottle_rebuild":0}]""");
+        });
+        var first = HomebrewImporter.Import(fixture.Options);
+        var yaml = new YamlDotNet.RepresentationModel.YamlStream();
+        yaml.Load(new StringReader(File.ReadAllText(
+            Path.Combine(fixture.Options.ManifestOutput, first["manifestFile"]!.GetValue<string>()))));
+        var parsed = yaml.Documents[0].RootNode;
+        Assert.Equal("x64", parsed["Installers"][0]["Architecture"].ToString());
+        Assert.Equal("6.9.10.bottle.0", first["runtimeDependencies"]![0]!["MinimumVersion"]!.GetValue<string>());
+        Assert.Equal(HomebrewPackageIds.Create("homebrew/core", "oniguruma"),
+            first["runtimeDependencies"]![0]!["PackageIdentifier"]!.GetValue<string>());
+        fixture.Change(value => value["bottle"]!["stable"]!["rebuild"] = 4);
+        var next = HomebrewImporter.Import(fixture.Options);
+        Assert.Equal("1.2.3_1.bottle.4", next["packageVersion"]!.GetValue<string>());
+        Assert.NotEqual(first["manifestFile"]!.GetValue<string>(), next["manifestFile"]!.GetValue<string>());
+        Assert.Equal(first["bottleFile"]!.GetValue<string>(), next["bottleFile"]!.GetValue<string>());
+    }
+
+    [Fact]
     public void PinnedImport_MirrorsExactBytesAndIsDeterministic()
     {
         using var fixture = new Fixture();
@@ -19,7 +50,7 @@ public sealed class HomebrewImporterTests
         var root = Assert.IsType<YamlDotNet.RepresentationModel.YamlMappingNode>(yaml.Documents[0].RootNode);
         var homebrew = root["Pinget"]["Homebrew"];
         Assert.Equal(HomebrewPackageIds.Create("homebrew/core", "tinytool"), report["packageIdentifier"]!.GetValue<string>());
-        Assert.Equal("1.2.3_1", report["packageVersion"]!.GetValue<string>());
+        Assert.Equal("1.2.3_1.bottle.3", report["packageVersion"]!.GetValue<string>());
         Assert.Equal("singleton", root["ManifestType"].ToString());
         Assert.Equal("https://tinytool.example.invalid/", root["PackageUrl"].ToString());
         Assert.Equal("Small dependency-free test utility", root["ShortDescription"].ToString());
@@ -122,13 +153,12 @@ public sealed class HomebrewImporterTests
     }
 
     [Theory]
-    [InlineData("dependencies")]
     [InlineData("recommended_dependencies")]
     [InlineData("optional_dependencies")]
     [InlineData("uses_from_macos")]
     [InlineData("requirements")]
     [InlineData("conflicts_with")]
-    public void RejectsRuntimeDependenciesAndRequirements(string field)
+    public void RejectsOptionalDependenciesAndRequirements(string field)
     {
         using var fixture = new Fixture();
         fixture.Change(v => v[field] = new JsonArray("runtime"));
@@ -174,7 +204,7 @@ public sealed class HomebrewImporterTests
     {
         using var fixture = new Fixture();
         fixture.Change(v => v["bottle"]!["stable"]!["files"] = new JsonObject());
-        fixture.Reject("no arm64_sonoma bottle");
+        fixture.Reject("no selected bottle");
     }
 
     [Fact]

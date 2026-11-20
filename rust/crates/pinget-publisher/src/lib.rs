@@ -426,15 +426,23 @@ fn collect_bottle_assets(input: &Path, inventory: &mut Inventory) -> Result<Vec<
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(expected_hash) = name.strip_suffix(".tar.gz") else {
-            return Err(PublisherError::Invalid(format!("invalid bottle mirror filename: {name}")));
+            return Err(PublisherError::Invalid(format!(
+                "invalid bottle mirror filename: {name}"
+            )));
         };
         if expected_hash.len() != 64
-            || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || !expected_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
-            return Err(PublisherError::Invalid(format!("invalid bottle mirror filename: {name}")));
+            return Err(PublisherError::Invalid(format!(
+                "invalid bottle mirror filename: {name}"
+            )));
         }
         if sha256_file(&path)? != expected_hash {
-            return Err(PublisherError::Invalid(format!("bottle mirror hash does not match filename: {name}")));
+            return Err(PublisherError::Invalid(format!(
+                "bottle mirror hash does not match filename: {name}"
+            )));
         }
         let relative = format!("bottles/{name}");
         inventory.files.insert(relative.clone(), expected_hash.to_owned());
@@ -444,10 +452,7 @@ fn collect_bottle_assets(input: &Path, inventory: &mut Inventory) -> Result<Vec<
     Ok(assets)
 }
 
-fn validate_homebrew_bottle_assets(
-    groups: &ManifestGroups,
-    inventory: &BTreeMap<String, String>,
-) -> Result<()> {
+fn validate_homebrew_bottle_assets(groups: &ManifestGroups, inventory: &BTreeMap<String, String>) -> Result<()> {
     for documents in groups.values() {
         for document in documents {
             let Some(installers) = document.document.get("Installers").and_then(Value::as_sequence) else {
@@ -470,17 +475,21 @@ fn validate_homebrew_bottle_assets(
                     .get("InstallerUrl")
                     .and_then(Value::as_str)
                     .ok_or_else(|| PublisherError::Invalid("Homebrew installer is missing InstallerUrl".to_owned()))?;
-                let rest = url
-                    .strip_prefix("https://")
-                    .ok_or_else(|| PublisherError::Invalid("Homebrew bottle URL must be an HTTPS static URL".to_owned()))?;
-                let (authority, path) = rest
-                    .split_once('/')
-                    .ok_or_else(|| PublisherError::Invalid("Homebrew bottle URL must include a static path".to_owned()))?;
+                let rest = url.strip_prefix("https://").ok_or_else(|| {
+                    PublisherError::Invalid("Homebrew bottle URL must be an HTTPS static URL".to_owned())
+                })?;
+                let (authority, path) = rest.split_once('/').ok_or_else(|| {
+                    PublisherError::Invalid("Homebrew bottle URL must include a static path".to_owned())
+                })?;
                 if authority.is_empty() || authority.contains('@') {
-                    return Err(PublisherError::Invalid("Homebrew bottle URL has an invalid authority".to_owned()));
+                    return Err(PublisherError::Invalid(
+                        "Homebrew bottle URL has an invalid authority".to_owned(),
+                    ));
                 }
                 if path.contains(['?', '#', '%']) || path.split('/').any(|part| matches!(part, "." | "..")) {
-                    return Err(PublisherError::Invalid("Homebrew bottle URL contains unsupported path syntax".to_owned()));
+                    return Err(PublisherError::Invalid(
+                        "Homebrew bottle URL contains unsupported path syntax".to_owned(),
+                    ));
                 }
                 let segments: Vec<_> = path.split('/').collect();
                 if segments.len() < 2 || segments[segments.len() - 2] != "bottles" {
@@ -3552,9 +3561,10 @@ fn verify_msix_contents(package_path: &Path, marker: &OwnerMarker) -> Result<()>
         )));
     }
     if marker.unsigned_development && parsed.has_signature_parts {
-        return Err(PublisherError::Invalid(
-            format!("unsigned development destination contains a signed {}", marker.package_file_name),
-        ));
+        return Err(PublisherError::Invalid(format!(
+            "unsigned development destination contains a signed {}",
+            marker.package_file_name
+        )));
     }
     Ok(())
 }
@@ -3655,13 +3665,7 @@ fn verify_destination_with_tool(
     verify_msix_contents(&package_path, &marker)?;
     if !marker.unsigned_development {
         let psign_tool = psign::require_psign_tool(psign_tool)?;
-        psign::verify(
-            &psign_tool,
-            &package_path,
-            &marker.publisher,
-            trusted_ca,
-            policy,
-        )?;
+        psign::verify(&psign_tool, &package_path, &marker.publisher, trusted_ca, policy)?;
     }
     Ok(VerifyReport {
         valid: true,

@@ -36,11 +36,12 @@ implementation boundary are documented in
 offline, single-formula bottle importer is described in
 [Homebrew import](docs/homebrew-import.md), with the precise support matrix in
 [Homebrew bottle compatibility](docs/homebrew-bottle-compatibility.md). The
-publisher-only static feed workflow is documented in
+static feed and native client workflow is documented in
 [Homebrew static source](docs/homebrew-static-source.md). It records the
 Homebrew-only `brew.msix` publishing profile and the dedicated source update
-path. Successful signed-feed acceptance and native bottle installation remain
-unverified/unimplemented.
+path. Both native clients have installed and executed the real jq/oniguruma
+chain from a signed static feed on Linux; the compatibility document records
+platform gates and deliberately unsupported Homebrew behavior.
 
 The C# implementation also ships the **`Devolutions.Pinget.Client` PowerShell 7 module** that mirrors the upstream `Microsoft.WinGet.Client` cmdlet family with renamed `Pinget` nouns, backed by `Devolutions.Pinget.Core`.
 

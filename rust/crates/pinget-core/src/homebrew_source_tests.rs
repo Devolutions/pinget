@@ -25,13 +25,14 @@ fn source_registration_persists_publisher_and_trust_anchors() {
     let app_root = temporary_directory();
     let root = app_root.join("test-root.cer");
     fs::write(&root, b"test certificate placeholder").expect("write test root");
-    let mut repository = Repository::open_with_options(RepositoryOptions::new(app_root.clone())).expect("open repository");
+    let mut repository =
+        Repository::open_with_options(RepositoryOptions::new(app_root.clone())).expect("open repository");
     repository
         .add_homebrew_source(
             "homebrew",
             "https://packages.example.test/brew/",
             "CN=Pinget Homebrew Source",
-            &[root.clone()],
+            std::slice::from_ref(&root),
         )
         .expect("register Homebrew source");
 
@@ -45,11 +46,14 @@ fn source_registration_persists_publisher_and_trust_anchors() {
     assert_eq!(source.publisher.as_deref(), Some("CN=Pinget Homebrew Source"));
     assert_eq!(
         source.trusted_ca,
-        [root.canonicalize().expect("canonical root").to_string_lossy().into_owned()]
+        [root
+            .canonicalize()
+            .expect("canonical root")
+            .to_string_lossy()
+            .into_owned()]
     );
 
-    let reopened =
-        Repository::open_with_options(RepositoryOptions::new(app_root.clone())).expect("reopen repository");
+    let reopened = Repository::open_with_options(RepositoryOptions::new(app_root.clone())).expect("reopen repository");
     let restored = reopened
         .list_sources()
         .into_iter()
@@ -72,7 +76,8 @@ fn source_registration_rejects_secret_or_ambiguous_urls() {
     }
 
     let app_root = temporary_directory();
-    let mut repository = Repository::open_with_options(RepositoryOptions::new(app_root.clone())).expect("open repository");
+    let mut repository =
+        Repository::open_with_options(RepositoryOptions::new(app_root.clone())).expect("open repository");
     for url in [
         "https://user@packages.example.test/brew",
         "https://packages.example.test/brew?token=secret",

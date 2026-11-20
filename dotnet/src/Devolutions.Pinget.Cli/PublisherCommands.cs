@@ -14,7 +14,8 @@ internal static class PublisherCommands
             "Import one pinned local formula/bottle offline; no downloads or dependency resolution. Only arm64_sonoma/macOS/arm64 is supported.");
         var importOptions = new[] { "formula-json", "bottle-archive", "manifest-output", "bottle-mirror", "tag", "target-os", "architecture", "base-url" }
             .ToDictionary(name => name, name => new Option<string>($"--{name}",
-                name == "base-url" ? "Public HTTPS mirror URL without credentials, query, fragment or escapes" : $"Explicit {name} input") { IsRequired = true });
+                name == "base-url" ? "Public HTTPS mirror URL without credentials, query, fragment or escapes" : $"Explicit {name} input")
+            { IsRequired = true });
         foreach (var option in importOptions.Values)
             importHomebrew.AddOption(option);
         importHomebrew.SetHandler(context => Run(context, outputOption, () =>
