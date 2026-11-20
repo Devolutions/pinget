@@ -127,6 +127,19 @@ def certificates(work, openssl):
     return fingerprint.strip().split("=")[1].replace(":", "")
 
 
+def private_dependencies(app, env):
+    executable = app / "homebrew/bin/jq"
+    if platform.system() == "Linux":
+        lines = run(["ldd", executable], env).splitlines()
+    else:
+        files = [executable, *list((app / "homebrew/Cellar/jq/1.8.1/lib").glob("*.dylib"))]
+        lines = [line for file in files for line in run(["otool", "-L", file], env).splitlines()[1:]]
+    libraries = [line for line in lines if "libonig." in line or "libjq." in line]
+    prefix = str(app / "homebrew") + os.sep
+    if not any("libonig." in line for line in libraries) or any(prefix not in line for line in libraries):
+        raise RuntimeError(f"jq did not resolve its bottle libraries inside the private prefix: {libraries}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rust-cli", type=Path, required=True)
@@ -235,6 +248,7 @@ def main():
                         run(cli + ["install", "jq", "--source", "homebrew", "--silent",
                                    "--accept-package-agreements"], client_env)
                         assert run([app / "homebrew/bin/jq", "-n", '"abc" | test("^a")'], client_env).strip() == "true"
+                        private_dependencies(app, client_env)
                         assert "oniguruma" in run(cli + ["list"], client_env)
                     clients.append((consumer, publisher, app, client_env))
                     report["checks"].append(f"{consumer} consumed {publisher} signed static source")
@@ -254,6 +268,7 @@ def main():
                 opposite = clis["dotnet" if consumer == "rust" else "rust"]
                 run(opposite + ["repair", "jq", "--source", "homebrew", "--silent"], client_env)
                 assert run([app / "homebrew/bin/jq", "-n", '"abc" | test("^a")'], client_env).strip() == "true"
+                private_dependencies(app, client_env)
                 refusal = subprocess.run(
                     opposite + ["uninstall", "oniguruma", "--silent"], env=client_env,
                     capture_output=True, text=True, timeout=60

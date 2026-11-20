@@ -95,9 +95,10 @@ source cache preservation. The rebuild transition is synthetic; bottle bytes
 are unchanged. Windows checks publishing and signed source consumption only.
 
 The `Homebrew prototype acceptance` workflow runs these gates on Linux,
-macOS arm64/x64, and Windows and uploads only a non-secret JSON report. Its
-prototype-branch push trigger is temporary; `workflow_call` is the reusable
-entry point. A queued workflow is not evidence of platform success.
+macOS arm64/x64, and Windows and uploads only a non-secret JSON report.
+`workflow_call` is the reusable entry point; the prototype-branch push trigger
+was removed after registering the acceptance run. A queued or approval-blocked
+workflow is not evidence of platform success.
 
 Local Linux runs require built CLIs, Psign, `patchelf`, OpenSSL, Python, and
 an explicit private temporary parent:

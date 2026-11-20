@@ -1,14 +1,6 @@
 name: Homebrew prototype acceptance
 
 on:
-  push:
-    branches:
-      - copilot/scaling-chainsaw
-    paths:
-      - 'rust/**'
-      - 'dotnet/**'
-      - 'tests/homebrew/**'
-      - '.github/workflows/homebrew-prototype.yml'
   workflow_dispatch:
   workflow_call:
 
@@ -26,6 +18,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      DOTNET_ROLL_FORWARD: Major
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-dotnet@v5

@@ -73,3 +73,7 @@ fixtures. Rebuild-only transitions must use increasing catalog rebuild versions
 and must not be described as authentic upstream rebuilds when synthesized for
 a test. Native macOS and Windows/macOS publisher/signature interoperability
 gates remain necessary; Linux success alone does not establish them.
+The cloud prototype's hosted run
+[44815970690](https://github.com/Devolutions/pinget/actions/runs/44815970690)
+stopped at `action_required` before any matrix job ran. Maintainer approval
+is required before macOS execution or Windows/macOS publishing can be claimed.
