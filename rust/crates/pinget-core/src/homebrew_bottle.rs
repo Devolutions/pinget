@@ -145,47 +145,62 @@ fn normalize_link(root: &Path, parent: &Path, link: &Path) -> Result<PathBuf> {
 pub(crate) fn relocate(files: &[PathBuf], prefix: &Path, original_prefix: &str) -> Result<()> {
     let prefix = prefix.to_str().context("Bottle prefix is not UTF-8")?;
     for path in files {
-        if fs::metadata(path)?.len() > 256 * 1024 * 1024 {
-            bail!(
-                "Bottle relocation exceeds the 256 MiB per-file limit: {}",
-                path.display()
-            );
-        }
-        let bytes = fs::read(path)?;
-        if bytes.starts_with(b"\x7fELF") {
-            if !cfg!(target_os = "linux") {
-                bail!("A Linux ELF bottle cannot be installed on this platform");
-            }
-            let path_text = path.to_str().context("Bottle path is not UTF-8")?;
-            let rpath = run("patchelf", &["--print-rpath", path_text])?;
-            let rpath = rpath.trim_end_matches(['\r', '\n']);
-            let relocated = replace(rpath, prefix, original_prefix);
-            if relocated != rpath {
-                run("patchelf", &["--set-rpath", &relocated, path_text])?;
-            }
-            if has_elf_interpreter(&bytes)? {
-                let interpreter = match std::env::consts::ARCH {
-                    "x86_64" => "/lib64/ld-linux-x86-64.so.2",
-                    "aarch64" => "/lib/ld-linux-aarch64.so.1",
-                    _ => bail!("Bottle relocation supports x64 and arm64 Linux"),
-                };
-                if !Path::new(interpreter).is_file() {
-                    bail!("The host glibc interpreter is missing: {interpreter}");
-                }
-                run("patchelf", &["--set-interpreter", interpreter, path_text])?;
-            }
-        } else if is_macho(&bytes) {
-            if !cfg!(target_os = "macos") {
-                bail!("A macOS Mach-O bottle cannot be installed on this platform");
-            }
-            relocate_macho(path, prefix, original_prefix)?;
-        } else if !bytes.contains(&0)
-            && let Ok(text) = std::str::from_utf8(&bytes)
+        #[cfg(unix)]
         {
-            let relocated = replace(text, prefix, original_prefix);
-            if relocated != text {
-                fs::write(path, relocated)?;
+            use std::os::unix::fs::PermissionsExt as _;
+            let permissions = fs::metadata(path)?.permissions();
+            fs::set_permissions(path, fs::Permissions::from_mode(permissions.mode() | 0o600))?;
+            let result = relocate_file(path, prefix, original_prefix);
+            fs::set_permissions(path, permissions)?;
+            result?;
+        }
+        #[cfg(not(unix))]
+        relocate_file(path, prefix, original_prefix)?;
+    }
+    Ok(())
+}
+
+fn relocate_file(path: &Path, prefix: &str, original_prefix: &str) -> Result<()> {
+    if fs::metadata(path)?.len() > 256 * 1024 * 1024 {
+        bail!(
+            "Bottle relocation exceeds the 256 MiB per-file limit: {}",
+            path.display()
+        );
+    }
+    let bytes = fs::read(path)?;
+    if bytes.starts_with(b"\x7fELF") {
+        if !cfg!(target_os = "linux") {
+            bail!("A Linux ELF bottle cannot be installed on this platform");
+        }
+        let path_text = path.to_str().context("Bottle path is not UTF-8")?;
+        let rpath = run("patchelf", &["--print-rpath", path_text])?;
+        let rpath = rpath.trim_end_matches(['\r', '\n']);
+        let relocated = replace(rpath, prefix, original_prefix);
+        if relocated != rpath {
+            run("patchelf", &["--set-rpath", &relocated, path_text])?;
+        }
+        if has_elf_interpreter(&bytes)? {
+            let interpreter = match std::env::consts::ARCH {
+                "x86_64" => "/lib64/ld-linux-x86-64.so.2",
+                "aarch64" => "/lib/ld-linux-aarch64.so.1",
+                _ => bail!("Bottle relocation supports x64 and arm64 Linux"),
+            };
+            if !Path::new(interpreter).is_file() {
+                bail!("The host glibc interpreter is missing: {interpreter}");
             }
+            run("patchelf", &["--set-interpreter", interpreter, path_text])?;
+        }
+    } else if is_macho(&bytes) {
+        if !cfg!(target_os = "macos") {
+            bail!("A macOS Mach-O bottle cannot be installed on this platform");
+        }
+        relocate_macho(path, prefix, original_prefix)?;
+    } else if !bytes.contains(&0)
+        && let Ok(text) = std::str::from_utf8(&bytes)
+    {
+        let relocated = replace(text, prefix, original_prefix);
+        if relocated != text {
+            fs::write(path, relocated)?;
         }
     }
     Ok(())
@@ -397,6 +412,23 @@ pub(crate) mod tests {
             fs::read_to_string(path)?,
             "prefix=/old/private\ncellar=/old/private/Cellar\nold=/old/private/lib\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relocates_read_only_files_and_restores_mode_on_failure() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let path = fixture.0.join("readonly.pc");
+        fs::write(&path, "prefix=@@HOMEBREW_PREFIX@@")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444))?;
+        relocate(std::slice::from_ref(&path), Path::new("/private"), "/old")?;
+        assert_eq!(fs::read_to_string(&path)?, "prefix=/private");
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o444);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        fs::write(&path, b"\x7fELF")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444))?;
+        assert!(relocate(std::slice::from_ref(&path), Path::new("/private"), "/old").is_err());
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o444);
         Ok(())
     }
 }

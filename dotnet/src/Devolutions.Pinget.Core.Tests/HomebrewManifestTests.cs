@@ -106,7 +106,7 @@ public sealed class HomebrewManifestTests
         var packageIdError = ParseExpectingInvalid(mismatchedPackageId, "formula ID must be canonical");
         Assert.Contains("PackageIdentifier must equal Homebrew-derived identifier", packageIdError.Message, StringComparison.Ordinal);
 
-        var mismatchedInstaller = ValidManifest.Replace(
+        var mismatchedInstaller = ValidManifest.Replace("\r\n", "\n", StringComparison.Ordinal).Replace(
             "InstallerType: homebrew-bottle\n    Architecture: arm64",
             "InstallerType: homebrew-bottle\n    Architecture: x64",
             StringComparison.Ordinal);

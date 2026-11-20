@@ -11,52 +11,71 @@ internal static class HomebrewBottleRelocation
     {
         foreach (var path in files)
         {
-            if (new FileInfo(path).Length > 256L * 1024 * 1024)
-                throw new InvalidDataException($"Bottle relocation exceeds the 256 MiB per-file limit: {path}");
-            var bytes = File.ReadAllBytes(path);
-            if (bytes.AsSpan().StartsWith("\x7f"u8) && bytes.Length >= 4 &&
-                bytes[1] == (byte)'E' && bytes[2] == (byte)'L' && bytes[3] == (byte)'F')
+            if (OperatingSystem.IsWindows())
             {
-                if (!OperatingSystem.IsLinux())
-                    throw new InvalidDataException("A Linux ELF bottle cannot be installed on this platform.");
-                var rpath = Run("patchelf", "--print-rpath", path).TrimEnd('\r', '\n');
-                var relocated = Replace(rpath, prefix, originalPrefix);
-                if (rpath != relocated)
-                    Run("patchelf", "--set-rpath", relocated, path);
-                if (HasElfInterpreter(bytes))
-                {
-                    var interpreter = RuntimeInformation.ProcessArchitecture switch
-                    {
-                        Architecture.X64 => "/lib64/ld-linux-x86-64.so.2",
-                        Architecture.Arm64 => "/lib/ld-linux-aarch64.so.1",
-                        _ => throw new PlatformNotSupportedException("Bottle relocation supports x64 and arm64 Linux."),
-                    };
-                    if (!File.Exists(interpreter))
-                        throw new PlatformNotSupportedException($"The host glibc interpreter is missing: {interpreter}");
-                    Run("patchelf", "--set-interpreter", interpreter, path);
-                }
+                RelocateFile(path, prefix, originalPrefix);
+                continue;
             }
-            else if (IsMachO(bytes))
+            var mode = File.GetUnixFileMode(path);
+            File.SetUnixFileMode(path, mode | UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            try
             {
-                if (!OperatingSystem.IsMacOS())
-                    throw new InvalidDataException("A macOS Mach-O bottle cannot be installed on this platform.");
-                RelocateMachO(path, prefix, originalPrefix);
+                RelocateFile(path, prefix, originalPrefix);
             }
-            else if (!bytes.Contains((byte)0))
+            finally
             {
-                string text;
-                try
-                {
-                    text = new UTF8Encoding(false, true).GetString(bytes);
-                }
-                catch (DecoderFallbackException)
-                {
-                    continue;
-                }
-                var relocated = Replace(text, prefix, originalPrefix);
-                if (relocated != text)
-                    File.WriteAllText(path, relocated, new UTF8Encoding(false));
+                File.SetUnixFileMode(path, mode);
             }
+        }
+    }
+
+    private static void RelocateFile(string path, string prefix, string originalPrefix)
+    {
+        if (new FileInfo(path).Length > 256L * 1024 * 1024)
+            throw new InvalidDataException($"Bottle relocation exceeds the 256 MiB per-file limit: {path}");
+        var bytes = File.ReadAllBytes(path);
+        if (bytes.AsSpan().StartsWith("\x7f"u8) && bytes.Length >= 4 &&
+            bytes[1] == (byte)'E' && bytes[2] == (byte)'L' && bytes[3] == (byte)'F')
+        {
+            if (!OperatingSystem.IsLinux())
+                throw new InvalidDataException("A Linux ELF bottle cannot be installed on this platform.");
+            var rpath = Run("patchelf", "--print-rpath", path).TrimEnd('\r', '\n');
+            var relocated = Replace(rpath, prefix, originalPrefix);
+            if (rpath != relocated)
+                Run("patchelf", "--set-rpath", relocated, path);
+            if (HasElfInterpreter(bytes))
+            {
+                var interpreter = RuntimeInformation.ProcessArchitecture switch
+                {
+                    Architecture.X64 => "/lib64/ld-linux-x86-64.so.2",
+                    Architecture.Arm64 => "/lib/ld-linux-aarch64.so.1",
+                    _ => throw new PlatformNotSupportedException("Bottle relocation supports x64 and arm64 Linux."),
+                };
+                if (!File.Exists(interpreter))
+                    throw new PlatformNotSupportedException($"The host glibc interpreter is missing: {interpreter}");
+                Run("patchelf", "--set-interpreter", interpreter, path);
+            }
+        }
+        else if (IsMachO(bytes))
+        {
+            if (!OperatingSystem.IsMacOS())
+                throw new InvalidDataException("A macOS Mach-O bottle cannot be installed on this platform.");
+            RelocateMachO(path, prefix, originalPrefix);
+        }
+        else if (!bytes.Contains((byte)0))
+        {
+            string text;
+            try
+            {
+                text = new UTF8Encoding(false, true).GetString(bytes);
+            }
+            catch (DecoderFallbackException)
+            {
+                return;
+            }
+            var relocated = Replace(text, prefix, originalPrefix);
+            if (relocated != text)
+                File.WriteAllText(path, relocated, new UTF8Encoding(false));
         }
     }
 

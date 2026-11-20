@@ -63,6 +63,27 @@ public sealed class HomebrewBottleArchiveTests
     }
 
     [Fact]
+    public void Relocate_ReadOnlyFileRestoresModeOnSuccessAndFailure()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        using var fixture = new Fixture();
+        Directory.CreateDirectory(fixture.Root);
+        var path = Path.Combine(fixture.Root, "readonly.pc");
+        File.WriteAllText(path, "prefix=@@HOMEBREW_PREFIX@@");
+        var mode = UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead;
+        File.SetUnixFileMode(path, mode);
+        HomebrewBottleRelocation.Relocate([path], "/private", "/old");
+        Assert.Equal("prefix=/private", File.ReadAllText(path));
+        Assert.Equal(mode, File.GetUnixFileMode(path));
+        File.SetUnixFileMode(path, mode | UnixFileMode.UserWrite);
+        File.WriteAllBytes(path, [0x7f, (byte)'E', (byte)'L', (byte)'F']);
+        File.SetUnixFileMode(path, mode);
+        Assert.ThrowsAny<Exception>(() => HomebrewBottleRelocation.Relocate([path], "/private", "/old"));
+        Assert.Equal(mode, File.GetUnixFileMode(path));
+    }
+
+    [Fact]
     public void Install_UpgradeCollisionPreservesPreviousKegAndReceipt()
     {
         if (OperatingSystem.IsWindows())

@@ -185,9 +185,10 @@ def main():
         keychain = None
         try:
             if platform.system() == "Darwin":
-                keychain = run(["security", "default-keychain", "-d", "user"]).strip().strip('"')
+                keychain = "/Library/Keychains/System.keychain"
                 trust_added = True
-                run(["security", "add-trusted-cert", "-r", "trustRoot", "-k", keychain, work / "root.pem"])
+                run(["sudo", "-n", "security", "add-trusted-cert", "-d", "-r", "trustRoot",
+                     "-k", keychain, work / "root.pem"])
             elif platform.system() == "Windows":
                 trust_added = True
                 run(["certutil", "-user", "-addstore", "Root", work / "root.pem"])
@@ -306,8 +307,13 @@ def main():
                 server.shutdown()
                 server.server_close()
             if trust_added and platform.system() == "Darwin":
-                run(["security", "remove-trusted-cert", work / "root.pem"])
-                run(["security", "delete-certificate", "-Z", fingerprint, keychain])
+                found = subprocess.run(
+                    ["security", "find-certificate", "-a", "-Z", "-c",
+                     "Pinget Homebrew Disposable Root", keychain], capture_output=True, text=True, timeout=30
+                )
+                if fingerprint.upper() in found.stdout.upper():
+                    run(["sudo", "-n", "security", "remove-trusted-cert", "-d", work / "root.pem"])
+                    run(["sudo", "-n", "security", "delete-certificate", "-Z", fingerprint, keychain])
             elif trust_added and platform.system() == "Windows":
                 run(["certutil", "-user", "-delstore", "Root", fingerprint])
             report["success"] = succeeded
