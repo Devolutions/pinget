@@ -110,7 +110,8 @@ def certificates(work, openssl):
          "-addext", "keyUsage=critical,keyCertSign,cRLSign"])
     for name, subject, extensions in [
         ("signer", f"/{PUBLISHER}", "extendedKeyUsage=codeSigning\n"),
-        ("server", "/CN=localhost", "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n"),
+        ("server", "/CN=localhost",
+         "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n"),
     ]:
         (work / f"{name}.ext").write_text(
             "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n" + extensions
@@ -123,8 +124,59 @@ def certificates(work, openssl):
     run([openssl, "pkcs12", "-export", "-inkey", work / "signer.key",
          "-in", work / "signer.pem", "-certfile", root, "-passout", "pass:",
          "-out", work / "signer.pfx"])
-    fingerprint = run([openssl, "x509", "-in", root, "-noout", "-fingerprint", "-sha1"])
-    return fingerprint.strip().split("=")[1].replace(":", "")
+    run([openssl, "x509", "-in", root, "-outform", "DER", "-out", work / "root.cer"])
+    return run([openssl, "x509", "-in", root, "-noout", "-fingerprint", "-sha1"]).strip().split("=")[1].replace(":", "")
+
+
+def install_tls_trust(work):
+    root = work / "root.pem"
+    if platform.system() == "Darwin":
+        keychain = work / "acceptance.keychain-db"
+        password = "pinget-temporary-keychain"
+        previous = subprocess.run(
+            ["security", "list-keychains", "-d", "user"], capture_output=True, text=True, timeout=30, check=True
+        ).stdout
+        keychains = [line.strip().strip('"') for line in previous.splitlines() if line.strip()]
+        try:
+            run(["security", "create-keychain", "-p", password, keychain])
+            run(["security", "set-keychain-settings", "-lut", "21600", keychain])
+            run(["security", "unlock-keychain", "-p", password, keychain])
+            run(["security", "list-keychains", "-d", "user", "-s", keychain, *keychains])
+            run(["security", "add-trusted-cert", "-r", "trustRoot", "-k", keychain, root])
+        except Exception:
+            if keychain.exists():
+                run(["security", "list-keychains", "-d", "user", "-s", *keychains])
+                subprocess.run(["security", "delete-keychain", keychain], capture_output=True, timeout=30)
+            raise
+        return ("macOS", keychain, keychains)
+    if platform.system() == "Windows":
+        script = work / "add-tls-root.ps1"
+        script.write_text(
+            "$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($args[0])\n"
+            "$store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')\n"
+            "$store.Open('ReadWrite')\n"
+            "try { $store.Add($cert) } finally { $store.Close(); $cert.Dispose() }\n"
+        )
+        run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script, work / "root.cer"])
+        return ("Windows", None, None)
+    return ("Linux", None, None)
+
+
+def remove_tls_trust(state, work, fingerprint):
+    system, keychain, old_keychains = state
+    if system == "macOS":
+        if keychain.exists():
+            run(["security", "list-keychains", "-d", "user", "-s", *old_keychains])
+            run(["security", "delete-keychain", keychain])
+    elif system == "Windows":
+        script = work / "remove-tls-root.ps1"
+        script.write_text(
+            "$store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')\n"
+            "$store.Open('ReadWrite')\n"
+            "try { foreach ($cert in @($store.Certificates | Where-Object Thumbprint -eq $args[0])) "
+            "{ $store.Remove($cert); $cert.Dispose() } } finally { $store.Close() }\n"
+        )
+        run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script, fingerprint])
 
 
 def private_dependencies(app, env):
@@ -162,8 +214,8 @@ def main():
     if not openssl:
         raise RuntimeError("OpenSSL is required")
     arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
-    target_os = "MacOS" if platform.system() == "Darwin" else "Linux"
-    tag = ("arm64_sonoma" if arch == "arm64" else "sonoma") if target_os == "MacOS" else (
+    target_os = "macOS" if platform.system() == "Darwin" else "Linux"
+    tag = ("arm64_sonoma" if arch == "arm64" else "sonoma") if target_os == "macOS" else (
         "aarch64_linux" if arch == "arm64" else "x86_64_linux"
     )
     # Windows exercises cross-platform publishing and source verification, not installation.
@@ -179,26 +231,20 @@ def main():
         public = work / "public"
         public.mkdir()
         fingerprint = certificates(work, openssl)
-        trust_added = False
         succeeded = False
         server = None
-        keychain = None
+        server_thread = None
+        trust_state = None
         try:
-            if platform.system() == "Darwin":
-                keychain = "/Library/Keychains/System.keychain"
-                trust_added = True
-                run(["sudo", "-n", "security", "add-trusted-cert", "-d", "-r", "trustRoot",
-                     "-k", keychain, work / "root.pem"])
-            elif platform.system() == "Windows":
-                trust_added = True
-                run(["certutil", "-user", "-addstore", "Root", work / "root.pem"])
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            context.load_cert_chain(work / "server.pem", work / "server.key")
+            trust_state = install_tls_trust(work)
             server = http.server.ThreadingHTTPServer(
                 ("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(public))
             )
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(work / "server.pem", work / "server.key")
             server.socket = context.wrap_socket(server.socket, server_side=True)
-            threading.Thread(target=server.serve_forever, daemon=True).start()
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
             base = f"https://localhost:{server.server_port}"
             env = os.environ.copy()
             env.update(PINGET_SOURCE_MODE="private", SSL_CERT_FILE=str(work / "root.pem"))
@@ -303,19 +349,12 @@ def main():
                 report["checks"].append(f"{consumer}/{publisher}: tamper rejection preserves active cache")
             succeeded = True
         finally:
-            if server:
+            if server and server_thread:
                 server.shutdown()
+                server_thread.join(timeout=10)
                 server.server_close()
-            if trust_added and platform.system() == "Darwin":
-                found = subprocess.run(
-                    ["security", "find-certificate", "-a", "-Z", "-c",
-                     "Pinget Homebrew Disposable Root", keychain], capture_output=True, text=True, timeout=30
-                )
-                if fingerprint.upper() in found.stdout.upper():
-                    run(["sudo", "-n", "security", "remove-trusted-cert", "-d", work / "root.pem"])
-                    run(["sudo", "-n", "security", "delete-certificate", "-Z", fingerprint, keychain])
-            elif trust_added and platform.system() == "Windows":
-                run(["certutil", "-user", "-delstore", "Root", fingerprint])
+            if trust_state:
+                remove_tls_trust(trust_state, work, fingerprint)
             report["success"] = succeeded
             args.report.write_text(json.dumps(report, indent=2) + "\n")
 

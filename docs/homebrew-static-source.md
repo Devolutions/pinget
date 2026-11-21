@@ -87,18 +87,18 @@ pinget uninstall oniguruma
 ## Reproducing the real-bottle gate
 
 `tests/homebrew/run-native-acceptance.py` pins jq/oniguruma OCI indexes,
-authenticates metadata and bottle digests, creates disposable signing/TLS
-credentials, and checks both publisher/consumer directions against a static
-HTTPS host. Linux/macOS additionally check native execution, rebuild-only
+authenticates metadata and bottle digests, creates a disposable signing
+identity, and checks both publisher/consumer directions against a loopback
+static HTTPS host using temporary trust configuration. Linux/macOS additionally check native execution, rebuild-only
 upgrade, cross-runtime repair, dependency-protected uninstall, and tampered
 source cache preservation. The rebuild transition is synthetic; bottle bytes
 are unchanged. Windows checks publishing and signed source consumption only.
 
 The `Homebrew prototype acceptance` workflow runs these gates on Linux,
 macOS arm64/x64, and Windows and uploads only a non-secret JSON report.
-`workflow_call` is the reusable entry point; the prototype-branch push trigger
-was removed after registering the acceptance run. A queued or approval-blocked
-workflow is not evidence of platform success.
+`workflow_call` is the reusable entry point. The prototype-branch push trigger
+is scoped to this work branch and can be removed after platform acceptance.
+An approval-blocked workflow is not evidence of platform success.
 
 Local Linux runs require built CLIs, Psign, `patchelf`, OpenSSL, Python, and
 an explicit private temporary parent:
@@ -112,9 +112,9 @@ python tests/homebrew/run-native-acceptance.py \
   --report /absolute/path/to/report.json
 ```
 
-Linux uses process-local TLS trust, without modifying host certificate stores.
-macOS/Windows trust changes are guarded to disposable GitHub-hosted runners
-and remove the explicit test certificate afterward. Temporary keys, packages,
+The gate supplies its disposable root explicitly for MSIX signature trust,
+uses process-local trust on Linux and disposable user-scoped trust on macOS and
+Windows, and removes that trust before exit. Temporary keys, packages,
 client state, and the loopback server are cleaned up; no private key is an
 artifact or a repository fixture.
 
