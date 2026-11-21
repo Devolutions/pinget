@@ -115,6 +115,13 @@ python tests/homebrew/run-native-acceptance.py \
   --report /absolute/path/to/report.json
 ```
 
+The disposable certificates come from a self-contained OpenSSL configuration
+with subject/authority key identifiers and no duplicate extensions; macOS
+rejects a root that is not standards compliant, and the gate checks the server
+chain with `security verify-cert` before starting. On Windows, the `dotnet tool`
+shim is `psign-tool.cmd`, so the workflow passes the packaged native
+`psign-tool.exe` to the gate.
+
 The gate supplies its disposable root explicitly for both MSIX signature and
 source-scoped TLS trust; it never modifies host trust stores. Temporary keys,
 packages, client state, and the loopback server are cleaned up; no private key
@@ -128,7 +135,9 @@ one or more `-TrustedCa` values. Do not register the Homebrew feed as
 The client activates its cache only after signature/trust/signer identity and
 schema validation, retaining the previous cache when an update fails.
 Successful signing, publication, client verification, native dependency
-installation, execution, and receipt listing have been demonstrated on Linux.
+installation, execution, upgrade, repair, uninstall, and tamper rejection have
+been demonstrated on hosted Linux x64, macOS arm64, and macOS x64 runners;
+Windows runners demonstrated Rust/.NET publishing and signature verification.
 Use an increasing four-part MSIX package version for each changed publication.
 
 The default private prefix is `<AppRoot>/homebrew`; add its `bin` directory to
@@ -141,5 +150,5 @@ the separate `--rust-sip` option.
 Receipts and links are shared between Rust and .NET. Upgrade/repair replace the
 managed keg, and uninstall honors the managed dependency graph. The prototype
 fails closed on unsupported archives, ABI constraints, and unowned/modified
-paths. macOS execution and Windows/macOS publishing need their own acceptance
-gates; this workflow does not imply general Homebrew compatibility.
+paths. Acceptance covers the pinned jq/oniguruma bottles only; it does not
+imply general Homebrew compatibility.
