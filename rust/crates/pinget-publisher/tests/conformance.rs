@@ -3,7 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(not(windows))]
 use pinget_publisher::{BuildOptions, build, diff, status, verify};
 #[cfg(windows)]
 use pinget_publisher::{PackageOptions, PublishOptions, package, publish, verify_published_destination};

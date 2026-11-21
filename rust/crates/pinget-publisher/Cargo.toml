@@ -14,7 +14,6 @@ workspace = true
 base64 = "0.22"
 chrono = { version = "0.4.44", features = ["serde"] }
 flate2 = "1.1.9"
-fs2 = "0.4"
 quick-xml = "0.38"
 pinget-core = { version = "0.15.0", path = "../pinget-core" }
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -25,3 +24,6 @@ sha2 = "0.11.0"
 thiserror = "2"
 x509-cert = { version = "0.2.5", default-features = false, features = ["std"] }
 zip = "8.6.0"
+
+[target.'cfg(not(windows))'.dependencies]
+fs2 = "0.4"
