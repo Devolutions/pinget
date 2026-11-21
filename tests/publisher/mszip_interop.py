@@ -77,6 +77,10 @@ class NativeEmptyReferenceUnavailable(VerificationError):
     """The native compressor cannot provide an empty positive control."""
 
 
+class NativeReferenceUnavailable(VerificationError):
+    """The native compressor could not produce a positive control."""
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise VerificationError(message)
@@ -346,25 +350,41 @@ class WindowsNativeMsZip:
         finally:
             self.api.CloseDecompressor(handle)
 
-    def compress_empty_reference(self) -> bytes:
+    def compress_reference(self, data: bytes) -> bytes:
         handle = ctypes.c_void_p()
         if not self.api.CreateCompressor(2, None, ctypes.byref(handle)):
-            raise NativeEmptyReferenceUnavailable(
-                f"empty control CreateCompressor failed: Win32 error {ctypes.get_last_error()}"
+            raise NativeReferenceUnavailable(
+                f"control CreateCompressor failed: Win32 error {ctypes.get_last_error()}"
             )
         try:
-            source = ctypes.create_string_buffer(1)
-            destination = ctypes.create_string_buffer(4096)
+            source = ctypes.create_string_buffer(data, max(len(data), 1))
+            destination = ctypes.create_string_buffer(4096 + 2 * len(data))
             written = ctypes.c_size_t()
-            if not self.api.Compress(handle, source, 0, destination, len(destination), ctypes.byref(written)):
-                raise NativeEmptyReferenceUnavailable(
-                    "native empty compression control failed: "
-                    f"Win32 error {ctypes.get_last_error()}"
+            if not self.api.Compress(handle, source, len(data), destination, len(destination), ctypes.byref(written)):
+                raise NativeReferenceUnavailable(
+                    f"native compression control failed: Win32 error {ctypes.get_last_error()}"
                 )
-            require(written.value <= len(destination), "native empty compression exceeded its output buffer")
+            require(written.value <= len(destination), "native compression exceeded its output buffer")
             return ctypes.string_at(destination, written.value)
         finally:
             self.api.CloseCompressor(handle)
+
+    def compress_empty_reference(self) -> bytes:
+        try:
+            return self.compress_reference(b"")
+        except NativeReferenceUnavailable as error:
+            raise NativeEmptyReferenceUnavailable(f"native empty compression control failed: {error}") from error
+
+
+def check_native_positive_control(native, root: Path) -> None:
+    original = b"\xa7"
+    reference = native.compress_reference(original)
+    require(native.decompress(reference, len(original)) == original, "native nonempty control failed its round trip")
+    print(f"Native single-byte reference: {reference.hex()}", flush=True)
+    for producer in PRODUCERS:
+        encoded = read_file(root / producer / "single_byte.mszip")
+        print(f"Portable {producer} single-byte fixture: {encoded.hex()}", flush=True)
+    print(f"Win32 error 605: {ctypes.FormatError(605).strip()}", flush=True)
 
 
 def assert_native_rejects_malformed_empty(native, valid: bytes, reference: bytes | None = None) -> None:
@@ -487,6 +507,7 @@ def produce(root: Path, reports: Path, run_id: str, *, dotnet_no_restore: bool =
 
 def validate_windows(root: Path, run_id: str) -> None:
     native = WindowsNativeMsZip()
+    check_native_positive_control(native, root)
     try:
         reference = validate_native_empty_reference(native)
     except NativeEmptyReferenceUnavailable as error:

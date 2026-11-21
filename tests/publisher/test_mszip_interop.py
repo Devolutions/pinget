@@ -367,6 +367,32 @@ class NativeEmptyControlTests(unittest.TestCase):
             native.api.calls,
         )
 
+    def test_native_positive_control_checks_roundtrip_before_fixture_validation(self):
+        class FakeNative:
+            def compress_reference(self, data):
+                self.asserted_input = data
+                return b"native"
+
+            def decompress(self, data, size):
+                if data == b"native" and size == 1:
+                    return b"\xa7"
+                raise interop.NativeDecodeError("wrong control")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for producer in interop.PRODUCERS:
+                (root / producer).mkdir()
+                (root / producer / "single_byte.mszip").write_bytes(SINGLE_FRAME)
+            native = FakeNative()
+            with mock.patch.object(interop.ctypes, "FormatError", return_value="bad compression", create=True), \
+                    mock.patch("builtins.print"):
+                interop.check_native_positive_control(native, root)
+            self.assertEqual(b"\xa7", native.asserted_input)
+
+            with mock.patch.object(native, "decompress", return_value=b"\x00"):
+                with self.assertRaisesRegex(interop.VerificationError, "native nonempty control failed"):
+                    interop.check_native_positive_control(native, root)
+
     def test_native_empty_positive_and_corrupted_controls_are_all_exercised(self):
         class FakeNative:
             def __init__(self):
@@ -468,9 +494,11 @@ class NativeEmptyControlTests(unittest.TestCase):
             on_empty(EMPTY_FRAME)
 
         with mock.patch.object(interop, "WindowsNativeMsZip", return_value=native), mock.patch.object(
-            interop, "validate_tree", side_effect=fake_validate
-        ) as validator, mock.patch("builtins.print"):
+            interop, "check_native_positive_control"
+        ) as positive_control, mock.patch.object(interop, "validate_tree", side_effect=fake_validate) as validator, \
+                mock.patch("builtins.print"):
             interop.validate_windows(Path("unused"), "run-42")
+        positive_control.assert_called_once_with(native, Path("unused"))
         validator.assert_called_once()
         self.assertEqual([b"", EMPTY_FRAME, EMPTY_FRAME[:23]], [call[0] for call in native.calls[:3]])
         self.assertNotEqual(EMPTY_FRAME[0], native.calls[3][0][0])
