@@ -90,7 +90,9 @@ Publishing still uses the external `psign-tool` flow documented in
 `repository-publishing.md`. This creates publisher artifacts for the
 `Pinget.PreIndexed.Homebrew` source type. The client update path verifies
 `brew.msix` before cache activation. Both CLIs have installed and executed a
-real jq/oniguruma chain from a signed static feed on Linux.
+real jq/oniguruma chain from signed static feeds on Linux x64 and macOS
+x64/arm64. Windows has been tested for publishing and signature verification,
+not Homebrew source consumption.
 
 Curated OCI adaptations must be labelled as such: retain pinned OCI digests,
 upstream source references, and the provenance of ABI/dependency fields.

@@ -40,8 +40,8 @@ static feed and native client workflow is documented in
 [Homebrew static source](docs/homebrew-static-source.md). It records the
 Homebrew-only `brew.msix` publishing profile and the dedicated source update
 path. Both native clients have installed and executed the real jq/oniguruma
-chain from a signed static feed on Linux; the compatibility document records
-platform gates and deliberately unsupported Homebrew behavior.
+chain from signed static feeds on Linux x64 and macOS x64/arm64; the
+compatibility document records remaining gates and unsupported behavior.
 
 The C# implementation also ships the **`Devolutions.Pinget.Client` PowerShell 7 module** that mirrors the upstream `Microsoft.WinGet.Client` cmdlet family with renamed `Pinget` nouns, backed by `Devolutions.Pinget.Core`.
 

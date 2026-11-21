@@ -2,8 +2,8 @@
 
 This is a curated formula-bottle prototype, not general Homebrew compatibility.
 Both CLIs have verified a signed static `brew.msix`, installed real jq 1.8.1
-and oniguruma 6.9.10 bottles on Linux x64, and executed jq arithmetic/regex
-using the private bottle libraries rather than system substitutes.
+and oniguruma 6.9.10 bottles on Linux x64 and macOS x64/arm64, and executed
+jq using private bottle libraries rather than system substitutes.
 Both publishers have been consumed by the opposite runtime. Actual CLI checks
 also cover a labelled synthetic rebuild-only upgrade, bidirectional
 cross-runtime repair, dependency-protected uninstall, and rejection of
@@ -19,14 +19,13 @@ tampered signed source updates without changing the active cache.
 | Bottle classes | `any` and `any_skip_relocation` are preserved as distinct metadata values | Fixed-cellar bottles |
 | Archive handling | Digest verification, unchanged mirroring, bounded extraction, contained regular files/directories/links, executable modes | Traversal, escaping/dangling/chained links, special devices/FIFOs, hooks |
 | Relocation | UTF-8 text/placeholders; ELF RUNPATH and host interpreter; Mach-O dependency names, rpaths, IDs and ad-hoc signing | Arbitrary embedded binary paths, application bundles, general formula-specific patching |
-| Static publishing | Homebrew-only snapshots, mirrored bytes, preindexed DB in signed `brew.msix`, external Psign verification | REST serving; Windows/macOS publisher acceptance not established by Linux checks |
-| Source update | `brew.msix` only, no redirects, digest/trust/signer identity/EKU checks before index activation | Unsigned sources, implicit private root installation, acceptance of failed updates |
+| Static publishing | Homebrew-only snapshots, mirrored bytes, preindexed DB in signed `brew.msix`, external Psign verification | REST serving, mixed Homebrew/Windows snapshots |
+| Source update | `brew.msix` only, no redirects, digest/trust/signer identity/EKU checks before index activation | Windows Homebrew source clients, unsigned sources, implicit private root installation, acceptance of failed updates |
 | Client operations | Native install/list/upgrade/repair/uninstall, shared receipts, dependency ordering, normal-failure rollback, ownership checks | Homebrew/Ruby, system-prefix installation, arbitrary installer arguments, uninstall-previous, durable crash recovery |
 
 Manifest readers recognize more historical tags than the importer. That does
-not claim those targets or arbitrary bottles are installable. Linux x64 real
-execution is verified; macOS runtime and other platform publisher execution
-must be checked separately.
+not claim those targets or arbitrary bottles are installable. Real execution
+has been verified only for Linux x64 and macOS x64/arm64.
 
 ## Import and publication checks
 
@@ -66,19 +65,19 @@ data. Operator inspection and recovery are required before another operation;
 do not blindly remove locks while an operation may still run. Installing an
 entire dependency closure is not one atomic transaction.
 
-## Required acceptance before claiming support
+## Acceptance and remaining gates
 
 Keep real signed-source and lifecycle checks distinct from synthetic unit
 fixtures. Rebuild-only transitions must use increasing catalog rebuild versions
 and must not be described as authentic upstream rebuilds when synthesized for
-a test. Native macOS and Windows/macOS publisher/signature interoperability
-gates remain necessary; Linux success alone does not establish them.
-The approved hosted run
-[44815970690](https://github.com/Devolutions/pinget/actions/runs/44815970690)
-exposed non-root relocation and macOS trust setup failures; its results do not
-establish macOS execution or Windows/macOS publishing acceptance. Both
-implementations now temporarily grant owner read/write access during
-relocation and restore file modes on success or failure; all 16 real-bottle
-acceptance checks pass as an unprivileged Linux user. The follow-up hosted run
-[44833201971](https://github.com/Devolutions/pinget/actions/runs/44833201971)
-requires approval before its platform jobs can execute.
+a test. Hosted run
+[44917759088](https://github.com/Devolutions/pinget/actions/runs/44917759088)
+passed 18 checks each on Linux x64 and macOS x64/arm64, and five Windows
+publishing/signature checks. This covers the pinned jq/oniguruma chain, not
+all formulas or Linux arm64 execution.
+
+The Homebrew workflow does not rerun the existing Windows-profile/stock
+WinGet conformance suite. Its portable non-Windows MSZIP output has not been
+independently decoded by the Windows Compression API; Pinget's own readers
+were used in the cross-platform Homebrew gate. See the
+[publisher contract](../tests/publisher/contract.md) for that remaining gate.

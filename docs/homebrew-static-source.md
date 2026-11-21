@@ -3,8 +3,8 @@
 Both publishers create a fully static Homebrew-profile feed. Native clients
 verify its signed `brew.msix`, activate the enclosed preindexed database, then
 download manifests and unchanged bottle bytes from the static host. No REST
-server, Homebrew, or Ruby runs on clients. Real Linux jq/oniguruma installation
-has been exercised through both CLIs; see the separate platform and
+server, Homebrew, or Ruby runs on clients. Real jq/oniguruma installation has
+been exercised through both CLIs on Linux x64 and macOS x64/arm64; see the
 [compatibility limits](homebrew-bottle-compatibility.md).
 
 ## Build the artifacts

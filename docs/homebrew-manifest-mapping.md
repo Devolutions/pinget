@@ -126,6 +126,6 @@ through managed receipts. Linux relocates ELF RUNPATH/interpreters with
 Source updates require `psign-tool`, the expected `Pinget.HomebrewSource`
 identity/publisher, and explicit signing trust anchors before cache activation.
 Real jq/oniguruma signed-source installation has been executed through both
-CLIs on Linux. macOS runtime and Windows/macOS publishing acceptance are
-separate gates, not implied by Linux success. See the
+CLIs on Linux x64 and macOS x64/arm64. Windows acceptance covers publishing
+and signature verification, not Homebrew source consumption. See the
 [compatibility boundary](homebrew-bottle-compatibility.md).
