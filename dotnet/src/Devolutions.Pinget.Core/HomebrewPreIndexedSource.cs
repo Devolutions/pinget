@@ -22,6 +22,8 @@ internal static class HomebrewPreIndexedSource
         if (string.IsNullOrWhiteSpace(source.Publisher))
             throw new InvalidOperationException("Homebrew source has no expected publisher configured.");
 
+        using var sourceClient = CreateTlsTrustedClient(client, source);
+        client = sourceClient ?? client;
         var stateDir = SourceStoreManager.SourceStateDir(source, appRoot);
         Directory.CreateDirectory(stateDir);
         var url = $"{Repository.ValidateHomebrewSourceBaseUrl(source.Arg)}/brew.msix";
@@ -82,6 +84,78 @@ internal static class HomebrewPreIndexedSource
             TryDelete(stagedPackage);
             TryDelete(stagedIndex);
         }
+    }
+
+    public static HttpClient? CreateTlsTrustedClient(HttpClient baseline, SourceRecord source)
+    {
+        if (source.TrustedCa.Count == 0)
+            return null;
+
+        var handler = new SocketsHttpHandler
+        {
+            AutomaticDecompression = System.Net.DecompressionMethods.None,
+            ConnectTimeout = TimeSpan.FromSeconds(30),
+            AllowAutoRedirect = false,
+        };
+        var anchors = source.TrustedCa.ToArray();
+        handler.SslOptions.RemoteCertificateValidationCallback =
+            (_, certificate, presentedChain, errors) => VerifyTlsCertificate(certificate, presentedChain, errors, anchors);
+
+        var client = new HttpClient(handler) { Timeout = baseline.Timeout };
+        foreach (var header in baseline.DefaultRequestHeaders)
+            client.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+        return client;
+    }
+
+    private static bool VerifyTlsCertificate(
+        X509Certificate? certificate,
+        X509Chain? presentedChain,
+        System.Net.Security.SslPolicyErrors errors,
+        IReadOnlyList<string> anchorPaths)
+    {
+        if (errors == System.Net.Security.SslPolicyErrors.None)
+            return true;
+        if (errors != System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors || certificate is null)
+            return false;
+
+        using var leaf = LoadCertificate(certificate);
+        using var chain = new X509Chain();
+        chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        chain.ChainPolicy.ApplicationPolicy.Add(new Oid("1.3.6.1.5.5.7.3.1"));
+        var roots = anchorPaths.Select(LoadCertificateFromFile).ToArray();
+        try
+        {
+            foreach (var root in roots)
+                chain.ChainPolicy.CustomTrustStore.Add(root);
+            if (presentedChain is not null)
+                foreach (var element in presentedChain.ChainElements.Cast<X509ChainElement>().Skip(1))
+                    chain.ChainPolicy.ExtraStore.Add(element.Certificate);
+            return chain.Build(leaf);
+        }
+        finally
+        {
+            foreach (var root in roots)
+                root.Dispose();
+        }
+    }
+
+    private static X509Certificate2 LoadCertificateFromFile(string path)
+    {
+#if NET9_0_OR_GREATER
+        return X509CertificateLoader.LoadCertificateFromFile(path);
+#else
+        return new X509Certificate2(path);
+#endif
+    }
+
+    private static X509Certificate2 LoadCertificate(X509Certificate certificate)
+    {
+#if NET9_0_OR_GREATER
+        return X509CertificateLoader.LoadCertificate(certificate.GetRawCertData());
+#else
+        return new X509Certificate2(certificate);
+#endif
     }
 
     private static byte[] VerifyMsix(string path, SourceRecord source, string? psignToolPath)

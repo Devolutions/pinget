@@ -1283,7 +1283,6 @@ pub struct Repository {
     app_root: PathBuf,
     user_agent: String,
     client: Client,
-    homebrew_client: Client,
     store: SourceStore,
     source_mode: EffectiveSourceMode,
     install_progress: Option<fn(&InstallProgress)>,
@@ -1356,17 +1355,10 @@ impl Repository {
             .timeout(StdDuration::from_secs(30 * 60))
             .build()
             .context("failed to build HTTP client")?;
-        let homebrew_client = Client::builder()
-            .user_agent(&options.user_agent)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(StdDuration::from_secs(30 * 60))
-            .build()
-            .context("failed to build non-redirecting Homebrew source HTTP client")?;
         Ok(Self {
             app_root: options.app_root,
             user_agent: options.user_agent,
             client,
-            homebrew_client,
             store,
             source_mode,
             install_progress: options.install_progress,
@@ -2784,7 +2776,13 @@ impl Repository {
             url: url.to_owned(),
             path: dest.clone(),
         });
-        let actual_hash = download_installer_to_file(&self.user_agent, url, &dest)?;
+        let trusted_ca = if manifest.homebrew.is_some() && request.manifest_path.is_none() {
+            let (located, _) = self.find_single_match(&request.query)?;
+            self.store.sources[located.source_index].trusted_ca.clone()
+        } else {
+            Vec::new()
+        };
+        let actual_hash = download_installer_to_file(&self.user_agent, url, &dest, &trusted_ca)?;
 
         self.emit_install_progress(InstallProgress::VerifyingInstaller { path: dest.clone() });
         if let Some(expected_hash) = expected_hash
@@ -4277,8 +4275,17 @@ impl Repository {
         let state_dir = self.source_state_dir(&source_snapshot);
         fs::create_dir_all(&state_dir).context("failed to create Homebrew source state directory")?;
         let url = format!("{}/brew.msix", source_snapshot.arg.trim_end_matches('/'));
-        let response = self
-            .homebrew_client
+        let mut client_builder = Client::builder()
+            .user_agent(&self.user_agent)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(StdDuration::from_secs(30 * 60));
+        for anchor in &source_snapshot.trusted_ca {
+            client_builder = client_builder.add_root_certificate(load_homebrew_trust_anchor(anchor)?);
+        }
+        let client = client_builder
+            .build()
+            .context("failed to build non-redirecting Homebrew source HTTP client")?;
+        let response = client
             .get(&url)
             .send()
             .with_context(|| format!("failed to download Homebrew source package from {url}"))?
@@ -4502,8 +4509,8 @@ impl Repository {
         }
 
         let url = format!("{}/{}", source.arg.trim_end_matches('/'), normalized_relative);
-        let response = self
-            .client
+        let client = self.client_for_source(source)?;
+        let response = client
             .get(url)
             .send()
             .context("failed to fetch source file")?
@@ -4524,6 +4531,23 @@ impl Repository {
             path: cache_path,
             bytes,
         })
+    }
+
+    fn client_for_source(&self, source: &SourceRecord) -> Result<Client> {
+        if source.kind != SourceKind::HomebrewPreIndexed {
+            return Ok(self.client.clone());
+        }
+
+        let mut builder = Client::builder()
+            .user_agent(&self.user_agent)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(StdDuration::from_secs(30 * 60));
+        for anchor in &source.trusted_ca {
+            builder = builder.add_root_certificate(load_homebrew_trust_anchor(anchor)?);
+        }
+        builder
+            .build()
+            .context("failed to build non-redirecting Homebrew source HTTP client")
     }
 
     /// Fetches a REST manifest. Like the C# implementation (and WinGet), REST manifests are
@@ -12497,15 +12521,30 @@ struct DownloadAttempt {
     total_length: Option<u64>,
 }
 
-fn download_installer_to_file(user_agent: &str, url: &str, dest: &Path) -> Result<String> {
+fn load_homebrew_trust_anchor(path: &str) -> Result<reqwest::Certificate> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read Homebrew trust anchor {path}"))?;
+    let certificate = if bytes.starts_with(b"-----BEGIN CERTIFICATE-----") {
+        reqwest::Certificate::from_pem(&bytes)
+    } else {
+        reqwest::Certificate::from_der(&bytes)
+    };
+    certificate.with_context(|| format!("invalid Homebrew TLS trust anchor {path}"))
+}
+
+fn download_installer_to_file(user_agent: &str, url: &str, dest: &Path, trusted_ca: &[String]) -> Result<String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to create installer download runtime")?;
-    runtime.block_on(download_installer_to_file_async(user_agent, url, dest))
+    runtime.block_on(download_installer_to_file_async(user_agent, url, dest, trusted_ca))
 }
 
-async fn download_installer_to_file_async(user_agent: &str, url: &str, dest: &Path) -> Result<String> {
+async fn download_installer_to_file_async(
+    user_agent: &str,
+    url: &str,
+    dest: &Path,
+    trusted_ca: &[String],
+) -> Result<String> {
     let part_path = sidecar_path(dest, "part");
     let metadata_path = sidecar_path(dest, "part.json");
     let started_at = Instant::now();
@@ -12519,7 +12558,7 @@ async fn download_installer_to_file_async(user_agent: &str, url: &str, dest: &Pa
         let remaining = INSTALLER_DOWNLOAD_TOTAL_TIMEOUT
             .checked_sub(started_at.elapsed())
             .unwrap_or_else(|| StdDuration::from_secs(1));
-        match try_download_installer_to_part(user_agent, url, &part_path, &metadata_path, remaining).await {
+        match try_download_installer_to_part(user_agent, url, &part_path, &metadata_path, remaining, trusted_ca).await {
             Ok(()) => {
                 let actual_hash = sha256_file_hex(&part_path)?;
                 replace_file(&part_path, dest)?;
@@ -12541,19 +12580,21 @@ async fn try_download_installer_to_part(
     part_path: &Path,
     metadata_path: &Path,
     remaining: StdDuration,
+    trusted_ca: &[String],
 ) -> Result<()> {
     let metadata = read_installer_download_metadata(metadata_path, part_path, url)?;
     let mut offset = metadata.as_ref().map_or(0, |metadata| metadata.offset);
-    let mut request = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent(user_agent)
         // Match WinINet and .NET: redirects must not synthesize a browser Referer.
         .referer(false)
         .connect_timeout(INSTALLER_DOWNLOAD_CONNECT_TIMEOUT)
-        .timeout(remaining)
-        .build()
-        .context("failed to build installer download client")?
-        .get(url)
-        .header(ACCEPT_ENCODING, "identity");
+        .timeout(remaining);
+    for anchor in trusted_ca {
+        builder = builder.add_root_certificate(load_homebrew_trust_anchor(anchor)?);
+    }
+    let client = builder.build().context("failed to build installer download client")?;
+    let mut request = client.get(url).header(ACCEPT_ENCODING, "identity");
 
     if offset > 0 {
         request = request.header(RANGE, format!("bytes={offset}-"));

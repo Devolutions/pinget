@@ -111,7 +111,7 @@ def certificates(work, openssl):
     for name, subject, extensions in [
         ("signer", f"/{PUBLISHER}", "extendedKeyUsage=codeSigning\n"),
         ("server", "/CN=localhost",
-         "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n"),
+         "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n"),
     ]:
         (work / f"{name}.ext").write_text(
             "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n" + extensions
@@ -124,59 +124,6 @@ def certificates(work, openssl):
     run([openssl, "pkcs12", "-export", "-inkey", work / "signer.key",
          "-in", work / "signer.pem", "-certfile", root, "-passout", "pass:",
          "-out", work / "signer.pfx"])
-    run([openssl, "x509", "-in", root, "-outform", "DER", "-out", work / "root.cer"])
-    return run([openssl, "x509", "-in", root, "-noout", "-fingerprint", "-sha1"]).strip().split("=")[1].replace(":", "")
-
-
-def install_tls_trust(work):
-    root = work / "root.pem"
-    if platform.system() == "Darwin":
-        keychain = work / "acceptance.keychain-db"
-        password = "pinget-temporary-keychain"
-        previous = subprocess.run(
-            ["security", "list-keychains", "-d", "user"], capture_output=True, text=True, timeout=30, check=True
-        ).stdout
-        keychains = [line.strip().strip('"') for line in previous.splitlines() if line.strip()]
-        try:
-            run(["security", "create-keychain", "-p", password, keychain])
-            run(["security", "set-keychain-settings", "-lut", "21600", keychain])
-            run(["security", "unlock-keychain", "-p", password, keychain])
-            run(["security", "list-keychains", "-d", "user", "-s", keychain, *keychains])
-            run(["security", "add-trusted-cert", "-r", "trustRoot", "-k", keychain, root])
-        except Exception:
-            if keychain.exists():
-                run(["security", "list-keychains", "-d", "user", "-s", *keychains])
-                subprocess.run(["security", "delete-keychain", keychain], capture_output=True, timeout=30)
-            raise
-        return ("macOS", keychain, keychains)
-    if platform.system() == "Windows":
-        script = work / "add-tls-root.ps1"
-        script.write_text(
-            "$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($args[0])\n"
-            "$store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')\n"
-            "$store.Open('ReadWrite')\n"
-            "try { $store.Add($cert) } finally { $store.Close(); $cert.Dispose() }\n"
-        )
-        run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script, work / "root.cer"])
-        return ("Windows", None, None)
-    return ("Linux", None, None)
-
-
-def remove_tls_trust(state, work, fingerprint):
-    system, keychain, old_keychains = state
-    if system == "macOS":
-        if keychain.exists():
-            run(["security", "list-keychains", "-d", "user", "-s", *old_keychains])
-            run(["security", "delete-keychain", keychain])
-    elif system == "Windows":
-        script = work / "remove-tls-root.ps1"
-        script.write_text(
-            "$store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')\n"
-            "$store.Open('ReadWrite')\n"
-            "try { foreach ($cert in @($store.Certificates | Where-Object Thumbprint -eq $args[0])) "
-            "{ $store.Remove($cert); $cert.Dispose() } } finally { $store.Close() }\n"
-        )
-        run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script, fingerprint])
 
 
 def private_dependencies(app, env):
@@ -218,7 +165,7 @@ def main():
     tag = ("arm64_sonoma" if arch == "arm64" else "sonoma") if target_os == "macOS" else (
         "aarch64_linux" if arch == "arm64" else "x86_64_linux"
     )
-    # Windows exercises cross-platform publishing and source verification, not installation.
+    # Windows exercises cross-platform publishing and signature verification, not client consumption.
     if platform.system() == "Windows":
         arch, target_os, tag = "x64", "Linux", "x86_64_linux"
     clis = {"rust": [args.rust_cli.resolve()], "dotnet": ["dotnet", args.dotnet_assembly.resolve()]}
@@ -230,13 +177,11 @@ def main():
         work = Path(temporary)
         public = work / "public"
         public.mkdir()
-        fingerprint = certificates(work, openssl)
+        certificates(work, openssl)
         succeeded = False
         server = None
         server_thread = None
-        trust_state = None
         try:
-            trust_state = install_tls_trust(work)
             server = http.server.ThreadingHTTPServer(
                 ("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(public))
             )
@@ -247,7 +192,7 @@ def main():
             server_thread.start()
             base = f"https://localhost:{server.server_port}"
             env = os.environ.copy()
-            env.update(PINGET_SOURCE_MODE="private", SSL_CERT_FILE=str(work / "root.pem"))
+            env.update(PINGET_SOURCE_MODE="private")
             env["PATH"] = str(psign.parent) + os.pathsep + env["PATH"]
             formulas = curate(work, tag)
             report["inputs"] = {
@@ -282,23 +227,36 @@ def main():
             for runtime in clis:
                 publish(runtime, 0)
             clients = []
-            for consumer, cli in clis.items():
-                for publisher in clis:
-                    app = work / f"{consumer}-from-{publisher}"
-                    client_env = dict(env, PINGET_APPROOT=str(app))
-                    run(cli + ["source", "add", "--name", "homebrew", "--arg", f"{base}/{publisher}",
-                               "--type", "Pinget.PreIndexed.Homebrew", "--publisher", PUBLISHER,
-                               "--trusted-ca", work / "root.pem"], client_env)
-                    run(cli + ["source", "update", "homebrew"], client_env)
-                    assert "Pinget.Homebrew.jq" in run(cli + ["search", "jq", "--source", "homebrew"], client_env)
-                    if platform.system() != "Windows":
+            if platform.system() == "Windows":
+                report["checks"].append("Windows Rust/.NET publishing and signature verification (native clients disabled)")
+            else:
+                for consumer, cli in clis.items():
+                    for publisher in clis:
+                        app = work / f"{consumer}-from-{publisher}"
+                        client_env = dict(env, PINGET_APPROOT=str(app))
+                        run(cli + ["source", "add", "--name", "homebrew", "--arg", f"{base}/{publisher}",
+                                   "--type", "Pinget.PreIndexed.Homebrew", "--publisher", PUBLISHER,
+                                   "--trusted-ca", work / "root.pem"], client_env)
+                        run(cli + ["source", "update", "homebrew"], client_env)
+                        assert "Pinget.Homebrew.jq" in run(cli + ["search", "jq", "--source", "homebrew"], client_env)
                         run(cli + ["install", "jq", "--source", "homebrew", "--silent",
                                    "--accept-package-agreements"], client_env)
                         assert run([app / "homebrew/bin/jq", "-n", '"abc" | test("^a")'], client_env).strip() == "true"
                         private_dependencies(app, client_env)
                         assert "oniguruma" in run(cli + ["list"], client_env)
-                    clients.append((consumer, publisher, app, client_env))
-                    report["checks"].append(f"{consumer} consumed {publisher} signed static source")
+                        clients.append((consumer, publisher, app, client_env))
+                        report["checks"].append(f"{consumer} consumed {publisher} signed static source")
+                    app = work / f"{consumer}-hostname-mismatch"
+                    client_env = dict(env, PINGET_APPROOT=str(app))
+                    run(cli + ["source", "add", "--name", "wrong-host", "--arg", f"https://127.0.0.1:{server.server_port}",
+                               "--type", "Pinget.PreIndexed.Homebrew", "--publisher", PUBLISHER,
+                               "--trusted-ca", work / "root.pem"], client_env)
+                    failure = subprocess.run(
+                        cli + ["source", "update", "wrong-host"], env=client_env,
+                        capture_output=True, text=True, timeout=60
+                    )
+                    assert failure.returncode != 0 and not list(app.rglob("brew.msix"))
+                    report["checks"].append(f"{consumer} rejected a trusted CA with a hostname mismatch")
             for runtime in clis:
                 publish(runtime, 1)
             for consumer, publisher, app, client_env in clients:
@@ -353,8 +311,6 @@ def main():
                 server.shutdown()
                 server_thread.join(timeout=10)
                 server.server_close()
-            if trust_state:
-                remove_tls_trust(trust_state, work, fingerprint)
             report["success"] = succeeded
             args.report.write_text(json.dumps(report, indent=2) + "\n")
 

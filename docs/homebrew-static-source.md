@@ -66,8 +66,9 @@ before replacing `brew.msix`. Preserve those immutable paths and permit
 
 Use the dedicated source type on native macOS/Linux clients; it requests only
 `brew.msix`, rejects redirects, and requires an external `psign-tool` for
-MSIX digest, signer, and trust verification. Supply the expected certificate
-subject and explicit trust anchors. For the CLI:
+MSIX digest, signer, and trust verification. `--trusted-ca` provides explicit
+MSIX signing trust and a source-scoped TLS root fallback; it never disables
+hostname or certificate-chain validation. For the CLI:
 
 ```sh
 pinget source add --name homebrew --arg https://packages.example.com \
@@ -89,10 +90,12 @@ pinget uninstall oniguruma
 `tests/homebrew/run-native-acceptance.py` pins jq/oniguruma OCI indexes,
 authenticates metadata and bottle digests, creates a disposable signing
 identity, and checks both publisher/consumer directions against a loopback
-static HTTPS host using temporary trust configuration. Linux/macOS additionally check native execution, rebuild-only
-upgrade, cross-runtime repair, dependency-protected uninstall, and tampered
+static HTTPS host using source-scoped trust configuration. Linux/macOS
+additionally check native execution, rebuild-only upgrade, cross-runtime
+repair, dependency-protected uninstall, and tampered
 source cache preservation. The rebuild transition is synthetic; bottle bytes
-are unchanged. Windows checks publishing and signed source consumption only.
+are unchanged. Windows checks Rust/.NET publishing and signing; native
+Homebrew source clients are disabled on Windows.
 
 The `Homebrew prototype acceptance` workflow runs these gates on Linux,
 macOS arm64/x64, and Windows and uploads only a non-secret JSON report.
@@ -112,11 +115,10 @@ python tests/homebrew/run-native-acceptance.py \
   --report /absolute/path/to/report.json
 ```
 
-The gate supplies its disposable root explicitly for MSIX signature trust,
-uses process-local trust on Linux and disposable user-scoped trust on macOS and
-Windows, and removes that trust before exit. Temporary keys, packages,
-client state, and the loopback server are cleaned up; no private key is an
-artifact or a repository fixture.
+The gate supplies its disposable root explicitly for both MSIX signature and
+source-scoped TLS trust; it never modifies host trust stores. Temporary keys,
+packages, client state, and the loopback server are cleaned up; no private key
+is an artifact or a repository fixture.
 
 In PowerShell, use `Add-PingetSource` with the same `-Type`, `-Publisher`, and
 one or more `-TrustedCa` values. Do not register the Homebrew feed as

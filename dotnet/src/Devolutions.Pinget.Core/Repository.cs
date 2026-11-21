@@ -849,7 +849,8 @@ public class Repository : IDisposable
         // (EnsureSupportForDownload). Install does not apply these download-only checks.
         EnsurePackageAgreementsAccepted(manifest, request);
         EnsureInstallerDownloadSupported(installer);
-        var installerPath = FetchInstaller(request, manifest, installer, request.Rename, downloadDir);
+        using var sourceClient = CreateHomebrewSourceClient(request, manifest);
+        var installerPath = FetchInstaller(request, manifest, installer, request.Rename, downloadDir, sourceClient);
         var manifestYaml = BuildDownloadManifestYaml(manifest, manifestDocuments, installer);
         var manifestFileName = DeriveDownloadManifestFilename(manifest, installer);
         var manifestPath = Path.Combine(downloadDir, manifestFileName);
@@ -900,7 +901,13 @@ public class Repository : IDisposable
     /// different manifest (a newly published version, a source refresh) whose file would run with the first
     /// one's type and switches.
     /// </summary>
-    internal string FetchInstaller(InstallRequest request, Manifest manifest, Installer installer, string? rename, string downloadDir)
+    internal string FetchInstaller(
+        InstallRequest request,
+        Manifest manifest,
+        Installer installer,
+        string? rename,
+        string downloadDir,
+        HttpClient? downloadClient = null)
     {
         EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
         if (string.Equals(installer.InstallerType, "msstore", StringComparison.OrdinalIgnoreCase) &&
@@ -916,7 +923,9 @@ public class Repository : IDisposable
         Directory.CreateDirectory(downloadDir);
         var dest = Path.Combine(downloadDir, filename);
 
-        var actualHash = DownloadInstallerToFile(url, dest);
+        var client = downloadClient ??
+            (manifest.Homebrew is not null && request.ManifestPath is null ? _homebrewClient : _client);
+        var actualHash = DownloadInstallerToFile(url, dest, client);
 
         if (expectedHash is not null &&
             !actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase) &&
@@ -1024,7 +1033,7 @@ public class Repository : IDisposable
         return name + extensions[0];
     }
 
-    private string DownloadInstallerToFile(string url, string dest)
+    private string DownloadInstallerToFile(string url, string dest, HttpClient? downloadClient = null)
     {
         var partPath = SidecarPath(dest, "part");
         var metadataPath = SidecarPath(dest, "part.json");
@@ -1043,7 +1052,8 @@ public class Repository : IDisposable
                     url,
                     partPath,
                     metadataPath,
-                    InstallerDownloadTotalTimeout - elapsed).GetAwaiter().GetResult();
+                    InstallerDownloadTotalTimeout - elapsed,
+                    downloadClient).GetAwaiter().GetResult();
 
                 var actualHash = Sha256FileHex(partPath);
                 File.Move(partPath, dest, overwrite: true);
@@ -1060,7 +1070,12 @@ public class Repository : IDisposable
         throw lastError ?? new TimeoutException("Installer download timed out.");
     }
 
-    private async Task TryDownloadInstallerToPartAsync(string url, string partPath, string metadataPath, TimeSpan remaining)
+    private async Task TryDownloadInstallerToPartAsync(
+        string url,
+        string partPath,
+        string metadataPath,
+        TimeSpan remaining,
+        HttpClient? downloadClient)
     {
         var metadata = ReadInstallerDownloadMetadata(metadataPath, partPath, url);
         var offset = metadata?.Offset ?? 0;
@@ -1075,7 +1090,7 @@ public class Repository : IDisposable
                 request.Headers.TryAddWithoutValidation("If-Range", ifRange);
         }
 
-        using var response = await _client
+        using var response = await (downloadClient ?? _client)
             .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, totalCts.Token)
             .ConfigureAwait(false);
 
@@ -1361,7 +1376,8 @@ public class Repository : IDisposable
                 : Path.Combine(Path.GetTempPath(), "pinget-install");
             // Like WinGet, --rename never names the installer an install downloads: it only names a
             // portable's command alias (see InstallerDispatch.DeterminePortableLinks).
-            installerPath = FetchInstaller(request, manifest, selectedInstaller, rename: null, tempDir);
+            using var sourceClient = CreateHomebrewSourceClient(request, manifest);
+            installerPath = FetchInstaller(request, manifest, selectedInstaller, rename: null, tempDir, sourceClient);
             installerPath = PrepareInstallerForExecution(installerPath, installerType);
         }
         int exitCode;
@@ -2675,7 +2691,11 @@ public class Repository : IDisposable
     {
         var source = _store.Sources[sourceIndex];
         using var conn = OpenPreindexedConnection(sourceIndex);
-        var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn, source, packageRowid, packageHash, _appRoot);
+        using var sourceClient = source.Kind == SourceKind.HomebrewPreIndexed
+            ? HomebrewPreIndexedSource.CreateTlsTrustedClient(_homebrewClient, source)
+            : null;
+        var client = sourceClient ?? (source.Kind == SourceKind.HomebrewPreIndexed ? _homebrewClient : _client);
+        var (entries, _) = PreIndexedSource.LoadV2VersionData(client, conn, source, packageRowid, packageHash, _appRoot);
         return entries.Select(e => new VersionKey { Version = e.Version, Channel = "" }).ToList();
     }
 
@@ -2691,6 +2711,18 @@ public class Repository : IDisposable
             RestLocator rest => ManifestFromRest(located.SourceIndex, rest.PackageId, rest.Versions, located.Display, query),
             _ => throw new InvalidOperationException("Unknown locator type")
         };
+    }
+
+    private HttpClient? CreateHomebrewSourceClient(InstallRequest request, Manifest manifest)
+    {
+        if (manifest.Homebrew is null || request.ManifestPath is not null)
+            return null;
+
+        var (located, _, _) = FindSingleMatch(request.Query);
+        var source = _store.Sources[located.SourceIndex];
+        return source.Kind == SourceKind.HomebrewPreIndexed
+            ? HomebrewPreIndexedSource.CreateTlsTrustedClient(_homebrewClient, source)
+            : null;
     }
 
     private (Manifest, object, List<string>) ManifestFromV1(
@@ -2734,7 +2766,11 @@ public class Repository : IDisposable
         var versions = PreIndexedSource.QueryV1Versions(conn, packageRowid);
         var selected = SelectV1Version(versions, query.Version, query.Channel, display.Id, source.Name);
         var relativePath = PreIndexedSource.ResolveV1RelativePath(conn, selected.PathPart);
-        var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V1_M", source, relativePath, selected.ManifestHash, _appRoot);
+        using var sourceClient = source.Kind == SourceKind.HomebrewPreIndexed
+            ? HomebrewPreIndexedSource.CreateTlsTrustedClient(_homebrewClient, source)
+            : null;
+        var client = sourceClient ?? (source.Kind == SourceKind.HomebrewPreIndexed ? _homebrewClient : _client);
+        var bytes = PreIndexedSource.GetCachedSourceFile(client, "V1_M", source, relativePath, selected.ManifestHash, _appRoot);
         var manifest = ParseYamlManifest(bytes);
         var structuredDocument = ParseYamlManifestDocuments(bytes);
         manifest = manifest with { Version = selected.Version, Channel = selected.Channel };
@@ -2781,9 +2817,13 @@ public class Repository : IDisposable
         PackageQuery query)
     {
         var source = _store.Sources[sourceIndex];
-        var (entries, vdFile) = PreIndexedSource.LoadV2VersionData(_client, conn, source, packageRowid, packageHash, _appRoot);
+        using var sourceClient = source.Kind == SourceKind.HomebrewPreIndexed
+            ? HomebrewPreIndexedSource.CreateTlsTrustedClient(_homebrewClient, source)
+            : null;
+        var client = sourceClient ?? (source.Kind == SourceKind.HomebrewPreIndexed ? _homebrewClient : _client);
+        var (entries, vdFile) = PreIndexedSource.LoadV2VersionData(client, conn, source, packageRowid, packageHash, _appRoot);
         var selected = SelectV2Version(entries, query.Version, query.Channel, display.Id, source.Name);
-        var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V2_M", source, selected.ManifestRelativePath, selected.ManifestHash, _appRoot);
+        var bytes = PreIndexedSource.GetCachedSourceFile(client, "V2_M", source, selected.ManifestRelativePath, selected.ManifestHash, _appRoot);
         var manifest = ParseYamlManifest(bytes);
         var structuredDocument = ParseYamlManifestDocuments(bytes);
         manifest = manifest with { Version = selected.Version };

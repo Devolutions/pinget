@@ -435,7 +435,7 @@ var saArgOpt = new Option<string?>("--arg", "Source URL"); saArgOpt.AddAlias("-a
 var saTypeOpt = new Option<string?>("--type", "Source type"); saTypeOpt.AddAlias("-t");
 var saTrustLevelOpt = new Option<string?>("--trust-level", "Source trust level");
 var saPublisherOpt = new Option<string?>("--publisher", "Expected MSIX publisher for a Pinget Homebrew source");
-var saTrustedCaOpt = new Option<string[]>("--trusted-ca", "Explicit Homebrew source signing trust anchor (repeatable)")
+var saTrustedCaOpt = new Option<string[]>("--trusted-ca", "Explicit Homebrew source TLS and MSIX signing trust anchor (repeatable)")
 {
     ArgumentHelpName = "certificate",
     AllowMultipleArgumentsPerToken = false,

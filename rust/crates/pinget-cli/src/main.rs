@@ -444,7 +444,7 @@ struct SourceAddArgs {
     /// Expected publisher distinguished name for a Pinget Homebrew source.
     #[arg(long)]
     publisher: Option<String>,
-    /// Explicit signing trust anchor for a Pinget Homebrew source; repeat as needed.
+    /// Explicit TLS and MSIX signing trust anchor for a Pinget Homebrew source; repeat as needed.
     #[arg(long = "trusted-ca", requires = "publisher")]
     trusted_ca: Vec<PathBuf>,
     #[arg(long = "trust-level")]
