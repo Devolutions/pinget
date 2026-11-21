@@ -463,7 +463,7 @@ def produce(root: Path, reports: Path, run_id: str, *, dotnet_no_restore: bool =
         "CARGO_INCREMENTAL": "0",
     })
     rust_output = run_command([
-        "cargo", "test", "--locked", "--manifest-path", "rust/Cargo.toml",
+        "cargo", "test", "--manifest-path", "rust/Cargo.toml",
         "-p", "pinget-publisher", "--lib", "wave21_tests::mszip_interop_tests",
         "--", "--test-threads=1",
     ], env)
