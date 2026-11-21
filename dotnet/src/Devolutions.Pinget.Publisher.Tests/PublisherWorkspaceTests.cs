@@ -12,6 +12,68 @@ namespace Devolutions.Pinget.Publisher.Tests;
 public sealed class PublisherWorkspaceTests
 {
     [Fact]
+    public void Build_RejectsReuseOfLegacyPortableSnapshotWithoutMutation()
+    {
+        using var temp = new TempDirectory();
+        var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
+        var state = Path.Combine(temp.Path, "state");
+        var workspace = new PublisherWorkspace(state);
+        var options = new PublisherBuildOptions(input, state);
+        var build = workspace.Build(options);
+        var snapshot = build.SnapshotDirectory;
+        var indexPath = Path.Combine(snapshot, "Public", "index.db");
+        var feed = Path.Combine(snapshot, "feed");
+        byte[] legacy;
+        string oldRelative;
+        string legacyRelative;
+        string legacyHash;
+        using (var database = new SqliteConnection(new SqliteConnectionStringBuilder
+        { DataSource = indexPath, Mode = SqliteOpenMode.ReadWrite, Pooling = false }.ToString()))
+        {
+            database.Open();
+            using var query = database.CreateCommand();
+            query.CommandText = "SELECT hash FROM packages WHERE id='Pinget.Test.Matrix'";
+            var oldHash = Convert.ToHexString(Assert.IsType<byte[]>(query.ExecuteScalar())).ToLowerInvariant();
+            oldRelative = $"packages/Pinget.Test.Matrix/{oldHash[..8]}/versionData.mszyml";
+            var oldPath = Path.Combine(feed, oldRelative.Replace('/', Path.DirectorySeparatorChar));
+            legacy = File.ReadAllBytes(oldPath);
+            Array.Clear(legacy, 4, 4);
+            var digest = SHA256.HashData(legacy);
+            legacyHash = Convert.ToHexString(digest).ToLowerInvariant();
+            legacyRelative = $"packages/Pinget.Test.Matrix/{legacyHash[..8]}/versionData.mszyml";
+            Assert.NotEqual(oldRelative, legacyRelative);
+            var legacyPath = Path.Combine(feed, legacyRelative.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(legacyPath)!);
+            File.WriteAllBytes(legacyPath, legacy);
+            File.Delete(oldPath);
+            Directory.Delete(Path.GetDirectoryName(oldPath)!);
+            using var update = database.CreateCommand();
+            update.CommandText = "UPDATE packages SET hash=$hash WHERE id='Pinget.Test.Matrix'";
+            update.Parameters.AddWithValue("$hash", digest);
+            Assert.Equal(1, update.ExecuteNonQuery());
+        }
+
+        var metadataPath = Path.Combine(snapshot, "snapshot.json");
+        var metadata = JsonNode.Parse(File.ReadAllText(metadataPath))!.AsObject();
+        var artifacts = metadata["artifacts"]!.AsObject();
+        Assert.True(artifacts.Remove(oldRelative));
+        artifacts[legacyRelative] = legacyHash;
+        metadata["indexHash"] = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(indexPath))).ToLowerInvariant();
+        File.WriteAllText(metadataPath, metadata.ToJsonString());
+        var metadataBefore = File.ReadAllBytes(metadataPath);
+        var indexBefore = File.ReadAllBytes(indexPath);
+        var stateBefore = File.ReadAllBytes(Path.Combine(state, "publisher.db"));
+
+        var error = Assert.Throws<PublisherException>(() => workspace.Build(options));
+
+        Assert.Contains("fresh --state", error.Message);
+        Assert.Equal(metadataBefore, File.ReadAllBytes(metadataPath));
+        Assert.Equal(indexBefore, File.ReadAllBytes(indexPath));
+        Assert.Equal(stateBefore, File.ReadAllBytes(Path.Combine(state, "publisher.db")));
+        Assert.Equal(legacy, File.ReadAllBytes(Path.Combine(feed, legacyRelative.Replace('/', Path.DirectorySeparatorChar))));
+    }
+
+    [Fact]
     public void Build_MultiFileVersionsLocalesAndInstallerMetadata_WritesCompleteV2Snapshot()
     {
         using var temp = new TempDirectory();

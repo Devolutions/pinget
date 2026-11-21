@@ -252,11 +252,10 @@ public sealed class MsixPackageWriterTests
     }
 
     [Fact]
-    public void PortableMsZipWriter_RoundTripsEmptyBoundaryAndMultiblockPayloads()
+    public void PortableMsZipWriter_RoundTripsBoundaryAndMultiblockPayloads()
     {
         var inputs = new[]
         {
-            Array.Empty<byte>(),
             Enumerable.Repeat((byte)7, 32 * 1024).ToArray(),
             Encoding.UTF8.GetBytes(string.Concat(
                 Enumerable.Range(0, 200_000).Select(value => $"  - v: \"{value % 977}\"\n"))),
@@ -277,6 +276,60 @@ public sealed class MsixPackageWriterTests
         var compressed = MsZipCompressor.CompressPortable(new byte[size]);
 
         Assert.Equal(nativeHeader, Convert.ToHexString(compressed.AsSpan(0, 24)).ToLowerInvariant());
+    }
+
+    [Fact]
+    public void PortableMsZipWriter_BoundsIncompressibleBlocks()
+    {
+        var input = new byte[32 * 1024 + 137];
+        new Random(128).NextBytes(input);
+        var encoded = MsZipCompressor.CompressPortable(input);
+
+        Assert.Equal(32u * 1024 + 7, BinaryPrimitives.ReadUInt32LittleEndian(encoded.AsSpan(24)));
+        Assert.Equal("434b010080ff7f", Convert.ToHexString(encoded.AsSpan(28, 7)).ToLowerInvariant());
+        Assert.Equal(input.AsSpan(0, 32 * 1024).ToArray(), encoded.AsSpan(35, 32 * 1024).ToArray());
+        Assert.Equal(input, MsZipCompressor.Decompress(encoded));
+    }
+
+    [Fact]
+    public void Publisher_RejectsOversizedPortableBlockWithoutBreakingClientReads()
+    {
+        var input = Enumerable.Range(0, 32 * 1024).Select(value => (byte)value).ToArray();
+        var compatible = new byte[24 + 4 + 2 + input.Length + 10];
+        MsZipCompressor.CompressPortable(input).AsSpan(0, 24).CopyTo(compatible);
+        BinaryPrimitives.WriteUInt32LittleEndian(compatible.AsSpan(24), (uint)input.Length + 12);
+        "CK"u8.CopyTo(compatible.AsSpan(28));
+        var offset = 30;
+        for (var index = 0; index < 2; index++)
+        {
+            const ushort size = 16 * 1024;
+            compatible[offset] = (byte)index;
+            BinaryPrimitives.WriteUInt16LittleEndian(compatible.AsSpan(offset + 1), size);
+            BinaryPrimitives.WriteUInt16LittleEndian(compatible.AsSpan(offset + 3), ushort.MaxValue - size);
+            input.AsSpan(index * size, size).CopyTo(compatible.AsSpan(offset + 5));
+            offset += size + 5;
+        }
+
+        Assert.Equal(input, MsZipCompressor.Decompress(compatible));
+        var legacy = new byte[compatible.Length + 2];
+        compatible.CopyTo(legacy, 0);
+        legacy[30 + 5 + 16 * 1024] = 0;
+        legacy[^2] = 0x03;
+        BinaryPrimitives.WriteUInt32LittleEndian(legacy.AsSpan(24), (uint)input.Length + 14);
+        Assert.Equal(input, MsZipCompressor.DecompressPortable(legacy));
+        var error = Assert.Throws<PublisherException>(() => MsZipCompressor.Decompress(legacy));
+        Assert.Contains("fresh --state", error.Message);
+    }
+
+    [Fact]
+    public void Publisher_RejectsLegacyPortableHeaderWithoutBreakingClientReads()
+    {
+        var legacy = Convert.FromHexString(
+            "0a51e5c0000000000100000000000000008000000000000005000000434b5b0e00");
+
+        Assert.Equal(new byte[] { 0xa7 }, MsZipCompressor.DecompressPortable(legacy));
+        var error = Assert.Throws<PublisherException>(() => MsZipCompressor.Decompress(legacy));
+        Assert.Contains("fresh --state", error.Message);
     }
 
     [Fact]

@@ -199,8 +199,9 @@ public static partial class PublisherPackaging
                 if (comparison < 0)
                     throw new PublisherException($"Source package version {version} must be greater than published version {oldVersion}.");
                 if (comparison == 0
-                    && !string.Equals(effectiveMarker["buildId"]?.GetValue<string>(), buildId, StringComparison.Ordinal))
-                    throw new PublisherException("The source package version has already been used for different build content.");
+                    && (!string.Equals(effectiveMarker["buildId"]?.GetValue<string>(), buildId, StringComparison.Ordinal)
+                        || !string.Equals(effectiveMarker["indexHash"]?.GetValue<string>(), expectedIndexHash, StringComparison.Ordinal)))
+                    throw new PublisherException("The source package version has already been used for different build content or index; use a higher version.");
             }
         }
 
@@ -353,6 +354,7 @@ public static partial class PublisherPackaging
             if (marker is not null)
             {
                 var reuse = string.Equals(oldBuildId, buildId, StringComparison.Ordinal)
+                    && string.Equals(marker["indexHash"]?.GetValue<string>(), expectedIndexHash, StringComparison.Ordinal)
                     && Version.TryParse(oldVersionText, out var publishedVersion) && version.CompareTo(publishedVersion) == 0;
                 // The package about to be replaced only needs intact digests and the expected signer: an
                 // expired or rotated signing certificate must not block the next publication. Fully copied
@@ -380,8 +382,9 @@ public static partial class PublisherPackaging
                 if (comparison == 0)
                 {
                     if (!string.Equals(oldBuildId, buildId, StringComparison.Ordinal)
+                        || !string.Equals(marker["indexHash"]?.GetValue<string>(), expectedIndexHash, StringComparison.Ordinal)
                         || (marker["unsignedDevelopment"]?.GetValue<bool>() ?? false) != options.UnsignedDevelopment)
-                        throw new PublisherException("The source package version has already been used for different build content or signing mode.");
+                        throw new PublisherException("The source package version has already been used for different build content, index or signing mode; use a higher version.");
                     PublisherWorkspace.RecordPublished(state, buildId);
                     return verified;
                 }

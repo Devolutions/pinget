@@ -73,6 +73,15 @@ state is rejected without automatic migration; use a new state directory
 rather than editing its schema markers. Existing version-1 destination
 ownership records can still be verified and updated through normal publication.
 
+Earlier portable MSZIP writers could produce sidecars with invalid Windows
+headers or oversized blocks. A snapshot containing those sidecars is rejected
+without modification; rebuild from the same inputs with a fresh `--state`
+directory. Build IDs are based on inputs, so a rebuilt index can have the same
+build ID but different bytes. If its index differs from the published index,
+use a higher four-part source package version; same-version reuse requires the
+same build ID, index hash, and signing mode. Retain the old published
+hash-addressed files for clients with cached indexes.
+
 State lives in `publisher.db`. Each snapshot is under `builds\<buildId>`,
 with `snapshot.json`, `Public\index.db` and hosted files under
 `feed\manifests` and `feed\packages`. Use `--build <buildId>` with `package`,

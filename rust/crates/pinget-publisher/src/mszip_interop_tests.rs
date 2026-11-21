@@ -65,6 +65,16 @@ fn portable_encoder_encodes_fixture_matrix_when_requested() {
 }
 
 #[test]
+fn portable_encoder_rejects_empty_input() {
+    let error = crate::compress_mszip(&[]).expect_err("empty input must be rejected");
+    assert!(
+        matches!(error, crate::PublisherError::Invalid(ref message)
+            if message == "MSZIP payload must not be empty"),
+        "unexpected empty-input error: {error}"
+    );
+}
+
+#[test]
 fn portable_encoder_rejects_input_over_64_mib() {
     let input = vec![0; crate::MAX_MSZIP_SIZE + 1];
     let error = crate::compress_mszip(&input).expect_err("over-limit input must be rejected");

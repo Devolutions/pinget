@@ -57,6 +57,15 @@ public sealed class PortableMsZipInteropTests
     }
 
     [Fact]
+    public void PortableEncoderRejectsEmptyInput()
+    {
+        var error = Assert.Throws<PublisherException>(() => MsZipCompressor.CompressPortable([]));
+        Assert.Equal("MSZIP input must not be empty.", error.Message);
+        error = Assert.Throws<PublisherException>(() => MsZipCompressor.Compress([]));
+        Assert.Equal("MSZIP input must not be empty.", error.Message);
+    }
+
+    [Fact]
     public void PortableEncoderRejectsInputOver64MiB()
     {
         var input = new byte[MaximumSize + 1];

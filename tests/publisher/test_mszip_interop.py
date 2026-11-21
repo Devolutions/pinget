@@ -195,7 +195,6 @@ class FixtureDefinitionTests(unittest.TestCase):
         self.assertEqual(
             [(case.name, case.size, case.pattern) for case in interop.CASES],
             [
-                ("empty", 0, "empty"),
                 ("single_byte", 1, "single"),
                 ("block_32k_before", 32767, "random"),
                 ("block_32k_at", 32768, "random"),
@@ -209,12 +208,12 @@ class FixtureDefinitionTests(unittest.TestCase):
                 ("limit_64m_at", 67108864, "repeated"),
             ],
         )
-        self.assertEqual(b"\xa7", interop.payload(interop.CASES[1]))
-        repeated = interop.payload(interop.CASES[8])
-        random = interop.payload(interop.CASES[9])
+        self.assertEqual(b"\xa7", interop.payload(interop.CASES[0]))
+        repeated = interop.payload(interop.CASES[7])
+        random = interop.payload(interop.CASES[8])
         self.assertNotEqual(repeated[:64], repeated[interop.BLOCK : interop.BLOCK + 64])
         self.assertNotEqual(random[:64], random[interop.BLOCK : interop.BLOCK + 64])
-        self.assertEqual(random, interop.payload(interop.CASES[9]))
+        self.assertEqual(random, interop.payload(interop.CASES[8]))
         self.assertLess(len(zlib.compress(repeated)), len(repeated) // 10)
         self.assertGreater(len(zlib.compress(random)), len(random) * 98 // 100)
 
@@ -258,6 +257,15 @@ class FixtureDefinitionTests(unittest.TestCase):
         ):
             with self.assertRaises(interop.VerificationError):
                 interop.portable_smoke_decode(frame, 1)
+
+    def test_frame_parser_enforces_native_framed_block_limit(self):
+        header = bytearray(interop.SIGNATURE + bytes.fromhex("18000002") + struct.pack("<QQ", interop.BLOCK, interop.BLOCK))
+        header[6] = zlib.crc32(header[:6] + header[7:]) & 0xFF
+        at_limit = bytes(header) + struct.pack("<I", interop.BLOCK + 12) + b"CK" + bytes(interop.BLOCK + 10)
+        interop.check_frame(at_limit, interop.BLOCK)
+        oversized = bytes(header) + struct.pack("<I", interop.BLOCK + 13) + b"CK" + bytes(interop.BLOCK + 11)
+        with self.assertRaisesRegex(interop.VerificationError, "exceeds the Windows Compression API limit"):
+            interop.check_frame(oversized, interop.BLOCK)
 
 
 class NativeEmptyControlTests(unittest.TestCase):
@@ -337,7 +345,7 @@ class NativeEmptyControlTests(unittest.TestCase):
                 native.decompress(EMPTY_FRAME, 0)
         self.assertTrue(native.api.closed)
 
-    def test_native_empty_reference_compression_uses_explicit_buffer(self):
+    def test_native_empty_compression_control_uses_explicit_buffer(self):
         class FakeApi:
             def __init__(self):
                 self.calls = []
@@ -359,7 +367,7 @@ class NativeEmptyControlTests(unittest.TestCase):
 
         native = object.__new__(interop.WindowsNativeMsZip)
         native.api = FakeApi()
-        self.assertEqual(EMPTY_FRAME, native.compress_empty_reference())
+        self.assertEqual(EMPTY_FRAME, native.compress_reference(b""))
         self.assertEqual(
             [("create", 2, None), ("compress", 0, 4096, True), ("close", 14)],
             native.api.calls,
@@ -390,59 +398,29 @@ class NativeEmptyControlTests(unittest.TestCase):
                 with self.assertRaisesRegex(interop.VerificationError, "native nonempty control failed"):
                     interop.check_native_positive_control(native, root)
 
-    def test_native_empty_positive_and_corrupted_controls_are_all_exercised(self):
+    def test_native_corrupted_controls_are_all_exercised(self):
         class FakeNative:
             def __init__(self):
                 self.calls = []
 
-            def compress_empty_reference(self):
-                return EMPTY_FRAME
-
             def decompress(self, data, size):
                 self.calls.append((data, size))
-                if data == EMPTY_FRAME:
-                    return b""
                 raise interop.NativeDecodeError("invalid native stream")
 
         native = FakeNative()
-        reference = interop.validate_native_empty_reference(native)
-        self.assertIn("rejected", interop.probe_native_zero_input(native))
-        interop.assert_native_rejects_malformed_empty(native, EMPTY_FRAME, reference)
-        self.assertEqual(4, len(native.calls))
-        self.assertEqual([0, 0, 0, 0], [size for _, size in native.calls])
-        self.assertEqual([EMPTY_FRAME, b"", EMPTY_FRAME[:23]], [item[0] for item in native.calls[:3]])
-        self.assertNotEqual(EMPTY_FRAME[0], native.calls[3][0][0])
+        interop.assert_native_rejects_malformed_reference(native, SINGLE_FRAME, 1)
+        self.assertEqual(2, len(native.calls))
+        self.assertEqual([1, 1], [size for _, size in native.calls])
+        self.assertEqual(SINGLE_FRAME[:23], native.calls[0][0])
+        self.assertNotEqual(SINGLE_FRAME[0], native.calls[1][0][0])
 
-    def test_zero_byte_native_reference_is_not_mislabeled_as_malformed(self):
-        class ZeroByteReference:
-            def __init__(self):
-                self.calls = []
-
-            def compress_empty_reference(self):
-                return b""
-
-            def decompress(self, data, size):
-                self.calls.append((data, size))
-                if data == b"":
-                    return b""
-                raise interop.NativeDecodeError("invalid native stream")
-
-        native = ZeroByteReference()
-        reference = interop.validate_native_empty_reference(native)
-        self.assertEqual(b"", reference)
-        self.assertEqual("accepted", interop.probe_native_zero_input(native))
-        interop.assert_native_rejects_malformed_empty(native, EMPTY_FRAME, reference)
-        self.assertEqual(4, len(native.calls))
-        self.assertEqual([b"", b"", EMPTY_FRAME[:23]], [item[0] for item in native.calls[:3]])
-        self.assertNotEqual(EMPTY_FRAME[0], native.calls[3][0][0])
-
-    def test_native_decoder_accepting_malformed_empty_is_a_failure(self):
+    def test_native_decoder_accepting_malformed_reference_is_a_failure(self):
         class AcceptsAnything:
             def decompress(self, _data, _size):
                 return b""
 
-        with self.assertRaisesRegex(interop.VerificationError, "accepted malformed empty control: truncated_header"):
-            interop.assert_native_rejects_malformed_empty(AcceptsAnything(), EMPTY_FRAME)
+        with self.assertRaisesRegex(interop.VerificationError, "accepted malformed control: truncated_header"):
+            interop.assert_native_rejects_malformed_reference(AcceptsAnything(), SINGLE_FRAME, 1)
 
     def test_native_zero_input_probe_rejects_a_nonempty_result(self):
         class WrongZeroResult:
@@ -452,61 +430,48 @@ class NativeEmptyControlTests(unittest.TestCase):
         with self.assertRaisesRegex(interop.VerificationError, "zero-input probe returned nonempty"):
             interop.probe_native_zero_input(WrongZeroResult())
 
-    def test_native_empty_reference_failure_is_not_treated_as_compatibility(self):
-        class UnsupportedControl:
-            def compress_empty_reference(self):
-                raise interop.NativeEmptyReferenceUnavailable("native empty compression control failed")
+    def test_native_empty_control_requires_compress_error_87(self):
+        native = mock.Mock()
+        native.compress_reference.side_effect = interop.NativeCompressionError(87)
+        with mock.patch("builtins.print"):
+            interop.check_native_empty_rejection(native)
+        native.compress_reference.assert_called_once_with(b"")
 
-        with self.assertRaisesRegex(interop.NativeEmptyReferenceUnavailable, "native empty compression control failed"):
-            interop.validate_native_empty_reference(UnsupportedControl())
+        native.compress_reference.side_effect = interop.NativeCompressionError(5)
+        with self.assertRaisesRegex(interop.VerificationError, "unexpected native empty-input failure"):
+            interop.check_native_empty_rejection(native)
+        native.compress_reference.side_effect = interop.NativeReferenceUnavailable("compressor creation failed")
+        with self.assertRaisesRegex(interop.NativeReferenceUnavailable, "compressor creation failed"):
+            interop.check_native_empty_rejection(native)
+        native.compress_reference.side_effect = None
+        native.compress_reference.return_value = b"unexpected"
+        with self.assertRaisesRegex(interop.VerificationError, "unexpectedly accepted empty input"):
+            interop.check_native_empty_rejection(native)
 
-    def test_portable_empty_rejection_distinguishes_reference_availability(self):
-        class RejectsEmpty:
-            def decompress(self, _data, _size):
-                raise interop.NativeDecodeError("Win32 error 13")
-
-        with self.assertRaisesRegex(interop.VerificationError, "cannot distinguish unsupported empty decoding"):
-            interop.decode_windows_fixture(RejectsEmpty(), EMPTY_FRAME, 0, None)
-        with self.assertRaisesRegex(interop.VerificationError, "after decoding its own empty reference"):
-            interop.decode_windows_fixture(RejectsEmpty(), EMPTY_FRAME, 0, EMPTY_FRAME)
-
-    def test_unavailable_native_reference_still_requires_portable_empty_and_corruption_checks(self):
-        class NoNativeCompressor:
-            def __init__(self):
-                self.calls = []
-
-            def compress_empty_reference(self):
-                raise interop.NativeEmptyReferenceUnavailable("native compressor cannot encode empty input")
-
-            def decompress(self, data, size):
-                self.calls.append((data, size))
-                if data == EMPTY_FRAME:
-                    return b""
-                raise interop.NativeDecodeError("invalid native stream")
-
-        native = NoNativeCompressor()
-
-        def fake_validate(_root, _run_id, decoder, *, on_empty):
-            self.assertEqual(b"", decoder(EMPTY_FRAME, 0))
-            on_empty(EMPTY_FRAME)
-
+    def test_native_validator_runs_controls_and_fixture_matrix(self):
+        native = mock.Mock()
         with mock.patch.object(interop, "WindowsNativeMsZip", return_value=native), mock.patch.object(
-            interop, "check_native_positive_control"
-        ) as positive_control, mock.patch.object(interop, "validate_tree", side_effect=fake_validate) as validator, \
-                mock.patch("builtins.print"):
+            interop, "check_native_positive_control", return_value=SINGLE_FRAME
+        ) as positive, mock.patch.object(
+            interop, "assert_native_rejects_malformed_reference"
+        ) as malformed, mock.patch.object(
+            interop, "check_native_empty_rejection"
+        ) as empty, mock.patch.object(
+            interop, "probe_native_zero_input", return_value="rejected"
+        ), mock.patch.object(interop, "validate_tree") as validator, mock.patch("builtins.print"):
             interop.validate_windows(Path("unused"), "run-42")
-        positive_control.assert_called_once_with(native, Path("unused"))
-        validator.assert_called_once()
-        self.assertEqual([b"", EMPTY_FRAME, EMPTY_FRAME[:23]], [call[0] for call in native.calls[:3]])
-        self.assertNotEqual(EMPTY_FRAME[0], native.calls[3][0][0])
+        positive.assert_called_once_with(native, Path("unused"))
+        malformed.assert_called_once_with(native, SINGLE_FRAME, 1)
+        empty.assert_called_once_with(native)
+        validator.assert_called_once_with(Path("unused"), "run-42", native.decompress)
 
 
 class RunnerEvidenceTests(unittest.TestCase):
-    def test_rust_results_require_both_named_passing_tests(self):
-        output = "running 2 tests\n" + "".join(f"test {name} ... ok\n" for name in sorted(interop.RUST_TESTS))
-        output += "test result: ok. 2 passed; 0 failed; 0 ignored; 4 measured; 0 filtered out\n"
+    def test_rust_results_require_all_named_passing_tests(self):
+        output = "running 3 tests\n" + "".join(f"test {name} ... ok\n" for name in sorted(interop.RUST_TESTS))
+        output += "test result: ok. 3 passed; 0 failed; 0 ignored; 4 measured; 0 filtered out\n"
         interop.check_rust_results(output)
-        for invalid in ("test result: ok. 0 passed; 0 failed; 0 ignored;", output.replace("2 passed", "1 passed")):
+        for invalid in ("test result: ok. 0 passed; 0 failed; 0 ignored;", output.replace("3 passed", "1 passed")):
             with self.assertRaises(interop.VerificationError):
                 interop.check_rust_results(invalid)
 
@@ -519,13 +484,13 @@ class RunnerEvidenceTests(unittest.TestCase):
             text = (
                 '<TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">'
                 f"<Results>{results}</Results>"
-                '<ResultSummary><Counters total="2" executed="2" passed="2" failed="0" notExecuted="0" />'
+                '<ResultSummary><Counters total="3" executed="3" passed="3" failed="0" notExecuted="0" />'
                 "</ResultSummary></TestRun>"
             )
             report.write_text(text, encoding="utf-8")
             interop.check_dotnet_report(report)
             for invalid in (
-                text.replace('passed="2"', 'passed="0"'),
+                text.replace('passed="3"', 'passed="0"'),
                 text.replace('outcome="Passed"', 'outcome="Failed"', 1),
                 text.replace(results, ""),
             ):

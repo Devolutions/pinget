@@ -2,8 +2,8 @@
 
 This is a curated formula-bottle prototype, not general Homebrew compatibility.
 Both CLIs have verified a signed static `brew.msix`, installed real jq 1.8.1
-and oniguruma 6.9.10 bottles on Linux x64 and macOS x64/arm64, and executed
-jq using private bottle libraries rather than system substitutes.
+and oniguruma 6.9.10 bottles on Linux x64/arm64 and macOS x64/arm64, and
+executed jq using private bottle libraries rather than system substitutes.
 Both publishers have been consumed by the opposite runtime. Actual CLI checks
 also cover a labelled synthetic rebuild-only upgrade, bidirectional
 cross-runtime repair, dependency-protected uninstall, and rejection of
@@ -25,7 +25,7 @@ tampered signed source updates without changing the active cache.
 
 Manifest readers recognize more historical tags than the importer. That does
 not claim those targets or arbitrary bottles are installable. Real execution
-has been verified only for Linux x64 and macOS x64/arm64.
+has been verified only for Linux x64/arm64 and macOS x64/arm64.
 
 ## Import and publication checks
 
@@ -71,10 +71,10 @@ Keep real signed-source and lifecycle checks distinct from synthetic unit
 fixtures. Rebuild-only transitions must use increasing catalog rebuild versions
 and must not be described as authentic upstream rebuilds when synthesized for
 a test. Hosted run
-[44917759088](https://github.com/Devolutions/pinget/actions/runs/44917759088)
-passed 18 checks each on Linux x64 and macOS x64/arm64, and five Windows
-publishing/signature checks. This covers the pinned jq/oniguruma chain, not
-all formulas or Linux arm64 execution.
+[44920177215](https://github.com/Devolutions/pinget/actions/runs/44920177215),
+attempt 2, passed 18 checks each on Linux x64/arm64 and macOS x64/arm64, and
+five Windows publishing/signature checks. This covers the pinned jq/oniguruma
+chain, not all formulas.
 
 The Homebrew workflow does not rerun the existing Windows-profile/stock
 WinGet conformance suite. Its portable non-Windows MSZIP output has not been

@@ -4,7 +4,7 @@ Both publishers create a fully static Homebrew-profile feed. Native clients
 verify its signed `brew.msix`, activate the enclosed preindexed database, then
 download manifests and unchanged bottle bytes from the static host. No REST
 server, Homebrew, or Ruby runs on clients. Real jq/oniguruma installation has
-been exercised through both CLIs on Linux x64 and macOS x64/arm64; see the
+been exercised through both CLIs on Linux x64/arm64 and macOS x64/arm64; see the
 [compatibility limits](homebrew-bottle-compatibility.md).
 
 ## Build the artifacts
@@ -97,8 +97,9 @@ source cache preservation. The rebuild transition is synthetic; bottle bytes
 are unchanged. Windows checks Rust/.NET publishing and signing; native
 Homebrew source clients are disabled on Windows.
 
-The `Homebrew prototype acceptance` workflow runs these gates on Linux,
-macOS arm64/x64, and Windows and uploads only a non-secret JSON report.
+The `Homebrew prototype acceptance` workflow runs these gates on Linux and
+macOS x64/arm64, and Windows. It uploads non-secret acceptance reports and
+generated MSZIP test fixtures and results.
 `workflow_call` is the reusable entry point. The prototype-branch push trigger
 is scoped to this work branch and can be removed after platform acceptance.
 An approval-blocked workflow is not evidence of platform success.
@@ -136,7 +137,7 @@ The client activates its cache only after signature/trust/signer identity and
 schema validation, retaining the previous cache when an update fails.
 Successful signing, publication, client verification, native dependency
 installation, execution, upgrade, repair, uninstall, and tamper rejection have
-been demonstrated on hosted Linux x64, macOS arm64, and macOS x64 runners;
+been demonstrated on hosted Linux x64/arm64 and macOS x64/arm64 runners;
 Windows runners demonstrated Rust/.NET publishing and signature verification.
 Use an increasing four-part MSIX package version for each changed publication.
 

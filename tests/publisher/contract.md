@@ -154,6 +154,13 @@ current artifact-format marker are rejected without mutation; use a fresh
 destination ownership marker remains independently versioned by its existing
 schema and does not require this snapshot-format field.
 
+Snapshots with the earlier invalid portable MSZIP header or blocks exceeding
+the Windows decoder's framed-block limit are also rejected without mutation.
+Rebuild with fresh state. Reusing the same source package version requires
+both the same build ID and the same index hash; otherwise publish a higher
+four-part version. This prevents a corrected snapshot with the same
+inventory-derived build ID from silently reusing the old index.
+
 Cross-language comparisons pin canonical manifest bytes, raw input inventory,
 logical SQLite index contents, and the index digest recorded by each snapshot
 against that snapshot's exact `Public/index.db` bytes (the two SQLite files are

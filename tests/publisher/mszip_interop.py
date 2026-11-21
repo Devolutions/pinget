@@ -41,7 +41,6 @@ class Case:
 
 
 CASES = (
-    Case("empty", 0, "empty"),
     Case("single_byte", 1, "single"),
     Case("block_32k_before", BLOCK - 1, "random"),
     Case("block_32k_at", BLOCK, "random"),
@@ -57,10 +56,12 @@ CASES = (
 
 RUST_TESTS = {
     "wave21_tests::mszip_interop_tests::portable_encoder_encodes_fixture_matrix_when_requested",
+    "wave21_tests::mszip_interop_tests::portable_encoder_rejects_empty_input",
     "wave21_tests::mszip_interop_tests::portable_encoder_rejects_input_over_64_mib",
 }
 DOTNET_TESTS = {
     "Devolutions.Pinget.Publisher.Tests.PortableMsZipInteropTests.PortableEncoderEncodesFixtureMatrixWhenRequested",
+    "Devolutions.Pinget.Publisher.Tests.PortableMsZipInteropTests.PortableEncoderRejectsEmptyInput",
     "Devolutions.Pinget.Publisher.Tests.PortableMsZipInteropTests.PortableEncoderRejectsInputOver64MiB",
 }
 
@@ -73,12 +74,16 @@ class NativeDecodeError(VerificationError):
     """Decompress itself rejected a stream (not a Python-side comparison)."""
 
 
-class NativeEmptyReferenceUnavailable(VerificationError):
-    """The native compressor cannot provide an empty positive control."""
-
-
 class NativeReferenceUnavailable(VerificationError):
     """The native compressor could not produce a positive control."""
+
+
+class NativeCompressionError(NativeReferenceUnavailable):
+    """The native Compress call itself rejected its input."""
+
+    def __init__(self, error_code: int) -> None:
+        self.error_code = error_code
+        super().__init__(f"native compression control failed: Win32 error {error_code}")
 
 
 def require(condition: bool, message: str) -> None:
@@ -206,6 +211,7 @@ def check_frame(data: bytes, expected_size: int, inflate: bool = False) -> bytes
         framed_size = struct.unpack_from("<I", data, offset)[0]
         offset += 4
         require(framed_size >= 2 and framed_size <= len(data) - offset, "invalid or truncated MSZIP block")
+        require(framed_size <= BLOCK + 12, "MSZIP block exceeds the Windows Compression API limit")
         require(data[offset : offset + 2] == b"CK", "invalid MSZIP block marker")
         if inflate:
             decoder = zlib.decompressobj(-15)
@@ -236,7 +242,6 @@ def validate_tree(
     cases: tuple[Case, ...] = CASES,
     complete: bool = True,
     frame_check=check_frame,
-    on_empty=None,
     verbose: bool = True,
 ) -> None:
     """Validate inventory and bytes; only callers, not the CLI, can inject test fakes."""
@@ -298,8 +303,6 @@ def validate_tree(
                 frame_check(encoded, case.size)
                 decoded = decoder(encoded, case.size)
                 require(decoded == expected, f"decoded bytes differ for {producer}/{case.name}")
-                if case.name == "empty" and on_empty is not None:
-                    on_empty(encoded)
             except VerificationError as error:
                 failure = f"invalid or undecodable {producer}/{case.name}: {error}"
                 failures.append(failure)
@@ -364,22 +367,14 @@ class WindowsNativeMsZip:
             destination = ctypes.create_string_buffer(4096 + 2 * len(data))
             written = ctypes.c_size_t()
             if not self.api.Compress(handle, source, len(data), destination, len(destination), ctypes.byref(written)):
-                raise NativeReferenceUnavailable(
-                    f"native compression control failed: Win32 error {ctypes.get_last_error()}"
-                )
+                raise NativeCompressionError(ctypes.get_last_error())
             require(written.value <= len(destination), "native compression exceeded its output buffer")
             return ctypes.string_at(destination, written.value)
         finally:
             self.api.CloseCompressor(handle)
 
-    def compress_empty_reference(self) -> bytes:
-        try:
-            return self.compress_reference(b"")
-        except NativeReferenceUnavailable as error:
-            raise NativeEmptyReferenceUnavailable(f"native empty compression control failed: {error}") from error
 
-
-def check_native_positive_control(native, root: Path) -> None:
+def check_native_positive_control(native, root: Path) -> bytes:
     original = b"\xa7"
     reference = native.compress_reference(original)
     require(native.decompress(reference, len(original)) == original, "native nonempty control failed its round trip")
@@ -387,24 +382,28 @@ def check_native_positive_control(native, root: Path) -> None:
     for producer in PRODUCERS:
         encoded = read_file(root / producer / "single_byte.mszip")
         print(f"Portable {producer} single-byte fixture: {encoded.hex()}", flush=True)
+    return reference
 
 
-def assert_native_rejects_malformed_empty(native, valid: bytes, reference: bytes | None = None) -> None:
-    require(len(valid) >= 24, "empty control frame is truncated")
+def assert_native_rejects_malformed_reference(native, valid: bytes, size: int) -> None:
+    require(len(valid) >= 24, "native control frame is truncated")
     damaged_signature = bytes([valid[0] ^ 0xFF]) + valid[1:]
     for name, damaged in (("truncated_header", valid[:23]), ("invalid_signature", damaged_signature)):
-        require(damaged != reference, f"malformed empty control {name} matches the native reference")
         try:
-            native.decompress(damaged, 0)
+            native.decompress(damaged, size)
         except NativeDecodeError:
             continue
-        raise VerificationError(f"native decoder accepted malformed empty control: {name}")
+        raise VerificationError(f"native decoder accepted malformed control: {name}")
 
 
-def validate_native_empty_reference(native) -> bytes:
-    reference = native.compress_empty_reference()
-    require(native.decompress(reference, 0) == b"", "native empty reference did not decode to zero bytes")
-    return reference
+def check_native_empty_rejection(native) -> None:
+    try:
+        native.compress_reference(b"")
+    except NativeCompressionError as error:
+        require(error.error_code == 87, f"unexpected native empty-input failure: {error}")
+        print("Native Compress rejected empty input with Win32 error 87.", flush=True)
+        return
+    raise VerificationError("native Compress unexpectedly accepted empty input")
 
 
 def probe_native_zero_input(native) -> str:
@@ -417,28 +416,12 @@ def probe_native_zero_input(native) -> str:
     return "accepted"
 
 
-def decode_windows_fixture(native, data: bytes, expected_size: int, reference: bytes | None) -> bytes:
-    try:
-        return native.decompress(data, expected_size)
-    except NativeDecodeError as error:
-        if expected_size != 0:
-            raise
-        if reference is None:
-            raise VerificationError(
-                "native rejected the portable empty stream, but no native empty reference was available; "
-                f"cannot distinguish unsupported empty decoding from a malformed stream: {error}"
-            ) from error
-        raise VerificationError(
-            f"native rejected the portable empty stream after decoding its own empty reference: {error}"
-        ) from error
-
-
 def check_rust_results(output: str) -> None:
     found = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. ok$", output, flags=re.MULTILINE)
     require(len(found) == len(RUST_TESTS) and set(found) == RUST_TESTS, f"unexpected Rust test discovery/results: {found}")
     require(
-        re.search(r"^test result: ok\. 2 passed; 0 failed; 0 ignored;", output, flags=re.MULTILINE) is not None,
-        "Rust test summary did not report two passing, non-ignored tests",
+        re.search(rf"^test result: ok\. {len(RUST_TESTS)} passed; 0 failed; 0 ignored;", output, flags=re.MULTILINE) is not None,
+        "Rust test summary did not report all passing, non-ignored tests",
     )
 
 
@@ -449,11 +432,12 @@ def check_dotnet_report(path: Path) -> None:
         raise VerificationError(f"missing or invalid .NET TRX report {path}: {error}") from error
     counters = document.find(".//{*}ResultSummary/{*}Counters")
     require(counters is not None, "TRX report has no counters")
-    for name, expected in (("total", 2), ("executed", 2), ("passed", 2), ("failed", 0), ("notExecuted", 0)):
+    count = len(DOTNET_TESTS)
+    for name, expected in (("total", count), ("executed", count), ("passed", count), ("failed", 0), ("notExecuted", 0)):
         require(counters.get(name) == str(expected), f"unexpected TRX {name} counter: {counters.get(name)}")
     results = document.findall(".//{*}UnitTestResult")
     names = [result.get("testName") for result in results]
-    require(len(results) == 2 and set(names) == DOTNET_TESTS, f"unexpected .NET test discovery: {names}")
+    require(len(results) == count and set(names) == DOTNET_TESTS, f"unexpected .NET test discovery: {names}")
     require(all(result.get("outcome") == "Passed" for result in results), "TRX contains a non-passing test")
 
 
@@ -509,21 +493,11 @@ def produce(root: Path, reports: Path, run_id: str, *, dotnet_no_restore: bool =
 
 def validate_windows(root: Path, run_id: str) -> None:
     native = WindowsNativeMsZip()
-    check_native_positive_control(native, root)
-    try:
-        reference = validate_native_empty_reference(native)
-    except NativeEmptyReferenceUnavailable as error:
-        reference = None
-        print(f"Native empty reference unavailable ({error}); portable empty decoding is still required.")
-    if reference is not None:
-        print(f"Native empty reference decoded to zero bytes (compressed length {len(reference)}).")
+    reference = check_native_positive_control(native, root)
+    assert_native_rejects_malformed_reference(native, reference, 1)
+    check_native_empty_rejection(native)
     print(f"Native zero-compressed-byte probe: {probe_native_zero_input(native)}.")
-    validate_tree(
-        root,
-        run_id,
-        lambda data, size: decode_windows_fixture(native, data, size, reference),
-        on_empty=lambda data: assert_native_rejects_malformed_empty(native, data, reference),
-    )
+    validate_tree(root, run_id, native.decompress)
     print("All portable fixtures passed the Windows native MSZIP decoder.")
 
 

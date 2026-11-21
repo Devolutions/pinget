@@ -991,9 +991,11 @@ pub fn package(options: &PackageOptions) -> Result<PackageReport> {
                             owner.package_version
                         )));
                     }
-                    std::cmp::Ordering::Equal if owner.build_id != build_id => {
+                    std::cmp::Ordering::Equal
+                        if owner.build_id != build_id || owner.index_hash != snapshot_metadata.index_hash =>
+                    {
                         return Err(PublisherError::Invalid(
-                            "the package version has already been used for different build content".to_owned(),
+                            "the package version has already been used for different build content or index; use a higher version".to_owned(),
                         ));
                     }
                     std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {}
@@ -1182,6 +1184,7 @@ fn publish_with_hooks(
         let unsigned_development = options.unsigned_development;
         if let Some(owner) = prior.as_ref() {
             let reuse = owner.build_id == build_id
+                && owner.index_hash == snapshot_metadata.index_hash
                 && compare_quad_version(&canonical_version, &owner.package_version)? == std::cmp::Ordering::Equal;
             // The package about to be replaced only needs intact digests and the expected signer: an
             // expired or rotated signing certificate must not block the next publication.
@@ -1229,7 +1232,7 @@ fn publish_with_hooks(
                 }
                 std::cmp::Ordering::Equal => {
                     return Err(PublisherError::Invalid(
-                        "the package version has already been used for different build content".to_owned(),
+                        "the package version has already been used for different build content or index; use a higher version".to_owned(),
                     ));
                 }
                 std::cmp::Ordering::Greater => {}
@@ -4660,11 +4663,7 @@ fn win32_last_error() -> u32 {
 
 #[cfg(windows)]
 fn compress_mszip(input: &[u8]) -> Result<Vec<u8>> {
-    if input.len() > MAX_MSZIP_SIZE {
-        return Err(PublisherError::Invalid(
-            "MSZIP payload exceeds the 64 MiB limit".to_owned(),
-        ));
-    }
+    validate_mszip_input(input)?;
     use std::ffi::c_void;
     type CompressorHandle = *mut c_void;
 
@@ -4823,6 +4822,18 @@ fn decompress_mszip(input: &[u8]) -> Result<Vec<u8>> {
     result
 }
 
+fn validate_mszip_input(input: &[u8]) -> Result<()> {
+    if input.is_empty() {
+        return Err(PublisherError::Invalid("MSZIP payload must not be empty".to_owned()));
+    }
+    if input.len() > MAX_MSZIP_SIZE {
+        return Err(PublisherError::Invalid(
+            "MSZIP payload exceeds the 64 MiB limit".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_mszip_size(input: &[u8]) -> Result<()> {
     let size = input
         .get(8..16)
@@ -4834,7 +4845,61 @@ fn validate_mszip_size(input: &[u8]) -> Result<()> {
             "MSZIP decoded payload exceeds the 64 MiB limit".to_owned(),
         ));
     }
+    if has_legacy_portable_mszip_header(input) {
+        return Err(PublisherError::Invalid(
+            "legacy portable MSZIP header is not Windows-compatible; rebuild with a fresh --state directory".to_owned(),
+        ));
+    }
+    if has_oversized_mszip_block(input) {
+        return Err(PublisherError::Invalid(
+            "portable MSZIP block is not Windows-compatible; rebuild with a fresh --state directory".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn has_legacy_portable_mszip_header(input: &[u8]) -> bool {
+    input.starts_with(&[0x0a, 0x51, 0xe5, 0xc0, 0, 0, 0, 0])
+}
+
+fn has_oversized_mszip_block(input: &[u8]) -> bool {
+    if input.len() < 24
+        || !input.starts_with(&[0x0a, 0x51, 0xe5, 0xc0, 24, 0])
+        || input[7] != 2
+        || input[20..24] != [0; 4]
+    {
+        return false;
+    }
+    let mut remaining = u64::from_le_bytes(input[8..16].try_into().expect("header length checked"));
+    let block_size = u64::from(u32::from_le_bytes(
+        input[16..20].try_into().expect("header length checked"),
+    ));
+    if block_size == 0 || block_size > 32 * 1024 {
+        return false;
+    }
+    let mut offset = 24usize;
+    while remaining > 0 {
+        let Some(length_bytes) = input.get(offset..offset + 4) else {
+            return false;
+        };
+        let length = u32::from_le_bytes(length_bytes.try_into().expect("block length checked"));
+        let expected = remaining.min(block_size);
+        if length > 32 * 1024 + 12 {
+            return true;
+        }
+        let Ok(length) = usize::try_from(length) else {
+            return false;
+        };
+        let Some(end) = offset.checked_add(4).and_then(|start| start.checked_add(length)) else {
+            return false;
+        };
+        if end > input.len() {
+            return false;
+        }
+        offset = end;
+        remaining -= expected;
+    }
+    false
 }
 
 #[cfg(not(windows))]
@@ -4843,22 +4908,14 @@ fn compress_mszip(input: &[u8]) -> Result<Vec<u8>> {
     const BLOCK_SIZE: usize = 32 * 1024;
     const SIGNATURE: [u8; 4] = [0x0a, 0x51, 0xe5, 0xc0];
 
-    if input.len() > MAX_MSZIP_SIZE {
-        return Err(PublisherError::Invalid(
-            "MSZIP payload exceeds the 64 MiB limit".to_owned(),
-        ));
-    }
+    validate_mszip_input(input)?;
 
     let mut output = vec![0; usize::from(HEADER_SIZE)];
     output[..4].copy_from_slice(&SIGNATURE);
     output[4..6].copy_from_slice(&HEADER_SIZE.to_le_bytes());
     output[7] = 2;
     output[8..16].copy_from_slice(&(input.len() as u64).to_le_bytes());
-    let block_size = if input.is_empty() {
-        BLOCK_SIZE
-    } else {
-        input.len().min(BLOCK_SIZE)
-    };
+    let block_size = input.len().min(BLOCK_SIZE);
     output[16..24].copy_from_slice(&(block_size as u64).to_le_bytes());
     let mut checksum = flate2::Crc::new();
     checksum.update(&output[..6]);
@@ -4868,14 +4925,21 @@ fn compress_mszip(input: &[u8]) -> Result<Vec<u8>> {
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(block)?;
         let compressed = encoder.finish()?;
-        let framed_len = compressed
-            .len()
-            .checked_add(2)
-            .and_then(|length| u32::try_from(length).ok())
-            .ok_or_else(|| PublisherError::Invalid("MSZIP compressed block is too large".to_owned()))?;
+        let stored = compressed.len() > block.len() + 5;
+        let framed_len = u32::try_from(if stored { block.len() + 7 } else { compressed.len() + 2 })
+            .map_err(|_| PublisherError::Invalid("MSZIP compressed block is too large".to_owned()))?;
         output.extend_from_slice(&framed_len.to_le_bytes());
         output.extend_from_slice(b"CK");
-        output.extend_from_slice(&compressed);
+        if stored {
+            let length = u16::try_from(block.len())
+                .map_err(|_| PublisherError::Invalid("MSZIP uncompressed block is too large".to_owned()))?;
+            output.push(1);
+            output.extend_from_slice(&length.to_le_bytes());
+            output.extend_from_slice(&(!length).to_le_bytes());
+            output.extend_from_slice(block);
+        } else {
+            output.extend_from_slice(&compressed);
+        }
     }
     Ok(output)
 }
@@ -5224,9 +5288,8 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn portable_mszip_writer_roundtrips_empty_single_and_multiblock_payloads() {
+    fn portable_mszip_writer_roundtrips_single_and_multiblock_payloads() {
         for input in [
-            Vec::new(),
             b"small sidecar".to_vec(),
             (0..200_000u32)
                 .flat_map(|value| format!("  - v: \"{}\"\n", value % 977).into_bytes())
@@ -5251,6 +5314,67 @@ mod tests {
             let actual: String = compressed[..24].iter().map(|byte| format!("{byte:02x}")).collect();
             assert_eq!(actual, native_header, "header for {size} bytes");
         }
+    }
+
+    #[test]
+    fn mszip_writer_rejects_empty_input_on_every_platform() {
+        let error = compress_mszip(&[]).expect_err("empty MSZIP input");
+        assert!(error.to_string().contains("must not be empty"), "{error}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn portable_mszip_writer_bounds_incompressible_blocks() {
+        let mut input = Vec::new();
+        for value in 0..1029u32 {
+            input.extend_from_slice(&Sha256::digest(value.to_le_bytes()));
+        }
+        let encoded = compress_mszip(&input).expect("portable MSZIP");
+        let framed_length = u32::from_le_bytes(encoded[24..28].try_into().expect("block length"));
+        assert_eq!(framed_length, 32 * 1024 + 7);
+        assert_eq!(&encoded[28..35], b"CK\x01\x00\x80\xff\x7f");
+        assert_eq!(&encoded[35..35 + 32 * 1024], &input[..32 * 1024]);
+        assert_eq!(pinget_core::decompress_mszip_buffer(&encoded).expect("decode"), input);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn publisher_rejects_oversized_portable_block_without_breaking_client_reads() {
+        let input: Vec<u8> = (0u8..=u8::MAX).cycle().take(32 * 1024).collect();
+        let mut compatible = compress_mszip(&input).expect("portable MSZIP")[..24].to_vec();
+        let length = u32::try_from(input.len()).expect("test length") + 12;
+        compatible.extend_from_slice(&length.to_le_bytes());
+        compatible.extend_from_slice(b"CK");
+        for (index, block) in input.chunks(16 * 1024).enumerate() {
+            let size = u16::try_from(block.len()).expect("test block length");
+            compatible.push(u8::from(index == 1));
+            compatible.extend_from_slice(&size.to_le_bytes());
+            compatible.extend_from_slice(&(!size).to_le_bytes());
+            compatible.extend_from_slice(block);
+        }
+        assert_eq!(decompress_mszip(&compatible).expect("maximum valid frame"), input);
+        let mut legacy = compatible;
+        legacy[30 + 5 + 16 * 1024] = 0;
+        legacy.extend_from_slice(&[0x03, 0x00]);
+        legacy[24..28].copy_from_slice(&(length + 2).to_le_bytes());
+        assert_eq!(
+            pinget_core::decompress_mszip_buffer(&legacy).expect("legacy client read"),
+            input
+        );
+        let error = decompress_mszip(&legacy).expect_err("oversized publisher block");
+        assert!(error.to_string().contains("fresh --state"), "{error}");
+    }
+
+    #[test]
+    fn publisher_rejects_legacy_portable_header_without_breaking_client_reads() {
+        let legacy = b"\x0a\x51\xe5\xc0\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\
+                       \x00\x80\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00CK\x5b\x0e\x00";
+        assert_eq!(
+            pinget_core::decompress_mszip_buffer(legacy).expect("legacy client read"),
+            [0xa7]
+        );
+        let error = decompress_mszip(legacy).expect_err("legacy publisher snapshot");
+        assert!(error.to_string().contains("fresh --state"), "{error}");
     }
 
     #[cfg(windows)]
