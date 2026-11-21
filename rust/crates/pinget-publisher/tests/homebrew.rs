@@ -331,7 +331,7 @@ fn rejects_bad_identity_version_bottle_and_hash_metadata_without_outputs() {
         ("/bottle/stable/rebuild", json!(-1), "rebuild"),
         (
             "/bottle/stable/files/arm64_sonoma/cellar",
-            json!("/opt/homebrew/Cellar"),
+            json!("/usr/local/Cellar"),
             "fixed-cellar",
         ),
         ("/bottle/stable/files/arm64_sonoma/sha256", json!("bad"), "sha256"),
@@ -353,6 +353,24 @@ fn rejects_bad_identity_version_bottle_and_hash_metadata_without_outputs() {
     let fixture = Fixture::new();
     fixture.change(|v| v["bottle"]["stable"]["files"] = json!({}));
     fixture.reject("no selected bottle");
+}
+
+#[test]
+fn imports_only_target_matched_fixed_cellar_bottles() {
+    let fixture = Fixture::new();
+    fixture.change(|v| {
+        v["bottle"]["stable"]["files"]["arm64_sonoma"]["cellar"] = json!("/opt/homebrew/Cellar");
+    });
+    let report = import(&fixture.options).expect("import target-matched fixed-cellar metadata");
+    let manifest = fs::read_to_string(fixture.options.manifest_output.join(report.manifest_file)).expect("manifest");
+    assert!(manifest.contains("Relocation: /opt/homebrew/Cellar"));
+
+    let input = publisher_input(&fixture);
+    pinget_publisher::build(&pinget_publisher::BuildOptions {
+        input,
+        state: fixture.root.join("state"),
+    })
+    .expect("publisher accepts the verified target-matched cellar");
 }
 
 #[test]

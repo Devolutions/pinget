@@ -3652,7 +3652,8 @@ public class Repository : IDisposable
                     $"Homebrew bottle tag '{bottleTag}' maps to {tagTarget.Value.OperatingSystem}/{tagTarget.Value.Architecture}, not {targetOs}/{architecture}.");
             var rebuild = RequiredUInt32(bottle, "Rebuild", bottlePrefix);
             var relocation = RequiredString(bottle, "Relocation", bottlePrefix);
-            if (relocation is not ("any" or "any_skip_relocation" or "fixed"))
+            var expectedFixedCellar = HomebrewBottleMetadata.FixedCellarForTag(bottleTag);
+            if (relocation is not ("any" or "any_skip_relocation") && relocation != expectedFixedCellar)
                 throw new InvalidDataException($"Unsupported Homebrew bottle relocation value '{relocation}'.");
 
             var minimumOsVersion = OptionalString(bottle, "MinimumOSVersion");

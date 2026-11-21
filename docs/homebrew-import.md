@@ -1,4 +1,4 @@
-# Offline Homebrew formula import
+# Homebrew formula import
 
 Both CLIs provide the same bounded `repository import-homebrew` command:
 
@@ -12,9 +12,9 @@ pinget repository import-homebrew \
   --base-url https://packages.example.invalid/bottles
 ```
 
-Inputs must be pinned local files supplied by the operator. **No API calls,
-downloads, DNS, authentication, or other network behavior is implemented.**
-The importer accepts one formula object, not a bulk API list or cask.
+Inputs must be local files supplied by the operator. The offline importer makes
+no network requests and accepts one formula object, not a bulk API list or
+cask.
 Supported triples are `arm64_sonoma` / `macOS` / `arm64`, `sonoma` / `macOS` /
 `x64`, `x86_64_linux` / `Linux` / `x64`, and `aarch64_linux` / `Linux` / `arm64`.
 Sonoma implies macOS product version 14.0. Linux inputs must augment the
@@ -33,9 +33,17 @@ Formula `desc`, `homepage`, and SPDX `license` populate `ShortDescription`,
 provide an upstream author and the manifest publisher field is required by the
 source builder, `Publisher` is the literal `Unknown`; the tap is never treated
 as an upstream publisher or author.
-Only `any` and `any_skip_relocation` bottles are accepted; no relocation or
-installation is performed. The archive is treated as opaque bytes, not
-extracted, inspected, or repacked.
+`any` and `any_skip_relocation` are preserved as distinct metadata values.
+Fixed-cellar bottles are accepted only when the cellar exactly matches the
+selected native tag (`/opt/homebrew/Cellar` for arm64 Sonoma,
+`/usr/local/Cellar` for x64 Sonoma, or `/home/linuxbrew/.linuxbrew/Cellar`
+for Linux). The client relocates those known source prefixes to its private
+prefix using the same bounded ELF, Mach-O, and text relocation as other
+bottles. Unknown or cross-target fixed cellars are rejected. Relocation is
+not a general binary rewriting facility; see
+[`homebrew-bottle-compatibility.md`](homebrew-bottle-compatibility.md).
+The importer verifies and mirrors bottle bytes unchanged; it does not extract
+or repack them.
 
 Runtime `dependencies` names map to exact derived Pinget IDs. Import every
 member of the curated closure before publishing. Optional
@@ -48,8 +56,8 @@ source and installs dependencies before the dependent.
 Nonempty recommended, optional, macOS-provided dependency lists, requirements,
 conflicts, and target-specific variations are rejected rather than discarded. Build/test
 dependency lists do not describe the runtime bottle and are not imported.
-Disabled/deprecated formulas, fixed-cellar bottles, unsupported version schemes
-and targets are rejected. Formula aliases are sorted/deduplicated in metadata;
+Disabled/deprecated formulas, unsupported fixed-cellar paths, unsupported
+version schemes and targets are rejected. Formula aliases are sorted/deduplicated in metadata;
 no alias is automatically selected as a catalog moniker.
 
 Inputs must be outside both output directories; the manifest and mirror
@@ -75,8 +83,40 @@ are reused; conflicting output bytes fail without overwriting existing files.
 All validation and conflict checks precede output creation. Files are created
 exclusively, but the three output writes are not a transactional publication;
 an interrupted write may require a clean output directory. This does not publish
-a source or authenticate Homebrew metadata. SHA-256 verifies consistency with the operator's pinned JSON,
-not the authenticity of that JSON.
+a source or authenticate Homebrew metadata. SHA-256 verifies consistency with
+the supplied JSON, not the authenticity of that JSON.
+
+## Automated `homebrew/core` catalog import
+
+For a bounded dependency closure, use the cross-runtime catalog driver:
+
+```sh
+python3 scripts/import-homebrew-catalog.py \
+  --formula jq --formula ripgrep \
+  --tag x86_64_linux \
+  --runtime rust --rust-cli rust/target/release/pinget \
+  --manifest-output out/manifests --bottle-mirror out/bottles \
+  --base-url https://packages.example.invalid/bottles \
+  --report out/catalog-import.json
+```
+
+For .NET use `--runtime dotnet --dotnet-assembly <path-to-Devolutions.Pinget.Cli.dll>`.
+`--formula-list` accepts one formula name per line; repeat `--formula` for
+additional roots. The tool fetches the public `formulae.brew.sh` formula API,
+walks exact runtime dependencies (maximum 256 formulas and depth 64), selects
+one native tag, downloads only the matching public GHCR bottle blob, verifies
+its SHA-256 (2 GiB total bottle-download budget), adds dependency version pins,
+and invokes the selected offline importer. No Ruby runs and no Homebrew install
+command is used. It is limited to `homebrew/core`; tap crawling and casks are
+unsupported.
+
+Formulae the offline importer rejects are reported as skipped; a requested
+root that cannot be imported makes the command fail. The JSON report records
+formula API and bottle hashes for imported entries. API data is fetched live
+and is not signed, so retain the report and mirror outputs as an operator
+review/audit artifact and review generated manifests before publishing. This
+driver is not a trusted unattended catalog sync service: it does not pin an
+API commit, approve formula changes, or publish/sign the resulting source.
 
 For a publisher snapshot, keep the generated `manifests/` and `bottles/`
 directories as siblings under a publisher input root (the example's `output/`

@@ -75,8 +75,14 @@ pub(crate) fn spec(
                     .is_some_and(|hash| bottle.sha256.eq_ignore_ascii_case(hash))
         })
         .ok_or_else(|| anyhow!("Selected installer has no matching Homebrew bottle metadata"))?;
-    if !matches!(bottle.relocation.as_str(), "any" | "any_skip_relocation") || formula.version_scheme != 0 {
-        bail!("Native bottles currently require relocatable archives and version scheme 0");
+    let expected_fixed_cellar = crate::HomebrewBottleMetadata::fixed_cellar_for_tag(&bottle.bottle_tag);
+    if (!matches!(bottle.relocation.as_str(), "any" | "any_skip_relocation")
+        && Some(bottle.relocation.as_str()) != expected_fixed_cellar)
+        || formula.version_scheme != 0
+    {
+        bail!(
+            "Native bottles require a supported relocatable or target-matched fixed-cellar archive and version scheme 0"
+        );
     }
     let original_prefix = match (bottle.target_os.as_str(), bottle.architecture.as_str()) {
         ("Linux", _) => {

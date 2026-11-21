@@ -131,8 +131,9 @@ public static class HomebrewImporter
         if (!PublicUrl(Text(selected, "url")))
             throw Invalid("selected bottle URL must be public HTTPS without credentials or query/fragment");
         var cellar = Text(selected, "cellar");
-        if (cellar is not ("any" or "any_skip_relocation"))
-            throw Invalid("fixed-cellar bottles are unsupported; select any or any_skip_relocation");
+        var relocation = cellar is "any" or "any_skip_relocation" || cellar == HomebrewBottleMetadata.FixedCellarForTag(options.Tag)
+            ? cellar
+            : throw Invalid("fixed-cellar bottle path does not match the selected native target");
         var description = OptionalText(formula, "desc", 4096);
         var homepage = OptionalText(formula, "homepage", 2048);
         if (homepage is not null && !PublicUrl(homepage))
@@ -189,7 +190,7 @@ public static class HomebrewImporter
                         ["Architecture"] = options.Architecture,
                         ["BottleTag"] = options.Tag,
                         ["Rebuild"] = rebuild,
-                        ["Relocation"] = cellar,
+                        ["Relocation"] = relocation,
                     }),
                 },
             },

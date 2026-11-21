@@ -416,6 +416,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn relocates_known_fixed_cellar_paths_into_the_private_prefix() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let path = fixture.0.join("fixed-cellar.txt");
+        fs::write(&path, "/opt/homebrew/Cellar/sample/1.0/bin/sample\n")?;
+        relocate(
+            std::slice::from_ref(&path),
+            Path::new("/private/pinget"),
+            "/opt/homebrew",
+        )?;
+        assert_eq!(
+            fs::read_to_string(path)?,
+            "/private/pinget/Cellar/sample/1.0/bin/sample\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn relocates_read_only_files_and_restores_mode_on_failure() -> Result<()> {
         let fixture = Fixture::new()?;
         let path = fixture.0.join("readonly.pc");

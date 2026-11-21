@@ -63,6 +63,17 @@ public sealed class HomebrewBottleArchiveTests
     }
 
     [Fact]
+    public void Relocate_KnownFixedCellarPathsIntoPrivatePrefix()
+    {
+        using var fixture = new Fixture();
+        Directory.CreateDirectory(fixture.Root);
+        var path = Path.Combine(fixture.Root, "fixed-cellar.txt");
+        File.WriteAllText(path, "/opt/homebrew/Cellar/sample/1.0/bin/sample\n");
+        HomebrewBottleRelocation.Relocate([path], "/private/pinget", "/opt/homebrew");
+        Assert.Equal("/private/pinget/Cellar/sample/1.0/bin/sample\n", File.ReadAllText(path));
+    }
+
+    [Fact]
     public void Relocate_ReadOnlyFileRestoresModeOnSuccessAndFailure()
     {
         if (OperatingSystem.IsWindows())

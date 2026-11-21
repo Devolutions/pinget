@@ -100,6 +100,19 @@ public sealed class HomebrewImporterTests
     }
 
     [Fact]
+    public void ImportsOnlyTargetMatchedFixedCellarBottles()
+    {
+        using var fixture = new Fixture();
+        fixture.Change(value =>
+            value["bottle"]!["stable"]!["files"]!["arm64_sonoma"]!["cellar"] = "/opt/homebrew/Cellar");
+        var report = HomebrewImporter.Import(fixture.Options);
+        var manifest = File.ReadAllText(Path.Combine(fixture.Options.ManifestOutput, report["manifestFile"]!.GetValue<string>()));
+        Assert.Contains("Relocation: /opt/homebrew/Cellar", manifest);
+        var state = Path.Combine(fixture.Root, "fixed-cellar-state");
+        new PublisherWorkspace(state).Build(new PublisherBuildOptions(PublisherInput(fixture), state));
+    }
+
+    [Fact]
     public void Build_RejectsMixedHomebrewAndWindowsProfiles()
     {
         using var fixture = new Fixture();
@@ -181,7 +194,7 @@ public sealed class HomebrewImporterTests
     [InlineData("homepage", "\"https://user:secret@example.invalid/\"", "homepage")]
     [InlineData("version_scheme", "6", "version_scheme")]
     [InlineData("bottle/stable/rebuild", "-1", "rebuild")]
-    [InlineData("bottle/stable/files/arm64_sonoma/cellar", "\"/opt/homebrew/Cellar\"", "fixed-cellar")]
+    [InlineData("bottle/stable/files/arm64_sonoma/cellar", "\"/usr/local/Cellar\"", "fixed-cellar")]
     [InlineData("bottle/stable/files/arm64_sonoma/sha256", "\"bad\"", "sha256")]
     [InlineData("bottle/stable/files/arm64_sonoma/sha256", "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "SHA-256 mismatch")]
     [InlineData("bottle/stable/files/arm64_sonoma/url", "\"https://user:secret@example.invalid/bottle\"", "public HTTPS")]

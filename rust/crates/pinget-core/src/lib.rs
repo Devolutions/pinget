@@ -500,6 +500,17 @@ pub struct HomebrewBottleMetadata {
     pub loader: Option<String>,
 }
 
+impl HomebrewBottleMetadata {
+    pub fn fixed_cellar_for_tag(tag: &str) -> Option<&'static str> {
+        match tag {
+            "arm64_sonoma" => Some("/opt/homebrew/Cellar"),
+            "sonoma" => Some("/usr/local/Cellar"),
+            "x86_64_linux" | "aarch64_linux" => Some("/home/linuxbrew/.linuxbrew/Cellar"),
+            _ => None,
+        }
+    }
+}
+
 /// Creates a stable Pinget identifier from the exact Homebrew tap and formula names.
 ///
 /// The formula slug fits WinGet's 32-character segment limit; a digest of the
@@ -9451,7 +9462,10 @@ fn yaml_homebrew_metadata(root: &YamlMapping) -> Result<Option<HomebrewFormulaMe
             .parse::<u32>()
             .with_context(|| format!("Pinget.Homebrew.Bottles[{index}].Rebuild must be an unsigned integer"))?;
         let relocation = bottle_required("Relocation")?;
-        if !matches!(relocation.as_str(), "any" | "any_skip_relocation" | "fixed") {
+        let expected_fixed_cellar = HomebrewBottleMetadata::fixed_cellar_for_tag(&bottle_tag);
+        if !matches!(relocation.as_str(), "any" | "any_skip_relocation")
+            && Some(relocation.as_str()) != expected_fixed_cellar
+        {
             bail!("unsupported Homebrew bottle relocation value '{relocation}'");
         }
         let minimum_os_version = yaml_string(bottle, "MinimumOSVersion");

@@ -13,12 +13,12 @@ tampered signed source updates without changing the active cache.
 
 | Area | Supported now | Explicitly not supported |
 | --- | --- | --- |
-| Formula input | One pinned local formula JSON object per import; explicitly labelled OCI adaptations | API fetching, automatic tap curation, casks, Ruby evaluation |
+| Formula input | One local object per offline import; bounded live `homebrew/core` dependency-closure importer | Authenticated API snapshots, automatic tap curation, casks, Ruby evaluation |
 | Bottle target | Sonoma macOS x64/arm64 and glibc Linux x64/arm64 metadata; native architecture only | Other importer tags, emulation, musl, platform-independent targets |
 | Formula metadata | Identity, stable version, revision, aliases, old names, keg-only, description, homepage, SPDX license, runtime dependency identities/minima | Nonzero version schemes, `uses_from_macos`, requirements, conflicts, optional dependencies, variations |
-| Bottle classes | `any` and `any_skip_relocation` are preserved as distinct metadata values | Fixed-cellar bottles |
+| Bottle classes | `any`, `any_skip_relocation`, and target-matched fixed-cellar paths | Unknown or cross-target fixed cellars |
 | Archive handling | Digest verification, unchanged mirroring, bounded extraction, contained regular files/directories/links, executable modes | Traversal, escaping/dangling/chained links, special devices/FIFOs, hooks |
-| Relocation | UTF-8 text/placeholders; ELF RUNPATH and host interpreter; Mach-O dependency names, rpaths, IDs and ad-hoc signing | Arbitrary embedded binary paths, application bundles, general formula-specific patching |
+| Relocation | UTF-8 text/placeholders; ELF RUNPATH and host interpreter; Mach-O dependency names, rpaths, IDs and ad-hoc signing; known fixed-cellar prefixes | Arbitrary embedded binary paths, application bundles, general formula-specific patching |
 | Static publishing | Homebrew-only snapshots, mirrored bytes, preindexed DB in signed `brew.msix`, external Psign verification | REST serving, mixed Homebrew/Windows snapshots |
 | Source update | `brew.msix` only, no redirects, digest/trust/signer identity/EKU checks before index activation | Windows Homebrew source clients, unsigned sources, implicit private root installation, acceptance of failed updates |
 | Client operations | Native install/list/upgrade/repair/uninstall, shared receipts, dependency ordering, journaled per-formula transactions with crash recovery shared by both runtimes, ownership checks | Homebrew/Ruby, system-prefix installation, arbitrary installer arguments, uninstall-previous, atomic dependency-closure transactions |
@@ -140,4 +140,6 @@ passed on the same code commit, including publisher interoperability and signed
 stock WinGet acceptance with the native-AOT CLI. The recovery platform and
 JSON trimming/AOT warnings are absent from these final runs. These are distinct
 gates; see the [publisher contract](../tests/publisher/contract.md) for their
-coverage and limits.
+coverage and limits. The API-driven catalog tool has bounded dependency-graph
+tests, but the current real-bottle acceptance set has not expanded beyond jq
+and oniguruma. No claim is made that 20–50 arbitrary formulas install.

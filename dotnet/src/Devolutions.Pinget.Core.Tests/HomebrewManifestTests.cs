@@ -78,6 +78,18 @@ public sealed class HomebrewManifestTests
     }
 
     [Fact]
+    public void Parse_AcceptsOnlyFixedCellarMatchingBottleTarget()
+    {
+        var fixedManifest = ValidManifest.Replace("Relocation: any", "Relocation: /opt/homebrew/Cellar", StringComparison.Ordinal);
+        var bottle = Assert.Single(Repository.ParseYamlManifest(Encoding.UTF8.GetBytes(fixedManifest)).Homebrew!.Bottles);
+        Assert.Equal("/opt/homebrew/Cellar", bottle.Relocation);
+
+        var mismatched = ValidManifest.Replace("Relocation: any", "Relocation: /usr/local/Cellar", StringComparison.Ordinal);
+        var error = ParseExpectingInvalid(mismatched, "wrong fixed cellar must fail");
+        Assert.Contains("Unsupported Homebrew bottle relocation value", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Parse_RejectsUnknownSchemaAndPlatformMismatchedConstraints()
     {
         var unknownSchema = ValidManifest.Replace("SchemaVersion: 1", "SchemaVersion: 2", StringComparison.Ordinal);

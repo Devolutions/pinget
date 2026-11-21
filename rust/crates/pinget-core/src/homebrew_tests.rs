@@ -77,6 +77,24 @@ fn parses_and_normalizes_versioned_homebrew_metadata() {
 }
 
 #[test]
+fn fixed_cellar_metadata_must_match_the_bottle_target() {
+    let fixed = VALID_HOME_BREW_MANIFEST.replace("Relocation: any", "Relocation: /opt/homebrew/Cellar");
+    let manifest = parse_yaml_manifest(fixed.as_bytes()).expect("matching fixed cellar");
+    assert_eq!(
+        manifest.homebrew.expect("Homebrew metadata").bottles[0].relocation,
+        "/opt/homebrew/Cellar"
+    );
+
+    let mismatched = VALID_HOME_BREW_MANIFEST.replace("Relocation: any", "Relocation: /usr/local/Cellar");
+    assert!(
+        parse_yaml_manifest(mismatched.as_bytes())
+            .expect_err("wrong fixed cellar rejected")
+            .to_string()
+            .contains("unsupported Homebrew bottle relocation value")
+    );
+}
+
+#[test]
 fn rejects_unknown_schema_and_mismatched_target_constraints() {
     let unknown_schema = VALID_HOME_BREW_MANIFEST.replace("SchemaVersion: 1", "SchemaVersion: 2");
     assert!(

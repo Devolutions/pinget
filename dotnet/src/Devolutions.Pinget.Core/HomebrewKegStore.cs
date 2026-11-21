@@ -74,8 +74,10 @@ internal static class HomebrewKegStore
         var formula = manifest.Homebrew ?? throw new InvalidDataException("Missing Homebrew metadata.");
         var bottle = formula.Bottles.Single(bottle =>
             bottle.Url == installer.Url && bottle.Sha256.Equals(installer.Sha256, StringComparison.OrdinalIgnoreCase));
-        if (bottle.Relocation is not ("any" or "any_skip_relocation") || formula.VersionScheme != 0)
-            throw new InvalidDataException("Native bottles currently require relocatable archives and version scheme 0.");
+        var expectedFixedCellar = HomebrewBottleMetadata.FixedCellarForTag(bottle.BottleTag);
+        if ((bottle.Relocation is not ("any" or "any_skip_relocation") && bottle.Relocation != expectedFixedCellar) ||
+            formula.VersionScheme != 0)
+            throw new InvalidDataException("Native bottles require a supported relocatable or target-matched fixed-cellar archive and version scheme 0.");
         string originalPrefix;
         if (bottle.TargetOS == "Linux")
         {

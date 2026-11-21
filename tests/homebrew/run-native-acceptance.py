@@ -1,4 +1,4 @@
-"""Real pinned bottles and disposable signed-source acceptance on hosted runners."""
+"""Pinned and live-catalog bottle acceptance on disposable hosted runners."""
 
 import argparse
 import functools
@@ -11,6 +11,7 @@ import platform
 import shutil
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import urllib.parse
@@ -26,9 +27,9 @@ PACKAGES = {
 PUBLISHER = "CN=Pinget Homebrew Acceptance"
 
 
-def run(command, env=None, expected=0):
+def run(command, env=None, expected=0, timeout=180):
     result = subprocess.run(
-        [str(value) for value in command], env=env, capture_output=True, text=True, timeout=180
+        [str(value) for value in command], env=env, capture_output=True, text=True, timeout=timeout
     )
     if result.returncode != expected:
         raise RuntimeError(
@@ -254,6 +255,46 @@ def main():
                 name: dict(value["pinget_provenance"], bottle_sha256=value["bottle"]["stable"]["files"][tag]["sha256"])
                 for name, value in formulas.items()
             }
+            catalog_input = None
+            catalog_roots = []
+            if platform.system() != "Windows":
+                catalog_root = work / "catalog"
+                catalog_input = catalog_root / "input"
+                catalog_report_path = catalog_root / "import-report.json"
+                run([
+                    sys.executable, "scripts/import-homebrew-catalog.py",
+                    "--formula-list", "tests/homebrew/acceptance-corpus.txt",
+                    "--minimum-imported", "20",
+                    "--tag", tag,
+                    "--runtime", "rust",
+                    "--rust-cli", clis["rust"][0],
+                    "--manifest-output", catalog_input / "manifests",
+                    "--bottle-mirror", catalog_input / "bottles",
+                    "--base-url", f"{base}/catalog/bottles",
+                    "--report", catalog_report_path,
+                ], env, timeout=3600)
+                catalog_result = json.loads(catalog_report_path.read_text())
+                catalog_roots = catalog_result["importedRoots"][:20]
+                if len(catalog_roots) < 20:
+                    raise RuntimeError("The live Homebrew catalog acceptance imported fewer than 20 formula roots")
+                fixed_cellar_roots = [
+                    entry["formula"]
+                    for entry in catalog_result["importedMetadata"]
+                    if entry["formula"] in catalog_result["importedRoots"]
+                    and entry["relocation"] not in ("any", "any_skip_relocation")
+                ]
+                if fixed_cellar_roots and fixed_cellar_roots[0] not in catalog_roots:
+                    catalog_roots[-1] = fixed_cellar_roots[0]
+                catalog_public_bottles = public / "catalog/bottles"
+                catalog_public_bottles.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(catalog_input / "bottles", catalog_public_bottles, copy_function=os.link)
+                report["catalog"] = {
+                    "target": tag,
+                    "importedRoots": catalog_roots,
+                    "fixedCellarRoots": fixed_cellar_roots,
+                    "importedMetadata": catalog_result["importedMetadata"],
+                    "skipped": catalog_result["skipped"],
+                }
 
             def publish(runtime, rebuild):
                 cli = clis[runtime]
@@ -270,6 +311,19 @@ def main():
                                "--bottle-mirror", generation / "input/bottles",
                                "--tag", tag, "--target-os", target_os, "--architecture", arch,
                                "--base-url", f"{base}/{runtime}/bottles"], env)
+                if catalog_input:
+                    for directory in ("manifests", "bottles"):
+                        source_dir = catalog_input / directory
+                        destination_dir = generation / "input" / directory
+                        for source_file in source_dir.iterdir():
+                            destination_file = destination_dir / source_file.name
+                            if destination_file.exists():
+                                if destination_file.read_bytes() != source_file.read_bytes():
+                                    raise RuntimeError(
+                                        f"Catalog and pinned acceptance inputs conflict at {source_file.name}"
+                                    )
+                            else:
+                                os.link(source_file, destination_file)
                 state, msix = generation / "state", generation / "brew.msix"
                 run(cli + ["repository", "build", "--input", generation / "input", "--state", state], env)
                 run(cli + ["repository", "package", "--state", state, "--name", "Pinget.HomebrewSource",
@@ -278,6 +332,7 @@ def main():
                 run(cli + ["repository", "publish", "--state", state, "--destination", public / runtime,
                            "--msix", msix, "--psign-tool", psign, "--trusted-ca", work / "root.pem"], env)
                 report["checks"].append(f"{runtime} signed publishing generation {rebuild}")
+                shutil.rmtree(generation)
 
             for runtime in clis:
                 publish(runtime, 0)
@@ -382,6 +437,24 @@ def main():
                 finally:
                     package.write_bytes(original)
                 report["checks"].append(f"{consumer}/{publisher}: tamper rejection preserves active cache")
+            for index, formula in enumerate(catalog_roots):
+                consumer, publisher, app, client_env = clients[index % len(clients)]
+                cli = clis[consumer]
+                run(cli + ["install", formula, "--source", "homebrew", "--silent",
+                           "--accept-package-agreements"], client_env, timeout=600)
+                receipt = None
+                for path in (app / "homebrew/receipts").glob("*.json"):
+                    candidate = json.loads(path.read_text())
+                    if candidate.get("Package", {}).get("Formula") == formula:
+                        receipt = candidate
+                        break
+                if receipt is None:
+                    raise RuntimeError(f"Catalog package {formula} installed without a Homebrew receipt")
+                if not (app / "homebrew/opt" / formula).is_symlink():
+                    raise RuntimeError(f"Catalog package {formula} did not create its private opt link")
+                report["checks"].append(
+                    f"{consumer}/{publisher}: installed real catalog bottle {formula} {receipt['Package']['KegVersion']}"
+                )
             succeeded = True
         finally:
             if server and server_thread:

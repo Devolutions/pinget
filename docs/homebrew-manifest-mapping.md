@@ -31,7 +31,7 @@ private prefix without Homebrew, Ruby, source builds, or formula hooks.
 | Renamed formula names | `Pinget.Homebrew.OldNames` | Preserve Homebrew old names; do not silently make them Pinget IDs or aliases. |
 | Runtime formula dependencies | `Installers[].Dependencies.PackageDependencies` | Exact derived package IDs; curated OCI receipt minima use `<pkg_version>.bottle.<bottle_rebuild>`. Dependencies install first and prevent ordinary dependency removal while dependents remain. Build/test dependencies are not installed. |
 | Keg-only formula | `Pinget.Homebrew.KegOnly` | Do not create default command links for a keg-only formula. |
-| Relocation classification | `Pinget.Homebrew.Bottles[].Relocation` | Retains `any`, `any_skip_relocation`, or `fixed`. `any` and `any_skip_relocation` are not interchangeable; fixed-prefix bottles must be rejected unless their actual relocation is supported. |
+| Relocation classification | `Pinget.Homebrew.Bottles[].Relocation` | Retains `any`, `any_skip_relocation`, or the exact supported fixed cellar path. Supported paths are target-bound (`/opt/homebrew/Cellar`, `/usr/local/Cellar`, or `/home/linuxbrew/.linuxbrew/Cellar`); unknown or mismatched paths are rejected. |
 | macOS product-version requirements | `MinimumOSVersion`, `MaximumOSVersion` | Product version, not Darwin kernel version. These fields are valid only for macOS targets. |
 | Linux ABI requirements | `MinimumGlibc`, `Loader` | Retain glibc and loader constraints; these fields are valid only for Linux targets. Unknown requirements are not guessed. |
 | SPDX license | `License` | Preserve the upstream SPDX expression when present. |

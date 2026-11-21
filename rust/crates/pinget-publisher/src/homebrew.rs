@@ -331,11 +331,15 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
         ));
     }
     let cellar = text(selected, "cellar")?;
-    if !matches!(cellar, "any" | "any_skip_relocation") {
-        return Err(invalid(
-            "fixed-cellar bottles are unsupported; select any or any_skip_relocation",
-        ));
-    }
+    let relocation = match cellar {
+        "any" | "any_skip_relocation" => cellar,
+        fixed if Some(fixed) == pinget_core::HomebrewBottleMetadata::fixed_cellar_for_tag(&options.tag) => fixed,
+        _ => {
+            return Err(invalid(
+                "fixed-cellar bottle path does not match the selected native target",
+            ));
+        }
+    };
     let description = optional_text(&formula, "desc", 4096)?;
     let homepage = optional_text(&formula, "homepage", 2048)?;
     if homepage.is_some_and(|url| !public_url(url)) {
@@ -381,7 +385,7 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
             "UpstreamVersion": upstream, "Revision": revision, "VersionScheme": version_scheme,
             "KegOnly": keg_only, "Aliases": lists[0], "OldNames": lists[1],
             "Bottles": [{"Url": url, "Sha256": sha256, "TargetOS": options.target_os, "Architecture": options.architecture,
-                "BottleTag": options.tag, "Rebuild": rebuild, "Relocation": cellar}]}}
+                "BottleTag": options.tag, "Rebuild": rebuild, "Relocation": relocation}]}}
     });
     if options.target_os == "Linux" {
         let minimum = text(selected, "minimum_glibc")?;
@@ -395,6 +399,7 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
                 "Linux bottle requires curated minimum_glibc and loader=glibc from its OCI receipt metadata",
             ));
         }
+
         manifest["Pinget"]["Homebrew"]["Bottles"][0]["MinimumGlibc"] = json!(minimum);
         manifest["Pinget"]["Homebrew"]["Bottles"][0]["Loader"] = json!("glibc");
     } else {

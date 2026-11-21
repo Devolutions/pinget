@@ -411,6 +411,14 @@ public record HomebrewBottleMetadata
     public string? MaximumOSVersion { get; init; }
     public string? MinimumGlibc { get; init; }
     public string? Loader { get; init; }
+
+    public static string? FixedCellarForTag(string tag) => tag switch
+    {
+        "arm64_sonoma" => "/opt/homebrew/Cellar",
+        "sonoma" => "/usr/local/Cellar",
+        "x86_64_linux" or "aarch64_linux" => "/home/linuxbrew/.linuxbrew/Cellar",
+        _ => null,
+    };
 }
 
 public static class HomebrewPackageIds
