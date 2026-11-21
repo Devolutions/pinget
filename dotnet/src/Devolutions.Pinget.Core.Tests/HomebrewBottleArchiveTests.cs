@@ -52,6 +52,83 @@ public sealed class HomebrewBottleArchiveTests
     }
 
     [Fact]
+    public void Extract_ResolvesInternalSymlinkChainsIndependentOfArchiveOrder()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        using var fixture = new Fixture();
+        fixture.Write(
+            new PaxTarEntry(TarEntryType.SymbolicLink, "sample/1.0/lib/libshort.dylib") { LinkName = "libmajor.dylib" },
+            new PaxTarEntry(TarEntryType.SymbolicLink, "sample/1.0/lib/libmajor.dylib") { LinkName = "libreal.dylib" },
+            new PaxTarEntry(TarEntryType.RegularFile, "sample/1.0/lib/libreal.dylib") { DataStream = new MemoryStream("library"u8.ToArray()) });
+        HomebrewBottleArchive.Extract(fixture.Archive, fixture.Keg, "sample", "1.0");
+        var directory = Path.Combine(fixture.Keg, "lib");
+        Assert.Equal("libmajor.dylib", new FileInfo(Path.Combine(directory, "libshort.dylib")).LinkTarget);
+        Assert.Equal("library", File.ReadAllText(Path.Combine(directory, "libshort.dylib")));
+    }
+
+    [Fact]
+    public void Extract_RejectsDanglingEscapingAndCyclicLinkChains()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        using (var fixture = new Fixture())
+        {
+            fixture.Write(new PaxTarEntry(TarEntryType.SymbolicLink, "sample/1.0/link") { LinkName = "missing" });
+            Assert.Throws<InvalidDataException>(() => HomebrewBottleArchive.Extract(fixture.Archive, fixture.Keg, "sample", "1.0"));
+        }
+        using (var fixture = new Fixture())
+        {
+            fixture.Write(
+                new PaxTarEntry(TarEntryType.SymbolicLink, "sample/1.0/first") { LinkName = "second" },
+                new PaxTarEntry(TarEntryType.SymbolicLink, "sample/1.0/second") { LinkName = "../../escape" });
+            Assert.Throws<InvalidDataException>(() => HomebrewBottleArchive.Extract(fixture.Archive, fixture.Keg, "sample", "1.0"));
+        }
+        using (var fixture = new Fixture())
+        {
+            fixture.Write(
+                new PaxTarEntry(TarEntryType.SymbolicLink, "sample/1.0/first") { LinkName = "second" },
+                new PaxTarEntry(TarEntryType.SymbolicLink, "sample/1.0/second") { LinkName = "first" });
+            Assert.Throws<InvalidDataException>(() => HomebrewBottleArchive.Extract(fixture.Archive, fixture.Keg, "sample", "1.0"));
+        }
+    }
+
+    [Fact]
+    public void Extract_AcceptsThirtyTwoLinksAndRejectsThirtyThree()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        using (var fixture = new Fixture())
+        {
+            fixture.Write(LinkChain(32));
+            HomebrewBottleArchive.Extract(fixture.Archive, fixture.Keg, "sample", "1.0");
+            Assert.Equal("payload", File.ReadAllText(Path.Combine(fixture.Keg, "0")));
+        }
+        using (var fixture = new Fixture())
+        {
+            fixture.Write(LinkChain(33));
+            Assert.Throws<InvalidDataException>(() =>
+                HomebrewBottleArchive.Extract(fixture.Archive, fixture.Keg, "sample", "1.0"));
+        }
+
+        static TarEntry[] LinkChain(int depth)
+        {
+            var links = Enumerable.Range(0, depth)
+                .Select(index => (TarEntry)new PaxTarEntry(
+                    TarEntryType.SymbolicLink, $"sample/1.0/{index}")
+                {
+                    LinkName = index + 1 == depth ? "real" : (index + 1).ToString(),
+                })
+                .ToList();
+            links.Add(new PaxTarEntry(TarEntryType.RegularFile, "sample/1.0/real")
+            {
+                DataStream = new MemoryStream("payload"u8.ToArray()),
+            });
+            return links.ToArray();
+        }
+    }
+
+    [Fact]
     public void Relocate_TextDoesNotRelocateTheInsertedPrefixTwice()
     {
         using var fixture = new Fixture();

@@ -220,7 +220,7 @@ def main():
     # Windows exercises cross-platform publishing and signature verification, not client consumption.
     if platform.system() == "Windows":
         arch, target_os, tag = "x64", "Linux", "x86_64_linux"
-    catalog_tag = ("arm64_sequoia" if arch == "arm64" else "sequoia") if target_os == "macOS" else tag
+    catalog_tag = tag
     clis = {"rust": [args.rust_cli.resolve()], "dotnet": ["dotnet", args.dotnet_assembly.resolve()]}
     # Resolve the platform executable name (for example psign-tool.exe on Windows).
     psign_path = shutil.which(args.psign_tool.name, path=str(args.psign_tool.resolve().parent))

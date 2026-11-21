@@ -5,6 +5,8 @@ namespace Devolutions.Pinget.Core;
 
 internal static class HomebrewBottleArchive
 {
+    private const int MaxSymlinkDepth = 32;
+
     internal static IReadOnlyList<string> Extract(string archivePath, string destination, string formula, string version)
     {
         var root = Path.GetFullPath(destination);
@@ -15,6 +17,8 @@ internal static class HomebrewBottleArchive
         var links = new List<(string Path, string Target, bool Hard)>();
         var names = new HashSet<string>(StringComparer.Ordinal);
         var parents = new HashSet<string>(StringComparer.Ordinal);
+        var regularFiles = new HashSet<string>(StringComparer.Ordinal);
+        var validTargets = new HashSet<string>(StringComparer.Ordinal);
         long expandedSize = 0;
         Directory.CreateDirectory(root);
         using var input = File.OpenRead(archivePath);
@@ -46,6 +50,7 @@ internal static class HomebrewBottleArchive
             {
                 case TarEntryType.Directory:
                     Directory.CreateDirectory(path);
+                    validTargets.Add(relative);
                     break;
                 case TarEntryType.RegularFile:
                 case TarEntryType.V7RegularFile:
@@ -55,6 +60,8 @@ internal static class HomebrewBottleArchive
                     if (!OperatingSystem.IsWindows())
                         File.SetUnixFileMode(path, entry.Mode & (UnixFileMode)0x1FF);
                     files.Add(path);
+                    regularFiles.Add(relative);
+                    validTargets.Add(relative);
                     break;
                 case TarEntryType.SymbolicLink:
                 case TarEntryType.HardLink:
@@ -64,9 +71,12 @@ internal static class HomebrewBottleArchive
                     throw new InvalidDataException($"Unsupported bottle entry type: {entry.EntryType}");
             }
         }
+        validTargets.UnionWith(parents);
+        var linkTargets = new Dictionary<string, (string Target, bool Hard)>(StringComparer.Ordinal);
         foreach (var link in links)
         {
-            if (parents.Contains(Path.GetRelativePath(root, link.Path).Replace(Path.DirectorySeparatorChar, '/')))
+            var relative = Path.GetRelativePath(root, link.Path).Replace(Path.DirectorySeparatorChar, '/');
+            if (parents.Contains(relative))
                 throw new InvalidDataException($"Bottle places an entry below a symbolic link: {link.Path}");
             if (Path.IsPathRooted(link.Target) || link.Target.Contains('\\'))
                 throw new InvalidDataException($"Unsafe bottle link target: {link.Target}");
@@ -77,31 +87,76 @@ internal static class HomebrewBottleArchive
                 : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(link.Path)!, link.Target));
             if (!target.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal))
                 throw new InvalidDataException($"Bottle link escapes its keg: {link.Target}");
-            for (var current = target; current != root; current = Path.GetDirectoryName(current)!)
-            {
-                if (new FileInfo(current).LinkTarget is not null)
-                    throw new InvalidDataException($"Bottle link target traverses another link: {link.Target}");
-            }
-            if (!File.Exists(target) && !Directory.Exists(target))
-                throw new InvalidDataException($"Bottle link target does not exist: {link.Target}");
+            var targetRelative = Path.GetRelativePath(root, target).Replace(Path.DirectorySeparatorChar, '/');
+            linkTargets.Add(relative, (targetRelative, link.Hard));
+        }
+        var resolvedTargets = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var link in links)
+        {
+            var relative = Path.GetRelativePath(root, link.Path).Replace(Path.DirectorySeparatorChar, '/');
+            var resolved = ResolveLinkTarget(linkTargets[relative].Target, linkTargets, validTargets);
+            if (link.Hard && !regularFiles.Contains(resolved))
+                throw new InvalidDataException($"Hard link has no regular-file target: {link.Target}");
+            resolvedTargets.Add(relative, resolved);
+        }
+        foreach (var link in links.Where(link => link.Hard))
+        {
+            var relative = Path.GetRelativePath(root, link.Path).Replace(Path.DirectorySeparatorChar, '/');
+            var target = ChildPath(root, resolvedTargets[relative]);
             Directory.CreateDirectory(Path.GetDirectoryName(link.Path)!);
-            if (link.Hard)
-            {
-                if (!File.Exists(target) || new FileInfo(target).LinkTarget is not null)
-                    throw new InvalidDataException($"Bottle hard link has no regular-file target: {link.Target}");
-                File.Copy(target, link.Path, overwrite: false);
-                if (!OperatingSystem.IsWindows())
-                    File.SetUnixFileMode(link.Path, File.GetUnixFileMode(target));
-                files.Add(link.Path);
-            }
-            else
-            {
-                File.CreateSymbolicLink(link.Path, link.Target);
-            }
+            File.Copy(target, link.Path, overwrite: false);
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(link.Path, File.GetUnixFileMode(target));
+            files.Add(link.Path);
+        }
+        foreach (var link in links.Where(link => !link.Hard))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(link.Path)!);
+            File.CreateSymbolicLink(link.Path, link.Target);
         }
         if (files.Count == 0)
             throw new InvalidDataException("Bottle contains no files.");
         return files;
+    }
+
+    private static string ResolveLinkTarget(
+        string target,
+        IReadOnlyDictionary<string, (string Target, bool Hard)> links,
+        ISet<string> validTargets)
+    {
+        var pending = new Queue<string>(target.Split('/'));
+        var resolved = new List<string>();
+        var traversals = 1;
+        while (pending.TryDequeue(out var component))
+        {
+            if (component is "" or ".")
+                continue;
+            if (component == "..")
+            {
+                if (resolved.Count == 0)
+                    throw new InvalidDataException($"Bottle link target escapes its keg: {target}");
+                resolved.RemoveAt(resolved.Count - 1);
+                continue;
+            }
+            resolved.Add(component);
+            var current = string.Join('/', resolved);
+            if (links.TryGetValue(current, out var nested))
+            {
+                if (++traversals > MaxSymlinkDepth)
+                    throw new InvalidDataException($"Bottle link chain is cyclic or exceeds {MaxSymlinkDepth} links: {target}");
+                var expanded = new Queue<string>(nested.Target.Split('/'));
+                while (pending.TryDequeue(out var remainder))
+                    expanded.Enqueue(remainder);
+                pending = expanded;
+                resolved.Clear();
+            }
+            else if (pending.Count > 0 && !validTargets.Contains(current))
+                throw new InvalidDataException($"Bottle link target traverses a missing or non-directory entry: {target}");
+        }
+        var result = string.Join('/', resolved);
+        if (!validTargets.Contains(result))
+            throw new InvalidDataException($"Bottle link target does not exist: {target}");
+        return result;
     }
 
     internal static string ChildPath(string root, string relative)

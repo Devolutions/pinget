@@ -1,10 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
+
+const MAX_SYMLINK_DEPTH: usize = 32;
 
 pub(crate) fn extract(archive: &Path, destination: &Path, formula: &str, version: &str) -> Result<Vec<PathBuf>> {
     if destination.exists() {
@@ -19,6 +21,8 @@ pub(crate) fn extract(archive: &Path, destination: &Path, formula: &str, version
     let mut links = Vec::new();
     let mut names = HashSet::new();
     let mut parents = HashSet::new();
+    let mut regular_files = HashSet::new();
+    let mut valid_targets = HashSet::new();
     let mut expanded_size = 0u64;
     let mut tar = tar::Archive::new(GzDecoder::new(fs::File::open(archive)?));
     for entry in tar.entries()? {
@@ -34,9 +38,10 @@ pub(crate) fn extract(archive: &Path, destination: &Path, formula: &str, version
         }
         let relative = name
             .strip_prefix(&expected)
-            .context("Bottle entry is outside the expected keg")?;
-        let target = child_path(destination, relative)?;
-        if !names.insert(relative.to_owned()) || names.len() > 100_000 {
+            .context("Bottle entry is outside the expected keg")?
+            .to_owned();
+        let target = child_path(destination, &relative)?;
+        if !names.insert(relative.clone()) || names.len() > 100_000 {
             bail!("Duplicate or excessive bottle entry: {name}");
         }
         for (index, _) in relative.match_indices('/') {
@@ -50,6 +55,7 @@ pub(crate) fn extract(archive: &Path, destination: &Path, formula: &str, version
         }
         let kind = entry.header().entry_type();
         if kind.is_dir() {
+            valid_targets.insert(PathBuf::from(&relative));
             fs::create_dir_all(target)?;
         } else if kind.is_file() {
             fs::create_dir_all(target.parent().context("Bottle file has no parent")?)?;
@@ -60,23 +66,29 @@ pub(crate) fn extract(archive: &Path, destination: &Path, formula: &str, version
                 use std::os::unix::fs::PermissionsExt as _;
                 fs::set_permissions(&target, fs::Permissions::from_mode(entry.header().mode()? & 0o777))?;
             }
+            regular_files.insert(PathBuf::from(&relative));
+            valid_targets.insert(PathBuf::from(&relative));
             files.push(target);
         } else if kind.is_symlink() || kind.is_hard_link() {
             let link = entry.link_name()?.context("Bottle link has no target")?.into_owned();
-            links.push((relative.to_owned(), target, link, kind.is_hard_link()));
+            links.push((relative, target, link, kind.is_hard_link()));
         } else {
             bail!("Unsupported bottle entry type: {kind:?}");
         }
     }
-    for (relative, path, link, hard) in links {
-        if parents.contains(&relative) {
+    for parent in &parents {
+        valid_targets.insert(PathBuf::from(parent));
+    }
+    let mut link_targets = HashMap::new();
+    for (relative, path, link, hard) in &links {
+        if parents.contains(relative.as_str()) {
             bail!("Bottle places an entry below a symbolic link: {relative}");
         }
         let link_text = link.to_str().context("Bottle link is not UTF-8")?;
         if link.is_absolute() || link_text.contains('\\') {
             bail!("Unsafe bottle link target: {link_text}");
         }
-        let target = if hard {
+        let target = if *hard {
             child_path(
                 destination,
                 link_text
@@ -84,33 +96,107 @@ pub(crate) fn extract(archive: &Path, destination: &Path, formula: &str, version
                     .context("Bottle hard link is outside its keg")?,
             )?
         } else {
-            normalize_link(destination, path.parent().context("Bottle link has no parent")?, &link)?
+            normalize_link(destination, path.parent().context("Bottle link has no parent")?, link)?
         };
-        let mut current = target.as_path();
-        while current != destination {
-            if fs::symlink_metadata(current)?.file_type().is_symlink() {
-                bail!("Bottle link target traverses another link: {link_text}");
-            }
-            current = current.parent().context("Bottle link target escapes its keg")?;
+        let target = target
+            .strip_prefix(destination)
+            .context("Bottle link target escapes its keg")?
+            .to_path_buf();
+        link_targets.insert(PathBuf::from(relative), (target, *hard));
+    }
+    let mut resolved_targets = HashMap::new();
+    for (relative, _, link, hard) in &links {
+        let link_text = link.to_str().context("Bottle link is not UTF-8")?;
+        let link_path = PathBuf::from(relative);
+        let target = link_targets
+            .get(&link_path)
+            .map(|(target, _)| target)
+            .context("Bottle link has no normalized target")?;
+        let resolved = resolve_link_target(target, &link_targets, &valid_targets)?;
+        if *hard && !regular_files.contains(&resolved) {
+            bail!("Bottle hard link has no regular-file target: {link_text}");
         }
+        resolved_targets.insert(link_path, resolved);
+    }
+    for (relative, path, _, _) in links.iter().filter(|(_, _, _, hard)| *hard) {
+        let resolved = resolved_targets
+            .get(&PathBuf::from(relative))
+            .context("Bottle hard link has no resolved target")?;
+        let target = destination.join(resolved);
         fs::create_dir_all(path.parent().context("Bottle link has no parent")?)?;
-        if hard {
-            if !target.is_file() {
-                bail!("Bottle hard link has no regular-file target: {link_text}");
-            }
-            fs::copy(target, &path)?;
-            files.push(path);
-        } else {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(link, path)?;
-            #[cfg(not(unix))]
-            bail!("Native bottle installation requires Linux or macOS");
+        fs::copy(target, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(
+                path,
+                fs::Permissions::from_mode(fs::metadata(destination.join(resolved))?.permissions().mode()),
+            )?;
         }
+        files.push(path.clone());
+    }
+    for (_, path, link, _) in links.iter().filter(|(_, _, _, hard)| !*hard) {
+        fs::create_dir_all(path.parent().context("Bottle link has no parent")?)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(link, path)?;
+        #[cfg(not(unix))]
+        bail!("Native bottle installation requires Linux or macOS");
     }
     if files.is_empty() {
         bail!("Bottle contains no files");
     }
     Ok(files)
+}
+
+fn resolve_link_target(
+    target: &Path,
+    links: &HashMap<PathBuf, (PathBuf, bool)>,
+    valid_targets: &HashSet<PathBuf>,
+) -> Result<PathBuf> {
+    let mut pending: VecDeque<_> = target
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect();
+    let mut resolved = PathBuf::new();
+    let mut traversals = 1;
+    while let Some(component) = pending.pop_front() {
+        match component.to_str() {
+            Some(".") => continue,
+            Some("..") => {
+                if !resolved.pop() {
+                    bail!("Bottle link target escapes its keg: {}", target.display());
+                }
+                continue;
+            }
+            Some(value) => resolved.push(value),
+            None => bail!("Bottle link target is not UTF-8"),
+        }
+        if let Some((link_target, _)) = links.get(&resolved) {
+            traversals += 1;
+            if traversals > MAX_SYMLINK_DEPTH {
+                bail!(
+                    "Bottle link chain is cyclic or exceeds {MAX_SYMLINK_DEPTH} links: {}",
+                    target.display()
+                );
+            }
+            let mut expanded: VecDeque<_> = link_target
+                .components()
+                .map(|part| part.as_os_str().to_owned())
+                .collect();
+            expanded.append(&mut pending);
+            pending = expanded;
+            resolved.clear();
+        } else if !pending.is_empty() && !valid_targets.contains(&resolved) {
+            bail!(
+                "Bottle link target traverses a missing or non-directory entry: {}",
+                target.display()
+            );
+        }
+    }
+    if !valid_targets.contains(&resolved) {
+        bail!("Bottle link target does not exist: {}", target.display());
+    }
+    Ok(resolved)
 }
 
 fn child_path(root: &Path, relative: &str) -> Result<PathBuf> {
@@ -369,6 +455,63 @@ pub(crate) mod tests {
         assert_eq!(files.len(), 1);
         assert_ne!(fs::metadata(&files[0])?.permissions().mode() & 0o100, 0);
         assert_eq!(fs::read_link(fixture.0.join("keg/bin/alias"))?, Path::new("sample"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_internal_symlink_chains_independent_of_archive_order() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.write(&[
+            ("sample/1.0/lib/libshort.dylib", Some("libmajor.dylib")),
+            ("sample/1.0/lib/libmajor.dylib", Some("libreal.dylib")),
+            ("sample/1.0/lib/libreal.dylib", None),
+        ])?;
+        fixture.extract()?;
+        let directory = fixture.0.join("keg/lib");
+        assert_eq!(
+            fs::read_link(directory.join("libshort.dylib"))?,
+            Path::new("libmajor.dylib")
+        );
+        assert_eq!(fs::read(directory.join("libshort.dylib"))?, b"x");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_dangling_escaping_and_cyclic_symlink_chains() -> Result<()> {
+        for entries in [
+            vec![("sample/1.0/link", Some("missing"))],
+            vec![
+                ("sample/1.0/first", Some("second")),
+                ("sample/1.0/second", Some("../../escape")),
+            ],
+            vec![
+                ("sample/1.0/first", Some("second")),
+                ("sample/1.0/second", Some("first")),
+            ],
+        ] {
+            let fixture = Fixture::new()?;
+            fixture.write(&entries)?;
+            assert!(fixture.extract().is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_at_most_thirty_two_symlinks() -> Result<()> {
+        for (depth, accepted) in [(MAX_SYMLINK_DEPTH, true), (MAX_SYMLINK_DEPTH + 1, false)] {
+            let mut links = HashMap::new();
+            for index in 0..depth {
+                let target = if index + 1 == depth {
+                    PathBuf::from("lib/real")
+                } else {
+                    PathBuf::from(format!("lib/{}", index + 1))
+                };
+                links.insert(PathBuf::from(format!("lib/{index}")), (target, false));
+            }
+            let valid = HashSet::from([PathBuf::from("lib"), PathBuf::from("lib/real")]);
+            let result = resolve_link_target(Path::new("lib/1"), &links, &valid);
+            assert_eq!(result.is_ok(), accepted, "symlink depth {depth}");
+        }
         Ok(())
     }
 
