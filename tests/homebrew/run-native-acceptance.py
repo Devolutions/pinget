@@ -102,28 +102,60 @@ def curate(work, tag):
     return formulas
 
 
+CERTIFICATE_CONFIG = """[req]
+distinguished_name = dn
+prompt = no
+[dn]
+[root]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+[signer]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = codeSigning
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+[server]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+"""
+
+
 def certificates(work, openssl):
+    # A self-contained config keeps OpenSSL and macOS LibreSSL from merging default
+    # extensions into these certificates; Apple rejects duplicate extensions.
+    config = work / "certificates.cnf"
+    config.write_text(CERTIFICATE_CONFIG)
+    env = {**os.environ, "OPENSSL_CONF": str(config)}
     root = work / "root.pem"
-    run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-         "-subj", "/CN=Pinget Homebrew Disposable Root", "-keyout", work / "root.key",
-         "-out", root, "-addext", "basicConstraints=critical,CA:TRUE",
-         "-addext", "keyUsage=critical,keyCertSign,cRLSign"])
-    for name, subject, extensions in [
-        ("signer", f"/{PUBLISHER}", "extendedKeyUsage=codeSigning\n"),
-        ("server", "/CN=localhost",
-         "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n"),
-    ]:
-        (work / f"{name}.ext").write_text(
-            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n" + extensions
-        )
-        run([openssl, "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", subject,
-             "-keyout", work / f"{name}.key", "-out", work / f"{name}.csr"])
-        run([openssl, "x509", "-req", "-in", work / f"{name}.csr", "-CA", root,
-             "-CAkey", work / "root.key", "-CAcreateserial", "-days", "1",
-             "-extfile", work / f"{name}.ext", "-out", work / f"{name}.pem"])
+    run([openssl, "req", "-config", config, "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256",
+         "-days", "1", "-subj", "/CN=Pinget Homebrew Disposable Root", "-extensions", "root",
+         "-keyout", work / "root.key", "-out", root], env)
+    for serial, (name, subject) in enumerate(
+        [("signer", f"/{PUBLISHER}"), ("server", "/CN=localhost")], start=2
+    ):
+        run([openssl, "req", "-config", config, "-new", "-newkey", "rsa:2048", "-nodes", "-sha256",
+             "-subj", subject, "-keyout", work / f"{name}.key", "-out", work / f"{name}.csr"], env)
+        run([openssl, "x509", "-req", "-sha256", "-in", work / f"{name}.csr", "-CA", root,
+             "-CAkey", work / "root.key", "-set_serial", serial, "-days", "1",
+             "-extfile", config, "-extensions", name, "-out", work / f"{name}.pem"], env)
+    for name in ("root", "signer", "server"):
+        text = run([openssl, "x509", "-in", work / f"{name}.pem", "-noout", "-text"], env)
+        names = [line.strip() for line in text.splitlines() if line.strip().startswith("X509v3 ")]
+        if len(names) != len(set(names)):
+            raise RuntimeError(f"{name} certificate has duplicate extensions: {names}")
+    if platform.system() == "Darwin":
+        # Fail early with Apple's own policy verdict instead of an opaque TLS handshake error.
+        run(["security", "verify-cert", "-c", work / "server.pem", "-r", root, "-p", "ssl",
+             "-s", "localhost", "-L", "-l"])
     run([openssl, "pkcs12", "-export", "-inkey", work / "signer.key",
          "-in", work / "signer.pem", "-certfile", root, "-passout", "pass:",
-         "-out", work / "signer.pfx"])
+         "-out", work / "signer.pfx"], env)
 
 
 def private_dependencies(app, env):
@@ -169,7 +201,11 @@ def main():
     if platform.system() == "Windows":
         arch, target_os, tag = "x64", "Linux", "x86_64_linux"
     clis = {"rust": [args.rust_cli.resolve()], "dotnet": ["dotnet", args.dotnet_assembly.resolve()]}
-    psign = args.psign_tool.resolve()
+    # Resolve the platform executable name (for example psign-tool.exe on Windows).
+    psign_path = shutil.which(args.psign_tool.name, path=str(args.psign_tool.resolve().parent))
+    if not psign_path:
+        raise RuntimeError(f"Psign tool not found: {args.psign_tool}")
+    psign = Path(psign_path).resolve()
     report = {"platform": platform.platform(), "architecture": arch, "success": False, "checks": []}
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n")

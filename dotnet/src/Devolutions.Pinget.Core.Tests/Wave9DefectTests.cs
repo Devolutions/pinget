@@ -9,10 +9,6 @@ namespace Devolutions.Pinget.Core.Tests;
 /// <summary>Wave 9 (sources and HTTP, round 2) regression tests.</summary>
 public class Wave9DefectTests
 {
-    private const string InformationJson = """
-        {"Data":{"SourceIdentifier":"Test.Rest","ServerSupportedVersions":["1.10.0"],"RequiredPackageMatchFields":[],"UnsupportedPackageMatchFields":[]}}
-        """;
-
     /// <summary>In-process HTTP stub: answers each request from a handler and records the request URIs.</summary>
     private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
     {
