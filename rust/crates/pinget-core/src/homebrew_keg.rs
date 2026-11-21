@@ -188,6 +188,66 @@ pub(crate) fn installed_packages(app_root: &Path, scope: Option<&str>) -> Result
         .collect()
 }
 
+/// Durable write-ahead journal shared with the .NET runtime. Its presence means a mutation of the
+/// prefix may be incomplete; `Prepared` is rolled back and `Committed` is finished on recovery.
+const JOURNAL: &str = "transaction.json";
+/// Test-only seam: `<formula>:<step>` terminates the process at that step to simulate a crash.
+const INTERRUPT_VARIABLE: &str = "PINGET_HOMEBREW_TEST_INTERRUPT";
+const PREPARED: &str = "Prepared";
+const COMMITTED: &str = "Committed";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LinkChange {
+    before: Option<String>,
+    after: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Transaction {
+    schema_version: u32,
+    operation: String,
+    state: String,
+    formula: String,
+    keg_version: String,
+    stage: Option<String>,
+    backup: Option<String>,
+    trash: Option<String>,
+    obsolete_keg_version: Option<String>,
+    links: BTreeMap<String, LinkChange>,
+    previous_receipt: Option<Receipt>,
+    receipt: Option<Receipt>,
+}
+
+#[derive(Debug)]
+struct Interrupted(String);
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "simulated interruption at {}", self.0)
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+#[cfg(test)]
+thread_local! {
+    static INTERRUPT_AT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn checkpoint(formula: &str, step: &str) -> Result<()> {
+    let point = format!("{formula}:{step}");
+    #[cfg(test)]
+    if INTERRUPT_AT.with(|value| value.borrow().as_deref() == Some(point.as_str())) {
+        return Err(Interrupted(point).into());
+    }
+    if std::env::var_os(INTERRUPT_VARIABLE).is_some_and(|value| value == point.as_str()) {
+        std::process::exit(86);
+    }
+    Ok(())
+}
+
 pub(crate) fn read_all(app_root: &Path) -> Result<Vec<Receipt>> {
     let root = prefix(app_root);
     if link_target(&root)?.is_some() {
@@ -197,6 +257,16 @@ pub(crate) fn read_all(app_root: &Path) -> Result<Vec<Receipt>> {
         return Ok(Vec::new());
     }
     check_directory(&root)?;
+    if fs::symlink_metadata(root.join(JOURNAL)).is_ok() {
+        // An active operation owns the journal; otherwise recover before reporting state.
+        if let Some(_lock) = try_lock(&root)? {
+            recover(&root, &mut Vec::new())?;
+        }
+    }
+    read_receipts(&root)
+}
+
+fn read_receipts(root: &Path) -> Result<Vec<Receipt>> {
     let directory = root.join("receipts");
     if link_target(&directory)?.is_some() {
         bail!("Homebrew receipts must not be a symbolic link: {}", directory.display());
@@ -218,16 +288,22 @@ pub(crate) fn read_all(app_root: &Path) -> Result<Vec<Receipt>> {
             bail!("Homebrew receipt must not be a symbolic link: {}", path.display());
         }
         let receipt: Receipt = serde_json::from_slice(&fs::read(&path)?)?;
-        validate(&receipt.package)?;
-        if receipt.schema_version != 1
-            || path.file_name().and_then(|name| name.to_str()) != Some(&format!("{}.json", receipt.package.formula))
-            || receipt.links.keys().any(|name| !is_command_link(name))
-        {
+        validate_receipt(&receipt)
+            .with_context(|| format!("Unsupported or invalid Homebrew receipt: {}", path.display()))?;
+        if path.file_name().and_then(|name| name.to_str()) != Some(&format!("{}.json", receipt.package.formula)) {
             bail!("Unsupported or invalid Homebrew receipt: {}", path.display());
         }
         receipts.push(receipt);
     }
     Ok(receipts)
+}
+
+fn validate_receipt(receipt: &Receipt) -> Result<()> {
+    validate(&receipt.package)?;
+    if receipt.schema_version != 1 || receipt.links.keys().any(|name| !is_command_link(name)) {
+        bail!("Unsupported or invalid Homebrew receipt");
+    }
+    Ok(())
 }
 
 pub(crate) fn install(app_root: &Path, archive: &Path, package: KegSpec, warnings: &mut Vec<String>) -> Result<()> {
@@ -236,12 +312,13 @@ pub(crate) fn install(app_root: &Path, archive: &Path, package: KegSpec, warning
     }
     validate(&package)?;
     let root = prepare(app_root)?;
-    with_lock(&root, || {
-        let receipts = read_all(app_root)?;
+    with_lock(&root, warnings, |warnings| {
+        let receipts = read_receipts(&root)?;
         let previous = receipts
             .iter()
-            .find(|receipt| receipt.package.formula == package.formula);
-        if previous.is_some_and(|receipt| {
+            .find(|receipt| receipt.package.formula == package.formula)
+            .cloned();
+        if previous.as_ref().is_some_and(|receipt| {
             receipt.package.package_identifier != package.package_identifier
                 || receipt.package.source_identifier != package.source_identifier
         }) {
@@ -262,11 +339,9 @@ pub(crate) fn install(app_root: &Path, archive: &Path, package: KegSpec, warning
         fs::create_dir_all(&formula_directory)?;
         check_directory(&formula_directory)?;
         let keg = formula_directory.join(&package.keg_version);
-        let stage = root.join(".staging").join(unique());
-        let backup = stage.with_extension("previous");
-        let mut links_before = BTreeMap::new();
-        let mut moved_keg = false;
-        let result = (|| -> Result<()> {
+        let stage_name = unique();
+        let stage = root.join(".staging").join(&stage_name);
+        let prepared = (|| -> Result<Transaction> {
             let files = homebrew_bottle::extract(archive, &stage, &package.formula, &package.keg_version)?;
             homebrew_bottle::relocate(&files, &root, &package.original_prefix)?;
             let mut links = BTreeMap::from([(
@@ -296,13 +371,17 @@ pub(crate) fn install(app_root: &Path, archive: &Path, package: KegSpec, warning
                     }
                 }
             }
-            let mut old_links = previous.map(|receipt| receipt.links.clone()).unwrap_or_default();
-            if let Some(previous) = previous {
+            let mut old_links = previous
+                .as_ref()
+                .map(|receipt| receipt.links.clone())
+                .unwrap_or_default();
+            if let Some(previous) = &previous {
                 old_links.insert(
                     format!("opt/{}", package.formula),
                     format!("../Cellar/{}/{}", package.formula, previous.package.keg_version),
                 );
             }
+            let mut changes = BTreeMap::new();
             for relative in links.keys().chain(old_links.keys()) {
                 let path = root.join(relative);
                 let target = link_target(&path)?;
@@ -310,65 +389,380 @@ pub(crate) fn install(app_root: &Path, archive: &Path, package: KegSpec, warning
                 if exists && (target.is_none() || target.as_ref() != old_links.get(relative)) {
                     bail!("Refusing to overwrite an unowned Homebrew link: {}", path.display());
                 }
-                links_before.insert(relative.clone(), target);
+                changes.insert(
+                    relative.clone(),
+                    LinkChange {
+                        before: target,
+                        after: links.get(relative).cloned(),
+                    },
+                );
             }
-            if fs::symlink_metadata(&keg).is_ok() {
-                if previous.is_none_or(|receipt| receipt.package.keg_version != package.keg_version)
+            let backup = if fs::symlink_metadata(&keg).is_ok() {
+                if previous
+                    .as_ref()
+                    .is_none_or(|receipt| receipt.package.keg_version != package.keg_version)
                     || fs::symlink_metadata(&keg)?.file_type().is_symlink()
                 {
                     bail!("Refusing to replace an unowned Homebrew keg: {}", keg.display());
                 }
-                fs::rename(&keg, &backup)?;
-            }
-            fs::rename(&stage, &keg)?;
-            moved_keg = true;
-            for relative in links_before.keys() {
-                if let Some(target) = links.get(relative) {
-                    set_link(&root.join(relative), target)?;
-                } else {
-                    fs::remove_file(root.join(relative))?;
-                }
-            }
-            let receipt = Receipt {
-                schema_version: 1,
-                package: package.clone(),
-                links: links.into_iter().filter(|(name, _)| is_command_link(name)).collect(),
+                Some(format!("{stage_name}.previous"))
+            } else {
+                None
             };
-            save_receipt(&root, &receipt)?;
-            Ok(())
+            Ok(Transaction {
+                schema_version: 1,
+                operation: "install".to_owned(),
+                state: PREPARED.to_owned(),
+                formula: package.formula.clone(),
+                keg_version: package.keg_version.clone(),
+                stage: Some(stage_name.clone()),
+                backup,
+                trash: None,
+                obsolete_keg_version: previous
+                    .as_ref()
+                    .map(|receipt| receipt.package.keg_version.clone())
+                    .filter(|version| *version != package.keg_version),
+                receipt: Some(Receipt {
+                    schema_version: 1,
+                    package: package.clone(),
+                    links: links.into_iter().filter(|(name, _)| is_command_link(name)).collect(),
+                }),
+                links: changes,
+                previous_receipt: previous.clone(),
+            })
         })();
-        if let Err(failure) = result {
-            let rollback = (|| -> Result<()> {
-                for (relative, target) in &links_before {
-                    if let Some(target) = target {
-                        set_link(&root.join(relative), target)?;
-                    } else {
-                        remove_link_if_present(&root.join(relative))?;
-                    }
-                }
-                if moved_keg {
-                    fs::remove_dir_all(&keg)?;
-                }
-                if backup.is_dir() {
-                    fs::rename(&backup, &keg)?;
-                }
-                Ok(())
-            })();
-            cleanup(&stage, warnings);
-            if let Err(rollback) = rollback {
-                bail!("Bottle installation failed: {failure:#}; rollback requires attention: {rollback:#}");
+        let transaction = match prepared {
+            Ok(transaction) => transaction,
+            Err(failure) => {
+                cleanup(&stage, warnings);
+                return Err(failure);
             }
-            return Err(failure);
-        }
-        cleanup(&stage, warnings);
-        cleanup(&backup, warnings);
-        if let Some(previous) = previous
-            && previous.package.keg_version != package.keg_version
-        {
-            cleanup(&formula_directory.join(&previous.package.keg_version), warnings);
+        };
+        run_transaction(&root, transaction, warnings, apply_install)?;
+        if let Some(previous) = &previous {
+            report_dependency_changes(&previous.package, &package, warnings);
         }
         Ok(())
     })
+}
+
+fn report_dependency_changes(previous: &KegSpec, current: &KegSpec, warnings: &mut Vec<String>) {
+    let added = current
+        .dependencies
+        .iter()
+        .filter(|dependency| !previous.dependencies.contains(dependency))
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed = previous
+        .dependencies
+        .iter()
+        .filter(|dependency| !current.dependencies.contains(dependency))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !added.is_empty() {
+        warnings.push(format!(
+            "{} now depends on: {}",
+            current.package_identifier,
+            added.join(", ")
+        ));
+    }
+    if !removed.is_empty() {
+        warnings.push(format!(
+            "{} no longer depends on: {}; those packages remain installed",
+            current.package_identifier,
+            removed.join(", ")
+        ));
+    }
+}
+
+fn apply_install(root: &Path, transaction: &Transaction) -> Result<()> {
+    let staging = root.join(".staging");
+    let formula_directory = root.join("Cellar").join(&transaction.formula);
+    let keg = formula_directory.join(&transaction.keg_version);
+    if let Some(backup) = &transaction.backup {
+        fs::rename(&keg, staging.join(backup))?;
+        sync_directory(&formula_directory)?;
+        sync_directory(&staging)?;
+        checkpoint(&transaction.formula, "install-backup")?;
+    }
+    let stage = transaction.stage.as_deref().context("Install journal has no stage")?;
+    fs::rename(staging.join(stage), &keg)?;
+    sync_directory(&formula_directory)?;
+    sync_directory(&staging)?;
+    checkpoint(&transaction.formula, "install-keg")?;
+    apply_links(root, transaction, "install-link")?;
+    save_receipt(
+        root,
+        transaction.receipt.as_ref().context("Install journal has no receipt")?,
+    )?;
+    checkpoint(&transaction.formula, "install-receipt")
+}
+
+fn apply_uninstall(root: &Path, transaction: &Transaction) -> Result<()> {
+    let staging = root.join(".staging");
+    let formula_directory = root.join("Cellar").join(&transaction.formula);
+    let trash = transaction.trash.as_deref().context("Uninstall journal has no trash")?;
+    fs::rename(formula_directory.join(&transaction.keg_version), staging.join(trash))?;
+    sync_directory(&formula_directory)?;
+    sync_directory(&staging)?;
+    checkpoint(&transaction.formula, "uninstall-trash")?;
+    apply_links(root, transaction, "uninstall-link")?;
+    fs::remove_file(root.join("receipts").join(format!("{}.json", transaction.formula)))?;
+    sync_directory(&root.join("receipts"))?;
+    checkpoint(&transaction.formula, "uninstall-receipt")
+}
+
+fn apply_links(root: &Path, transaction: &Transaction, step: &str) -> Result<()> {
+    for (index, (relative, change)) in transaction.links.iter().enumerate() {
+        let path = root.join(relative);
+        match &change.after {
+            Some(target) => set_link(root, &path, target)?,
+            None => remove_link_if_present(&path)?,
+        }
+        if index == 0 {
+            checkpoint(&transaction.formula, step)?;
+        }
+    }
+    for directory in ["opt", "bin", "sbin"] {
+        sync_directory(&root.join(directory))?;
+    }
+    Ok(())
+}
+
+fn run_transaction(
+    root: &Path,
+    mut transaction: Transaction,
+    warnings: &mut Vec<String>,
+    apply: fn(&Path, &Transaction) -> Result<()>,
+) -> Result<()> {
+    write_journal(root, &transaction)?;
+    let operation = transaction.operation.clone();
+    let result = checkpoint(&transaction.formula, &format!("{operation}-journal"))
+        .and_then(|()| apply(root, &transaction))
+        .and_then(|()| {
+            let mut committed = transaction.clone();
+            committed.state = COMMITTED.to_owned();
+            write_journal(root, &committed)
+        });
+    if let Err(failure) = result {
+        if failure.is::<Interrupted>() {
+            return Err(failure);
+        }
+        if let Err(rollback) = rollback(root, &transaction) {
+            bail!(
+                "Homebrew {operation} of {} failed: {failure:#}; rollback requires attention and the recovery journal was kept at {}: {rollback:#}",
+                transaction.formula,
+                root.join(JOURNAL).display()
+            );
+        }
+        return Err(failure);
+    }
+    transaction.state = COMMITTED.to_owned();
+    checkpoint(&transaction.formula, &format!("{operation}-commit"))?;
+    finish(root, &transaction, warnings)
+}
+
+fn recover(root: &Path, warnings: &mut Vec<String>) -> Result<()> {
+    let path = root.join(JOURNAL);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let unrecoverable = || {
+        format!(
+            "Unrecoverable Homebrew transaction journal; inspect {} manually",
+            path.display()
+        )
+    };
+    if !metadata.is_file() {
+        bail!("{}", unrecoverable());
+    }
+    let transaction: Transaction = serde_json::from_slice(&fs::read(&path)?).with_context(unrecoverable)?;
+    validate_transaction(&transaction).with_context(unrecoverable)?;
+    if transaction.state == PREPARED {
+        rollback(root, &transaction).with_context(|| {
+            format!(
+                "Could not roll back the interrupted Homebrew {} of {}; the journal was kept at {} for manual recovery",
+                transaction.operation,
+                transaction.formula,
+                path.display()
+            )
+        })?;
+        warnings.push(format!(
+            "Rolled back an interrupted Homebrew {} of {}",
+            transaction.operation, transaction.formula
+        ));
+    } else {
+        finish(root, &transaction, warnings)?;
+        warnings.push(format!(
+            "Completed an interrupted Homebrew {} of {}",
+            transaction.operation, transaction.formula
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transaction(transaction: &Transaction) -> Result<()> {
+    validate_component(&transaction.formula)?;
+    validate_component(&transaction.keg_version)?;
+    for name in [
+        &transaction.stage,
+        &transaction.backup,
+        &transaction.trash,
+        &transaction.obsolete_keg_version,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_component(name)?;
+    }
+    let install = transaction.operation == "install";
+    if transaction.schema_version != 1
+        || !matches!(transaction.state.as_str(), PREPARED | COMMITTED)
+        || (install && (transaction.stage.is_none() || transaction.receipt.is_none()))
+        || (!install
+            && (transaction.operation != "uninstall"
+                || transaction.trash.is_none()
+                || transaction.previous_receipt.is_none()))
+    {
+        bail!("Unsupported Homebrew transaction");
+    }
+    for receipt in [&transaction.previous_receipt, &transaction.receipt]
+        .into_iter()
+        .flatten()
+    {
+        validate_receipt(receipt)?;
+        if receipt.package.formula != transaction.formula {
+            bail!("Homebrew transaction receipt does not match its formula");
+        }
+    }
+    let opt = format!("opt/{}", transaction.formula);
+    if transaction
+        .links
+        .keys()
+        .any(|name| *name != opt && !is_command_link(name))
+    {
+        bail!("Homebrew transaction contains an unsupported link");
+    }
+    Ok(())
+}
+
+/// Restores the pre-transaction state. Every step is idempotent so recovery can itself be interrupted.
+fn rollback(root: &Path, transaction: &Transaction) -> Result<()> {
+    let staging = root.join(".staging");
+    for (relative, change) in &transaction.links {
+        let path = root.join(relative);
+        let current = entry_state(&path)?;
+        if current == change.before.clone().map(Some) {
+            continue;
+        }
+        if current != change.after.clone().map(Some) {
+            bail!(
+                "Homebrew link was changed outside Pinget during an interrupted operation: {}",
+                path.display()
+            );
+        }
+        match &change.before {
+            Some(target) => set_link(root, &path, target)?,
+            None => fs::remove_file(&path)?,
+        }
+    }
+    for directory in ["opt", "bin", "sbin"] {
+        sync_directory(&root.join(directory))?;
+    }
+    checkpoint(&transaction.formula, "rollback-links")?;
+    let formula_directory = root.join("Cellar").join(&transaction.formula);
+    let keg = formula_directory.join(&transaction.keg_version);
+    if transaction.operation == "install" {
+        match &transaction.backup {
+            Some(backup) => {
+                let backup = staging.join(backup);
+                if fs::symlink_metadata(&backup).is_ok() {
+                    remove_owned_directory(&keg)?;
+                    fs::rename(&backup, &keg)?;
+                }
+            }
+            None => remove_owned_directory(&keg)?,
+        }
+    } else if let Some(trash) = &transaction.trash {
+        let trash = staging.join(trash);
+        if fs::symlink_metadata(&trash).is_ok() {
+            if fs::symlink_metadata(&keg).is_ok() {
+                bail!(
+                    "A Homebrew keg reappeared during an interrupted uninstall: {}",
+                    keg.display()
+                );
+            }
+            fs::rename(&trash, &keg)?;
+        }
+    }
+    if formula_directory.is_dir() {
+        if transaction.previous_receipt.is_none() && fs::read_dir(&formula_directory)?.next().is_none() {
+            fs::remove_dir(&formula_directory)?;
+            sync_directory(&root.join("Cellar"))?;
+        } else {
+            sync_directory(&formula_directory)?;
+        }
+    }
+    match &transaction.previous_receipt {
+        Some(receipt) => save_receipt(root, receipt)?,
+        None => {
+            remove_link_if_present(&root.join("receipts").join(format!("{}.json", transaction.formula)))?;
+            sync_directory(&root.join("receipts"))?;
+        }
+    }
+    if let Some(stage) = &transaction.stage {
+        remove_tree_if_present(&staging.join(stage))?;
+    }
+    remove_journal(root)
+}
+
+/// Completes cleanup for a committed transaction; leftovers only produce warnings.
+fn finish(root: &Path, transaction: &Transaction, warnings: &mut Vec<String>) -> Result<()> {
+    let staging = root.join(".staging");
+    for name in [&transaction.stage, &transaction.backup, &transaction.trash]
+        .into_iter()
+        .flatten()
+    {
+        cleanup(&staging.join(name), warnings);
+    }
+    if let Some(obsolete) = &transaction.obsolete_keg_version
+        && *obsolete != transaction.keg_version
+    {
+        cleanup(&root.join("Cellar").join(&transaction.formula).join(obsolete), warnings);
+    }
+    remove_journal(root)
+}
+
+/// `None` = absent, `Some(None)` = non-link entry, `Some(Some(target))` = symbolic link.
+fn entry_state(path: &Path) -> Result<Option<Option<String>>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(Some(link_target(path)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_owned_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(fs::remove_dir_all(path)?),
+        Ok(_) => bail!(
+            "Homebrew keg was replaced outside Pinget during an interrupted operation: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_tree_if_present(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(fs::remove_dir_all(path)?),
+        Ok(_) => Ok(fs::remove_file(path)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) fn uninstall(app_root: &Path, package_id: &str, force: bool, warnings: &mut Vec<String>) -> Result<()> {
@@ -376,8 +770,8 @@ pub(crate) fn uninstall(app_root: &Path, package_id: &str, force: bool, warnings
         bail!("Native Homebrew bottles require Linux or macOS");
     }
     let root = prepare(app_root)?;
-    with_lock(&root, || {
-        let receipts = read_all(app_root)?;
+    with_lock(&root, warnings, |warnings| {
+        let receipts = read_receipts(&root)?;
         let receipt = receipts
             .iter()
             .find(|receipt| receipt.package.package_identifier == package_id)
@@ -411,25 +805,32 @@ pub(crate) fn uninstall(app_root: &Path, package_id: &str, force: bool, warnings
         let keg = root.join("Cellar").join(&package.formula).join(&package.keg_version);
         check_directory(keg.parent().context("Keg has no parent")?)?;
         check_directory(&keg)?;
-        let trash = root.join(".staging").join(format!("{}.uninstalled", unique()));
-        fs::rename(&keg, &trash)?;
-        let result = (|| -> Result<()> {
-            for relative in links.keys() {
-                fs::remove_file(root.join(relative))?;
-            }
-            fs::remove_file(root.join("receipts").join(format!("{}.json", package.formula)))?;
-            Ok(())
-        })();
-        if let Err(failure) = result {
-            fs::rename(&trash, &keg).with_context(|| format!("Uninstall failed: {failure:#}; rollback failed"))?;
-            for (relative, target) in &links {
-                set_link(&root.join(relative), target)
-                    .with_context(|| format!("Uninstall failed: {failure:#}; link rollback failed"))?;
-            }
-            return Err(failure);
-        }
-        cleanup(&trash, warnings);
-        Ok(())
+        let transaction = Transaction {
+            schema_version: 1,
+            operation: "uninstall".to_owned(),
+            state: PREPARED.to_owned(),
+            formula: package.formula.clone(),
+            keg_version: package.keg_version.clone(),
+            stage: None,
+            backup: None,
+            trash: Some(format!("{}.uninstalled", unique())),
+            obsolete_keg_version: None,
+            links: links
+                .into_iter()
+                .map(|(relative, target)| {
+                    (
+                        relative,
+                        LinkChange {
+                            before: Some(target),
+                            after: None,
+                        },
+                    )
+                })
+                .collect(),
+            previous_receipt: Some(receipt.clone()),
+            receipt: None,
+        };
+        run_transaction(&root, transaction, warnings, apply_uninstall)
     })
 }
 
@@ -507,8 +908,9 @@ fn link_target(path: &Path) -> Result<Option<String>> {
     }
 }
 
-fn set_link(path: &Path, target: &str) -> Result<()> {
-    let temporary = path.with_extension(format!("{}.tmp", unique()));
+fn set_link(root: &Path, path: &Path, target: &str) -> Result<()> {
+    // Stage the link privately so an interruption never leaves temporary entries in bin/opt.
+    let temporary = root.join(".staging").join(format!("{}.link", unique()));
     #[cfg(unix)]
     std::os::unix::fs::symlink(target, &temporary)?;
     #[cfg(not(unix))]
@@ -526,26 +928,46 @@ fn remove_link_if_present(path: &Path) -> Result<()> {
     }
 }
 
-fn save_receipt(root: &Path, receipt: &Receipt) -> Result<()> {
+fn write_durable(root: &Path, destination: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = root.join(".staging").join(format!("{}.json", unique()));
     let result = (|| -> Result<()> {
         let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
-        file.write_all(&serde_json::to_vec(receipt)?)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(
-            &temporary,
-            root.join("receipts").join(format!("{}.json", receipt.package.formula)),
-        )?;
-        Ok(())
+        fs::rename(&temporary, destination)?;
+        sync_directory(destination.parent().context("Durable file has no parent")?)
     })();
     remove_link_if_present(&temporary)?;
     result
 }
 
+fn save_receipt(root: &Path, receipt: &Receipt) -> Result<()> {
+    write_durable(
+        root,
+        &root.join("receipts").join(format!("{}.json", receipt.package.formula)),
+        &serde_json::to_vec(receipt)?,
+    )
+}
+
+fn write_journal(root: &Path, transaction: &Transaction) -> Result<()> {
+    write_durable(root, &root.join(JOURNAL), &serde_json::to_vec(transaction)?)
+}
+
+fn remove_journal(root: &Path) -> Result<()> {
+    remove_link_if_present(&root.join(JOURNAL))?;
+    sync_directory(root)
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 fn cleanup(path: &Path, warnings: &mut Vec<String>) {
-    if path.is_dir()
-        && let Err(error) = fs::remove_dir_all(path)
-    {
+    if let Err(error) = remove_tree_if_present(path) {
         warnings.push(format!(
             "Could not remove obsolete Homebrew staging data '{}': {error}",
             path.display()
@@ -553,27 +975,35 @@ fn cleanup(path: &Path, warnings: &mut Vec<String>) {
     }
 }
 
-fn with_lock(root: &Path, action: impl FnOnce() -> Result<()>) -> Result<()> {
-    let path = root.join("operations.lock");
+/// Acquires the advisory operation lock shared with the .NET runtime (`flock` on Unix). The OS
+/// releases it when the process exits, so an interrupted operation never leaves a stale lock.
+fn try_lock(root: &Path) -> Result<Option<fs::File>> {
     let file = fs::OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true)
-        .open(&path)
-        .context(
-            "Homebrew operation lock exists or could not be created; check for an active operation or stale lock",
-        )?;
-    let result = action();
-    drop(file);
-    fs::remove_file(path).with_context(|| {
-        format!(
-            "Could not release Homebrew operation lock; operation result: {}",
-            result
-                .as_ref()
-                .err()
-                .map_or_else(|| "success".to_owned(), ToString::to_string)
-        )
-    })?;
-    result
+        .create(true)
+        .truncate(false)
+        .open(root.join("operations.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn with_lock<T>(
+    root: &Path,
+    warnings: &mut Vec<String>,
+    action: impl FnOnce(&mut Vec<String>) -> Result<T>,
+) -> Result<T> {
+    let _lock = try_lock(root)?.context("Another Pinget Homebrew operation is in progress for this prefix")?;
+    recover(root, warnings)?;
+    // Without a journal, anything left in the private staging area is from an interrupted
+    // extraction and is owned by Pinget.
+    for entry in fs::read_dir(root.join(".staging"))? {
+        cleanup(&entry?.path(), warnings);
+    }
+    action(warnings)
 }
 
 fn unique() -> String {
@@ -655,6 +1085,232 @@ mod tests {
         assert!(uninstall(&fixture.0, "Homebrew.sample", false, &mut warnings).is_err());
         assert_eq!(fs::read_to_string(command)?, "user-owned");
         assert_eq!(read_all(&fixture.0)?.len(), 2);
+        Ok(())
+    }
+
+    fn bottle(fixture: &Fixture, formula: &str, version: &str, commands: &[&str]) -> Result<()> {
+        let mut names = vec![format!("{formula}/{version}/lib/data")];
+        names.extend(
+            commands
+                .iter()
+                .map(|command| format!("{formula}/{version}/bin/{command}")),
+        );
+        let entries = names.iter().map(|name| (name.as_str(), None)).collect::<Vec<_>>();
+        fixture.write(&entries)
+    }
+
+    fn install_bottle(
+        fixture: &Fixture,
+        formula: &str,
+        version: &str,
+        commands: &[&str],
+        dependencies: &[&str],
+    ) -> Result<()> {
+        bottle(fixture, formula, version, commands)?;
+        let mut spec = package(formula, version);
+        spec.dependencies = dependencies.iter().map(|value| (*value).to_owned()).collect();
+        install(&fixture.0, &fixture.0.join("bottle.tar.gz"), spec, &mut Vec::new())
+    }
+
+    fn snapshot(fixture: &Fixture) -> Result<Vec<(String, String)>> {
+        fn walk(base: &Path, directory: &Path, entries: &mut Vec<(String, String)>) -> Result<()> {
+            let mut children = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+            children.sort_by_key(fs::DirEntry::file_name);
+            for child in children {
+                let path = child.path();
+                let relative = path.strip_prefix(base)?.to_string_lossy().into_owned();
+                if matches!(relative.as_str(), ".staging" | "operations.lock") {
+                    continue;
+                }
+                let metadata = fs::symlink_metadata(&path)?;
+                let description = if metadata.file_type().is_symlink() {
+                    format!("link:{}", fs::read_link(&path)?.display())
+                } else if metadata.is_dir() {
+                    walk(base, &path, entries)?;
+                    "dir".to_owned()
+                } else {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    format!(
+                        "file:{:o}:{}",
+                        metadata.permissions().mode() & 0o777,
+                        String::from_utf8_lossy(&fs::read(&path)?)
+                    )
+                };
+                entries.push((relative, description));
+            }
+            Ok(())
+        }
+        let root = prefix(&fixture.0);
+        let mut entries = Vec::new();
+        walk(&root, &root, &mut entries)?;
+        Ok(entries)
+    }
+
+    fn interrupted<T>(point: &str, action: impl FnOnce() -> Result<T>) -> Result<()> {
+        INTERRUPT_AT.with(|value| *value.borrow_mut() = Some(point.to_owned()));
+        let result = action();
+        INTERRUPT_AT.with(|value| *value.borrow_mut() = None);
+        let error = result.err().context("operation was not interrupted")?;
+        assert!(error.is::<Interrupted>(), "{error:#}");
+        Ok(())
+    }
+
+    type Step = fn(&Fixture) -> Result<()>;
+
+    fn setup_dependency(fixture: &Fixture) -> Result<()> {
+        install_bottle(fixture, "dependency", "1.0", &[], &[])?;
+        fs::write(prefix(&fixture.0).join("bin/unrelated"), "user file")?;
+        Ok(())
+    }
+
+    fn setup_sample(fixture: &Fixture) -> Result<()> {
+        setup_dependency(fixture)?;
+        install_bottle(fixture, "sample", "1.0", &["sample", "old"], &[])
+    }
+
+    fn fresh_install(fixture: &Fixture) -> Result<()> {
+        install_bottle(fixture, "sample", "1.0", &["sample"], &["Homebrew.dependency"])
+    }
+
+    fn repair(fixture: &Fixture) -> Result<()> {
+        install_bottle(fixture, "sample", "1.0", &["sample", "old"], &[])
+    }
+
+    fn upgrade(fixture: &Fixture) -> Result<()> {
+        install_bottle(fixture, "sample", "2.0", &["sample", "new"], &["Homebrew.dependency"])
+    }
+
+    fn remove(fixture: &Fixture) -> Result<()> {
+        uninstall(&fixture.0, "Homebrew.sample", false, &mut Vec::new())
+    }
+
+    #[test]
+    fn interruption_at_every_step_recovers_exact_previous_or_committed_state() -> Result<()> {
+        let scenarios: [(Step, Step, &[&str], &str); 4] = [
+            (
+                setup_dependency,
+                fresh_install,
+                &["journal", "keg", "link", "receipt"],
+                "install",
+            ),
+            (
+                setup_sample,
+                repair,
+                &["journal", "backup", "keg", "link", "receipt"],
+                "install",
+            ),
+            (setup_sample, upgrade, &["journal", "keg", "link", "receipt"], "install"),
+            (
+                setup_sample,
+                remove,
+                &["journal", "trash", "link", "receipt"],
+                "uninstall",
+            ),
+        ];
+        for (setup, operation, steps, kind) in scenarios {
+            let expected = Fixture::new()?;
+            setup(&expected)?;
+            operation(&expected)?;
+            let committed = snapshot(&expected)?;
+            for step in steps
+                .iter()
+                .map(|step| format!("{kind}-{step}"))
+                .chain([format!("{kind}-commit")])
+            {
+                let fixture = Fixture::new()?;
+                setup(&fixture)?;
+                let before = snapshot(&fixture)?;
+                interrupted(&format!("sample:{step}"), || operation(&fixture))?;
+                let root = prefix(&fixture.0);
+                assert!(root.join(JOURNAL).is_file(), "{step}");
+                // Listing recovers, as would the next operation from either runtime.
+                read_all(&fixture.0)?;
+                assert!(!root.join(JOURNAL).exists(), "{step}");
+                assert_eq!(fs::read_dir(root.join(".staging"))?.count(), 0, "{step}");
+                let recovered = snapshot(&fixture)?;
+                if step.ends_with("-commit") {
+                    assert_eq!(recovered, committed, "{step}");
+                } else {
+                    assert_eq!(recovered, before, "{step}");
+                    operation(&fixture)?;
+                    assert_eq!(snapshot(&fixture)?, committed, "{step}");
+                }
+                assert_eq!(fs::read_to_string(root.join("bin/unrelated"))?, "user file");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_recovery_resumes_and_outside_changes_are_unrecoverable() -> Result<()> {
+        let fixture = Fixture::new()?;
+        setup_sample(&fixture)?;
+        let before = snapshot(&fixture)?;
+        interrupted("sample:install-receipt", || upgrade(&fixture))?;
+        interrupted("sample:rollback-links", || read_all(&fixture.0))?;
+        let root = prefix(&fixture.0);
+        assert!(root.join(JOURNAL).is_file());
+        let mut warnings = Vec::new();
+        recover(&root, &mut warnings)?;
+        assert_eq!(warnings, ["Rolled back an interrupted Homebrew install of sample"]);
+        assert_eq!(snapshot(&fixture)?, before);
+
+        interrupted("sample:install-link", || upgrade(&fixture))?;
+        let command = root.join("bin/new");
+        assert_eq!(fs::read_link(&command)?, Path::new("../opt/sample/bin/new"));
+        fs::remove_file(&command)?;
+        fs::write(&command, "user replacement")?;
+        let error = read_all(&fixture.0).expect_err("outside change must stop recovery");
+        assert!(format!("{error:#}").contains("changed outside Pinget"), "{error:#}");
+        assert!(root.join(JOURNAL).is_file());
+        assert_eq!(fs::read_to_string(&command)?, "user replacement");
+        assert!(upgrade(&fixture).is_err());
+
+        fs::write(root.join(JOURNAL), "{")?;
+        let error = read_all(&fixture.0).expect_err("corrupt journal must be explicit");
+        assert!(
+            format!("{error:#}").contains("Unrecoverable Homebrew transaction journal"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_lock_is_exclusive_and_released_by_process_exit_semantics() -> Result<()> {
+        let fixture = Fixture::new()?;
+        setup_dependency(&fixture)?;
+        let root = prefix(&fixture.0);
+        let held = try_lock(&root)?.context("lock should be free")?;
+        let error = fresh_install(&fixture).expect_err("concurrent operation must be refused");
+        assert!(format!("{error:#}").contains("in progress"), "{error:#}");
+        drop(held);
+        // A leftover lock file from an interrupted process does not block later operations.
+        assert!(root.join("operations.lock").is_file());
+        fresh_install(&fixture)
+    }
+
+    #[test]
+    fn upgrade_reports_dependency_changes() -> Result<()> {
+        let fixture = Fixture::new()?;
+        setup_sample(&fixture)?;
+        bottle(&fixture, "sample", "2.0", &["sample"])?;
+        let mut spec = package("sample", "2.0");
+        spec.dependencies = vec!["Homebrew.dependency".to_owned()];
+        let mut warnings = Vec::new();
+        install(&fixture.0, &fixture.0.join("bottle.tar.gz"), spec, &mut warnings)?;
+        assert_eq!(warnings, ["Homebrew.sample now depends on: Homebrew.dependency"]);
+        bottle(&fixture, "sample", "3.0", &["sample"])?;
+        warnings.clear();
+        install(
+            &fixture.0,
+            &fixture.0.join("bottle.tar.gz"),
+            package("sample", "3.0"),
+            &mut warnings,
+        )?;
+        assert_eq!(
+            warnings,
+            ["Homebrew.sample no longer depends on: Homebrew.dependency; those packages remain installed"]
+        );
         Ok(())
     }
 }

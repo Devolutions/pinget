@@ -171,6 +171,25 @@ def private_dependencies(app, env):
         raise RuntimeError(f"jq did not resolve its bottle libraries inside the private prefix: {libraries}")
 
 
+def interrupted(command, env, point):
+    """Hard-exits the client at a journal checkpoint to simulate a crash mid-transaction."""
+    result = subprocess.run(command, env=dict(env, PINGET_HOMEBREW_TEST_INTERRUPT=point),
+                            capture_output=True, text=True, timeout=600)
+    if result.returncode != 86:
+        raise RuntimeError(f"Expected interruption at {point}, got {result.returncode}: {result.stdout}{result.stderr}")
+    if not (Path(env["PINGET_APPROOT"]) / "homebrew/transaction.json").is_file():
+        raise RuntimeError(f"Interruption at {point} left no recovery journal")
+
+
+def recovered(app):
+    if (app / "homebrew/transaction.json").exists() or list((app / "homebrew/.staging").iterdir()):
+        raise RuntimeError("Recovery left a journal or staging data behind")
+
+
+def opposite_name(consumer):
+    return "dotnet" if consumer == "rust" else "rust"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rust-cli", type=Path, required=True)
@@ -275,6 +294,18 @@ def main():
                                    "--trusted-ca", work / "root.pem"], client_env)
                         run(cli + ["source", "update", "homebrew"], client_env)
                         assert "Pinget.Homebrew.jq" in run(cli + ["search", "jq", "--source", "homebrew"], client_env)
+                        opposite = clis["dotnet" if consumer == "rust" else "rust"]
+                        interrupted(cli + ["install", "jq", "--source", "homebrew", "--silent",
+                                           "--accept-package-agreements"], client_env, "jq:install-link")
+                        assert (app / "homebrew/bin/jq").is_symlink()
+                        assert "oniguruma" in run(opposite + ["list"], client_env)
+                        recovered(app)
+                        assert (app / "homebrew/receipts/oniguruma.json").is_file()
+                        assert not (app / "homebrew/receipts/jq.json").exists()
+                        assert not (app / "homebrew/bin/jq").exists() and not (app / "homebrew/Cellar/jq").exists()
+                        report["checks"].append(
+                            f"{consumer}/{publisher}: interrupted install kept the dependency and {opposite_name(consumer)} rolled back jq"
+                        )
                         run(cli + ["install", "jq", "--source", "homebrew", "--silent",
                                    "--accept-package-agreements"], client_env)
                         assert run([app / "homebrew/bin/jq", "-n", '"abc" | test("^a")'], client_env).strip() == "true"
@@ -300,13 +331,23 @@ def main():
                 run(cli + ["source", "update", "homebrew"], client_env)
                 if platform.system() == "Windows":
                     continue
+                previous = json.loads((app / "homebrew/receipts/jq.json").read_text())["Package"]["PackageVersion"]
+                opposite = clis["dotnet" if consumer == "rust" else "rust"]
+                interrupted(cli + ["upgrade", "jq", "--source", "homebrew", "--silent"], client_env, "jq:install-receipt")
+                run(opposite + ["list"], client_env)
+                recovered(app)
+                assert json.loads((app / "homebrew/receipts/jq.json").read_text())["Package"]["PackageVersion"] == previous
+                assert run([app / "homebrew/bin/jq", "-n", '"abc" | test("^a")'], client_env).strip() == "true"
+                private_dependencies(app, client_env)
+                report["checks"].append(
+                    f"{consumer}/{publisher}: interrupted upgrade restored the working keg via {opposite_name(consumer)}"
+                )
                 run(cli + ["upgrade", "jq", "--source", "homebrew", "--silent"], client_env)
                 receipt = json.loads((app / "homebrew/receipts/jq.json").read_text())
                 assert receipt["Package"]["PackageVersion"] == "1.8.1.bottle.1"
                 assert receipt["Package"]["KegVersion"] == "1.8.1"
                 executable = app / "homebrew/Cellar/jq/1.8.1/bin/jq"
                 executable.chmod(executable.stat().st_mode & ~0o111)
-                opposite = clis["dotnet" if consumer == "rust" else "rust"]
                 run(opposite + ["repair", "jq", "--source", "homebrew", "--silent"], client_env)
                 assert run([app / "homebrew/bin/jq", "-n", '"abc" | test("^a")'], client_env).strip() == "true"
                 private_dependencies(app, client_env)
