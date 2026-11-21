@@ -56,7 +56,7 @@ jobs:
               header = bytearray(bytes.fromhex("0a51e5c018000002") + struct.pack("<QQ", 0, block_size))
               header[6] = zlib.crc32(header[:6] + header[7:]) & 255
               try:
-                  result = native.decompress(header, 0)
+                  result = native.decompress(bytes(header), 0)
                   print(f"empty block_size={block_size}: accepted {result!r}")
               except m.NativeDecodeError as error:
                   print(f"empty block_size={block_size}: rejected {error}")
