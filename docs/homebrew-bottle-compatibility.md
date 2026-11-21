@@ -24,8 +24,11 @@ tampered signed source updates without changing the active cache.
 | Client operations | Native install/list/upgrade/repair/uninstall, shared receipts, dependency ordering, journaled per-formula transactions with crash recovery shared by both runtimes, ownership checks | Homebrew/Ruby, system-prefix installation, arbitrary installer arguments, uninstall-previous, atomic dependency-closure transactions |
 
 Manifest readers recognize more historical tags than the importer. That does
-not claim those targets or arbitrary bottles are installable. Real execution
-has been verified only for Linux x64/arm64 and macOS x64/arm64.
+not claim those targets or arbitrary bottles are installable. The hosted
+workflow now attempts at least 20 live catalog formula roots on each supported
+Unix runner, but that expanded gate has not completed yet. The last verified
+real execution remains the pinned jq/oniguruma chain on Linux x64/arm64 and
+macOS x64/arm64.
 
 ## Import and publication checks
 
@@ -140,6 +143,7 @@ passed on the same code commit, including publisher interoperability and signed
 stock WinGet acceptance with the native-AOT CLI. The recovery platform and
 JSON trimming/AOT warnings are absent from these final runs. These are distinct
 gates; see the [publisher contract](../tests/publisher/contract.md) for their
-coverage and limits. The API-driven catalog tool has bounded dependency-graph
-tests, but the current real-bottle acceptance set has not expanded beyond jq
-and oniguruma. No claim is made that 20–50 arbitrary formulas install.
+coverage and limits. Target-matched fixed-cellar parsing, importing, and
+prefix relocation have focused synthetic tests; no hosted real fixed-cellar
+bottle has been confirmed yet. No claim is made that arbitrary formulas
+install.

@@ -117,6 +117,9 @@ and is not signed, so retain the report and mirror outputs as an operator
 review/audit artifact and review generated manifests before publishing. This
 driver is not a trusted unattended catalog sync service: it does not pin an
 API commit, approve formula changes, or publish/sign the resulting source.
+If a later formula fails, outputs from earlier imports remain in the output
+directories; inspect the report and use a clean staging directory before a
+retry rather than assuming the multi-formula operation rolled back.
 
 For a publisher snapshot, keep the generated `manifests/` and `bottles/`
 directories as siblings under a publisher input root (the example's `output/`
