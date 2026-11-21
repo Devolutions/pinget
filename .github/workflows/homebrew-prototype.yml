@@ -57,12 +57,14 @@ jobs:
           dotnet test dotnet/src/Devolutions.Pinget.Core.Tests/Devolutions.Pinget.Core.Tests.csproj -c Release --filter 'FullyQualifiedName~Homebrew'
           dotnet test dotnet/src/Devolutions.Pinget.Publisher.Tests/Devolutions.Pinget.Publisher.Tests.csproj -c Release --filter 'FullyQualifiedName~Homebrew'
           dotnet tool install Devolutions.Psign.Tool --version 0.8.5 --tool-path "$RUNNER_TEMP/psign-homebrew"
-          ls -la "$RUNNER_TEMP/psign-homebrew"
-          psign_extension=""
+          psign="$RUNNER_TEMP/psign-homebrew/psign-tool"
           if [ "$RUNNER_OS" = Windows ]; then
-            psign_extension=".exe"
+            # Windows gets a psign-tool.cmd shim; use the packaged native executable directly.
+            psign="$(find "$RUNNER_TEMP/psign-homebrew/.store" -type f -name psign-tool.exe | head -n 1)"
           fi
-          "$RUNNER_TEMP/psign-homebrew/psign-tool$psign_extension" --help > /dev/null
+          test -n "$psign"
+          "$psign" --help > /dev/null
+          echo "PSIGN_TOOL=$psign" >> "$GITHUB_ENV"
       - name: Run real signed static source acceptance
         shell: bash
         run: |
@@ -73,7 +75,7 @@ jobs:
           python tests/homebrew/run-native-acceptance.py \
             --rust-cli "rust/target/debug/pinget$extension" \
             --dotnet-assembly dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.dll \
-            --psign-tool "$RUNNER_TEMP/psign-homebrew/psign-tool" \
+            --psign-tool "$PSIGN_TOOL" \
             --report "$RUNNER_TEMP/homebrew-acceptance-report.json"
       - name: Upload non-secret acceptance report
         if: always()
