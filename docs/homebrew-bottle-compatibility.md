@@ -93,7 +93,11 @@ including other entries in `bin/`, are never touched.
 `operations.lock` is an advisory OS lock (`flock`) held only by a running
 operation. The OS releases it when the process exits, so the remaining file
 is not a stale lock and should not be deleted. A concurrent operation fails
-with an explicit "in progress" error.
+with an explicit "in progress" error. On normal completion or a reported
+failure, both runtimes explicitly unlock before closing the descriptor; a
+concurrently spawned child's inherited descriptor cannot prolong that lock.
+The .NET receipt and journal serializers use generated metadata, retaining
+the shared JSON format without reflection or runtime code generation.
 
 When an upgrade or repair changes runtime dependencies, the client reports
 added dependencies and dependencies that are no longer required. Packages that
@@ -119,14 +123,21 @@ Keep real signed-source and lifecycle checks distinct from synthetic unit
 fixtures. Rebuild-only transitions must use increasing catalog rebuild versions
 and must not be described as authentic upstream rebuilds when synthesized for
 a test. Hosted run
-[44925419503](https://github.com/Devolutions/pinget/actions/runs/44925419503),
-attempt 2, passed 18 checks each on Linux x64/arm64 and macOS x64/arm64, and
-five Windows publishing/signature checks. This covers the pinned jq/oniguruma
-chain, not all formulas.
+[44935233295](https://github.com/Devolutions/pinget/actions/runs/44935233295),
+attempt 2, passed on code commit `4cc3638`: 26 checks each on Linux x64/arm64
+and macOS x64/arm64, and five Windows publishing/signature checks. The Unix
+checks include process interruption during initial installation and upgrade,
+recovery by the opposite runtime, preservation of committed dependencies, and
+execution of the restored previous package. Focused unit tests additionally
+cover interrupted repair, uninstall, and recovery, outside modifications,
+corrupt journals, and lock exclusivity with inherited descriptors. This covers
+the pinned jq/oniguruma chain, not all formulas.
 
 The same run decoded Rust and .NET portable MSZIP fixtures from each Linux
 and macOS runner with the Windows Compression API. The separate
-[Windows-profile CI run](https://github.com/Devolutions/pinget/actions/runs/44924953057)
-passed publisher interoperability and signed stock WinGet acceptance. These
-are distinct gates; see the [publisher contract](../tests/publisher/contract.md)
-for their coverage and limits.
+[Windows-profile CI run](https://github.com/Devolutions/pinget/actions/runs/44935250942)
+passed on the same code commit, including publisher interoperability and signed
+stock WinGet acceptance with the native-AOT CLI. The recovery platform and
+JSON trimming/AOT warnings are absent from these final runs. These are distinct
+gates; see the [publisher contract](../tests/publisher/contract.md) for their
+coverage and limits.
