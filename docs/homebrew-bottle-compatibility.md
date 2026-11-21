@@ -26,9 +26,11 @@ tampered signed source updates without changing the active cache.
 Manifest readers recognize more historical tags than the importer. That does
 not claim those targets or arbitrary bottles are installable. The hosted
 workflow now attempts at least 20 live catalog formula roots on each supported
-Unix runner, but that expanded gate has not completed yet. The last verified
-real execution remains the pinned jq/oniguruma chain on Linux x64/arm64 and
-macOS x64/arm64.
+Unix runner, but that expanded gate has not passed. Run
+[44941756278](https://github.com/Devolutions/pinget/actions/runs/44941756278),
+attempt 2, failed on all four Unix runners during live catalog import. The
+last verified real execution remains the pinned jq/oniguruma chain on Linux
+x64/arm64 and macOS x64/arm64.
 
 ## Import and publication checks
 

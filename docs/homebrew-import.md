@@ -106,14 +106,19 @@ additional roots. The tool fetches the public `formulae.brew.sh` formula API,
 walks exact runtime dependencies (maximum 256 formulas and depth 64), selects
 one native tag, downloads only the matching public GHCR bottle blob, verifies
 its SHA-256 (2 GiB total bottle-download budget), adds dependency version pins,
-and invokes the selected offline importer. No Ruby runs and no Homebrew install
-command is used. It is limited to `homebrew/core`; tap crawling and casks are
-unsupported.
+and invokes the selected offline importer. The driver translates Homebrew's
+`arm64_linux` and symbolic `:any` / `:any_skip_relocation` spellings to the
+Pinget input format. For Linux it reads the matching GHCR OCI index entry by
+version, target and bottle digest and records the index hash and its glibc
+minimum. A missing or ambiguous match is rejected. No Ruby runs and no Homebrew
+install command is used. It is limited to `homebrew/core`; tap crawling and
+casks are unsupported.
 
 Formulae the offline importer rejects are reported as skipped; a requested
 root that cannot be imported makes the command fail. The JSON report records
-formula API and bottle hashes for imported entries. API data is fetched live
-and is not signed, so retain the report and mirror outputs as an operator
+formula API, Linux OCI index and bottle hashes for imported entries. The API
+and OCI index are fetched live and are not authenticated by a pinned signature,
+so retain the report and mirror outputs as an operator
 review/audit artifact and review generated manifests before publishing. This
 driver is not a trusted unattended catalog sync service: it does not pin an
 API commit, approve formula changes, or publish/sign the resulting source.

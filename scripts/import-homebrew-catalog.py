@@ -82,10 +82,62 @@ def api_formula(name):
 
 
 def bottle_for(formula, tag):
+    upstream_tag = "arm64_linux" if tag == "aarch64_linux" else tag
     try:
-        return formula["bottle"]["stable"]["files"][tag]
+        return formula["bottle"]["stable"]["files"][upstream_tag]
     except (KeyError, TypeError):
         raise ImportError(f"{formula.get('name')}: no stable bottle for target {tag}") from None
+
+
+def linux_bottle_abi(formula, tag, selected):
+    name = formula["name"]
+    stable = formula["bottle"]["stable"]
+    version = formula["versions"]["stable"]
+    revision = formula["revision"]
+    rebuild = stable["rebuild"]
+    digest = selected.get("sha256")
+    if (not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9.+_-]+", version)
+            or type(revision) is not int or revision < 0 or type(rebuild) is not int or rebuild < 0
+            or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest)):
+        raise ImportError(f"{name}: invalid version, revision or rebuild for OCI metadata")
+    pkg_version = version + (f"_{revision}" if revision else "")
+    index_tag = pkg_version + (f"-{rebuild}" if rebuild else "")
+    upstream_tag = "arm64_linux" if tag == "aarch64_linux" else tag
+    image_ref = f"{pkg_version}.{upstream_tag}" + (f".{rebuild}" if rebuild else "")
+    token = bottle_token(name)
+    url = f"https://ghcr.io/v2/homebrew/core/{name}/manifests/{index_tag}"
+    try:
+        data = read_https(
+            url, MAX_FORMULA_BYTES,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.oci.image.index.v1+json"},
+            allowed_hosts={"ghcr.io"},
+        )
+        index = json.loads(data)
+        matches = [
+            item["annotations"] for item in index["manifests"]
+            if item["annotations"].get("org.opencontainers.image.ref.name") == image_ref
+            and item["annotations"].get("sh.brew.bottle.digest", "").lower() == digest.lower()
+        ]
+    except (urllib.error.URLError, KeyError, TypeError, AttributeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ImportError(f"{name}: invalid or unavailable OCI index metadata") from error
+    if len(matches) != 1:
+        raise ImportError(f"{name}: OCI index does not uniquely match the selected bottle")
+    minimum = matches[0].get("sh.brew.bottle.glibc.version")
+    if not isinstance(minimum, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", minimum):
+        raise ImportError(f"{name}: OCI metadata lacks a valid minimum glibc version")
+    return minimum, hashlib.sha256(data).hexdigest()
+
+
+def adapted_bottle(formula, tag):
+    selected = dict(bottle_for(formula, tag))
+    if selected.get("cellar") in (":any", ":any_skip_relocation"):
+        selected["cellar"] = selected["cellar"][1:]
+    provenance = {}
+    if tag.endswith("_linux"):
+        minimum, index_digest = linux_bottle_abi(formula, tag, selected)
+        selected.update(minimum_glibc=minimum, loader="glibc")
+        provenance["oci_index_sha256"] = index_digest
+    return selected, provenance
 
 
 def bottle_token(name):
@@ -234,7 +286,7 @@ def import_catalog(args):
     cli = runtime_command(args)
     downloaded_bytes = 0
     with tempfile.TemporaryDirectory(prefix="pinget-homebrew-catalog-") as temp:
-        stage = Path(temp)
+        stage = Path(temp).resolve()
         for name in ordered:
             formula = formulas[name]
             unresolved = [dep for dep in dependency_names(formula) if dep not in report["imported"]]
@@ -242,7 +294,7 @@ def import_catalog(args):
                 report["skipped"].append({"formula": name, "reason": f"unavailable dependency: {', '.join(unresolved)}"})
                 continue
             try:
-                selected = bottle_for(formula, args.tag)
+                selected, provenance = adapted_bottle(formula, args.tag)
                 bottle_path = download_bottle(formula, args.tag, stage)
                 downloaded_bytes += bottle_path.stat().st_size
                 if downloaded_bytes > MAX_CLOSURE_BOTTLE_BYTES:
@@ -258,10 +310,15 @@ def import_catalog(args):
                 if not isinstance(version, str) or not isinstance(rebuild, int) or rebuild < 0:
                     raise ImportError(f"{name}: invalid stable version/rebuild metadata")
                 adapted = dict(formula)
+                adapted["bottle"] = dict(formula["bottle"])
+                adapted["bottle"]["stable"] = dict(metadata)
+                adapted["bottle"]["stable"]["files"] = {args.tag: selected}
                 adapted["pinget_runtime_dependencies"] = [
                     {
                         "full_name": dependency,
-                        "pkg_version": formulas[dependency]["versions"]["stable"],
+                        "pkg_version": formulas[dependency]["versions"]["stable"] + (
+                            f"_{formulas[dependency]['revision']}" if formulas[dependency]["revision"] else ""
+                        ),
                         "bottle_rebuild": formulas[dependency]["bottle"]["stable"]["rebuild"],
                     }
                     for dependency in dependency_names(formula)
@@ -269,6 +326,7 @@ def import_catalog(args):
                 adapted["pinget_import_provenance"] = {
                     "formula_api_sha256": api_hashes[name],
                     "bottle_sha256": selected["sha256"].lower(),
+                    **provenance,
                 }
                 formula_path = stage / f"{name}.json"
                 formula_path.write_text(json.dumps(adapted, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -294,6 +352,7 @@ def import_catalog(args):
                     "formulaApiSha256": api_hashes[name],
                     "bottleSha256": selected["sha256"].lower(),
                     "relocation": selected["cellar"],
+                    **provenance,
                     "packageVersion": f"{version}{'_' + str(formula.get('revision', 0)) if formula.get('revision', 0) else ''}.bottle.{rebuild}",
                 })
                 print(f"Imported {name} {version} bottle rebuild {rebuild}")

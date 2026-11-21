@@ -1,8 +1,10 @@
 import importlib.util
 import json
 import hashlib
+import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from subprocess import CompletedProcess
 from types import SimpleNamespace
@@ -54,6 +56,61 @@ class CatalogClosureTests(unittest.TestCase):
     def test_rejects_missing_target_bottle(self):
         with self.assertRaisesRegex(catalog.ImportError, "no stable bottle"):
             catalog.bottle_for({"name": "sample", "bottle": {}}, "x86_64_linux")
+
+    def test_linux_arm_uses_upstream_tag_and_normalizes_relocation(self):
+        formula = {
+            "name": "sample",
+            "bottle": {"stable": {"files": {"arm64_linux": {"cellar": ":any_skip_relocation"}}}},
+        }
+        with patch.object(catalog, "linux_bottle_abi", return_value=("2.35", "index-hash")) as abi:
+            selected, provenance = catalog.adapted_bottle(formula, "aarch64_linux")
+        self.assertEqual(selected, {"cellar": "any_skip_relocation", "minimum_glibc": "2.35", "loader": "glibc"})
+        self.assertEqual(provenance, {"oci_index_sha256": "index-hash"})
+        self.assertEqual(formula["bottle"]["stable"]["files"]["arm64_linux"]["cellar"], ":any_skip_relocation")
+        abi.assert_called_once()
+
+    def test_macos_normalizes_only_known_symbolic_cellar_values(self):
+        formula = {
+            "name": "sample",
+            "bottle": {"stable": {"files": {"sonoma": {"cellar": ":any"}}}},
+        }
+        selected, provenance = catalog.adapted_bottle(formula, "sonoma")
+        self.assertEqual(selected["cellar"], "any")
+        self.assertEqual(provenance, {})
+        formula["bottle"]["stable"]["files"]["sonoma"]["cellar"] = ":unknown"
+        selected, _ = catalog.adapted_bottle(formula, "sonoma")
+        self.assertEqual(selected["cellar"], ":unknown")
+
+    def test_linux_abi_requires_exact_oci_tag_and_bottle_digest(self):
+        digest = "a" * 64
+        formula = {
+            "name": "sample", "versions": {"stable": "1.2"}, "revision": 3,
+            "bottle": {"stable": {"rebuild": 2}},
+        }
+        selected = {"sha256": digest}
+        index = {"manifests": [{"annotations": {
+            "org.opencontainers.image.ref.name": "1.2_3.arm64_linux.2",
+            "sh.brew.bottle.digest": digest,
+            "sh.brew.bottle.glibc.version": "2.35",
+        }}]}
+        data = json.dumps(index).encode()
+        with patch.object(catalog, "bottle_token", return_value="token"), \
+             patch.object(catalog, "read_https", return_value=data) as fetch:
+            minimum, index_hash = catalog.linux_bottle_abi(formula, "aarch64_linux", selected)
+        self.assertEqual(minimum, "2.35")
+        self.assertEqual(index_hash, hashlib.sha256(data).hexdigest())
+        self.assertTrue(fetch.call_args.args[0].endswith("/manifests/1.2_3-2"))
+        with patch.object(catalog, "bottle_token", return_value="token"), \
+             patch.object(catalog, "read_https", return_value=data):
+            with self.assertRaisesRegex(catalog.ImportError, "does not uniquely match"):
+                catalog.linux_bottle_abi(formula, "x86_64_linux", selected)
+            with self.assertRaisesRegex(catalog.ImportError, "does not uniquely match"):
+                catalog.linux_bottle_abi(formula, "aarch64_linux", {"sha256": "b" * 64})
+        del index["manifests"][0]["annotations"]["sh.brew.bottle.glibc.version"]
+        with patch.object(catalog, "bottle_token", return_value="token"), \
+             patch.object(catalog, "read_https", return_value=json.dumps(index).encode()):
+            with self.assertRaisesRegex(catalog.ImportError, "lacks a valid minimum glibc"):
+                catalog.linux_bottle_abi(formula, "aarch64_linux", selected)
 
     def test_strips_registry_authorization_before_allowed_cdn_redirect(self):
         request = Request("https://ghcr.io/v2/blob", headers={"Authorization": "Bearer private-token"})
@@ -146,6 +203,7 @@ class CatalogClosureTests(unittest.TestCase):
             }
 
         formulas = {"jq": formula("jq", ["oniguruma"]), "oniguruma": formula("oniguruma", [])}
+        formulas["oniguruma"]["revision"] = 2
         args = SimpleNamespace(
             formula=["jq"],
             formula_list=None,
@@ -166,6 +224,13 @@ class CatalogClosureTests(unittest.TestCase):
             args.bottle_mirror = str(root / "bottles")
             args.report = str(root / "catalog-import.json")
             imports = []
+            stage = root / "stage"
+            stage.mkdir()
+            stage_input = root / "stage-link"
+            if os.name != "nt":
+                stage_input.symlink_to(stage, target_is_directory=True)
+            else:
+                stage_input = stage
 
             def download(value, tag, directory):
                 path = directory / f"{value['name']}.tar.gz"
@@ -174,12 +239,15 @@ class CatalogClosureTests(unittest.TestCase):
 
             def run(command, **_kwargs):
                 formula_path = Path(command[command.index("--formula-json") + 1])
+                self.assertEqual(formula_path.parent, stage.resolve())
                 imported = json.loads(formula_path.read_text(encoding="utf-8"))
                 imports.append(imported)
                 return CompletedProcess(command, 0, "", "")
 
             with patch.object(catalog, "api_formula", side_effect=lambda name: (formulas[name], f"api-{name}")), \
                  patch.object(catalog, "download_bottle", side_effect=download), \
+                 patch.object(catalog, "linux_bottle_abi", return_value=("2.35", "index-hash")), \
+                 patch.object(catalog.tempfile, "TemporaryDirectory", return_value=nullcontext(str(stage_input))), \
                  patch.object(catalog.subprocess, "run", side_effect=run):
                 report = catalog.import_catalog(args)
 
@@ -187,9 +255,11 @@ class CatalogClosureTests(unittest.TestCase):
             self.assertEqual(report["importedRoots"], ["jq"])
             self.assertEqual(imports[0]["pinget_runtime_dependencies"], [])
             self.assertEqual(imports[1]["pinget_runtime_dependencies"], [
-                {"full_name": "oniguruma", "pkg_version": "1.2.3", "bottle_rebuild": 1},
+                {"full_name": "oniguruma", "pkg_version": "1.2.3_2", "bottle_rebuild": 1},
             ])
+            self.assertEqual(imports[1]["bottle"]["stable"]["files"]["x86_64_linux"]["minimum_glibc"], "2.35")
             self.assertEqual(report["importedMetadata"][1]["formulaApiSha256"], "api-jq")
+            self.assertEqual(report["importedMetadata"][1]["oci_index_sha256"], "index-hash")
 
 
 if __name__ == "__main__":
