@@ -1,5 +1,10 @@
 //! Wave 21 publisher regression tests.
 
+// Keep the private encoder test-only; do not expose it through the public API.
+#[cfg(target_os = "linux")]
+#[path = "mszip_interop_tests.rs"]
+mod mszip_interop_tests;
+
 use super::*;
 
 const HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";

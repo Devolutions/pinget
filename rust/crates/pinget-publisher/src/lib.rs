@@ -5211,6 +5211,7 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn portable_mszip_writer_roundtrips_empty_single_and_multiblock_payloads() {
         for input in [

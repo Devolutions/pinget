@@ -7,6 +7,8 @@ on:
       - 'rust/**'
       - 'dotnet/**'
       - 'tests/homebrew/**'
+      - 'tests/publisher/mszip_interop.py'
+      - 'tests/publisher/test_mszip_interop.py'
       - '.github/workflows/homebrew-prototype.yml'
   workflow_dispatch:
   workflow_call:
@@ -84,3 +86,64 @@ jobs:
           name: homebrew-acceptance-${{ matrix.os }}
           path: ${{ runner.temp }}/homebrew-acceptance-report.json
           if-no-files-found: warn
+
+  portable-mszip-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      PYTHONDONTWRITEBYTECODE: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Generate portable MSZIP fixtures with both publishers
+        run: |
+          python -m unittest discover -s tests/publisher -p test_mszip_interop.py -v
+          python tests/publisher/mszip_interop.py produce \
+            --output "$RUNNER_TEMP/mszip-fixtures" \
+            --reports "$RUNNER_TEMP/mszip-reports" \
+            --run-id "${{ github.run_id }}-${{ github.run_attempt }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: portable-mszip-fixtures-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mszip-fixtures
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        with:
+          name: portable-mszip-test-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mszip-reports/mszip-portable.trx
+          if-no-files-found: error
+          retention-days: 7
+
+  native-mszip-decoder:
+    needs: portable-mszip-fixtures
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v7
+        with:
+          name: portable-mszip-fixtures-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mszip-fixtures
+      - name: Decode Linux-produced fixtures with the Windows Compression API
+        shell: pwsh
+        run: |
+          python tests/publisher/mszip_interop.py validate-windows `
+            --input "$env:RUNNER_TEMP/mszip-fixtures" `
+            --run-id "${{ github.run_id }}-${{ github.run_attempt }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
