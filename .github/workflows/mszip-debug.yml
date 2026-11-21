@@ -1,0 +1,64 @@
+name: MSZIP native diagnostics
+
+on:
+  push:
+    branches: [copilot/scaling-chainsaw]
+    paths: ['.github/workflows/mszip-debug.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Inspect native incompressible and empty frames
+        shell: pwsh
+        run: |
+          @'
+          import struct
+          import sys
+          import zlib
+          sys.path.insert(0, "tests/publisher")
+          import mszip_interop as m
+
+          native = m.WindowsNativeMsZip()
+          names = {
+              "single_byte", "block_32k_before", "block_32k_at",
+              "block_32k_after", "multiblock_incompressible",
+          }
+          for case in m.CASES:
+              if case.name not in names:
+                  continue
+              original = m.payload(case)
+              frame = native.compress_reference(original)
+              assert native.decompress(frame, len(original)) == original
+              block_size = struct.unpack_from("<I", frame, 16)[0]
+              print(f"{case.name}: header={frame[:24].hex()} encoded={len(frame)}")
+              offset = 24
+              plain_offset = 0
+              while offset < len(frame):
+                  length = struct.unpack_from("<I", frame, offset)[0]
+                  chunk = frame[offset + 4:offset + 4 + length]
+                  assert len(chunk) == length
+                  expected = original[plain_offset:plain_offset + block_size]
+                  print(f"  block length={length}, plaintext={len(expected)}, prefix={chunk[:16].hex()}, raw={chunk == expected}")
+                  offset += 4 + length
+                  plain_offset += len(expected)
+              assert plain_offset == len(original)
+
+          for block_size in (0, 1, 32768):
+              header = bytearray(bytes.fromhex("0a51e5c018000002") + struct.pack("<QQ", 0, block_size))
+              header[6] = zlib.crc32(header[:6] + header[7:]) & 255
+              try:
+                  result = native.decompress(header, 0)
+                  print(f"empty block_size={block_size}: accepted {result!r}")
+              except m.NativeDecodeError as error:
+                  print(f"empty block_size={block_size}: rejected {error}")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
