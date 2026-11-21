@@ -71,13 +71,14 @@ Keep real signed-source and lifecycle checks distinct from synthetic unit
 fixtures. Rebuild-only transitions must use increasing catalog rebuild versions
 and must not be described as authentic upstream rebuilds when synthesized for
 a test. Hosted run
-[44920177215](https://github.com/Devolutions/pinget/actions/runs/44920177215),
+[44925419503](https://github.com/Devolutions/pinget/actions/runs/44925419503),
 attempt 2, passed 18 checks each on Linux x64/arm64 and macOS x64/arm64, and
 five Windows publishing/signature checks. This covers the pinned jq/oniguruma
 chain, not all formulas.
 
-The Homebrew workflow does not rerun the existing Windows-profile/stock
-WinGet conformance suite. Its portable non-Windows MSZIP output has not been
-independently decoded by the Windows Compression API; Pinget's own readers
-were used in the cross-platform Homebrew gate. See the
-[publisher contract](../tests/publisher/contract.md) for that remaining gate.
+The same run decoded Rust and .NET portable MSZIP fixtures from each Linux
+and macOS runner with the Windows Compression API. The separate
+[Windows-profile CI run](https://github.com/Devolutions/pinget/actions/runs/44924953057)
+passed publisher interoperability and signed stock WinGet acceptance. These
+are distinct gates; see the [publisher contract](../tests/publisher/contract.md)
+for their coverage and limits.

@@ -37,8 +37,10 @@ Build, package, verify, status, diff and publish run on Windows, macOS and
 Linux. Windows uses the native Windows Compression API for MSZIP output;
 macOS and Linux use a portable raw-deflate encoder with the same WinGet v2
 MSZIP framing. The resulting sidecars are readable by the existing client
-decoder. A missing verification tool or unsigned MSIX fails `publish` unless
-`--unsigned-development` is explicitly passed.
+decoder, and both publishers' portable outputs have also been decoded by the
+Windows Compression API across Linux and macOS x64/arm64. The encoders reject
+empty input and payloads over 64 MiB. A missing verification tool or unsigned
+MSIX fails `publish` unless `--unsigned-development` is explicitly passed.
 
 ## Build, package, sign and publish
 

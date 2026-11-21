@@ -53,11 +53,20 @@ generator uses that Windows API and verifies the result with
 `CreateDecompressor`/`Decompress`, then hashes the bytes actually stored.
 Pinget keeps that native encoder on Windows. On macOS and Linux, its publisher
 encodes independent raw-deflate blocks in the same 24-byte Compression API
-header and `u32 length + CK + deflate` block framing; clients validate and
-decode both forms through the portable decoder. A Windows native
-`CreateDecompressor` acceptance test of the portable output remains required
-before claiming the portable encoder is independently verified against the
-Windows API.
+header and `u32 length + CK + deflate` block framing. Incompressible blocks
+fall back to stored deflate blocks to stay within the native framed-size
+limit. Both publishers reject empty input and input over 64 MiB.
+
+Hosted [run 44925419503](https://github.com/Devolutions/pinget/actions/runs/44925419503),
+attempt 2, generated fixtures with both publishers on Linux and macOS x64/arm64
+and decoded each with Windows `CreateDecompressor`/`Decompress`, comparing the
+exact bytes. It covers one byte, boundaries around 32 and 64 KiB, compressible
+and incompressible multiblock data, and payloads just below and at 64 MiB.
+Separate producer tests reject empty and over-limit input; native `Compress`
+also rejects empty input with error 87. This is not a claim that the native
+decoder accepted an encoded empty stream. The separate
+[Windows-profile CI run](https://github.com/Devolutions/pinget/actions/runs/44924953057)
+passed publisher interoperability and signed stock WinGet acceptance.
 
 The exact manifest serialization, version ordering, and search-normalization
 values are not inferred from the schema files. The locally authored singleton
