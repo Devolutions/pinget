@@ -193,6 +193,8 @@ public sealed class HomebrewKegRecoveryTests
                 }
                 else
                 {
+                    if (OperatingSystem.IsWindows())
+                        throw new PlatformNotSupportedException("Homebrew recovery snapshots require Unix file modes.");
                     entries.Add($"{relative} file:{File.GetUnixFileMode(path)}:{File.ReadAllText(path)}");
                 }
             }

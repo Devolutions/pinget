@@ -344,7 +344,7 @@ internal static partial class ManifestScanner
         {
             if (child is not YamlScalarNode item)
                 throw new PublisherException($"Manifest field '{key}' must be a sequence of strings.");
-            result.Add(JsonValue.Create(item.Value ?? string.Empty));
+            result.Add((JsonNode?)JsonValue.Create(item.Value ?? string.Empty));
         }
         return result;
     }

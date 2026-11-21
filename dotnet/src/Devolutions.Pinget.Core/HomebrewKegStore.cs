@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Devolutions.Pinget.Core;
 
@@ -39,6 +40,10 @@ internal sealed record HomebrewTransaction(
     Dictionary<string, HomebrewLinkChange> Links,
     HomebrewKegReceipt? PreviousReceipt,
     HomebrewKegReceipt? Receipt);
+
+[JsonSerializable(typeof(HomebrewKegReceipt))]
+[JsonSerializable(typeof(HomebrewTransaction))]
+internal partial class HomebrewKegJsonContext : JsonSerializerContext;
 
 internal static class HomebrewKegStore
 {
@@ -159,7 +164,7 @@ internal static class HomebrewKegStore
             {
                 if (new FileInfo(path).LinkTarget is not null)
                     throw new IOException($"Homebrew receipt must not be a symbolic link: {path}");
-                var receipt = JsonSerializer.Deserialize<HomebrewKegReceipt>(File.ReadAllText(path))
+                var receipt = JsonSerializer.Deserialize(File.ReadAllText(path), HomebrewKegJsonContext.Default.HomebrewKegReceipt)
                     ?? throw new InvalidDataException($"Invalid Homebrew receipt: {path}");
                 if (!IsValidReceipt(receipt) || Path.GetFileName(path) != receipt.Package.Formula + ".json")
                     throw new InvalidDataException($"Unsupported or invalid Homebrew receipt: {path}");
@@ -369,7 +374,7 @@ internal static class HomebrewKegStore
         HomebrewTransaction transaction;
         try
         {
-            transaction = JsonSerializer.Deserialize<HomebrewTransaction>(File.ReadAllText(path))
+            transaction = JsonSerializer.Deserialize(File.ReadAllText(path), HomebrewKegJsonContext.Default.HomebrewTransaction)
                 ?? throw new InvalidDataException(unrecoverable);
             ValidateTransaction(transaction);
         }
@@ -690,10 +695,10 @@ internal static class HomebrewKegStore
 
     private static void SaveReceipt(string root, HomebrewKegReceipt receipt) =>
         WriteDurable(root, Path.Combine(root, "receipts", receipt.Package.Formula + ".json"),
-            stream => JsonSerializer.Serialize(stream, receipt));
+            stream => JsonSerializer.Serialize(stream, receipt, HomebrewKegJsonContext.Default.HomebrewKegReceipt));
 
     private static void WriteJournal(string root, HomebrewTransaction transaction) =>
-        WriteDurable(root, Path.Combine(root, JournalName), stream => JsonSerializer.Serialize(stream, transaction));
+        WriteDurable(root, Path.Combine(root, JournalName), stream => JsonSerializer.Serialize(stream, transaction, HomebrewKegJsonContext.Default.HomebrewTransaction));
 
     private static void RemoveJournal(string root)
     {
