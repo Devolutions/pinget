@@ -60,5 +60,21 @@ jobs:
                   print(f"empty block_size={block_size}: accepted {result!r}")
               except m.NativeDecodeError as error:
                   print(f"empty block_size={block_size}: rejected {error}")
+
+          for size in (2, 100, 16384, 32763, 32764, 32767, 32768):
+              original = m.payload(m.Case("double_stored", size, "random"))
+              header = native.compress_reference(original)[:24]
+              midpoint = size // 2
+              chunks = (original[:midpoint], original[midpoint:])
+              raw = bytearray()
+              for index, chunk in enumerate(chunks):
+                  length = len(chunk)
+                  raw.extend(bytes([int(index == 1)]) + struct.pack("<HH", length, length ^ 0xffff) + chunk)
+              frame = header + struct.pack("<I", len(raw) + 2) + b"CK" + raw
+              try:
+                  assert native.decompress(frame, size) == original
+                  print(f"two-stored-block payload={size}, framed={len(raw) + 2}: accepted")
+              except m.NativeDecodeError as error:
+                  print(f"two-stored-block payload={size}, framed={len(raw) + 2}: rejected {error}")
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
