@@ -259,8 +259,8 @@ pub(crate) fn read_all(app_root: &Path) -> Result<Vec<Receipt>> {
     check_directory(&root)?;
     if fs::symlink_metadata(root.join(JOURNAL)).is_ok() {
         // An active operation owns the journal; otherwise recover before reporting state.
-        if let Some(_lock) = try_lock(&root)? {
-            recover(&root, &mut Vec::new())?;
+        if let Some(lock) = try_lock(&root)? {
+            lock.run(|| recover(&root, &mut Vec::new()))?;
         }
     }
     read_receipts(&root)
@@ -977,7 +977,18 @@ fn cleanup(path: &Path, warnings: &mut Vec<String>) {
 
 /// Acquires the advisory operation lock shared with the .NET runtime (`flock` on Unix). The OS
 /// releases it when the process exits, so an interrupted operation never leaves a stale lock.
-fn try_lock(root: &Path) -> Result<Option<fs::File>> {
+struct OperationLock(fs::File);
+
+impl OperationLock {
+    fn run<T>(self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let result = action();
+        // close alone can leave flock held by a concurrently forked child's inherited descriptor.
+        self.0.unlock().context("Failed to release Homebrew operation lock")?;
+        result
+    }
+}
+
+fn try_lock(root: &Path) -> Result<Option<OperationLock>> {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -985,7 +996,7 @@ fn try_lock(root: &Path) -> Result<Option<fs::File>> {
         .truncate(false)
         .open(root.join("operations.lock"))?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(OperationLock(file))),
         Err(fs::TryLockError::WouldBlock) => Ok(None),
         Err(fs::TryLockError::Error(error)) => Err(error.into()),
     }
@@ -996,14 +1007,16 @@ fn with_lock<T>(
     warnings: &mut Vec<String>,
     action: impl FnOnce(&mut Vec<String>) -> Result<T>,
 ) -> Result<T> {
-    let _lock = try_lock(root)?.context("Another Pinget Homebrew operation is in progress for this prefix")?;
-    recover(root, warnings)?;
-    // Without a journal, anything left in the private staging area is from an interrupted
-    // extraction and is owned by Pinget.
-    for entry in fs::read_dir(root.join(".staging"))? {
-        cleanup(&entry?.path(), warnings);
-    }
-    action(warnings)
+    let lock = try_lock(root)?.context("Another Pinget Homebrew operation is in progress for this prefix")?;
+    lock.run(|| {
+        recover(root, warnings)?;
+        // Without a journal, anything left in the private staging area is from an interrupted
+        // extraction and is owned by Pinget.
+        for entry in fs::read_dir(root.join(".staging"))? {
+            cleanup(&entry?.path(), warnings);
+        }
+        action(warnings)
+    })
 }
 
 fn unique() -> String {
@@ -1280,13 +1293,25 @@ mod tests {
         let fixture = Fixture::new()?;
         setup_dependency(&fixture)?;
         let root = prefix(&fixture.0);
-        let held = try_lock(&root)?.context("lock should be free")?;
-        let error = fresh_install(&fixture).expect_err("concurrent operation must be refused");
-        assert!(format!("{error:#}").contains("in progress"), "{error:#}");
-        drop(held);
-        // A leftover lock file from an interrupted process does not block later operations.
-        assert!(root.join("operations.lock").is_file());
-        fresh_install(&fixture)
+        for fail in [false, true] {
+            let held = try_lock(&root)?.context("lock should be free")?;
+            let error = fresh_install(&fixture).expect_err("concurrent operation must be refused");
+            assert!(format!("{error:#}").contains("in progress"), "{error:#}");
+            // A duplicate models a descriptor inherited by a child between fork and exec.
+            let inherited = held.0.try_clone()?;
+            let result = held.run(|| {
+                if fail {
+                    bail!("simulated operation failure");
+                }
+                Ok(())
+            });
+            assert_eq!(result.is_err(), fail);
+            // A leftover lock file from an interrupted process does not block later operations.
+            assert!(root.join("operations.lock").is_file());
+            fresh_install(&fixture)?;
+            drop(inherited);
+        }
+        Ok(())
     }
 
     #[test]

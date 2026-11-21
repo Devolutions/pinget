@@ -772,7 +772,22 @@ internal static class HomebrewKegStore
             }
         }
 
-        public void Dispose() => _stream.Dispose();
+        [DllImport("libc", EntryPoint = "flock", SetLastError = true)]
+        private static extern int Unlock(Microsoft.Win32.SafeHandles.SafeFileHandle descriptor, int operation);
+
+        public void Dispose()
+        {
+            try
+            {
+                // close alone can leave flock held by a concurrently forked child's inherited descriptor.
+                if (!_stream.SafeFileHandle.IsClosed && !OperatingSystem.IsWindows() && Unlock(_stream.SafeFileHandle, 8) != 0)
+                    throw new IOException($"Failed to release Homebrew operation lock: {Marshal.GetLastPInvokeError()}");
+            }
+            finally
+            {
+                _stream.Dispose();
+            }
+        }
     }
 }
 
