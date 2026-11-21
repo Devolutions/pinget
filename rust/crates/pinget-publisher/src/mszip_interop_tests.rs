@@ -1,4 +1,4 @@
-//! Linux fixture production using the actual private portable encoder.
+//! Non-Windows fixture production using the actual private portable encoder.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;

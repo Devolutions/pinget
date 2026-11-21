@@ -27,7 +27,7 @@ public sealed class PortableMsZipInteropTests
 
         Assert.False(string.IsNullOrEmpty(root), $"{RootVariable} must be set");
         Assert.False(string.IsNullOrEmpty(runId), $"{RunVariable} must be set");
-        Assert.True(OperatingSystem.IsLinux(), "fixture production must run on Linux");
+        Assert.True(OperatingSystem.IsLinux() || OperatingSystem.IsMacOS(), "fixture production must run on Linux or macOS");
         using var manifest = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(root!, "run.json")));
         var document = manifest.RootElement;
         Assert.Equal(Protocol, document.GetProperty("protocol").GetString());

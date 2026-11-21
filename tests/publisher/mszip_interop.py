@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Produce Linux MSZIP fixtures and validate them with the Windows native API.
+"""Produce non-Windows MSZIP fixtures and validate them with the Windows native API.
 
 The fixture producer calls test-only entry points into the two production
 encoders. No encoder is implemented here. A fresh, caller-supplied run ID is
@@ -193,7 +193,7 @@ def completion_record(root: Path, run_id: str) -> dict[str, str]:
 
 
 def check_frame(data: bytes, expected_size: int, inflate: bool = False) -> bytes:
-    """Check the emitted block framing; zlib is used only for the Linux smoke test."""
+    """Check the emitted block framing; zlib is used only for the portable smoke test."""
     require(len(data) >= 24, "truncated MSZIP header")
     signature, header_size, checksum, algorithm, declared, block_size, flags = struct.unpack_from("<4sHBBQII", data)
     require(signature == SIGNATURE, "invalid MSZIP signature")
@@ -450,7 +450,7 @@ def run_command(command: list[str], env: dict[str, str]) -> str:
 
 
 def produce(root: Path, reports: Path, run_id: str, *, dotnet_no_restore: bool = False) -> None:
-    require(sys.platform.startswith("linux"), "both portable fixture producers must run on Linux")
+    require(sys.platform.startswith("linux") or sys.platform == "darwin", "fixture producers require Linux or macOS")
     checked_run_id(run_id)
     root = root.resolve()
     reports = reports.resolve()
@@ -487,7 +487,7 @@ def produce(root: Path, reports: Path, run_id: str, *, dotnet_no_restore: bool =
         make_producer_manifest(root, run_id, producer)
     validate_tree(root, run_id, portable_smoke_decode, complete=False)
     write_json(root / "complete.json", completion_record(root, run_id))
-    print(f"Linux fixture production and portable smoke checks passed: {root}")
+    print(f"Portable fixture production and smoke checks passed: {root}")
     print("Windows native validation has NOT run.")
 
 
@@ -504,7 +504,7 @@ def validate_windows(root: Path, run_id: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
-    producer = subparsers.add_parser("produce", help="run both real portable encoders on Linux")
+    producer = subparsers.add_parser("produce", help="run both real portable encoders on Linux or macOS")
     producer.add_argument("--output", type=Path, required=True)
     producer.add_argument("--reports", type=Path, required=True)
     producer.add_argument("--run-id", required=True)

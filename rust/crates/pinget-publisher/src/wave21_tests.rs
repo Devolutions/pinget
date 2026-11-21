@@ -1,7 +1,7 @@
 //! Wave 21 publisher regression tests.
 
 // Keep the private encoder test-only; do not expose it through the public API.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "mszip_interop_tests.rs"]
 mod mszip_interop_tests;
 

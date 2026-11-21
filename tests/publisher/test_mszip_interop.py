@@ -189,6 +189,20 @@ class FixtureProtocolTests(unittest.TestCase):
         self.assertFalse((root / "complete.json").exists())
         self.assertEqual(interop.payload(SMALL_CASES[1]), (root / "inputs" / "single_byte.bin").read_bytes())
 
+    def test_fixture_producer_accepts_macos_and_rejects_windows(self):
+        root = Path(self.temporary.name) / "platform-run"
+        reports = Path(self.temporary.name) / "platform-reports"
+        with mock.patch.object(interop.sys, "platform", "win32"):
+            with self.assertRaisesRegex(interop.VerificationError, "require Linux or macOS"):
+                interop.produce(root, reports, "run-43")
+        self.assertFalse(root.exists())
+        self.assertFalse(reports.exists())
+        with mock.patch.object(interop.sys, "platform", "darwin"), mock.patch.object(
+            interop, "initialize_fixture", side_effect=interop.VerificationError("entered fixture initialization")
+        ):
+            with self.assertRaisesRegex(interop.VerificationError, "entered fixture initialization"):
+                interop.produce(root, reports, "run-43")
+
 
 class FixtureDefinitionTests(unittest.TestCase):
     def test_inventory_covers_exact_boundaries_and_both_multiblock_patterns(self):
