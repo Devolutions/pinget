@@ -48,8 +48,15 @@ internal static class MsZipCompressor
         using var output = new MemoryStream();
         var header = new byte[24];
         Signature.CopyTo(header);
+        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(4, 2), (ushort)header.Length);
+        header[7] = (byte)CompressAlgorithmMsZip;
         BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(8, 8), (ulong)input.Length);
-        BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(16, 8), BlockSize);
+        var blockSize = input.Length == 0 ? BlockSize : Math.Min(input.Length, BlockSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(16, 8), (ulong)blockSize);
+        Span<byte> checksumInput = stackalloc byte[23];
+        header.AsSpan(0, 6).CopyTo(checksumInput);
+        header.AsSpan(7).CopyTo(checksumInput[6..]);
+        header[6] = unchecked((byte)Crc32.Compute(checksumInput));
         output.Write(header);
 
         for (var offset = 0; offset < input.Length; offset += BlockSize)

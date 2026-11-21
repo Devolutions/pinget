@@ -190,11 +190,14 @@ def completion_record(root: Path, run_id: str) -> dict[str, str]:
 def check_frame(data: bytes, expected_size: int, inflate: bool = False) -> bytes:
     """Check the emitted block framing; zlib is used only for the Linux smoke test."""
     require(len(data) >= 24, "truncated MSZIP header")
-    signature, reserved, declared, block_size = struct.unpack_from("<4s4sQQ", data)
+    signature, header_size, checksum, algorithm, declared, block_size, flags = struct.unpack_from("<4sHBBQII", data)
     require(signature == SIGNATURE, "invalid MSZIP signature")
-    require(reserved == b"\0" * 4, "invalid MSZIP reserved bytes")
+    require(header_size == 24, f"invalid MSZIP header size {header_size}")
+    require(algorithm == 2 and flags == 0, "invalid MSZIP algorithm or flags")
+    require(checksum == zlib.crc32(data[:6] + data[7:header_size]) & 0xFF, "invalid MSZIP header checksum")
     require(declared == expected_size, f"MSZIP declared length {declared} != {expected_size}")
-    require(block_size == BLOCK, f"invalid MSZIP block size {block_size}")
+    expected_block_size = min(expected_size, BLOCK) if expected_size else BLOCK
+    require(block_size == expected_block_size, f"invalid MSZIP block size {block_size}")
     offset = 24
     decoded_blocks: list[bytes] = []
     for block_start in range(0, expected_size, BLOCK):
@@ -384,7 +387,6 @@ def check_native_positive_control(native, root: Path) -> None:
     for producer in PRODUCERS:
         encoded = read_file(root / producer / "single_byte.mszip")
         print(f"Portable {producer} single-byte fixture: {encoded.hex()}", flush=True)
-    print(f"Win32 error 605: {ctypes.FormatError(605).strip()}", flush=True)
 
 
 def assert_native_rejects_malformed_empty(native, valid: bytes, reference: bytes | None = None) -> None:

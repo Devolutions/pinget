@@ -17,14 +17,10 @@ SMALL_CASES = (
     interop.Case("single_byte", 1, "single"),
     interop.Case("block_32k_after", interop.BLOCK + 1, "random"),
 )
-EMPTY_FRAME = interop.SIGNATURE + bytes(4) + struct.pack("<QQ", 0, interop.BLOCK)
-# A fixed, final, uncompressed DEFLATE block containing one byte.
-SINGLE_FRAME = (
-    interop.SIGNATURE
-    + bytes(4)
-    + struct.pack("<QQI", 1, interop.BLOCK, 8)
-    + b"CK\x01\x01\x00\xfe\xff\xa7"
-)
+EMPTY_FRAME = bytearray(interop.SIGNATURE + bytes.fromhex("18000002") + struct.pack("<QQ", 0, interop.BLOCK))
+EMPTY_FRAME[6] = zlib.crc32(EMPTY_FRAME[:6] + EMPTY_FRAME[7:]) & 0xFF
+EMPTY_FRAME = bytes(EMPTY_FRAME)
+SINGLE_FRAME = bytes.fromhex("0a51e5c018001f020100000000000000010000000000000005000000434b5b0e00")
 
 
 def no_frame_check(_encoded, _size):
@@ -243,7 +239,9 @@ class FixtureDefinitionTests(unittest.TestCase):
         corruptions = {
             "truncated_header": EMPTY_FRAME[:23],
             "bad_signature": b"\x00" + EMPTY_FRAME[1:],
-            "bad_reserved": EMPTY_FRAME[:4] + b"\x01" + EMPTY_FRAME[5:],
+            "bad_header_size": EMPTY_FRAME[:4] + b"\x01" + EMPTY_FRAME[5:],
+            "bad_checksum": EMPTY_FRAME[:6] + bytes([EMPTY_FRAME[6] ^ 1]) + EMPTY_FRAME[7:],
+            "bad_algorithm": EMPTY_FRAME[:7] + b"\x03" + EMPTY_FRAME[8:],
             "wrong_length": SINGLE_FRAME,
             "wrong_block_size": EMPTY_FRAME[:16] + struct.pack("<Q", 32767),
             "unexpected_trailing": EMPTY_FRAME + b"\x00",
@@ -384,8 +382,7 @@ class NativeEmptyControlTests(unittest.TestCase):
                 (root / producer).mkdir()
                 (root / producer / "single_byte.mszip").write_bytes(SINGLE_FRAME)
             native = FakeNative()
-            with mock.patch.object(interop.ctypes, "FormatError", return_value="bad compression", create=True), \
-                    mock.patch("builtins.print"):
+            with mock.patch("builtins.print"):
                 interop.check_native_positive_control(native, root)
             self.assertEqual(b"\xa7", native.asserted_input)
 

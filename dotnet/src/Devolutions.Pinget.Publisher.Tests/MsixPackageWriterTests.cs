@@ -269,6 +269,16 @@ public sealed class MsixPackageWriterTests
         }
     }
 
+    [Theory]
+    [InlineData(1, "0a51e5c018001f0201000000000000000100000000000000")]
+    [InlineData(78_000, "0a51e5c018005202b0300100000000000080000000000000")]
+    public void PortableMsZipWriter_MatchesNativeHeadersAtSingleAndMultiblockSizes(int size, string nativeHeader)
+    {
+        var compressed = MsZipCompressor.CompressPortable(new byte[size]);
+
+        Assert.Equal(nativeHeader, Convert.ToHexString(compressed.AsSpan(0, 24)).ToLowerInvariant());
+    }
+
     [Fact]
     public void PortableMsZipDecoder_ReadsNativeCompressorOutput()
     {

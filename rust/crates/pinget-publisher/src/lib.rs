@@ -4839,7 +4839,7 @@ fn validate_mszip_size(input: &[u8]) -> Result<()> {
 
 #[cfg(not(windows))]
 fn compress_mszip(input: &[u8]) -> Result<Vec<u8>> {
-    const HEADER_SIZE: usize = 24;
+    const HEADER_SIZE: u16 = 24;
     const BLOCK_SIZE: usize = 32 * 1024;
     const SIGNATURE: [u8; 4] = [0x0a, 0x51, 0xe5, 0xc0];
 
@@ -4849,10 +4849,21 @@ fn compress_mszip(input: &[u8]) -> Result<Vec<u8>> {
         ));
     }
 
-    let mut output = vec![0; HEADER_SIZE];
+    let mut output = vec![0; usize::from(HEADER_SIZE)];
     output[..4].copy_from_slice(&SIGNATURE);
+    output[4..6].copy_from_slice(&HEADER_SIZE.to_le_bytes());
+    output[7] = 2;
     output[8..16].copy_from_slice(&(input.len() as u64).to_le_bytes());
-    output[16..24].copy_from_slice(&(BLOCK_SIZE as u64).to_le_bytes());
+    let block_size = if input.is_empty() {
+        BLOCK_SIZE
+    } else {
+        input.len().min(BLOCK_SIZE)
+    };
+    output[16..24].copy_from_slice(&(block_size as u64).to_le_bytes());
+    let mut checksum = flate2::Crc::new();
+    checksum.update(&output[..6]);
+    checksum.update(&output[7..usize::from(HEADER_SIZE)]);
+    output[6] = checksum.sum().to_le_bytes()[0];
     for block in input.chunks(BLOCK_SIZE) {
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(block)?;
@@ -5226,6 +5237,19 @@ mod tests {
                 pinget_core::decompress_mszip_buffer(&compressed).expect("portable decode"),
                 input
             );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn portable_mszip_writer_matches_native_headers_at_single_and_multiblock_sizes() {
+        for (size, native_header) in [
+            (1, "0a51e5c018001f0201000000000000000100000000000000"),
+            (78_000, "0a51e5c018005202b0300100000000000080000000000000"),
+        ] {
+            let compressed = compress_mszip(&vec![0; size]).expect("portable MSZIP");
+            let actual: String = compressed[..24].iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(actual, native_header, "header for {size} bytes");
         }
     }
 
