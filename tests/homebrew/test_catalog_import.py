@@ -81,6 +81,36 @@ class CatalogClosureTests(unittest.TestCase):
         selected, _ = catalog.adapted_bottle(formula, "sonoma")
         self.assertEqual(selected["cellar"], ":unknown")
 
+    def test_sequoia_targets_are_forwarded_with_matching_architecture(self):
+        for tag, architecture in (("sequoia", "x64"), ("arm64_sequoia", "arm64")):
+            with self.subTest(target=tag), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                formula = {
+                    "name": "sample", "tap": "homebrew/core", "dependencies": [],
+                    "versions": {"stable": "1.0"}, "revision": 0,
+                    "bottle": {"stable": {"rebuild": 0, "files": {
+                        tag: {"cellar": ":any", "sha256": "a" * 64}
+                    }}},
+                }
+                args = SimpleNamespace(
+                    formula=["sample"], formula_list=None, tag=tag, runtime="rust", rust_cli="pinget",
+                    dotnet_assembly=None, manifest_output=root / "manifests", bottle_mirror=root / "bottles",
+                    base_url="https://mirror.invalid/bottles", report=root / "report.json", minimum_imported=None,
+                )
+                def download(_formula, _tag, directory):
+                    path = directory / "sample.tar.gz"
+                    path.write_bytes(b"fixture")
+                    return path
+                with patch.object(catalog, "api_formula", return_value=(formula, "api-hash")), \
+                     patch.object(catalog, "download_bottle", side_effect=download), \
+                     patch.object(catalog.subprocess, "run") as invoke:
+                    report = catalog.import_catalog(args)
+                command = invoke.call_args.args[0]
+                self.assertEqual(command[command.index("--tag") + 1], tag)
+                self.assertEqual(command[command.index("--target-os") + 1], "macOS")
+                self.assertEqual(command[command.index("--architecture") + 1], architecture)
+                self.assertEqual(report["importedRoots"], ["sample"])
+
     def test_linux_abi_requires_exact_oci_tag_and_bottle_digest(self):
         digest = "a" * 64
         formula = {

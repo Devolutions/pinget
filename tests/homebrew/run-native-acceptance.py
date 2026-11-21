@@ -220,6 +220,7 @@ def main():
     # Windows exercises cross-platform publishing and signature verification, not client consumption.
     if platform.system() == "Windows":
         arch, target_os, tag = "x64", "Linux", "x86_64_linux"
+    catalog_tag = ("arm64_sequoia" if arch == "arm64" else "sequoia") if target_os == "macOS" else tag
     clis = {"rust": [args.rust_cli.resolve()], "dotnet": ["dotnet", args.dotnet_assembly.resolve()]}
     # Resolve the platform executable name (for example psign-tool.exe on Windows).
     psign_path = shutil.which(args.psign_tool.name, path=str(args.psign_tool.resolve().parent))
@@ -261,18 +262,22 @@ def main():
                 catalog_root = work / "catalog"
                 catalog_input = catalog_root / "input"
                 catalog_report_path = catalog_root / "import-report.json"
-                run([
-                    sys.executable, "scripts/import-homebrew-catalog.py",
-                    "--formula-list", "tests/homebrew/acceptance-corpus.txt",
-                    "--minimum-imported", "20",
-                    "--tag", tag,
-                    "--runtime", "rust",
-                    "--rust-cli", clis["rust"][0],
-                    "--manifest-output", catalog_input / "manifests",
-                    "--bottle-mirror", catalog_input / "bottles",
-                    "--base-url", f"{base}/catalog/bottles",
-                    "--report", catalog_report_path,
-                ], env, timeout=3600)
+                try:
+                    run([
+                        sys.executable, "scripts/import-homebrew-catalog.py",
+                        "--formula-list", "tests/homebrew/acceptance-corpus.txt",
+                        "--minimum-imported", "20",
+                        "--tag", catalog_tag,
+                        "--runtime", "rust",
+                        "--rust-cli", clis["rust"][0],
+                        "--manifest-output", catalog_input / "manifests",
+                        "--bottle-mirror", catalog_input / "bottles",
+                        "--base-url", f"{base}/catalog/bottles",
+                        "--report", catalog_report_path,
+                    ], env, timeout=3600)
+                finally:
+                    if catalog_report_path.is_file():
+                        report["catalogImport"] = json.loads(catalog_report_path.read_text())
                 catalog_result = json.loads(catalog_report_path.read_text())
                 catalog_roots = catalog_result["importedRoots"][:20]
                 if len(catalog_roots) < 20:
@@ -289,7 +294,7 @@ def main():
                 catalog_public_bottles.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(catalog_input / "bottles", catalog_public_bottles, copy_function=os.link)
                 report["catalog"] = {
-                    "target": tag,
+                    "target": catalog_tag,
                     "importedRoots": catalog_roots,
                     "fixedCellarRoots": fixed_cellar_roots,
                     "importedMetadata": catalog_result["importedMetadata"],
@@ -311,19 +316,6 @@ def main():
                                "--bottle-mirror", generation / "input/bottles",
                                "--tag", tag, "--target-os", target_os, "--architecture", arch,
                                "--base-url", f"{base}/{runtime}/bottles"], env)
-                if catalog_input:
-                    for directory in ("manifests", "bottles"):
-                        source_dir = catalog_input / directory
-                        destination_dir = generation / "input" / directory
-                        for source_file in source_dir.iterdir():
-                            destination_file = destination_dir / source_file.name
-                            if destination_file.exists():
-                                if destination_file.read_bytes() != source_file.read_bytes():
-                                    raise RuntimeError(
-                                        f"Catalog and pinned acceptance inputs conflict at {source_file.name}"
-                                    )
-                            else:
-                                os.link(source_file, destination_file)
                 state, msix = generation / "state", generation / "brew.msix"
                 run(cli + ["repository", "build", "--input", generation / "input", "--state", state], env)
                 run(cli + ["repository", "package", "--state", state, "--name", "Pinget.HomebrewSource",
@@ -437,10 +429,29 @@ def main():
                 finally:
                     package.write_bytes(original)
                 report["checks"].append(f"{consumer}/{publisher}: tamper rejection preserves active cache")
+            for publisher, cli in clis.items():
+                if not catalog_input:
+                    continue
+                state = work / f"catalog-{publisher}-state"
+                msix = work / f"catalog-{publisher}" / "brew.msix"
+                msix.parent.mkdir()
+                run(cli + ["repository", "build", "--input", catalog_input, "--state", state], env)
+                run(cli + ["repository", "package", "--state", state, "--name", "Pinget.HomebrewSource",
+                           "--publisher", PUBLISHER, "--version", "1.0.0.0", "--msix", msix], env)
+                run([psign, "sign", "--mode", "portable", "--pfx", work / "signer.pfx", "--password", "", msix], env)
+                run(cli + ["repository", "publish", "--state", state, "--destination", public / f"catalog-{publisher}",
+                           "--msix", msix, "--psign-tool", psign, "--trusted-ca", work / "root.pem"], env)
+                report["checks"].append(f"{publisher} signed live catalog source")
             for index, formula in enumerate(catalog_roots):
-                consumer, publisher, app, client_env = clients[index % len(clients)]
+                consumer, publisher, _, _ = clients[index % len(clients)]
                 cli = clis[consumer]
-                run(cli + ["install", formula, "--source", "homebrew", "--silent",
+                app = work / f"catalog-client-{index}"
+                client_env = dict(env, PINGET_APPROOT=str(app))
+                run(cli + ["source", "add", "--name", "catalog", "--arg", f"{base}/catalog-{publisher}",
+                           "--type", "Pinget.PreIndexed.Homebrew", "--publisher", PUBLISHER,
+                           "--trusted-ca", work / "root.pem"], client_env)
+                run(cli + ["source", "update", "catalog"], client_env)
+                run(cli + ["install", formula, "--source", "catalog", "--silent",
                            "--accept-package-agreements"], client_env, timeout=600)
                 receipt = None
                 for path in (app / "homebrew/receipts").glob("*.json"):

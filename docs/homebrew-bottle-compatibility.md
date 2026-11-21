@@ -14,7 +14,7 @@ tampered signed source updates without changing the active cache.
 | Area | Supported now | Explicitly not supported |
 | --- | --- | --- |
 | Formula input | One local object per offline import; bounded live `homebrew/core` dependency-closure importer | Authenticated API snapshots, automatic tap curation, casks, Ruby evaluation |
-| Bottle target | Sonoma macOS x64/arm64 and glibc Linux x64/arm64 metadata; native architecture only | Other importer tags, emulation, musl, platform-independent targets |
+| Bottle target | Sonoma and Sequoia macOS x64/arm64 and glibc Linux x64/arm64 metadata; native architecture only | Other importer tags, emulation, musl, platform-independent targets |
 | Formula metadata | Identity, stable version, revision, aliases, old names, keg-only, description, homepage, SPDX license, runtime dependency identities/minima | Nonzero version schemes, `uses_from_macos`, requirements, conflicts, optional dependencies, variations |
 | Bottle classes | `any`, `any_skip_relocation`, and target-matched fixed-cellar paths | Unknown or cross-target fixed cellars |
 | Archive handling | Digest verification, unchanged mirroring, bounded extraction, contained regular files/directories/links, executable modes | Traversal, escaping/dangling/chained links, special devices/FIFOs, hooks |
@@ -31,6 +31,10 @@ Unix runner, but that expanded gate has not passed. Run
 attempt 2, failed on all four Unix runners during live catalog import. The
 last verified real execution remains the pinned jq/oniguruma chain on Linux
 x64/arm64 and macOS x64/arm64.
+Run [44946344342](https://github.com/Devolutions/pinget/actions/runs/44946344342),
+attempt 2, also fell short of the 20-root threshold on all four Unix runners.
+The live catalog gate now targets Sequoia on macOS 15 while preserving the
+pinned Sonoma lifecycle test; the revised gate still needs hosted verification.
 
 ## Import and publication checks
 

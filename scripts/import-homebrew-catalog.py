@@ -19,6 +19,7 @@ MAX_FORMULAS = 256
 MAX_FORMULA_BYTES = 8 * 1024 * 1024
 MAX_BOTTLE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_CLOSURE_BOTTLE_BYTES = 2 * 1024 * 1024 * 1024
+TARGET_TAGS = ("arm64_sonoma", "sonoma", "arm64_sequoia", "sequoia", "x86_64_linux", "aarch64_linux")
 
 
 class ImportError(Exception):
@@ -270,9 +271,9 @@ def import_catalog(args):
     roots = list(dict.fromkeys(roots))
     if not roots or len(roots) > MAX_FORMULAS:
         raise ImportError(f"provide 1..{MAX_FORMULAS} unique --formula values or a formula list")
-    if args.tag not in {"arm64_sonoma", "sonoma", "x86_64_linux", "aarch64_linux"}:
+    if args.tag not in TARGET_TAGS:
         raise ImportError(f"unsupported native target tag: {args.tag}")
-    if args.tag.endswith("sonoma"):
+    if args.tag.endswith(("sonoma", "sequoia")):
         target_os, architecture = "macOS", "arm64" if args.tag.startswith("arm64") else "x64"
     else:
         target_os, architecture = "Linux", "arm64" if args.tag.startswith("aarch64") else "x64"
@@ -368,7 +369,10 @@ def import_catalog(args):
     if not 1 <= minimum <= len(roots):
         raise ImportError(f"--minimum-imported must be between 1 and {len(roots)}")
     if len(report["importedRoots"]) < minimum:
-        raise ImportError(f"requested formulas were not all imported: {', '.join(missing_roots)}; see {report_path}")
+        raise ImportError(
+            f"imported {len(report['importedRoots'])} of {len(roots)} requested roots; "
+            f"minimum is {minimum}. Missing: {', '.join(missing_roots)}; see {report_path}"
+        )
     return report
 
 
@@ -376,7 +380,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--formula", action="append", default=[], help="homebrew/core formula to include; repeatable")
     parser.add_argument("--formula-list", help="UTF-8 file with one formula name per line")
-    parser.add_argument("--tag", required=True, choices=["arm64_sonoma", "sonoma", "x86_64_linux", "aarch64_linux"])
+    parser.add_argument("--tag", required=True, choices=TARGET_TAGS)
     parser.add_argument("--manifest-output", required=True)
     parser.add_argument("--bottle-mirror", required=True)
     parser.add_argument("--base-url", required=True, help="Public HTTPS bottle mirror URL")

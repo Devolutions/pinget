@@ -414,8 +414,8 @@ public record HomebrewBottleMetadata
 
     public static string? FixedCellarForTag(string tag) => tag switch
     {
-        "arm64_sonoma" => "/opt/homebrew/Cellar",
-        "sonoma" => "/usr/local/Cellar",
+        "arm64_sonoma" or "arm64_sequoia" => "/opt/homebrew/Cellar",
+        "sonoma" or "sequoia" => "/usr/local/Cellar",
         "x86_64_linux" or "aarch64_linux" => "/home/linuxbrew/.linuxbrew/Cellar",
         _ => null,
     };

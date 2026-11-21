@@ -165,11 +165,13 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
         ),
         ("arm64_sonoma", "macOS", "arm64")
             | ("sonoma", "macOS", "x64")
+            | ("arm64_sequoia", "macOS", "arm64")
+            | ("sequoia", "macOS", "x64")
             | ("x86_64_linux", "Linux", "x64")
             | ("aarch64_linux", "Linux", "arm64")
     ) {
         return Err(invalid(
-            "unsupported target: select a Sonoma macOS or native glibc Linux bottle with its matching architecture",
+            "unsupported target: select a Sonoma or Sequoia macOS or native glibc Linux bottle with its matching architecture",
         ));
     }
     if !public_url(&options.base_url) {
@@ -403,7 +405,11 @@ pub fn import(options: &ImportOptions) -> Result<ImportReport> {
         manifest["Pinget"]["Homebrew"]["Bottles"][0]["MinimumGlibc"] = json!(minimum);
         manifest["Pinget"]["Homebrew"]["Bottles"][0]["Loader"] = json!("glibc");
     } else {
-        manifest["Pinget"]["Homebrew"]["Bottles"][0]["MinimumOSVersion"] = json!("14.0");
+        manifest["Pinget"]["Homebrew"]["Bottles"][0]["MinimumOSVersion"] = json!(if options.tag.ends_with("sequoia") {
+            "15.0"
+        } else {
+            "14.0"
+        });
     }
     if !dependencies.is_empty() {
         manifest["Installers"][0]["Dependencies"] = json!({"PackageDependencies": dependencies});

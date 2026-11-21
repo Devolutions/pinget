@@ -114,7 +114,7 @@ installable by the current client.
 
 ## Current implementation boundary
 
-The importer maps one pinned target at a time: Sonoma macOS x64/arm64 or glibc
+The offline importer maps one pinned target at a time: Sonoma or Sequoia macOS x64/arm64 or glibc
 Linux x64/arm64, with runtime dependency identities and optional curated minima.
 It does not fetch the formula API, evaluate Ruby, or automatically curate a tap.
 The publisher mirrors bottle bytes unchanged and produces a Homebrew-only

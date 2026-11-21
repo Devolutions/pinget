@@ -503,8 +503,8 @@ pub struct HomebrewBottleMetadata {
 impl HomebrewBottleMetadata {
     pub fn fixed_cellar_for_tag(tag: &str) -> Option<&'static str> {
         match tag {
-            "arm64_sonoma" => Some("/opt/homebrew/Cellar"),
-            "sonoma" => Some("/usr/local/Cellar"),
+            "arm64_sonoma" | "arm64_sequoia" => Some("/opt/homebrew/Cellar"),
+            "sonoma" | "sequoia" => Some("/usr/local/Cellar"),
             "x86_64_linux" | "aarch64_linux" => Some("/home/linuxbrew/.linuxbrew/Cellar"),
             _ => None,
         }

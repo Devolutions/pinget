@@ -18,8 +18,9 @@ public static class HomebrewImporter
     {
         if ((options.Tag, options.TargetOS, options.Architecture) is not
             (("arm64_sonoma", "macOS", "arm64") or ("sonoma", "macOS", "x64") or
+             ("arm64_sequoia", "macOS", "arm64") or ("sequoia", "macOS", "x64") or
              ("x86_64_linux", "Linux", "x64") or ("aarch64_linux", "Linux", "arm64")))
-            throw Invalid("unsupported target: select a Sonoma macOS or native glibc Linux bottle with its matching architecture");
+            throw Invalid("unsupported target: select a Sonoma or Sequoia macOS or native glibc Linux bottle with its matching architecture");
         if (!PublicUrl(options.BaseUrl))
             throw Invalid("base URL must be a public HTTPS URL without credentials, escapes, query, fragment, or dot segments");
         var formulaPath = SafePath(options.FormulaJson);
@@ -205,7 +206,7 @@ public static class HomebrewImporter
             bottleManifest["Loader"] = "glibc";
         }
         else
-            bottleManifest["MinimumOSVersion"] = "14.0";
+            bottleManifest["MinimumOSVersion"] = options.Tag.EndsWith("sequoia", StringComparison.Ordinal) ? "15.0" : "14.0";
         if (dependencies.Count > 0)
             manifest["Installers"]![0]!["Dependencies"] = new JsonObject
             {

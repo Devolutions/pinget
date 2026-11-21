@@ -7,6 +7,29 @@ namespace Devolutions.Pinget.Publisher.Tests;
 
 public sealed class HomebrewImporterTests
 {
+    [Theory]
+    [InlineData("arm64_sequoia", "arm64", "/opt/homebrew/Cellar")]
+    [InlineData("sequoia", "x64", "/usr/local/Cellar")]
+    public void ImportsSequoiaWithCorrectMinimumAndFixedCellar(string tag, string architecture, string cellar)
+    {
+        using var fixture = new Fixture();
+        fixture.Options = fixture.Options with { Tag = tag, Architecture = architecture };
+        fixture.Change(value =>
+        {
+            var bottle = value["bottle"]!["stable"]!["files"]!["arm64_sonoma"]!.DeepClone();
+            bottle["cellar"] = cellar;
+            value["bottle"]!["stable"]!["files"] = new JsonObject { [tag] = bottle };
+        });
+        var report = HomebrewImporter.Import(fixture.Options);
+        var yaml = new YamlDotNet.RepresentationModel.YamlStream();
+        yaml.Load(new StringReader(File.ReadAllText(
+            Path.Combine(fixture.Options.ManifestOutput, report["manifestFile"]!.GetValue<string>()))));
+        var bottle = yaml.Documents[0].RootNode["Pinget"]["Homebrew"]["Bottles"][0];
+        Assert.Equal(tag, bottle["BottleTag"].ToString());
+        Assert.Equal("15.0", bottle["MinimumOSVersion"].ToString());
+        Assert.Equal(cellar, bottle["Relocation"].ToString());
+    }
+
     [Fact]
     public void MapsLinuxRuntimeDependenciesAndDistinguishesBottleRebuilds()
     {

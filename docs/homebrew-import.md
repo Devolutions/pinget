@@ -16,8 +16,9 @@ Inputs must be local files supplied by the operator. The offline importer makes
 no network requests and accepts one formula object, not a bulk API list or
 cask.
 Supported triples are `arm64_sonoma` / `macOS` / `arm64`, `sonoma` / `macOS` /
-`x64`, `x86_64_linux` / `Linux` / `x64`, and `aarch64_linux` / `Linux` / `arm64`.
-Sonoma implies macOS product version 14.0. Linux inputs must augment the
+`x64`, `arm64_sequoia` / `macOS` / `arm64`, `sequoia` / `macOS` / `x64`,
+`x86_64_linux` / `Linux` / `x64`, and `aarch64_linux` / `Linux` / `arm64`.
+Sonoma implies macOS product version 14.0; Sequoia implies 15.0. Linux inputs must augment the
 selected bottle file with `minimum_glibc` and `loader: "glibc"` derived from
 pinned OCI metadata; those are curated Pinget input fields, not claimed
 formula API fields.
@@ -35,8 +36,8 @@ source builder, `Publisher` is the literal `Unknown`; the tap is never treated
 as an upstream publisher or author.
 `any` and `any_skip_relocation` are preserved as distinct metadata values.
 Fixed-cellar bottles are accepted only when the cellar exactly matches the
-selected native tag (`/opt/homebrew/Cellar` for arm64 Sonoma,
-`/usr/local/Cellar` for x64 Sonoma, or `/home/linuxbrew/.linuxbrew/Cellar`
+selected native tag (`/opt/homebrew/Cellar` for macOS arm64,
+`/usr/local/Cellar` for macOS x64, or `/home/linuxbrew/.linuxbrew/Cellar`
 for Linux). The client relocates those known source prefixes to its private
 prefix using the same bounded ELF, Mach-O, and text relocation as other
 bottles. Unknown or cross-target fixed cellars are rejected. Relocation is

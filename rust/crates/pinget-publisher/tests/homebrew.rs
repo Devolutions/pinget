@@ -139,6 +139,30 @@ fn maps_linux_runtime_dependencies_and_distinguishes_bottle_rebuilds() {
 }
 
 #[test]
+fn imports_sequoia_with_correct_minimum_and_fixed_cellar() {
+    for (tag, architecture, cellar) in [
+        ("arm64_sequoia", "arm64", "/opt/homebrew/Cellar"),
+        ("sequoia", "x64", "/usr/local/Cellar"),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.options.tag = tag.into();
+        fixture.options.architecture = architecture.into();
+        fixture.change(|value| {
+            let mut bottle = value["bottle"]["stable"]["files"]["arm64_sonoma"].clone();
+            bottle["cellar"] = json!(cellar);
+            value["bottle"]["stable"]["files"] = json!({tag: bottle});
+        });
+        let report = import(&fixture.options).expect("import Sequoia bottle");
+        let bytes = fs::read(fixture.options.manifest_output.join(report.manifest_file)).expect("manifest");
+        let manifest: Value = serde_yaml::from_slice(&bytes).expect("manifest YAML");
+        let bottle = &manifest["Pinget"]["Homebrew"]["Bottles"][0];
+        assert_eq!(bottle["BottleTag"], tag);
+        assert_eq!(bottle["MinimumOSVersion"], "15.0");
+        assert_eq!(bottle["Relocation"], cellar);
+    }
+}
+
+#[test]
 fn pinned_import_mirrors_exact_bytes_and_emits_deterministic_manifest_and_report() {
     let fixture = Fixture::new();
     let report = import(&fixture.options).expect("import pinned formula");
