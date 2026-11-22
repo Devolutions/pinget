@@ -128,7 +128,9 @@ with subject/authority key identifiers and no duplicate extensions; macOS
 rejects a root that is not standards compliant, and the gate checks the server
 chain with `security verify-cert` before starting. On Windows, the `dotnet tool`
 shim is `psign-tool.cmd`, so the workflow passes the packaged native
-`psign-tool.exe` to the gate.
+`psign-tool.exe` to the gate. Its loopback TLS host reimports the server key
+using `UserKeySet` for Schannel compatibility; the key is deleted on certificate
+disposal, without installing certificates in a host trust store.
 
 The gate supplies its disposable root explicitly for both MSIX signature and
 source-scoped TLS trust; it never modifies host trust stores. Temporary keys,

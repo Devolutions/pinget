@@ -224,6 +224,27 @@ function Test-GateSymlink {
     return (Test-Path -LiteralPath $Path) -and $null -ne (Get-Item -LiteralPath $Path -Force).LinkTarget
 }
 
+function New-GateHost {
+    param([string] $Root, [string] $CertificatePath, [string] $KeyPath)
+    $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($CertificatePath, $KeyPath)
+    try {
+        if ($IsWindows) {
+            # Schannel cannot use the ephemeral key created by the PEM loader.
+            # UserKeySet without PersistKeySet deletes the temporary key on disposal.
+            $imported = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+                $certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx),
+                [string]::Empty, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::UserKeySet)
+            $certificate.Dispose()
+            $certificate = $imported
+        }
+        return [HomebrewGateHost]::new($Root, $certificate)
+    }
+    catch {
+        $certificate.Dispose()
+        throw
+    }
+}
+
 function Publish-GateGeneration {
     param([string] $Runtime, [int] $Rebuild)
     $cli = $script:clis[$Runtime]
@@ -273,11 +294,12 @@ public sealed class HomebrewGateHost : IDisposable
     readonly Task loop;
     readonly List<Task> requests = new List<Task>();
     volatile bool stopping;
+    volatile string lastTlsFailure;
     public int Port { get; }
-    public HomebrewGateHost(string root, string pem, string key)
+    public HomebrewGateHost(string root, X509Certificate2 serverCertificate)
     {
         this.root = Path.GetFullPath(root) + Path.DirectorySeparatorChar;
-        certificate = X509Certificate2.CreateFromPemFile(pem, key);
+        certificate = serverCertificate;
         listener.Start();
         Port = ((IPEndPoint)listener.LocalEndpoint).Port;
         loop = Task.Run(async () => {
@@ -330,7 +352,8 @@ public sealed class HomebrewGateHost : IDisposable
                 }
                 tls.Flush();
             }
-            catch (AuthenticationException) { /* Expected for the hostname-rejection gate. */ }
+            // Clients deliberately reject the test host before applying source-scoped trust.
+            catch (AuthenticationException error) { lastTlsFailure = error.ToString(); }
             catch (IOException error) { Console.Error.WriteLine("Loopback client disconnected: " + error.Message); }
         }
     }
@@ -348,8 +371,14 @@ public sealed class HomebrewGateHost : IDisposable
             return chain.Build(cert);
         };
         using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
-        using var response = client.GetAsync("https://localhost:" + Port + "/" + path).GetAwaiter().GetResult();
-        response.EnsureSuccessStatusCode();
+        try {
+            using var response = client.GetAsync("https://localhost:" + Port + "/" + path).GetAwaiter().GetResult();
+            response.EnsureSuccessStatusCode();
+        }
+        catch (HttpRequestException error) {
+            throw new InvalidOperationException("Loopback HTTPS readiness failed: " + error +
+                "\nServer TLS failure: " + (lastTlsFailure ?? "none recorded"), error);
+        }
     }
     public void Dispose()
     {
@@ -400,7 +429,7 @@ $script:upstream = [System.Net.Http.HttpClient]::new()
 $script:upstream.Timeout = [timespan]::FromSeconds(60)
 try {
     New-GateCertificates $script:work $openSsl
-    $server = [HomebrewGateHost]::new($script:public, (Join-Path $script:work 'server.pem'), (Join-Path $script:work 'server.key'))
+    $server = New-GateHost $script:public (Join-Path $script:work 'server.pem') (Join-Path $script:work 'server.key')
     [System.IO.File]::WriteAllText((Join-Path $script:public 'ready'), 'ready')
     $server.CheckReady((Join-Path $script:work 'root.pem'), 'ready')
     $script:base = "https://localhost:$($server.Port)"
