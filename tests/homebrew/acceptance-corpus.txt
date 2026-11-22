@@ -89,3 +89,7 @@ lzip
 colordiff
 unzip
 screen
+c-ares
+libcbor
+libogg
+snappy
