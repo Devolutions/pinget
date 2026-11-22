@@ -7,9 +7,9 @@ on:
       - 'rust/**'
       - 'dotnet/**'
       - 'tests/homebrew/**'
-      - 'scripts/import-homebrew-catalog.py'
-      - 'tests/publisher/mszip_interop.py'
-      - 'tests/publisher/test_mszip_interop.py'
+      - 'scripts/Import-HomebrewCatalog.ps1'
+      - 'tests/publisher/mszip-interop.ps1'
+      - 'tests/publisher/Test-MszipInterop.ps1'
       - '.github/workflows/homebrew-prototype.yml'
   workflow_dispatch:
   workflow_call:
@@ -34,9 +34,6 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
       - name: Setup Rust
         shell: bash
         run: |
@@ -53,7 +50,6 @@ jobs:
       - name: Build and test Homebrew implementations
         shell: bash
         run: |
-          python -m unittest tests/homebrew/test_catalog_import.py
           cargo test --manifest-path rust/Cargo.toml -p pinget-core homebrew
           cargo test --manifest-path rust/Cargo.toml -p pinget-publisher --test homebrew
           cargo build --manifest-path rust/Cargo.toml -p pinget-cli
@@ -69,18 +65,19 @@ jobs:
           test -n "$psign"
           "$psign" --help > /dev/null
           echo "PSIGN_TOOL=$psign" >> "$GITHUB_ENV"
-      - name: Run real signed static source acceptance
-        shell: bash
+      - name: Test portable catalog importer
+        shell: pwsh
         run: |
-          extension=""
-          if [ "$RUNNER_OS" = Windows ]; then
-            extension=".exe"
-          fi
-          python tests/homebrew/run-native-acceptance.py \
-            --rust-cli "rust/target/debug/pinget$extension" \
-            --dotnet-assembly dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.dll \
-            --psign-tool "$PSIGN_TOOL" \
-            --report "$RUNNER_TEMP/homebrew-acceptance-report.json"
+          ./tests/homebrew/Test-CatalogImport.ps1
+      - name: Run real signed static source acceptance
+        shell: pwsh
+        run: |
+          $extension = if ($IsWindows) { '.exe' } else { '' }
+          ./tests/homebrew/Run-NativeAcceptance.ps1 `
+            -RustCli "rust/target/debug/pinget$extension" `
+            -DotnetAssembly dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.dll `
+            -PsignTool "$env:PSIGN_TOOL" `
+            -Report "$env:RUNNER_TEMP/homebrew-acceptance-report.json"
       - name: Upload non-secret acceptance report
         if: always()
         uses: actions/upload-artifact@v7
@@ -100,26 +97,23 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      PYTHONDONTWRITEBYTECODE: 1
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
       - name: Setup Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Generate portable MSZIP fixtures with both publishers
+        shell: pwsh
         run: |
-          python -m unittest discover -s tests/publisher -p test_mszip_interop.py -v
-          python tests/publisher/mszip_interop.py produce \
-            --output "$RUNNER_TEMP/mszip-fixtures" \
-            --reports "$RUNNER_TEMP/mszip-reports" \
-            --run-id "${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}"
+          ./tests/publisher/Test-MszipInterop.ps1
+          ./tests/publisher/mszip-interop.ps1 -Mode produce `
+            -Output "$env:RUNNER_TEMP/mszip-fixtures" `
+            -Reports "$env:RUNNER_TEMP/mszip-reports" `
+            -RunId "${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}"
       - uses: actions/upload-artifact@v7
         with:
           name: portable-mszip-fixtures-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -144,9 +138,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
       - uses: actions/download-artifact@v7
         with:
           name: portable-mszip-fixtures-${{ matrix.producer }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -154,7 +145,6 @@ jobs:
       - name: Decode portable fixtures with the Windows Compression API
         shell: pwsh
         run: |
-          python tests/publisher/mszip_interop.py validate-windows `
-            --input "$env:RUNNER_TEMP/mszip-fixtures" `
-            --run-id "${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.producer }}"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./tests/publisher/mszip-interop.ps1 -Mode validate-windows `
+            -InputDirectory "$env:RUNNER_TEMP/mszip-fixtures" `
+            -RunId "${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.producer }}"

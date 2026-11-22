@@ -91,19 +91,20 @@ the supplied JSON, not the authenticity of that JSON.
 
 For a bounded dependency closure, use the cross-runtime catalog driver:
 
-```sh
-python3 scripts/import-homebrew-catalog.py \
-  --formula jq --formula ripgrep \
-  --tag x86_64_linux \
-  --runtime rust --rust-cli rust/target/release/pinget \
-  --manifest-output out/manifests --bottle-mirror out/bottles \
-  --base-url https://packages.example.invalid/bottles \
-  --report out/catalog-import.json
+```powershell
+./scripts/Import-HomebrewCatalog.ps1 `
+  -Formula jq,ripgrep `
+  -Tag x86_64_linux `
+  -Runtime rust -RustCli rust/target/release/pinget `
+  -ManifestOutput out/manifests -BottleMirror out/bottles `
+  -BaseUrl https://packages.example.invalid/bottles `
+  -Report out/catalog-import.json
 ```
 
-For .NET use `--runtime dotnet --dotnet-assembly <path-to-Devolutions.Pinget.Cli.dll>`.
-`--formula-list` accepts one formula name per line; repeat `--formula` for
-additional roots. The tool fetches the public `formulae.brew.sh` formula API,
+Run the script in PowerShell 7.4 or later on Linux, macOS, or Windows.
+For .NET use `-Runtime dotnet -DotnetAssembly <path-to-pinget.dll>`.
+`-FormulaList` accepts one formula name per line; `-Formula` accepts an array
+of additional roots. The tool fetches the public `formulae.brew.sh` formula API,
 walks exact runtime dependencies (maximum 256 formulas and depth 64), selects
 one native tag, downloads only the matching public GHCR bottle blob, verifies
 its SHA-256 (2 GiB total bottle-download budget), adds dependency version pins,

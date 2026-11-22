@@ -87,7 +87,7 @@ pinget uninstall oniguruma
 
 ## Reproducing the real-bottle gate
 
-`tests/homebrew/run-native-acceptance.py` pins jq/oniguruma OCI indexes,
+`tests/homebrew/Run-NativeAcceptance.ps1` pins jq/oniguruma OCI indexes,
 authenticates metadata and bottle digests, creates a disposable signing
 identity, and checks both publisher/consumer directions against a loopback
 static HTTPS host using source-scoped trust configuration. Linux/macOS
@@ -100,20 +100,27 @@ Homebrew source clients are disabled on Windows.
 The `Homebrew prototype acceptance` workflow runs these gates on Linux and
 macOS x64/arm64, and Windows. It uploads non-secret acceptance reports and
 generated MSZIP test fixtures and results.
+All orchestration uses portable PowerShell 7.4 or later, without an additional
+scripting runtime or test-module dependency. Run
+`pwsh -NoLogo -NoProfile -File tests/homebrew/Test-CatalogImport.ps1` and
+`pwsh -NoLogo -NoProfile -File tests/publisher/Test-MszipInterop.ps1` for the
+offline driver tests. `tests/publisher/mszip-interop.ps1 -Mode produce` creates
+the four-platform fixtures; `-Mode validate-windows` checks them with the
+Windows native Compression API, not the portable decoder.
 `workflow_call` is the reusable entry point. The prototype-branch push trigger
 is scoped to this work branch and can be removed after platform acceptance.
 An approval-blocked workflow is not evidence of platform success.
 
-Local Linux runs require built CLIs, Psign, `patchelf`, OpenSSL, Python, and
+Local Linux runs require built CLIs, Psign, `patchelf`, OpenSSL, PowerShell 7.4 or later, and
 an explicit private temporary parent:
 
-```sh
-python tests/homebrew/run-native-acceptance.py \
-  --rust-cli rust/target/debug/pinget \
-  --dotnet-assembly dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.dll \
-  --psign-tool /absolute/path/to/psign-tool \
-  --work-root /absolute/private/temporary/parent \
-  --report /absolute/path/to/report.json
+```powershell
+pwsh -NoLogo -NoProfile -File tests/homebrew/Run-NativeAcceptance.ps1 `
+  -RustCli rust/target/debug/pinget `
+  -DotnetAssembly dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.dll `
+  -PsignTool /absolute/path/to/psign-tool `
+  -WorkRoot /absolute/private/temporary/parent `
+  -Report /absolute/path/to/report.json
 ```
 
 The disposable certificates come from a self-contained OpenSSL configuration
