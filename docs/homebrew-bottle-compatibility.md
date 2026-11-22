@@ -25,19 +25,16 @@ tampered signed source updates without changing the active cache.
 
 Manifest readers recognize more historical tags than the importer. That does
 not claim those targets or arbitrary bottles are installable. The hosted
-workflow now attempts at least 20 live catalog formula roots on each supported
-Unix runner, but that expanded gate has not passed. Run
-[44941756278](https://github.com/Devolutions/pinget/actions/runs/44941756278),
-attempt 2, failed on all four Unix runners during live catalog import. The
-last verified real execution remains the pinned jq/oniguruma chain on Linux
-x64/arm64 and macOS x64/arm64.
-Run [44946344342](https://github.com/Devolutions/pinget/actions/runs/44946344342),
-attempt 2, also fell short of the 20-root threshold on all four Unix runners.
-The live catalog gate still selects the Sonoma bottle tag, which is supported
-on the macOS 15 runner, while preserving the pinned Sonoma lifecycle test. The
-latest failure exposed chained bottle symlinks in real packages; extraction
-now resolves and validates bounded internal link chains before creating links.
-The revised gate still needs hosted verification.
+workflow imports live catalog formula roots using the Sonoma bottle tag on
+macOS 15. Run
+[44967149485](https://github.com/Devolutions/pinget/actions/runs/44967149485)
+passed every job: the four Unix runners imported 47, 47, 25 and 20 roots
+respectively, and each completed 20 real catalog installs across Rust and
+.NET. Windows publishing acceptance also passed. Portable MSZIP output from
+both publishers on all four non-Windows producer runners was independently
+decoded on Windows with the native Compression API, covering single-byte,
+32-KiB and 64-KiB boundaries, multiblock data, and the 64-MiB boundary.
+Both encoders also passed empty-input and over-limit rejection tests.
 
 ## Import and publication checks
 
