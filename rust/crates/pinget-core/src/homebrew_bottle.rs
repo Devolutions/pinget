@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 
-const MAX_SYMLINK_DEPTH: usize = 32;
+const MAX_SYMLINK_DEPTH: usize = 31;
 
 pub(crate) fn extract(archive: &Path, destination: &Path, formula: &str, version: &str) -> Result<Vec<PathBuf>> {
     if destination.exists() {
@@ -259,13 +259,15 @@ fn relocate_file(path: &Path, prefix: &str, original_prefix: &str) -> Result<()>
             bail!("A Linux ELF bottle cannot be installed on this platform");
         }
         let path_text = path.to_str().context("Bottle path is not UTF-8")?;
-        let rpath = run("patchelf", &["--print-rpath", path_text])?;
-        let rpath = rpath.trim_end_matches(['\r', '\n']);
-        let relocated = replace(rpath, prefix, original_prefix);
-        if relocated != rpath {
-            run("patchelf", &["--set-rpath", &relocated, path_text])?;
+        if has_elf_program_header(&bytes, 2)? {
+            let rpath = run("patchelf", &["--print-rpath", path_text])?;
+            let rpath = rpath.trim_end_matches(['\r', '\n']);
+            let relocated = replace(rpath, prefix, original_prefix);
+            if relocated != rpath {
+                run("patchelf", &["--set-rpath", &relocated, path_text])?;
+            }
         }
-        if has_elf_interpreter(&bytes)? {
+        if has_elf_program_header(&bytes, 3)? {
             let interpreter = match std::env::consts::ARCH {
                 "x86_64" => "/lib64/ld-linux-x86-64.so.2",
                 "aarch64" => "/lib/ld-linux-aarch64.so.1",
@@ -299,7 +301,7 @@ fn replace(value: &str, prefix: &str, original_prefix: &str) -> String {
         .replace("@@HOMEBREW_PREFIX@@", prefix)
 }
 
-fn has_elf_interpreter(bytes: &[u8]) -> Result<bool> {
+fn has_elf_program_header(bytes: &[u8], program_type: u32) -> Result<bool> {
     if bytes.len() < 64 || bytes[4] != 2 || bytes[5] != 1 {
         bail!("Bottle relocation requires a little-endian 64-bit ELF file");
     }
@@ -309,7 +311,7 @@ fn has_elf_interpreter(bytes: &[u8]) -> Result<bool> {
     if size < 56 || offset > bytes.len() || count * size > bytes.len() - offset {
         bail!("Invalid ELF program-header table");
     }
-    Ok((0..count).any(|index| bytes[offset + index * size..].starts_with(&3u32.to_le_bytes())))
+    Ok((0..count).any(|index| bytes[offset + index * size..].starts_with(&program_type.to_le_bytes())))
 }
 
 fn is_macho(bytes: &[u8]) -> bool {
@@ -497,7 +499,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resolves_at_most_thirty_two_symlinks() -> Result<()> {
+    fn resolves_at_most_thirty_one_symlinks() -> Result<()> {
         for (depth, accepted) in [(MAX_SYMLINK_DEPTH, true), (MAX_SYMLINK_DEPTH + 1, false)] {
             let mut links = HashMap::new();
             for index in 0..depth {
@@ -589,6 +591,27 @@ pub(crate) mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o444))?;
         assert!(relocate(std::slice::from_ref(&path), Path::new("/private"), "/old").is_err());
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o444);
+        Ok(())
+    }
+
+    #[test]
+    fn static_elf_does_not_require_patchelf() -> Result<()> {
+        if !cfg!(target_os = "linux") {
+            return Ok(());
+        }
+        let fixture = Fixture::new()?;
+        let path = fixture.0.join("static-elf");
+        let mut bytes = vec![0; 120];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(&path, bytes)?;
+        relocate(std::slice::from_ref(&path), Path::new("/private"), "/old")?;
+        assert!(has_elf_program_header(&fs::read(path)?, 1)?);
         Ok(())
     }
 }

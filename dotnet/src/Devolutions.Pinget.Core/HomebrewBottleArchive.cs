@@ -5,7 +5,7 @@ namespace Devolutions.Pinget.Core;
 
 internal static class HomebrewBottleArchive
 {
-    private const int MaxSymlinkDepth = 32;
+    private const int MaxSymlinkDepth = 31;
 
     internal static IReadOnlyList<string> Extract(string archivePath, string destination, string formula, string version)
     {

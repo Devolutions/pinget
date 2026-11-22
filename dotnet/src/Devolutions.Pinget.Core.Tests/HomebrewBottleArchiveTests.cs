@@ -1,5 +1,6 @@
 using System.Formats.Tar;
 using System.IO.Compression;
+using System.Buffers.Binary;
 using Devolutions.Pinget.Core;
 using Xunit;
 
@@ -94,19 +95,19 @@ public sealed class HomebrewBottleArchiveTests
     }
 
     [Fact]
-    public void Extract_AcceptsThirtyTwoLinksAndRejectsThirtyThree()
+    public void Extract_AcceptsThirtyOneLinksAndRejectsThirtyTwo()
     {
         if (OperatingSystem.IsWindows())
             return;
         using (var fixture = new Fixture())
         {
-            fixture.Write(LinkChain(32));
+            fixture.Write(LinkChain(31));
             HomebrewBottleArchive.Extract(fixture.Archive, fixture.Keg, "sample", "1.0");
             Assert.Equal("payload", File.ReadAllText(Path.Combine(fixture.Keg, "0")));
         }
         using (var fixture = new Fixture())
         {
-            fixture.Write(LinkChain(33));
+            fixture.Write(LinkChain(32));
             Assert.Throws<InvalidDataException>(() =>
                 HomebrewBottleArchive.Extract(fixture.Archive, fixture.Keg, "sample", "1.0"));
         }
@@ -169,6 +170,30 @@ public sealed class HomebrewBottleArchiveTests
         File.SetUnixFileMode(path, mode);
         Assert.ThrowsAny<Exception>(() => HomebrewBottleRelocation.Relocate([path], "/private", "/old"));
         Assert.Equal(mode, File.GetUnixFileMode(path));
+    }
+
+    [Fact]
+    public void Relocate_StaticElfDoesNotRequirePatchelf()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        using var fixture = new Fixture();
+        Directory.CreateDirectory(fixture.Root);
+        var path = Path.Combine(fixture.Root, "static-elf");
+        var bytes = new byte[120];
+        bytes[0] = 0x7f;
+        bytes[1] = (byte)'E';
+        bytes[2] = (byte)'L';
+        bytes[3] = (byte)'F';
+        bytes[4] = 2;
+        bytes[5] = 1;
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(32), 64);
+        BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(54), 56);
+        BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(56), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(64), 1);
+        File.WriteAllBytes(path, bytes);
+        HomebrewBottleRelocation.Relocate([path], "/private", "/old");
+        Assert.Equal(bytes, File.ReadAllBytes(path));
     }
 
     [Fact]

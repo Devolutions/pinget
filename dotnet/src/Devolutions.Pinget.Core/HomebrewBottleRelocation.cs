@@ -39,11 +39,14 @@ internal static class HomebrewBottleRelocation
         {
             if (!OperatingSystem.IsLinux())
                 throw new InvalidDataException("A Linux ELF bottle cannot be installed on this platform.");
-            var rpath = Run("patchelf", "--print-rpath", path).TrimEnd('\r', '\n');
-            var relocated = Replace(rpath, prefix, originalPrefix);
-            if (rpath != relocated)
-                Run("patchelf", "--set-rpath", relocated, path);
-            if (HasElfInterpreter(bytes))
+            if (HasElfProgramHeader(bytes, 2))
+            {
+                var rpath = Run("patchelf", "--print-rpath", path).TrimEnd('\r', '\n');
+                var relocated = Replace(rpath, prefix, originalPrefix);
+                if (rpath != relocated)
+                    Run("patchelf", "--set-rpath", relocated, path);
+            }
+            if (HasElfProgramHeader(bytes, 3))
             {
                 var interpreter = RuntimeInformation.ProcessArchitecture switch
                 {
@@ -84,7 +87,7 @@ internal static class HomebrewBottleRelocation
             .Replace("@@HOMEBREW_CELLAR@@", prefix + "/Cellar", StringComparison.Ordinal)
             .Replace("@@HOMEBREW_PREFIX@@", prefix, StringComparison.Ordinal);
 
-    private static bool HasElfInterpreter(byte[] bytes)
+    private static bool HasElfProgramHeader(byte[] bytes, uint programType)
     {
         if (bytes.Length < 64 || bytes[4] != 2 || bytes[5] != 1)
             throw new InvalidDataException("Bottle relocation requires a little-endian 64-bit ELF file.");
@@ -95,7 +98,7 @@ internal static class HomebrewBottleRelocation
             throw new InvalidDataException("Invalid ELF program-header table.");
         for (var index = 0; index < count; index++)
         {
-            if (BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(checked((int)(offset + (ulong)index * size)))) == 3)
+            if (BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(checked((int)(offset + (ulong)index * size)))) == programType)
                 return true;
         }
         return false;
