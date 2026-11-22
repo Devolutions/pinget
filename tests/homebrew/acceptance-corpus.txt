@@ -77,3 +77,15 @@ unbound
 libtermkey
 libvterm
 msgpack
+jq
+m4
+pkgconf
+ninja
+nasm
+yasm
+pv
+dos2unix
+lzip
+colordiff
+unzip
+screen
