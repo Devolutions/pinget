@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
+base64 = "0.22"
 chrono = { version = "0.4.44", features = ["serde"] }
 dirs = "6.0.0"
 flate2 = "1.1.9"
@@ -22,12 +23,15 @@ flate2 = "1.1.9"
 fancy-regex = "0.16"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "query", "rustls"] }
 pollster = "0.4.0"
+quick-xml = "0.38"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
 sha2 = "0.11.0"
+tar = "0.4"
 tokio = { version = "1.48.0", features = ["rt", "time", "net"] }
 turso = { version = "0.7.0-pre.4", default-features = false }
+x509-cert = { version = "0.2.5", default-features = false, features = ["std"] }
 zip = "8.5.1"
 
 [target.'cfg(windows)'.dependencies]

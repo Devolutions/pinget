@@ -51,6 +51,22 @@ Upstream calls Windows Compression API `CreateCompressor` with
 there is no additional application framing in `Compression.cpp`. The fixture
 generator uses that Windows API and verifies the result with
 `CreateDecompressor`/`Decompress`, then hashes the bytes actually stored.
+Pinget keeps that native encoder on Windows. On macOS and Linux, its publisher
+encodes independent raw-deflate blocks in the same 24-byte Compression API
+header and `u32 length + CK + deflate` block framing. Incompressible blocks
+fall back to stored deflate blocks to stay within the native framed-size
+limit. Both publishers reject empty input and input over 64 MiB.
+
+Hosted [run 44925419503](https://github.com/Devolutions/pinget/actions/runs/44925419503),
+attempt 2, generated fixtures with both publishers on Linux and macOS x64/arm64
+and decoded each with Windows `CreateDecompressor`/`Decompress`, comparing the
+exact bytes. It covers one byte, boundaries around 32 and 64 KiB, compressible
+and incompressible multiblock data, and payloads just below and at 64 MiB.
+Separate producer tests reject empty and over-limit input; native `Compress`
+also rejects empty input with error 87. This is not a claim that the native
+decoder accepted an encoded empty stream. The separate
+[Windows-profile CI run](https://github.com/Devolutions/pinget/actions/runs/44924953057)
+passed publisher interoperability and signed stock WinGet acceptance.
 
 The exact manifest serialization, version ordering, and search-normalization
 values are not inferred from the schema files. The locally authored singleton
@@ -116,12 +132,16 @@ pinget repository publish --state <work-directory> [--build <build-id>] `
 ```
 
 The `build` command creates a snapshot; it does not package, publish or sign an
-MSIX. The `package` command writes an unsigned `source2.msix` for external
-signing (for example via `psign-tool`), and `publish` verifies that MSIX and
-promotes immutable artifacts first and `source2.msix` last. Test harnesses may
-pass a built CLI executable or an already-built .NET CLI assembly, but must
-preserve these argument meanings. This command contract is a Pinget
-implementation expectation and is not part of the upstream WinGet format.
+MSIX. The `package` command writes the unsigned MSIX to the requested path for
+external signing (for example via `psign-tool`). Snapshot profiles are derived
+from their manifests: Homebrew-only snapshots require the package output and
+signed publish input to be named `brew.msix`; Windows snapshots retain the
+`source2.msix` root name regardless of the input basename. The ownership
+marker records the profile and root name. This does not establish a verified
+Homebrew client or native lifecycle. Test harnesses may pass a built CLI
+executable or an already-built .NET CLI assembly, but must preserve these
+argument meanings. This command contract is a Pinget implementation
+expectation and is not part of the upstream WinGet format.
 
 ## Production publisher cross-language contract (tested separately)
 
@@ -143,15 +163,25 @@ current artifact-format marker are rejected without mutation; use a fresh
 destination ownership marker remains independently versioned by its existing
 schema and does not require this snapshot-format field.
 
+Snapshots with the earlier invalid portable MSZIP header or blocks exceeding
+the Windows decoder's framed-block limit are also rejected without mutation.
+Rebuild with fresh state. Reusing the same source package version requires
+both the same build ID and the same index hash; otherwise publish a higher
+four-part version. This prevents a corrected snapshot with the same
+inventory-derived build ID from silently reusing the old index.
+
 Cross-language comparisons pin canonical manifest bytes, raw input inventory,
-logical SQLite index contents, version-data sidecars and their hashes, and the
-index digest recorded by each snapshot against that snapshot's exact
-`Public/index.db` bytes (the two SQLite files are not required to be bytewise
-identical). The helpers independently inspect SQLite tables through the native
-SQLite API and validate sidecar bytes with the Windows native MSZIP API. The
-YAML helpers use the existing YamlDotNet assembly from the .NET CLI build.
-These checks establish the tested outputs and interoperability; the private
-state schema remains governed by the embedded production schemas.
+logical SQLite index contents, and the index digest recorded by each snapshot
+against that snapshot's exact `Public/index.db` bytes (the two SQLite files are
+not required to be bytewise identical). On Windows, both implementations use
+the native encoder and compare version-data sidecar bytes and hashes. Portable
+macOS/Linux builds verify each sidecar's own hash and decoded version data;
+the deflate streams are not required to be bytewise identical. The helpers
+independently inspect SQLite tables through the native SQLite API and validate
+Windows sidecars with the native MSZIP API. The YAML helpers use the existing
+YamlDotNet assembly from the .NET CLI build. These checks establish the tested
+outputs and interoperability; the private state schema remains governed by
+the embedded production schemas.
 
 In JSON mode, the tested production command reports use these shared field
 sets and shapes (nullable values are `null`; command failures are nonzero and

@@ -30,6 +30,18 @@ Structured manifest output is also supported:
 For authoring a static Windows package source, see
 [Publishing a static WinGet source](docs/repository-publishing.md). The
 `repository` commands are separate from client-side `source` management.
+The experimental Homebrew formula manifest extension and its current
+implementation boundary are documented in
+[Homebrew manifest mapping](docs/homebrew-manifest-mapping.md). The limited
+offline, single-formula bottle importer is described in
+[Homebrew import](docs/homebrew-import.md), with the precise support matrix in
+[Homebrew bottle compatibility](docs/homebrew-bottle-compatibility.md). The
+static feed and native client workflow is documented in
+[Homebrew static source](docs/homebrew-static-source.md). It records the
+Homebrew-only `brew.msix` publishing profile and the dedicated source update
+path. Both native clients have installed and executed the real jq/oniguruma
+chain from signed static feeds on Linux x64 and macOS x64/arm64; the
+compatibility document records remaining gates and unsupported behavior.
 
 The C# implementation also ships the **`Devolutions.Pinget.Client` PowerShell 7 module** that mirrors the upstream `Microsoft.WinGet.Client` cmdlet family with renamed `Pinget` nouns, backed by `Devolutions.Pinget.Core`.
 

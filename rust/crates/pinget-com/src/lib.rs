@@ -873,6 +873,7 @@ fn set_last_error(object: &PackageManagerObject, error: impl Into<String>) {
 fn source_kind_name(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::PreIndexed => "Microsoft.PreIndexed.Package",
+        SourceKind::HomebrewPreIndexed => "Pinget.PreIndexed.Homebrew",
         SourceKind::Rest => "Microsoft.Rest",
     }
 }

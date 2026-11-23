@@ -16,6 +16,7 @@
     <ProjectReference Include="..\Devolutions.Pinget.Publisher\Devolutions.Pinget.Publisher.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="..\..\..\tests\homebrew\*" Link="Fixtures\Homebrew\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\..\tests\publisher\fixtures\**\*"
           Link="Fixtures\%(RecursiveDir)%(Filename)%(Extension)"
           CopyToOutputDirectory="PreserveNewest" />

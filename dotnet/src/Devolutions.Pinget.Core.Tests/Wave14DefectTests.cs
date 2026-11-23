@@ -186,8 +186,9 @@ public class Wave14DefectTests
             var results = WithRunner(Runner, () =>
             {
                 var constructor = typeof(Repository).GetConstructors(BindingFlags.NonPublic | BindingFlags.Instance).Single();
+                using var client = new HttpClient();
                 using var repository = (Repository)constructor.Invoke(
-                    [appRoot, new HttpClient(), new SourceStore(), EffectiveSourceMode.SystemWingetDirect, null, null, null]);
+                    [appRoot, client, client, new SourceStore(), EffectiveSourceMode.SystemWingetDirect, null, null, null]);
                 return repository.UpdateSources("Contoso.Corp");
             });
 
@@ -228,7 +229,7 @@ public class Wave14DefectTests
     // ── W14-8: a pathparts cycle in a V1 index is an error, not an endless loop ──
 
     [Fact]
-    public void V1RelativePath_WithAPathpartsCycle_Fails()
+    public async Task V1RelativePath_WithAPathpartsCycle_Fails()
     {
         var resolve = Task.Run(() =>
         {
@@ -246,9 +247,9 @@ public class Wave14DefectTests
             return PreIndexedSource.ResolveV1RelativePath(connection, 1);
         });
 
-        var finished = Task.WhenAny(resolve, Task.Delay(TimeSpan.FromSeconds(20))).GetAwaiter().GetResult();
+        var finished = await Task.WhenAny(resolve, Task.Delay(TimeSpan.FromSeconds(20)));
         Assert.True(finished == resolve, "resolving a pathparts cycle must terminate");
-        var error = Assert.IsType<InvalidOperationException>(resolve.Exception?.InnerException);
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => resolve);
         Assert.Contains("cycle", error.Message);
     }
 

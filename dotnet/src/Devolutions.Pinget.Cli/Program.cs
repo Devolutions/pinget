@@ -303,7 +303,7 @@ upgradeCommand.SetHandler((ctx) =>
     };
 
     using var repo = doInstall ? OpenRepositoryForPackageAction() : Repository.Open();
-    if (doInstall && !OperatingSystem.IsWindows())
+    if (doInstall && !OperatingSystem.IsWindows() && !repo.HasHomebrewPackages)
     {
         PrintWarnings([UpgradeUnsupportedWarning]);
         Console.WriteLine("No changes were made.");
@@ -434,9 +434,15 @@ var saNameOpt = new Option<string?>("--name", "Source name"); saNameOpt.AddAlias
 var saArgOpt = new Option<string?>("--arg", "Source URL"); saArgOpt.AddAlias("-a");
 var saTypeOpt = new Option<string?>("--type", "Source type"); saTypeOpt.AddAlias("-t");
 var saTrustLevelOpt = new Option<string?>("--trust-level", "Source trust level");
+var saPublisherOpt = new Option<string?>("--publisher", "Expected MSIX publisher for a Pinget Homebrew source");
+var saTrustedCaOpt = new Option<string[]>("--trusted-ca", "Explicit Homebrew source TLS and MSIX signing trust anchor (repeatable)")
+{
+    ArgumentHelpName = "certificate",
+    AllowMultipleArgumentsPerToken = false,
+};
 var saExplicitOpt = new Option<bool>("--explicit", "Exclude source from discovery unless specified");
 sourceAddCmd.AddArgument(saNameArg); sourceAddCmd.AddArgument(saArgArg);
-foreach (var o in new Option[] { saNameOpt, saArgOpt, saTypeOpt, saTrustLevelOpt, saExplicitOpt }) sourceAddCmd.AddOption(o);
+foreach (var o in new Option[] { saNameOpt, saArgOpt, saTypeOpt, saTrustLevelOpt, saPublisherOpt, saTrustedCaOpt, saExplicitOpt }) sourceAddCmd.AddOption(o);
 var sourceEditCmd = new Command("edit", "Edit source");
 sourceEditCmd.AddAlias("config");
 sourceEditCmd.AddAlias("set");
@@ -493,7 +499,9 @@ sourceExportCmd.SetHandler(() =>
         Identifier: s.Identifier,
         TrustLevel: s.TrustLevel,
         Explicit: s.Explicit,
-        Priority: s.Priority)).ToList();
+        Priority: s.Priority,
+        Publisher: s.Kind == SourceKind.HomebrewPreIndexed ? s.Publisher : null,
+        TrustedCa: s.Kind == SourceKind.HomebrewPreIndexed ? s.TrustedCa : null)).ToList();
     Console.WriteLine(StructuredOutputSerializer.SerializeJson(new SourceExportPayload(sources), CliJsonContext.Default.SourceExportPayload));
 });
 
@@ -509,10 +517,25 @@ sourceAddCmd.SetHandler((ctx) =>
         "argument");
     var type = ctx.ParseResult.GetValueForOption(saTypeOpt);
     var trustLevel = ctx.ParseResult.GetValueForOption(saTrustLevelOpt);
+    var publisher = ctx.ParseResult.GetValueForOption(saPublisherOpt);
+    var trustedCa = ctx.ParseResult.GetValueForOption(saTrustedCaOpt) ?? [];
     var explicitSource = ctx.ParseResult.GetValueForOption(saExplicitOpt);
     using var repo = Repository.Open();
     var kind = ParseSourceKind(type);
-    repo.AddSource(name, arg, kind, trustLevel ?? "None", explicitSource);
+    if (kind == SourceKind.HomebrewPreIndexed)
+    {
+        if (publisher is null)
+            throw new InvalidOperationException("--publisher is required for Pinget Homebrew sources.");
+        if (trustLevel is not null || explicitSource)
+            throw new InvalidOperationException("--trust-level and --explicit are not supported for Pinget Homebrew sources.");
+        repo.AddHomebrewSource(name, arg, publisher, trustedCa);
+    }
+    else
+    {
+        if (publisher is not null || trustedCa.Length > 0)
+            throw new InvalidOperationException("--publisher and --trusted-ca are only valid for Pinget Homebrew sources.");
+        repo.AddSource(name, arg, kind, trustLevel ?? "None", explicitSource);
+    }
     Console.WriteLine("Done");
 });
 
@@ -1126,18 +1149,28 @@ uninstallCommand.SetHandler((ctx) =>
     if (silent && interactive)
         throw new InvalidOperationException("--silent and --interactive cannot be used together.");
     using var repo = Repository.Open();
-    var result = repo.Uninstall(new UninstallRequest
+    InstallResult result;
+    try
     {
-        Query = query,
-        ManifestPath = ctx.ParseResult.GetValueForOption(uimanifestOpt),
-        ProductCode = ctx.ParseResult.GetValueForOption(uiproductCodeOpt),
-        Mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress,
-        AllVersions = ctx.ParseResult.GetValueForOption(uiallVersionsOpt),
-        Force = ctx.ParseResult.GetValueForOption(uiForceOpt),
-        Purge = ctx.ParseResult.GetValueForOption(uiPurgeOpt),
-        Preserve = ctx.ParseResult.GetValueForOption(uiPreserveOpt),
-        LogPath = ctx.ParseResult.GetValueForOption(uiLogOpt),
-    });
+        result = repo.Uninstall(new UninstallRequest
+        {
+            Query = query,
+            ManifestPath = ctx.ParseResult.GetValueForOption(uimanifestOpt),
+            ProductCode = ctx.ParseResult.GetValueForOption(uiproductCodeOpt),
+            Mode = interactive ? InstallerMode.Interactive : silent ? InstallerMode.Silent : InstallerMode.SilentWithProgress,
+            AllVersions = ctx.ParseResult.GetValueForOption(uiallVersionsOpt),
+            Force = ctx.ParseResult.GetValueForOption(uiForceOpt),
+            Purge = ctx.ParseResult.GetValueForOption(uiPurgeOpt),
+            Preserve = ctx.ParseResult.GetValueForOption(uiPreserveOpt),
+            LogPath = ctx.ParseResult.GetValueForOption(uiLogOpt),
+        });
+    }
+    catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+    {
+        Console.Error.WriteLine($"error: {ex.Message}");
+        ctx.ExitCode = 1;
+        return;
+    }
     ctx.ExitCode = PrintPackageActionResult(result, "uninstall", "uninstalled");
 });
 
@@ -1684,6 +1717,7 @@ static string FormatSourceType(SourceKind kind) => kind switch
 {
     SourceKind.Rest => "Microsoft.Rest",
     SourceKind.PreIndexed => "Microsoft.PreIndexed.Package",
+    SourceKind.HomebrewPreIndexed => "Pinget.PreIndexed.Homebrew",
     _ => kind.ToString(),
 };
 

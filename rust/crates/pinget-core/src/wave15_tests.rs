@@ -167,6 +167,8 @@ fn rest_source(arg: String) -> SourceRecord {
         source_version: None,
         etag: None,
         last_modified: None,
+        publisher: None,
+        trusted_ca: Vec::new(),
     }
 }
 

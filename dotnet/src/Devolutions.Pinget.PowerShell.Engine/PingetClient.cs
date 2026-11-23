@@ -43,9 +43,12 @@ public sealed class PingetClient : IDisposable
                 {
                     SourceKind.Rest => "Microsoft.Rest",
                     SourceKind.PreIndexed => "Microsoft.PreIndexed.Package",
+                    SourceKind.HomebrewPreIndexed => "Pinget.PreIndexed.Homebrew",
                     _ => source.Kind.ToString(),
                 },
                 TrustLevel = string.IsNullOrWhiteSpace(source.TrustLevel) ? "None" : source.TrustLevel,
+                Publisher = source.Publisher,
+                TrustedCa = source.TrustedCa.ToArray(),
                 Explicit = source.Explicit,
                 Priority = source.Priority,
                 Identifier = source.Identifier,
@@ -55,15 +58,32 @@ public sealed class PingetClient : IDisposable
             []);
     }
 
-    public void AddSource(string name, string argument, string? type, PSSourceTrustLevel trustLevel, bool explicitSource, int priority)
+    public void AddSource(
+        string name,
+        string argument,
+        string? type,
+        PSSourceTrustLevel trustLevel,
+        bool explicitSource,
+        int priority,
+        string? publisher = null,
+        IReadOnlyList<string>? trustedCa = null)
     {
-        _repository.AddSource(
-            name,
-            argument,
-            ParseSourceKind(type),
+        var kind = ParseSourceKind(type);
+        if (kind == SourceKind.HomebrewPreIndexed)
+        {
+            if (string.IsNullOrWhiteSpace(publisher))
+                throw new InvalidOperationException("-Publisher is required for Pinget Homebrew sources.");
+            if (trustLevel != PSSourceTrustLevel.Default || explicitSource || priority != 0)
+                throw new InvalidOperationException("-TrustLevel, -Explicit, and -Priority are not supported for Pinget Homebrew sources.");
+            _repository.AddHomebrewSource(name, argument, publisher, trustedCa ?? []);
+            return;
+        }
+        if (publisher is not null || trustedCa is { Count: > 0 })
+            throw new InvalidOperationException("-Publisher and -TrustedCa are only valid for Pinget Homebrew sources.");
+
+        _repository.AddSource(name, argument, kind,
             trustLevel == PSSourceTrustLevel.Default ? "None" : trustLevel.ToString(),
-            explicitSource,
-            priority);
+            explicitSource, priority);
     }
 
     public void RemoveSource(string name) => _repository.RemoveSource(name);
@@ -718,6 +738,12 @@ public sealed class PingetClient : IDisposable
             string.Equals(value, "Microsoft.Rest", StringComparison.OrdinalIgnoreCase))
         {
             return SourceKind.Rest;
+        }
+
+        if (string.Equals(value, "homebrew", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(value, "Pinget.PreIndexed.Homebrew", StringComparison.OrdinalIgnoreCase))
+        {
+            return SourceKind.HomebrewPreIndexed;
         }
 
         if (string.IsNullOrWhiteSpace(value) ||

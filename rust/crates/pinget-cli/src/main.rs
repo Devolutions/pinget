@@ -175,6 +175,8 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum RepositoryCommands {
+    /// Import one pinned local formula/bottle; offline, no downloads or dependency resolution.
+    ImportHomebrew(RepositoryImportHomebrewArgs),
     Build(RepositoryBuildArgs),
     Diff(RepositoryBuildArgs),
     Status(RepositoryStateArgs),
@@ -182,6 +184,28 @@ enum RepositoryCommands {
     Package(RepositoryPackageArgs),
     Publish(RepositoryPublishArgs),
     Doctor(RepositoryDoctorArgs),
+}
+
+#[derive(Args)]
+struct RepositoryImportHomebrewArgs {
+    #[arg(long)]
+    formula_json: PathBuf,
+    #[arg(long)]
+    bottle_archive: PathBuf,
+    #[arg(long)]
+    manifest_output: PathBuf,
+    #[arg(long)]
+    bottle_mirror: PathBuf,
+    /// Only arm64_sonoma is supported in this bounded slice.
+    #[arg(long)]
+    tag: String,
+    #[arg(long)]
+    target_os: String,
+    #[arg(long)]
+    architecture: String,
+    /// Public HTTPS mirror URL; credentials, queries and fragments are rejected.
+    #[arg(long)]
+    base_url: String,
 }
 
 #[derive(Args, Clone)]
@@ -417,6 +441,12 @@ struct SourceAddArgs {
     /// Source type; WinGet treats an omitted type as `Microsoft.PreIndexed.Package`.
     #[arg(short = 't', long = "type", default_value = "Microsoft.PreIndexed.Package")]
     kind: String,
+    /// Expected publisher distinguished name for a Pinget Homebrew source.
+    #[arg(long)]
+    publisher: Option<String>,
+    /// Explicit TLS and MSIX signing trust anchor for a Pinget Homebrew source; repeat as needed.
+    #[arg(long = "trusted-ca", requires = "publisher")]
+    trusted_ca: Vec<PathBuf>,
     #[arg(long = "trust-level")]
     trust_level: Option<String>,
     #[arg(long)]
@@ -812,7 +842,7 @@ fn run() -> Result<()> {
             } else {
                 Repository::open()?
             };
-            if do_install && !cfg!(windows) {
+            if do_install && !cfg!(windows) && !repository.has_homebrew_packages()? {
                 print_warnings(&[UPGRADE_UNSUPPORTED_WARNING.to_owned()]);
                 println!("No changes were made.");
                 return Ok(());
@@ -943,14 +973,28 @@ fn run() -> Result<()> {
                     let name = resolve_source_add_value(args.name.as_deref(), args.name_option.as_deref(), "name")?;
                     let arg = resolve_source_add_value(args.arg.as_deref(), args.arg_option.as_deref(), "argument")?;
                     let kind = parse_source_kind(&args.kind)?;
-                    repository.add_source_with_metadata(
-                        &name,
-                        &arg,
-                        kind,
-                        args.trust_level.as_deref(),
-                        args.explicit,
-                        0,
-                    )?;
+                    if kind == SourceKind::HomebrewPreIndexed {
+                        let publisher = args
+                            .publisher
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("--publisher is required for Pinget Homebrew sources"))?;
+                        if args.trust_level.is_some() || args.explicit {
+                            bail!("--trust-level and --explicit are not supported for Pinget Homebrew sources");
+                        }
+                        repository.add_homebrew_source(&name, &arg, publisher, &args.trusted_ca)?;
+                    } else {
+                        if args.publisher.is_some() || !args.trusted_ca.is_empty() {
+                            bail!("--publisher and --trusted-ca are only valid for Pinget Homebrew sources");
+                        }
+                        repository.add_source_with_metadata(
+                            &name,
+                            &arg,
+                            kind,
+                            args.trust_level.as_deref(),
+                            args.explicit,
+                            0,
+                        )?;
+                    }
                     println!("Done");
                 }
                 SourceCommands::Edit(args) => {
@@ -1267,6 +1311,26 @@ fn run() -> Result<()> {
 
 fn run_repository_command(command: RepositoryCommands, output: OutputFormat) -> Result<()> {
     match command {
+        RepositoryCommands::ImportHomebrew(args) => {
+            let result = pinget_publisher::homebrew::import(&pinget_publisher::homebrew::ImportOptions {
+                formula_json: args.formula_json,
+                bottle_archive: args.bottle_archive,
+                manifest_output: args.manifest_output,
+                bottle_mirror: args.bottle_mirror,
+                tag: args.tag,
+                target_os: args.target_os,
+                architecture: args.architecture,
+                base_url: args.base_url,
+            })?;
+            if output.is_text() {
+                println!(
+                    "Imported {} {} ({}); report: {}.import.json",
+                    result.package_identifier, result.package_version, result.bottle_tag, result.manifest_file
+                );
+            } else {
+                print_serialized(&result, output)?;
+            }
+        }
         RepositoryCommands::Build(args) => {
             let result = pinget_publisher::build(&PublisherBuildOptions {
                 input: args.input,
@@ -2334,7 +2398,7 @@ fn print_source_export(repository: &Repository) -> Result<()> {
     let source_array: Vec<serde_json::Value> = sources
         .iter()
         .map(|s| {
-            serde_json::json!({
+            let mut item = serde_json::json!({
                 "Name": s.name,
                 "Type": format_source_kind(s.kind),
                 "Arg": s.arg,
@@ -2343,7 +2407,23 @@ fn print_source_export(repository: &Repository) -> Result<()> {
                 "TrustLevel": s.trust_level,
                 "Explicit": s.explicit,
                 "Priority": s.priority
-            })
+            });
+            if s.kind == SourceKind::HomebrewPreIndexed
+                && let Some(object) = item.as_object_mut()
+            {
+                object.insert(
+                    "Publisher".to_owned(),
+                    s.publisher
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                object.insert(
+                    "TrustedCa".to_owned(),
+                    serde_json::Value::Array(s.trusted_ca.iter().cloned().map(serde_json::Value::String).collect()),
+                );
+            }
+            item
         })
         .collect();
     let export = serde_json::json!({
@@ -3059,6 +3139,8 @@ fn resolve_source_add_value(positional: Option<&str>, option: Option<&str>, labe
 fn parse_source_kind(value: &str) -> Result<SourceKind> {
     if value.eq_ignore_ascii_case("rest") || value.eq_ignore_ascii_case("Microsoft.Rest") {
         Ok(SourceKind::Rest)
+    } else if value.eq_ignore_ascii_case("homebrew") || value.eq_ignore_ascii_case("Pinget.PreIndexed.Homebrew") {
+        Ok(SourceKind::HomebrewPreIndexed)
     } else if value.eq_ignore_ascii_case("preindexed") || value.eq_ignore_ascii_case("Microsoft.PreIndexed.Package") {
         Ok(SourceKind::PreIndexed)
     } else {
@@ -3070,6 +3152,7 @@ fn format_source_kind(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::Rest => "Microsoft.Rest",
         SourceKind::PreIndexed => "Microsoft.PreIndexed.Package",
+        SourceKind::HomebrewPreIndexed => "Pinget.PreIndexed.Homebrew",
     }
 }
 
@@ -3700,6 +3783,8 @@ mod tests {
             source_version: None,
             etag: None,
             last_modified: None,
+            publisher: None,
+            trusted_ca: Vec::new(),
         }
     }
 

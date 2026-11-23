@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Serialization;
 
 namespace Devolutions.Pinget.Core;
@@ -6,6 +8,7 @@ namespace Devolutions.Pinget.Core;
 public enum SourceKind
 {
     PreIndexed,
+    HomebrewPreIndexed,
     Rest
 }
 
@@ -36,6 +39,8 @@ public record SourceRecord
     public string? SourceVersion { get; set; }
     public string? ETag { get; set; }
     public string? LastModified { get; set; }
+    public string? Publisher { get; set; }
+    public List<string> TrustedCa { get; set; } = [];
 }
 
 /// <summary>
@@ -379,6 +384,76 @@ public enum InstallerMode
     Silent,
 }
 
+public record HomebrewFormulaMetadata
+{
+    public required int SchemaVersion { get; init; }
+    public required string Formula { get; init; }
+    public required string Tap { get; init; }
+    public required string UpstreamVersion { get; init; }
+    public required uint Revision { get; init; }
+    public required uint VersionScheme { get; init; }
+    public List<string> Aliases { get; init; } = [];
+    public List<string> OldNames { get; init; } = [];
+    public required bool KegOnly { get; init; }
+    public List<HomebrewBottleMetadata> Bottles { get; init; } = [];
+}
+
+public record HomebrewBottleMetadata
+{
+    public required string Url { get; init; }
+    public required string Sha256 { get; init; }
+    public required string TargetOS { get; init; }
+    public required string Architecture { get; init; }
+    public required string BottleTag { get; init; }
+    public required uint Rebuild { get; init; }
+    public required string Relocation { get; init; }
+    public string? MinimumOSVersion { get; init; }
+    public string? MaximumOSVersion { get; init; }
+    public string? MinimumGlibc { get; init; }
+    public string? Loader { get; init; }
+
+    public static string? FixedCellarForTag(string tag) => tag switch
+    {
+        "arm64_sonoma" or "arm64_sequoia" => "/opt/homebrew/Cellar",
+        "sonoma" or "sequoia" => "/usr/local/Cellar",
+        "x86_64_linux" or "aarch64_linux" => "/home/linuxbrew/.linuxbrew/Cellar",
+        _ => null,
+    };
+}
+
+public static class HomebrewPackageIds
+{
+    public static string Create(string tap, string formula)
+    {
+        var tapParts = tap.Split('/');
+        if (tapParts.Length != 2 ||
+            tapParts.Any(part => string.IsNullOrWhiteSpace(part) ||
+                part != part.Trim() ||
+                part.Any(character => !char.IsAscii(character) || char.IsWhiteSpace(character)) ||
+                !part.Any(char.IsAsciiLetterOrDigit)) ||
+            string.IsNullOrWhiteSpace(formula) ||
+            formula != formula.Trim() ||
+            tap.Any(character => !char.IsAscii(character)) ||
+            formula.Any(character => !char.IsAscii(character) || char.IsWhiteSpace(character)) ||
+            !formula.Any(char.IsAsciiLetterOrDigit))
+        {
+            throw new ArgumentException("Homebrew package identity requires a formula name and fully qualified tap.");
+        }
+
+        var identity = $"{tap}/{formula}".ToLowerInvariant();
+        var slug = new string(formula.ToLowerInvariant().Select(character =>
+            char.IsAsciiLetterOrDigit(character) ? char.ToLowerInvariant(character) : '-').ToArray());
+        slug = string.Join("-", slug.Split('-', StringSplitOptions.RemoveEmptyEntries));
+        if (slug.Length > 15)
+        {
+            slug = slug[..15].TrimEnd('-');
+        }
+
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..16].ToLowerInvariant();
+        return $"Pinget.Homebrew.{slug}-{digest}";
+    }
+}
+
 public record Manifest
 {
     public required string Id { get; init; }
@@ -401,6 +476,7 @@ public record Manifest
     public string? ReleaseNotes { get; init; }
     public string? ReleaseNotesUrl { get; init; }
     public List<string> Tags { get; init; } = [];
+    public HomebrewFormulaMetadata? Homebrew { get; init; }
     public List<PackageAgreement> Agreements { get; init; } = [];
     public List<string> PackageDependencies { get; init; } = [];
     public List<Documentation> Documentation { get; init; } = [];

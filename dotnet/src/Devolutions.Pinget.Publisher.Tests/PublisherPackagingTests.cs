@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Xml.Linq;
+using Microsoft.Data.Sqlite;
 using Pinget.Publisher;
 using Xunit;
 
@@ -430,6 +431,69 @@ public sealed class PublisherPackagingTests
         foreach (var relative in oldArtifacts)
             Assert.True(File.Exists(Path.Combine(destination, relative.Replace('/', Path.DirectorySeparatorChar))));
         Assert.True(PublisherPackaging.VerifyDestination(destination).Valid);
+    }
+
+    [Fact]
+    public void Publication_SameBuildAndVersionWithDifferentIndex_IsRejectedWithoutMutation()
+    {
+        using var temp = new TempDirectory();
+        var input = CopyFixture("multi", Path.Combine(temp.Path, "manifests"));
+        var firstState = Path.Combine(temp.Path, "first-state");
+        var secondState = Path.Combine(temp.Path, "second-state");
+        var destination = Path.Combine(temp.Path, "published");
+        var first = new PublisherWorkspace(firstState).Build(new PublisherBuildOptions(input, firstState));
+        var second = new PublisherWorkspace(secondState).Build(new PublisherBuildOptions(input, secondState));
+        Assert.Equal(first.BuildId, second.BuildId);
+
+        var indexPath = Path.Combine(second.SnapshotDirectory, "Public", "index.db");
+        var originalHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(indexPath)));
+        using (var database = new SqliteConnection(new SqliteConnectionStringBuilder
+        { DataSource = indexPath, Pooling = false }.ToString()))
+        {
+            database.Open();
+            using var command = database.CreateCommand();
+            command.CommandText = "PRAGMA user_version=31415";
+            command.ExecuteNonQuery();
+        }
+        var indexHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(indexPath))).ToLowerInvariant();
+        Assert.NotEqual(originalHash, indexHash.ToUpperInvariant());
+        var metadataPath = Path.Combine(second.SnapshotDirectory, "snapshot.json");
+        var metadata = JsonNode.Parse(File.ReadAllText(metadataPath))!.AsObject();
+        metadata["indexHash"] = indexHash;
+        File.WriteAllText(metadataPath, metadata.ToJsonString(), new UTF8Encoding(false));
+
+        var initial = UnsignedOptions(firstState, destination, "1.0.0.0", first.BuildId);
+        Assert.True(PublisherPackaging.Publish(initial).Valid);
+        Assert.True(PublisherPackaging.Publish(initial).Valid);
+        var before = Directory.EnumerateFiles(destination, "*", SearchOption.AllDirectories)
+            .ToDictionary(path => Path.GetRelativePath(destination, path),
+                path => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))));
+
+        var preflightPath = Path.Combine(temp.Path, "preflight.msix");
+        var preflight = Assert.Throws<PublisherException>(() => PublisherPackaging.Package(new PublisherPackageOptions(
+            secondState, preflightPath, PackageName, Publisher, "1.0.0.0",
+            BuildId: second.BuildId, DestinationDirectory: destination)));
+        Assert.Contains("different build content or index", preflight.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(preflightPath));
+
+        var candidate = UnsignedOptions(secondState, destination, "1.0.0.0", second.BuildId);
+        var rejected = Assert.Throws<PublisherException>(() => PublisherPackaging.Publish(candidate));
+        Assert.Contains("different build content, index", rejected.Message, StringComparison.OrdinalIgnoreCase);
+        var after = Directory.EnumerateFiles(destination, "*", SearchOption.AllDirectories)
+            .ToDictionary(path => Path.GetRelativePath(destination, path),
+                path => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))));
+        Assert.Equal(before.OrderBy(static entry => entry.Key), after.OrderBy(static entry => entry.Key));
+
+        var upgradePath = Path.Combine(temp.Path, "upgraded.msix");
+        _ = PublisherPackaging.Package(new PublisherPackageOptions(
+            secondState, upgradePath, PackageName, Publisher, "1.0.0.1",
+            BuildId: second.BuildId, DestinationDirectory: destination));
+        var upgraded = PublisherPackaging.Publish(new PublisherPublishOptions(
+            secondState, destination, upgradePath, UnsignedDevelopment: true, BuildId: second.BuildId));
+        Assert.True(upgraded.Valid);
+        var marker = JsonNode.Parse(File.ReadAllText(Path.Combine(destination, ".pinget-publisher.json")))!;
+        Assert.Equal(indexHash, marker["indexHash"]!.GetValue<string>());
+        Assert.Equal("1.0.0.1", marker["packageVersion"]!.GetValue<string>());
     }
 
     [Fact]

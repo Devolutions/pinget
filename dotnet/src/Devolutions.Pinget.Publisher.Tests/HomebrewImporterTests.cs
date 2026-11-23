@@ -1,0 +1,342 @@
+using System.Text.Json.Nodes;
+using Devolutions.Pinget.Core;
+using Pinget.Publisher;
+using Xunit;
+
+namespace Devolutions.Pinget.Publisher.Tests;
+
+public sealed class HomebrewImporterTests
+{
+    [Theory]
+    [InlineData("arm64_sequoia", "arm64", "/opt/homebrew/Cellar")]
+    [InlineData("sequoia", "x64", "/usr/local/Cellar")]
+    public void ImportsSequoiaWithCorrectMinimumAndFixedCellar(string tag, string architecture, string cellar)
+    {
+        using var fixture = new Fixture();
+        fixture.Options = fixture.Options with { Tag = tag, Architecture = architecture };
+        fixture.Change(value =>
+        {
+            var bottle = value["bottle"]!["stable"]!["files"]!["arm64_sonoma"]!.DeepClone();
+            bottle["cellar"] = cellar;
+            value["bottle"]!["stable"]!["files"] = new JsonObject { [tag] = bottle };
+        });
+        var report = HomebrewImporter.Import(fixture.Options);
+        var yaml = new YamlDotNet.RepresentationModel.YamlStream();
+        yaml.Load(new StringReader(File.ReadAllText(
+            Path.Combine(fixture.Options.ManifestOutput, report["manifestFile"]!.GetValue<string>()))));
+        var bottle = yaml.Documents[0].RootNode["Pinget"]["Homebrew"]["Bottles"][0];
+        Assert.Equal(tag, bottle["BottleTag"].ToString());
+        Assert.Equal("15.0", bottle["MinimumOSVersion"].ToString());
+        Assert.Equal(cellar, bottle["Relocation"].ToString());
+    }
+
+    [Fact]
+    public void MapsLinuxRuntimeDependenciesAndDistinguishesBottleRebuilds()
+    {
+        using var fixture = new Fixture();
+        fixture.Options = fixture.Options with { Tag = "x86_64_linux", TargetOS = "Linux", Architecture = "x64" };
+        fixture.Change(value =>
+        {
+            var bottle = value["bottle"]!["stable"]!["files"]!["arm64_sonoma"]!.DeepClone();
+            bottle["url"] = "https://ghcr.io/v2/homebrew/core/tinytool/blobs/sha256:" + bottle["sha256"]!.GetValue<string>();
+            bottle["minimum_glibc"] = "2.35";
+            bottle["loader"] = "glibc";
+            value["bottle"]!["stable"]!["files"] = new JsonObject { ["x86_64_linux"] = bottle };
+            value["dependencies"] = new JsonArray("oniguruma");
+            value["pinget_runtime_dependencies"] = JsonNode.Parse("""[{"full_name":"oniguruma","pkg_version":"6.9.10","bottle_rebuild":0}]""");
+        });
+        var first = HomebrewImporter.Import(fixture.Options);
+        var yaml = new YamlDotNet.RepresentationModel.YamlStream();
+        yaml.Load(new StringReader(File.ReadAllText(
+            Path.Combine(fixture.Options.ManifestOutput, first["manifestFile"]!.GetValue<string>()))));
+        var parsed = yaml.Documents[0].RootNode;
+        Assert.Equal("x64", parsed["Installers"][0]["Architecture"].ToString());
+        Assert.Equal("6.9.10.bottle.0", first["runtimeDependencies"]![0]!["MinimumVersion"]!.GetValue<string>());
+        Assert.Equal(HomebrewPackageIds.Create("homebrew/core", "oniguruma"),
+            first["runtimeDependencies"]![0]!["PackageIdentifier"]!.GetValue<string>());
+        fixture.Change(value => value["bottle"]!["stable"]!["rebuild"] = 4);
+        var next = HomebrewImporter.Import(fixture.Options);
+        Assert.Equal("1.2.3_1.bottle.4", next["packageVersion"]!.GetValue<string>());
+        Assert.NotEqual(first["manifestFile"]!.GetValue<string>(), next["manifestFile"]!.GetValue<string>());
+        Assert.Equal(first["bottleFile"]!.GetValue<string>(), next["bottleFile"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PinnedImport_MirrorsExactBytesAndIsDeterministic()
+    {
+        using var fixture = new Fixture();
+        var report = HomebrewImporter.Import(fixture.Options);
+        var manifestPath = Path.Combine(fixture.Options.ManifestOutput, report["manifestFile"]!.GetValue<string>());
+        var manifestBytes = File.ReadAllBytes(manifestPath);
+        var yaml = new YamlDotNet.RepresentationModel.YamlStream();
+        yaml.Load(new StringReader(System.Text.Encoding.UTF8.GetString(manifestBytes)));
+        var root = Assert.IsType<YamlDotNet.RepresentationModel.YamlMappingNode>(yaml.Documents[0].RootNode);
+        var homebrew = root["Pinget"]["Homebrew"];
+        Assert.Equal(HomebrewPackageIds.Create("homebrew/core", "tinytool"), report["packageIdentifier"]!.GetValue<string>());
+        Assert.Equal("1.2.3_1.bottle.3", report["packageVersion"]!.GetValue<string>());
+        Assert.Equal("singleton", root["ManifestType"].ToString());
+        Assert.Equal("https://tinytool.example.invalid/", root["PackageUrl"].ToString());
+        Assert.Equal("Small dependency-free test utility", root["ShortDescription"].ToString());
+        Assert.Equal("Unknown", root["Publisher"].ToString());
+        Assert.NotEqual("homebrew/core", root["Publisher"].ToString());
+        Assert.Equal("homebrew-bottle", root["Installers"][0]["InstallerType"].ToString());
+        Assert.Equal("1", homebrew["Revision"].ToString());
+        Assert.Equal("3", homebrew["Bottles"][0]["Rebuild"].ToString());
+        Assert.Equal("14.0", homebrew["Bottles"][0]["MinimumOSVersion"].ToString());
+        Assert.Equal(root["Installers"][0]["InstallerSha256"].ToString(), homebrew["Bottles"][0]["Sha256"].ToString());
+        Assert.Equal(root["Installers"][0]["InstallerUrl"].ToString(), homebrew["Bottles"][0]["Url"].ToString());
+        Assert.Equal(new[] { "small", "tiny" }, ((YamlDotNet.RepresentationModel.YamlSequenceNode)homebrew["Aliases"]).Select(n => n.ToString()));
+        Assert.Equal(File.ReadAllBytes(fixture.Options.BottleArchive),
+            File.ReadAllBytes(Path.Combine(fixture.Options.BottleMirror, report["bottleFile"]!.GetValue<string>())));
+        var reportPath = manifestPath + ".import.json";
+        var reportBytes = File.ReadAllBytes(reportPath);
+        Assert.True(JsonNode.DeepEquals(report, JsonNode.Parse(reportBytes)));
+        var state = Path.Combine(fixture.Root, "state");
+        var input = PublisherInput(fixture);
+        var build = new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state));
+        Assert.Equal(1, build.PackageCount);
+        Assert.Equal(1, build.ManifestCount);
+        var snapshot = JsonNode.Parse(File.ReadAllBytes(Path.Combine(build.SnapshotDirectory, "snapshot.json")));
+        Assert.Equal("homebrew", snapshot!["profile"]!.GetValue<string>());
+        var bottleFile = report["bottleFile"]!.GetValue<string>();
+        Assert.Equal(
+            File.ReadAllBytes(Path.Combine(fixture.Options.BottleMirror, bottleFile)),
+            File.ReadAllBytes(Path.Combine(build.SnapshotDirectory, "feed", "bottles", bottleFile)));
+        var msix = Path.Combine(fixture.Root, "package", "brew.msix");
+        PublisherPackaging.Package(new PublisherPackageOptions(
+            state, msix, "Pinget.Test.Homebrew", "CN=Pinget Homebrew", "1.0.0.0", build.BuildId));
+        var destination = Path.Combine(fixture.Root, "static");
+        PublisherPackaging.Publish(new PublisherPublishOptions(
+            state, destination, msix, UnsignedDevelopment: true, BuildId: build.BuildId));
+        Assert.True(File.Exists(Path.Combine(destination, "brew.msix")));
+        Assert.False(File.Exists(Path.Combine(destination, "source2.msix")));
+        var marker = JsonNode.Parse(File.ReadAllBytes(Path.Combine(destination, ".pinget-publisher.json")));
+        Assert.Equal("brew.msix", marker!["packageFileName"]!.GetValue<string>());
+        Assert.Equal("homebrew", marker["profile"]!.GetValue<string>());
+        Assert.Equal(
+            File.ReadAllBytes(Path.Combine(fixture.Options.BottleMirror, bottleFile)),
+            File.ReadAllBytes(Path.Combine(destination, "bottles", bottleFile)));
+        PublisherPackaging.VerifyDestination(destination);
+        HomebrewImporter.Import(fixture.Options);
+        Assert.Equal(manifestBytes, File.ReadAllBytes(manifestPath));
+        Assert.Equal(reportBytes, File.ReadAllBytes(reportPath));
+    }
+
+    [Fact]
+    public void ImportsOnlyTargetMatchedFixedCellarBottles()
+    {
+        using var fixture = new Fixture();
+        fixture.Change(value =>
+            value["bottle"]!["stable"]!["files"]!["arm64_sonoma"]!["cellar"] = "/opt/homebrew/Cellar");
+        var report = HomebrewImporter.Import(fixture.Options);
+        var manifest = File.ReadAllText(Path.Combine(fixture.Options.ManifestOutput, report["manifestFile"]!.GetValue<string>()));
+        Assert.Contains("Relocation: /opt/homebrew/Cellar", manifest);
+        var state = Path.Combine(fixture.Root, "fixed-cellar-state");
+        new PublisherWorkspace(state).Build(new PublisherBuildOptions(PublisherInput(fixture), state));
+    }
+
+    [Fact]
+    public void Build_RejectsMixedHomebrewAndWindowsProfiles()
+    {
+        using var fixture = new Fixture();
+        HomebrewImporter.Import(fixture.Options);
+        File.WriteAllText(Path.Combine(fixture.Options.ManifestOutput, "Pinget.Contract.Singleton.yaml"), """
+            PackageIdentifier: Pinget.Contract.Singleton
+            PackageVersion: 1.0.0
+            PackageLocale: en-US
+            Publisher: Pinget Test Fixtures
+            PackageName: Pinget Contract Fixture
+            ShortDescription: Harmless production publisher conformance fixture
+            Installers:
+              - Architecture: x64
+                InstallerType: exe
+                InstallerUrl: https://example.invalid/a.exe
+                InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+            ManifestType: singleton
+            ManifestVersion: 1.10.0
+            """);
+        var state = Path.Combine(fixture.Root, "state");
+        var error = Assert.Throws<PublisherException>(() =>
+            new PublisherWorkspace(state).Build(new PublisherBuildOptions(PublisherInput(fixture), state)));
+        Assert.Contains("cannot mix Homebrew and Windows", error.Message);
+        Assert.False(Directory.Exists(Path.Combine(state, "builds")));
+    }
+
+    [Fact]
+    public void Build_RequiresValidMirroredBottlesForHomebrewManifests()
+    {
+        using (var fixture = new Fixture())
+        {
+            HomebrewImporter.Import(fixture.Options);
+            var input = PublisherInput(fixture);
+            File.Delete(Directory.EnumerateFiles(Path.Combine(input, "bottles")).Single());
+            var state = Path.Combine(fixture.Root, "missing-state");
+            var error = Assert.Throws<PublisherException>(() =>
+                new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state)));
+            Assert.Contains("missing from the bottles/ mirror", error.Message);
+        }
+
+        using (var fixture = new Fixture())
+        {
+            HomebrewImporter.Import(fixture.Options);
+            var input = PublisherInput(fixture);
+            File.WriteAllText(Directory.EnumerateFiles(Path.Combine(input, "bottles")).Single(), "tampered");
+            var state = Path.Combine(fixture.Root, "corrupt-state");
+            var error = Assert.Throws<PublisherException>(() =>
+                new PublisherWorkspace(state).Build(new PublisherBuildOptions(input, state)));
+            Assert.Contains("hash does not match filename", error.Message);
+        }
+    }
+
+    [Theory]
+    [InlineData("recommended_dependencies")]
+    [InlineData("optional_dependencies")]
+    [InlineData("uses_from_macos")]
+    [InlineData("requirements")]
+    [InlineData("conflicts_with")]
+    public void RejectsOptionalDependenciesAndRequirements(string field)
+    {
+        using var fixture = new Fixture();
+        fixture.Change(v => v[field] = new JsonArray("runtime"));
+        fixture.Reject(field);
+    }
+
+    [Fact]
+    public void RejectsVariations()
+    {
+        using var fixture = new Fixture();
+        fixture.Change(v => v["variations"] = JsonNode.Parse("""{"arm64_sonoma":{"dependencies":["runtime"]}}"""));
+        fixture.Reject("variations");
+    }
+
+    [Theory]
+    [InlineData("tap", "\"homebrew\"", "identity")]
+    [InlineData("full_name", "\"other\"", "full_name")]
+    [InlineData("versions/stable", "\"../bad\"", "version")]
+    [InlineData("revision", "-1", "revision")]
+    [InlineData("homepage", "\"https://user:secret@example.invalid/\"", "homepage")]
+    [InlineData("version_scheme", "6", "version_scheme")]
+    [InlineData("bottle/stable/rebuild", "-1", "rebuild")]
+    [InlineData("bottle/stable/files/arm64_sonoma/cellar", "\"/usr/local/Cellar\"", "fixed-cellar")]
+    [InlineData("bottle/stable/files/arm64_sonoma/sha256", "\"bad\"", "sha256")]
+    [InlineData("bottle/stable/files/arm64_sonoma/sha256", "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "SHA-256 mismatch")]
+    [InlineData("bottle/stable/files/arm64_sonoma/url", "\"https://user:secret@example.invalid/bottle\"", "public HTTPS")]
+    public void RejectsBadMetadataAndHashWithoutOutputs(string path, string json, string message)
+    {
+        using var fixture = new Fixture();
+        fixture.Change(v =>
+        {
+            var parts = path.Split('/');
+            JsonNode parent = v;
+            foreach (var part in parts[..^1])
+                parent = parent[part]!;
+            parent[parts[^1]] = JsonNode.Parse(json);
+        });
+        fixture.Reject(message);
+    }
+
+    [Fact]
+    public void RejectsMissingSelectedBottle()
+    {
+        using var fixture = new Fixture();
+        fixture.Change(v => v["bottle"]!["stable"]!["files"] = new JsonObject());
+        fixture.Reject("no selected bottle");
+    }
+
+    [Fact]
+    public void RejectsUnsupportedTargetsOverlapAndSecretUrls()
+    {
+        using var fixture = new Fixture();
+        fixture.Options = fixture.Options with { Tag = "unknown" };
+        fixture.Reject("unsupported target");
+        fixture.Options = fixture.Options with { Tag = "arm64_sonoma", Architecture = "x64" };
+        fixture.Reject("unsupported target");
+        fixture.Options = fixture.Options with { Architecture = "arm64" };
+        foreach (var url in new[] { "https://user:secret@example.invalid/bottles", "https://example.invalid/bottles?token=secret", "https://example.invalid/%2e%2e" })
+        {
+            fixture.Options = fixture.Options with { BaseUrl = url };
+            fixture.Reject("base URL");
+            Assert.DoesNotContain("secret", Assert.Throws<PublisherException>(() => HomebrewImporter.Import(fixture.Options)).Message);
+        }
+        fixture.Options = fixture.Options with { BaseUrl = "https://example.invalid/bottles", ManifestOutput = fixture.Root };
+        Assert.Contains("disjoint", Assert.Throws<PublisherException>(() => HomebrewImporter.Import(fixture.Options)).Message);
+        fixture.Options = fixture.Options with { ManifestOutput = Path.Combine(fixture.Root, "out"), BottleMirror = Path.Combine(fixture.Root, "out", "bottles") };
+        fixture.Reject("disjoint");
+    }
+
+    [Fact]
+    public void RejectsCorruptExistingMirrorWithoutWritingManifests()
+    {
+        using var fixture = new Fixture();
+        Directory.CreateDirectory(fixture.Options.BottleMirror);
+        var formula = JsonNode.Parse(File.ReadAllBytes(fixture.Options.FormulaJson))!;
+        var hash = formula["bottle"]!["stable"]!["files"]!["arm64_sonoma"]!["sha256"]!.GetValue<string>();
+        var path = Path.Combine(fixture.Options.BottleMirror, $"{hash}.tar.gz");
+        File.WriteAllText(path, "corruption");
+        Assert.Contains("different bytes", Assert.Throws<PublisherException>(() => HomebrewImporter.Import(fixture.Options)).Message);
+        Assert.False(Directory.Exists(fixture.Options.ManifestOutput));
+        Assert.Equal("corruption", File.ReadAllText(path));
+    }
+
+    [Fact]
+    public void RejectsSymlinkDestinations()
+    {
+        if (OperatingSystem.IsWindows())
+            return;
+        using var fixture = new Fixture();
+        var real = Path.Combine(fixture.Root, "real");
+        Directory.CreateDirectory(real);
+        var link = Path.Combine(fixture.Root, "link");
+        Directory.CreateSymbolicLink(link, real);
+        fixture.Options = fixture.Options with { ManifestOutput = Path.Combine(link, "manifests") };
+        fixture.Reject("symbolic links");
+        Assert.Empty(Directory.GetFileSystemEntries(real));
+    }
+
+    private sealed class Fixture : IDisposable
+    {
+        public string Root { get; } = Path.Combine(Directory.GetCurrentDirectory(), ".homebrew-tests", Guid.NewGuid().ToString("N"));
+        public HomebrewImportOptions Options { get; set; }
+
+        public Fixture()
+        {
+            Directory.CreateDirectory(Root);
+            Options = new HomebrewImportOptions(Path.Combine(Root, "formula.json"), Path.Combine(Root, "input.tar.gz"),
+                Path.Combine(Root, "manifests"), Path.Combine(Root, "bottles"), "arm64_sonoma", "macOS", "arm64",
+                "https://mirror.example.invalid/bottles/");
+            var fixtures = Path.Combine(AppContext.BaseDirectory, "Fixtures", "Homebrew");
+            File.Copy(Path.Combine(fixtures, "formula.json"), Options.FormulaJson);
+            File.WriteAllBytes(Options.BottleArchive, Convert.FromBase64String(File.ReadAllText(Path.Combine(fixtures, "bottle.base64")).Trim()));
+        }
+
+        public void Change(Action<JsonNode> mutate)
+        {
+            var formula = JsonNode.Parse(File.ReadAllBytes(Options.FormulaJson))!;
+            mutate(formula);
+            File.WriteAllText(Options.FormulaJson, formula.ToJsonString());
+        }
+
+        public void Reject(string message)
+        {
+            Assert.Contains(message, Assert.Throws<PublisherException>(() => HomebrewImporter.Import(Options)).Message);
+            Assert.False(Directory.Exists(Options.ManifestOutput));
+            Assert.False(Directory.Exists(Options.BottleMirror));
+        }
+
+        public void Dispose() => Directory.Delete(Root, true);
+    }
+
+    private static string PublisherInput(Fixture fixture)
+    {
+        var input = Path.Combine(fixture.Root, "publisher-input");
+        var manifests = Path.Combine(input, "manifests");
+        var bottles = Path.Combine(input, "bottles");
+        Directory.CreateDirectory(manifests);
+        Directory.CreateDirectory(bottles);
+        foreach (var path in Directory.EnumerateFiles(fixture.Options.ManifestOutput, "*.yaml"))
+            File.Copy(path, Path.Combine(manifests, Path.GetFileName(path)));
+        foreach (var path in Directory.EnumerateFiles(fixture.Options.BottleMirror))
+            File.Copy(path, Path.Combine(bottles, Path.GetFileName(path)));
+        return input;
+    }
+}

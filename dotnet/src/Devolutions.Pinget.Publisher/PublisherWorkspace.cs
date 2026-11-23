@@ -55,7 +55,7 @@ public sealed partial class PublisherWorkspace
             Directory.CreateDirectory(staging);
             try
             {
-                WriteSnapshot(staging, buildId, scan);
+                WriteSnapshot(staging, buildId, scan, input);
                 Directory.Move(staging, snapshot);
             }
             catch
@@ -67,6 +67,9 @@ public sealed partial class PublisherWorkspace
         else
         {
             VerifySnapshotDirectory(snapshot, buildId);
+            var metadata = JsonNode.Parse(File.ReadAllText(Path.Combine(snapshot, "snapshot.json")))!.AsObject();
+            if (!string.Equals(SnapshotProfile(metadata), scan.Profile, StringComparison.Ordinal))
+                throw new PublisherException("Snapshot profile does not match the scanned manifests.");
         }
 
         using var connection = OpenState(state, create: true);
@@ -82,6 +85,7 @@ public sealed partial class PublisherWorkspace
             {
                 ["manifestCount"] = scan.Manifests.Count,
                 ["packageCount"] = scan.Packages.Count,
+                ["profile"] = scan.Profile,
                 ["createdUtc"] = snapshotMetadata["createdUtc"]!.GetValue<string>(),
                 ["snapshot"] = Path.GetRelativePath(state, snapshot).Replace('\\', '/'),
             };
@@ -154,6 +158,9 @@ public sealed partial class PublisherWorkspace
         foreach (var key in new[] { "manifestCount", "packageCount", "createdUtc" })
             if (!JsonNode.DeepEquals(summary[key], snapshotMetadata![key]))
                 throw new PublisherException($"Snapshot '{key}' does not match publisher build summary.");
+        var summaryProfile = summary["profile"]?.GetValue<string>() ?? "windows";
+        if (!string.Equals(summaryProfile, SnapshotProfile(snapshotMetadata!), StringComparison.Ordinal))
+            throw new PublisherException("Snapshot profile does not match publisher build summary.");
         return new PublisherVerifyResult(true, "unsigned build snapshot", CountSnapshotArtifacts(snapshot), buildId);
     }
 
@@ -315,7 +322,7 @@ public sealed partial class PublisherWorkspace
         return buildId is null ? null : ReadInventory(connection, buildId);
     }
 
-    private static void WriteSnapshot(string directory, string buildId, ScanResult scan)
+    private static void WriteSnapshot(string directory, string buildId, ScanResult scan, string inputDirectory)
     {
         var feed = Path.Combine(directory, "feed");
         Directory.CreateDirectory(feed);
@@ -336,6 +343,19 @@ public sealed partial class PublisherWorkspace
             File.WriteAllBytes(sidecarPath, package.CompressedVersionData);
             artifactHashes.Add(sidecarRelative, sidecarHash);
         }
+        foreach (var asset in scan.Inventory.Where(item => item.Key.StartsWith("bottles/", StringComparison.Ordinal)))
+        {
+            var source = ResolveContained(inputDirectory, asset.Key);
+            var target = ResolveContained(feed, asset.Key);
+            EnsureSafeExistingPath(source);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.Copy(source, target, overwrite: false);
+            using var copied = File.OpenRead(target);
+            var copiedHash = Convert.ToHexString(SHA256.HashData(copied)).ToLowerInvariant();
+            if (!string.Equals(copiedHash, asset.Value, StringComparison.Ordinal))
+                throw new PublisherException($"Bottle changed while creating immutable snapshot: {asset.Key}");
+            artifactHashes.Add(asset.Key, asset.Value);
+        }
         var indexPath = Path.Combine(directory, "Public", "index.db");
         WinGetV2IndexWriter.Write(indexPath, scan.Packages, Guid.NewGuid().ToString("D"));
         var snapshot = new JsonObject
@@ -343,6 +363,7 @@ public sealed partial class PublisherWorkspace
             ["schemaVersion"] = StateSchemaVersion,
             ["artifactFormatVersion"] = ArtifactFormatVersion,
             ["buildId"] = buildId,
+            ["profile"] = scan.Profile,
             ["createdUtc"] = DateTimeOffset.UtcNow.ToString("O"),
             ["manifestCount"] = scan.Manifests.Count,
             ["packageCount"] = scan.Packages.Count,
@@ -369,6 +390,7 @@ public sealed partial class PublisherWorkspace
         if (metadata["schemaVersion"]?.GetValue<int>() != StateSchemaVersion)
             throw new PublisherException("Unsupported snapshot schema version.");
         ValidateArtifactFormatVersion(metadata["artifactFormatVersion"]?.ToJsonString(), "snapshot");
+        _ = SnapshotProfile(metadata);
         if (metadata["inventory"] is not JsonObject inputInventory)
             throw new PublisherException("Snapshot input inventory is missing.");
         var inventory = inputInventory.ToDictionary(p => p.Key, p => p.Value!.GetValue<string>(), StringComparer.Ordinal);
@@ -435,6 +457,21 @@ public sealed partial class PublisherWorkspace
             VerifyVersionData(feed, id, latestVersion, MsZipCompressor.Decompress(sidecarBytes));
         }
 
+    }
+
+    internal static string SnapshotProfile(string snapshotDirectory)
+    {
+        var metadata = JsonNode.Parse(File.ReadAllText(Path.Combine(snapshotDirectory, "snapshot.json"))) as JsonObject
+            ?? throw new PublisherException("Invalid snapshot metadata.");
+        return SnapshotProfile(metadata);
+    }
+
+    private static string SnapshotProfile(JsonObject metadata)
+    {
+        var profile = metadata["profile"]?.GetValue<string>() ?? "windows";
+        if (profile is not ("windows" or "homebrew"))
+            throw new PublisherException($"Unsupported publisher profile '{profile}'.");
+        return profile;
     }
 
     internal static IEnumerable<string> EnumerateSafeFiles(string root)

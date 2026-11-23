@@ -33,11 +33,13 @@ URLs; the build does not download or execute them.
   Signing, Azure Key Vault, or HSM), and a publisher distinguished name
   matching that certificate's subject.
 
-Building requires Windows because sidecars are compressed with the native
-Windows Compression API. `package`, `publish`, `verify`, `status` and `diff`
-also run on Linux and macOS, so a snapshot built on Windows can be packaged,
-signed and published elsewhere. Do not infer building support from the
-availability of the CLI on a platform. A missing verification tool or unsigned
+Build, package, verify, status, diff and publish run on Windows, macOS and
+Linux. Windows uses the native Windows Compression API for MSZIP output;
+macOS and Linux use a portable raw-deflate encoder with the same WinGet v2
+MSZIP framing. The resulting sidecars are readable by the existing client
+decoder, and both publishers' portable outputs have also been decoded by the
+Windows Compression API across Linux and macOS x64/arm64. The encoders reject
+empty input and payloads over 64 MiB. A missing verification tool or unsigned
 MSIX fails `publish` unless `--unsigned-development` is explicitly passed.
 
 ## Build, package, sign and publish
@@ -72,6 +74,15 @@ The state and snapshots record `artifactFormatVersion=2`. Older publisher
 state is rejected without automatic migration; use a new state directory
 rather than editing its schema markers. Existing version-1 destination
 ownership records can still be verified and updated through normal publication.
+
+Earlier portable MSZIP writers could produce sidecars with invalid Windows
+headers or oversized blocks. A snapshot containing those sidecars is rejected
+without modification; rebuild from the same inputs with a fresh `--state`
+directory. Build IDs are based on inputs, so a rebuilt index can have the same
+build ID but different bytes. If its index differs from the published index,
+use a higher four-part source package version; same-version reuse requires the
+same build ID, index hash, and signing mode. Retain the old published
+hash-addressed files for clients with cached indexes.
 
 State lives in `publisher.db`. Each snapshot is under `builds\<buildId>`,
 with `snapshot.json`, `Public\index.db` and hosted files under
@@ -151,20 +162,38 @@ Copy the **entire published directory**, maintaining relative paths:
 
 | Published file | Purpose |
 | --- | --- |
-| `source2.msix` | Signed source package containing `Public/index.db` |
+| `source2.msix` / `brew.msix` | Signed source package containing `Public/index.db` |
 | `manifests/<sha256>.yaml` | Merged manifest bytes referenced by version data |
 | `packages/<id>/<hash-prefix>/versionData.mszyml` | Compressed version metadata referenced by the index |
+| `bottles/<sha256>.tar.gz` | Unchanged Homebrew bottle bytes, present only in Homebrew snapshots |
+
+The builder records a `windows` or `homebrew` profile in each immutable
+snapshot. A snapshot is Homebrew-only when its manifests use the
+`Pinget.Homebrew.*` ID namespace, `Pinget.Homebrew` extension, or
+`homebrew-bottle` installer type; mixing Homebrew and ordinary Windows
+packages in one snapshot is rejected. For the Homebrew profile, `repository
+package --msix` and the signed input to `repository publish --msix` must be
+named `brew.msix`; the publisher selects that root name from the snapshot
+profile. The ownership marker records the profile and root name, and recovery
+verifies both. Older snapshots and ownership markers without a profile field
+continue to mean `windows` / `source2.msix`. The `Pinget.PreIndexed.Homebrew`
+client source consumes only `brew.msix` and verifies it before cache
+activation. Both clients have consumed a signed real-bottle source on Linux;
+platform acceptance and the native compatibility limits are documented in
+[Homebrew static source](homebrew-static-source.md).
 
 A static website, reverse proxy, object-storage HTTPS endpoint or CDN can serve
 these files. Enable `GET` and `HEAD`; retain `ETag`/`Last-Modified` metadata and
 conditional requests. Ensure the host serves `.msix`, `.mszyml` and `.yaml`
 rather than rejecting unknown extensions or rewriting them to a website page.
 Use `application/octet-stream` when no more specific type is configured.
-Range requests for large source packages are useful.
+Range requests for large source packages are useful. Apply the same cache
+policy to whichever root package name is selected.
 
-Use a short cache lifetime or revalidation for `source2.msix`. Hash-addressed
-manifests and sidecars may be cached for a long time. A CDN must not serve a
-new root package before its referenced objects are readable through that CDN.
+Use a short cache lifetime or revalidation for the selected root MSIX.
+Hash-addressed manifests, sidecars, and bottle archives may be cached for a
+long time. A CDN must not serve a new root package before its referenced
+objects are readable through that CDN.
 
 The local publisher promotes new immutable metadata **before** replacing
 `source2.msix`. A later cloud upload is a separate operation: upload new

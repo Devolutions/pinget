@@ -60,8 +60,24 @@ public sealed class PingetClient : IDisposable
         return new CollectionResult<PSSourceResult>(sources, Array.Empty<string>());
     }
 
-    public void AddSource(string name, string argument, string? type, PSSourceTrustLevel trustLevel, bool explicitSource, int priority)
+    public void AddSource(
+        string name,
+        string argument,
+        string? type,
+        PSSourceTrustLevel trustLevel,
+        bool explicitSource,
+        int priority,
+        string? publisher = null,
+        IReadOnlyList<string>? trustedCa = null)
     {
+        if (string.Equals(type, "Pinget.PreIndexed.Homebrew", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(type, "homebrew", StringComparison.OrdinalIgnoreCase) ||
+            publisher is not null ||
+            trustedCa is { Count: > 0 })
+        {
+            throw new InvalidOperationException("Pinget Homebrew sources require the native Pinget client and are not available through the Windows COM bridge.");
+        }
+
         _packageManager.AddSource(
             name,
             argument,

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -30,6 +31,7 @@ public class Repository : IDisposable
 
     private readonly string _appRoot;
     private readonly HttpClient _client;
+    private readonly HttpClient _homebrewClient;
     private readonly Action<RepositoryWarning>? _diagnostics;
     private readonly Func<Manifest, bool>? _packageAgreementsPrompt;
     private readonly TimeSpan? _preIndexedSourceAutoUpdateInterval;
@@ -45,6 +47,7 @@ public class Repository : IDisposable
     private Repository(
         string appRoot,
         HttpClient client,
+        HttpClient homebrewClient,
         SourceStore store,
         EffectiveSourceMode sourceMode,
         Action<RepositoryWarning>? diagnostics,
@@ -53,6 +56,7 @@ public class Repository : IDisposable
     {
         _appRoot = appRoot;
         _client = client;
+        _homebrewClient = homebrewClient;
         _store = store;
         _sourceMode = sourceMode;
         _diagnostics = diagnostics;
@@ -79,7 +83,15 @@ public class Repository : IDisposable
         });
         client.Timeout = Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
-        return new Repository(appRoot, client, store, sourceMode, options.Diagnostics, options.PackageAgreementsPrompt, options.PreIndexedSourceAutoUpdateInterval);
+        var homebrewClient = new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression = System.Net.DecompressionMethods.None,
+            ConnectTimeout = InstallerDownloadConnectTimeout,
+            AllowAutoRedirect = false,
+        });
+        homebrewClient.Timeout = Timeout.InfiniteTimeSpan;
+        homebrewClient.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
+        return new Repository(appRoot, client, homebrewClient, store, sourceMode, options.Diagnostics, options.PackageAgreementsPrompt, options.PreIndexedSourceAutoUpdateInterval);
     }
 
     internal static SourceMode ResolveRequestedSourceMode(SourceMode? configuredSourceMode, string? requestedAppRoot) =>
@@ -231,8 +243,43 @@ public class Repository : IDisposable
 
     public void AddSource(string name, string arg, SourceKind kind, string trustLevel = "None", bool explicitSource = false, int priority = 0)
     {
+        if (kind == SourceKind.HomebrewPreIndexed)
+            throw new InvalidOperationException("Homebrew static sources require an expected publisher and explicit trust configuration.");
         ValidateSourceArgument(arg);
         AddSourceUnvalidated(name, arg, kind, trustLevel, explicitSource, priority);
+    }
+
+    public void AddHomebrewSource(string name, string arg, string publisher, IReadOnlyList<string> trustedCa)
+    {
+        if (OperatingSystem.IsWindows())
+            throw new InvalidOperationException("Homebrew sources are only supported on native macOS and Linux clients.");
+        if (UsesSystemWingetSources)
+            throw new InvalidOperationException("Homebrew sources require Pinget's private source store, not WinGet source management.");
+        var normalizedArg = ValidateHomebrewSourceBaseUrl(arg);
+        if (string.IsNullOrWhiteSpace(publisher) || publisher.Length > 1024 || publisher.Any(char.IsControl))
+            throw new InvalidOperationException("Expected MSIX publisher must be a nonempty distinguished name of at most 1024 characters.");
+        var anchors = trustedCa.Select(path =>
+        {
+            var fullPath = Path.GetFullPath(path);
+            if (!File.Exists(fullPath))
+                throw new InvalidOperationException($"Trusted CA does not exist: {fullPath}");
+            return fullPath;
+        }).ToList();
+        if (_store.Sources.Any(source => string.Equals(source.Name, name, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException($"A source with name '{name}' already exists.");
+        if (_store.Sources.Any(source => source.Arg == normalizedArg))
+            throw new InvalidOperationException($"A source with argument '{arg}' already exists.");
+        _store.Sources.Add(new SourceRecord
+        {
+            Name = name,
+            Kind = SourceKind.HomebrewPreIndexed,
+            Arg = normalizedArg,
+            Identifier = name,
+            TrustLevel = "Trusted",
+            Publisher = publisher,
+            TrustedCa = anchors,
+        });
+        SourceStoreManager.Save(_store, _appRoot);
     }
 
     /// <summary>
@@ -258,12 +305,28 @@ public class Repository : IDisposable
             throw new InvalidOperationException($"The source argument '{arg}' is not a valid https:// URL.");
     }
 
+    internal static string ValidateHomebrewSourceBaseUrl(string arg)
+    {
+        ValidateSourceArgument(arg);
+        var trimmed = arg.Trim();
+        var uri = new Uri(trimmed, UriKind.Absolute);
+        var rawPath = trimmed.Split("://", 2).ElementAtOrDefault(1)?.Split('/', 2).ElementAtOrDefault(1) ?? "";
+        if (uri.UserInfo.Length > 0 || uri.Query.Length > 0 || uri.Fragment.Length > 0 ||
+            trimmed.Contains('%') || rawPath.Split('/').Any(part => part is "." or ".."))
+        {
+            throw new InvalidOperationException("Homebrew source base URL must not contain credentials, query strings, fragments, escapes, or dot segments.");
+        }
+        return trimmed.TrimEnd('/');
+    }
+
     /// <summary>
     /// Test seam: Core.Tests register loopback <c>http://</c> stub servers, which
     /// <see cref="AddSource"/> refuses.
     /// </summary>
     internal void AddSourceUnvalidated(string name, string arg, SourceKind kind, string trustLevel = "None", bool explicitSource = false, int priority = 0)
     {
+        if (kind == SourceKind.HomebrewPreIndexed)
+            throw new InvalidOperationException("Use AddHomebrewSource to configure a signed Homebrew source.");
         if (UsesSystemWingetSources)
         {
             SystemWingetSourceStore.AddSource(name, arg, kind, NormalizeSourceTrustLevel(trustLevel), explicitSource);
@@ -502,6 +565,7 @@ public class Repository : IDisposable
                 var detail = source.Kind switch
                 {
                     SourceKind.PreIndexed => PreIndexedSource.Update(_client, source, _appRoot, MirrorsSystemWingetSources),
+                    SourceKind.HomebrewPreIndexed => HomebrewPreIndexedSource.Update(_homebrewClient, source, _appRoot),
                     SourceKind.Rest => RestSource.UpdateRest(_client, source, _appRoot, MirrorsSystemWingetSources),
                     _ => "Unknown source kind"
                 };
@@ -662,7 +726,9 @@ public class Repository : IDisposable
             warnings.Add(sourceRefreshWarning);
 
         var installed = InstalledPackages.Collect(query.InstallScope);
-        if (!OperatingSystem.IsWindows())
+        var nativeInstalled = HomebrewKegStore.InstalledPackages(_appRoot, query.InstallScope);
+        installed.AddRange(nativeInstalled);
+        if (!OperatingSystem.IsWindows() && nativeInstalled.Count == 0)
             warnings.Add(InstalledStateUnsupportedWarning);
 
         // Even plain `list` should canonicalize installed package ids and
@@ -783,7 +849,8 @@ public class Repository : IDisposable
         // (EnsureSupportForDownload). Install does not apply these download-only checks.
         EnsurePackageAgreementsAccepted(manifest, request);
         EnsureInstallerDownloadSupported(installer);
-        var installerPath = FetchInstaller(request, manifest, installer, request.Rename, downloadDir);
+        using var sourceClient = CreateHomebrewSourceClient(request, manifest);
+        var installerPath = FetchInstaller(request, manifest, installer, request.Rename, downloadDir, sourceClient);
         var manifestYaml = BuildDownloadManifestYaml(manifest, manifestDocuments, installer);
         var manifestFileName = DeriveDownloadManifestFilename(manifest, installer);
         var manifestPath = Path.Combine(downloadDir, manifestFileName);
@@ -834,7 +901,13 @@ public class Repository : IDisposable
     /// different manifest (a newly published version, a source refresh) whose file would run with the first
     /// one's type and switches.
     /// </summary>
-    internal string FetchInstaller(InstallRequest request, Manifest manifest, Installer installer, string? rename, string downloadDir)
+    internal string FetchInstaller(
+        InstallRequest request,
+        Manifest manifest,
+        Installer installer,
+        string? rename,
+        string downloadDir,
+        HttpClient? downloadClient = null)
     {
         EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
         if (string.Equals(installer.InstallerType, "msstore", StringComparison.OrdinalIgnoreCase) &&
@@ -850,7 +923,9 @@ public class Repository : IDisposable
         Directory.CreateDirectory(downloadDir);
         var dest = Path.Combine(downloadDir, filename);
 
-        var actualHash = DownloadInstallerToFile(url, dest);
+        var client = downloadClient ??
+            (manifest.Homebrew is not null && request.ManifestPath is null ? _homebrewClient : _client);
+        var actualHash = DownloadInstallerToFile(url, dest, client);
 
         if (expectedHash is not null &&
             !actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase) &&
@@ -958,7 +1033,7 @@ public class Repository : IDisposable
         return name + extensions[0];
     }
 
-    private string DownloadInstallerToFile(string url, string dest)
+    private string DownloadInstallerToFile(string url, string dest, HttpClient? downloadClient = null)
     {
         var partPath = SidecarPath(dest, "part");
         var metadataPath = SidecarPath(dest, "part.json");
@@ -977,7 +1052,8 @@ public class Repository : IDisposable
                     url,
                     partPath,
                     metadataPath,
-                    InstallerDownloadTotalTimeout - elapsed).GetAwaiter().GetResult();
+                    InstallerDownloadTotalTimeout - elapsed,
+                    downloadClient).GetAwaiter().GetResult();
 
                 var actualHash = Sha256FileHex(partPath);
                 File.Move(partPath, dest, overwrite: true);
@@ -994,7 +1070,12 @@ public class Repository : IDisposable
         throw lastError ?? new TimeoutException("Installer download timed out.");
     }
 
-    private async Task TryDownloadInstallerToPartAsync(string url, string partPath, string metadataPath, TimeSpan remaining)
+    private async Task TryDownloadInstallerToPartAsync(
+        string url,
+        string partPath,
+        string metadataPath,
+        TimeSpan remaining,
+        HttpClient? downloadClient)
     {
         var metadata = ReadInstallerDownloadMetadata(metadataPath, partPath, url);
         var offset = metadata?.Offset ?? 0;
@@ -1009,7 +1090,7 @@ public class Repository : IDisposable
                 request.Headers.TryAddWithoutValidation("If-Range", ifRange);
         }
 
-        using var response = await _client
+        using var response = await (downloadClient ?? _client)
             .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, totalCts.Token)
             .ConfigureAwait(false);
 
@@ -1181,6 +1262,8 @@ public class Repository : IDisposable
     public InstallResult Install(InstallRequest request)
         => InstallCore(request, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
 
+    public bool HasHomebrewPackages => HomebrewKegStore.ReadAll(_appRoot).Count > 0;
+
     /// <summary>
     /// <paramref name="visited"/> holds the ids of every package already on the current dependency
     /// chain or already handled, shared across the whole recursion so a dependency cycle (or a
@@ -1193,7 +1276,7 @@ public class Repository : IDisposable
         EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
         request = ApplyInstallScope(request);
         var manifest = ResolveManifestForInstall(request);
-        if (!OperatingSystem.IsWindows())
+        if (!OperatingSystem.IsWindows() && manifest.Homebrew is null)
         {
             var unsupportedInstallerType = (SelectInstaller(manifest.Installers, request.Query)?.InstallerType ?? "install")
                 .ToLowerInvariant();
@@ -1212,11 +1295,33 @@ public class Repository : IDisposable
         var selectedInstaller = SelectInstaller(manifest.Installers, request.Query)
             ?? throw new InvalidOperationException("No applicable installer found");
 
+        HomebrewKegSpec? nativeSpec = null;
+        if (manifest.Homebrew is not null)
+        {
+            if (request.IgnoreSecurityHash || request.Query.InstallScope == "machine")
+                throw new InvalidOperationException("Homebrew bottles require verified hashes and a user-scoped private prefix.");
+            if (request.InstallLocation is not null || request.Rename is not null ||
+                request.Custom is not null || request.Override is not null)
+                throw new InvalidOperationException("Homebrew bottles do not support installer arguments, custom locations, or renamed commands.");
+            var sourceIdentifier = "local-manifest";
+            var sourceName = "local-manifest";
+            if (string.IsNullOrWhiteSpace(request.ManifestPath))
+            {
+                var (located, _, _) = FindSingleMatch(request.Query);
+                var source = _store.Sources[located.SourceIndex];
+                sourceIdentifier = source.Identifier;
+                sourceName = source.Name;
+            }
+            nativeSpec = HomebrewKegStore.Spec(manifest, selectedInstaller, sourceIdentifier, sourceName);
+        }
+
         // Installing a different version over an existing installation is an update (WinGet converts such an
         // install to the upgrade flow). A same-version reinstall (repair, --force) is not.
         var isUpdate = existingMatch is not null && InstallIsUpdate(existingMatch.InstalledVersion, manifest.Version);
         EnsureUpgradeAllowed(selectedInstaller, isUpdate);
         var uninstallPrevious = UninstallsPreviousVersion(request, selectedInstaller, isUpdate);
+        if (nativeSpec is not null && uninstallPrevious)
+            throw new InvalidOperationException("Homebrew upgrades replace the managed keg transactionally; uninstall-previous is unsupported.");
         if (!UpgradeSwitchApplies(isUpdate, uninstallPrevious) && selectedInstaller.Switches.Upgrade is not null)
         {
             // The `Upgrade` switch only applies when updating an existing installation.
@@ -1249,7 +1354,7 @@ public class Repository : IDisposable
             int previousExitCode;
             try
             {
-                previousExitCode = InstallerDispatch.Uninstall(existingMatch, CreateUninstallPreviousRequest(existingMatch), warnings);
+                previousExitCode = UninstallInstalled(existingMatch, CreateUninstallPreviousRequest(existingMatch), warnings);
             }
             catch (InvalidOperationException ex)
             {
@@ -1266,13 +1371,29 @@ public class Repository : IDisposable
         }
         else
         {
-            var tempDir = Path.Combine(Path.GetTempPath(), "pinget-install");
+            var tempDir = nativeSpec is not null
+                ? Path.Combine(_appRoot, "homebrew-downloads")
+                : Path.Combine(Path.GetTempPath(), "pinget-install");
             // Like WinGet, --rename never names the installer an install downloads: it only names a
             // portable's command alias (see InstallerDispatch.DeterminePortableLinks).
-            installerPath = FetchInstaller(request, manifest, selectedInstaller, rename: null, tempDir);
+            using var sourceClient = CreateHomebrewSourceClient(request, manifest);
+            installerPath = FetchInstaller(request, manifest, selectedInstaller, rename: null, tempDir, sourceClient);
             installerPath = PrepareInstallerForExecution(installerPath, installerType);
         }
-        var exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
+        int exitCode;
+        if (nativeSpec is not null)
+        {
+            HomebrewKegStore.Install(_appRoot, installerPath, nativeSpec, warnings);
+            exitCode = 0;
+        }
+        else if (OperatingSystem.IsWindows())
+        {
+            exitCode = InstallerDispatch.Execute(installerPath, installerType, request, manifest, selectedInstaller, warnings);
+        }
+        else
+        {
+            throw new PlatformNotSupportedException("This installer requires Windows.");
+        }
         var result = CompletedInstallResult(manifest, selectedInstaller, installerPath, installerType, exitCode, warnings);
         RemoveInstallerAfterSuccess(result);
         return result;
@@ -1405,7 +1526,8 @@ public class Repository : IDisposable
     public InstallResult Repair(RepairRequest request)
     {
         EnsureHashOverrideAllowed(request.IgnoreSecurityHash);
-        if (string.IsNullOrWhiteSpace(request.ManifestPath) && !OperatingSystem.IsWindows())
+        if (string.IsNullOrWhiteSpace(request.ManifestPath) && !OperatingSystem.IsWindows() &&
+            HomebrewKegStore.ReadAll(_appRoot).Count == 0)
         {
             var packageId = request.Query.Id ??
                 request.Query.Name ??
@@ -1471,7 +1593,7 @@ public class Repository : IDisposable
 
     public InstallResult Uninstall(UninstallRequest request)
     {
-        if (!OperatingSystem.IsWindows())
+        if (!OperatingSystem.IsWindows() && HomebrewKegStore.ReadAll(_appRoot).Count == 0)
         {
             var (packageId, version) = DescribeUninstallTarget(request);
             return CreateUnsupportedActionResult(packageId, version, "uninstall", UninstallUnsupportedWarning);
@@ -1480,9 +1602,7 @@ public class Repository : IDisposable
         var matches = ResolveUninstallMatches(request);
         var warnings = new List<string>();
         var exitCode = InstallerDispatch.UninstallEachMatch(matches, request.AllVersions,
-            installed => OperatingSystem.IsWindows()
-                ? InstallerDispatch.Uninstall(installed, request, warnings)
-                : throw new PlatformNotSupportedException("Uninstalling packages is only supported on Windows"));
+            installed => UninstallInstalled(installed, request, warnings));
 
         var primary = matches[0];
         return new InstallResult
@@ -1496,6 +1616,18 @@ public class Repository : IDisposable
             NoOp = false,
             Warnings = warnings,
         };
+    }
+
+    private int UninstallInstalled(ListMatch installed, UninstallRequest request, List<string> warnings)
+    {
+        if (installed.InstallerCategory == "homebrew-bottle")
+        {
+            HomebrewKegStore.Uninstall(_appRoot, installed.Id, request.Force, warnings);
+            return 0;
+        }
+        if (OperatingSystem.IsWindows())
+            return InstallerDispatch.Uninstall(installed, request, warnings);
+        throw new PlatformNotSupportedException("This installer requires Windows.");
     }
 
     private Manifest ResolveManifestForInstall(InstallRequest request)
@@ -2178,7 +2310,7 @@ public class Repository : IDisposable
         var source = _store.Sources[sourceIndex];
         return source.Kind switch
         {
-            SourceKind.PreIndexed => SearchPreindexed(sourceIndex, query, semantics),
+            SourceKind.PreIndexed or SourceKind.HomebrewPreIndexed => SearchPreindexed(sourceIndex, query, semantics),
             SourceKind.Rest => SearchRest(sourceIndex, query, semantics),
             _ => ([], false)
         };
@@ -2310,7 +2442,7 @@ public class Repository : IDisposable
     private string? SourceDiagnosticCachePath(SourceRecord source) =>
         source.Kind switch
         {
-            SourceKind.PreIndexed => PreIndexedSource.IndexPath(source, _appRoot, MirrorsSystemWingetSources),
+            SourceKind.PreIndexed or SourceKind.HomebrewPreIndexed => PreIndexedSource.IndexPath(source, _appRoot, MirrorsSystemWingetSources),
             SourceKind.Rest => Path.Combine(SourceStoreManager.SourceStateDir(source, _appRoot, MirrorsSystemWingetSources), "rest_info.json"),
             _ => null,
         };
@@ -2559,7 +2691,11 @@ public class Repository : IDisposable
     {
         var source = _store.Sources[sourceIndex];
         using var conn = OpenPreindexedConnection(sourceIndex);
-        var (entries, _) = PreIndexedSource.LoadV2VersionData(_client, conn, source, packageRowid, packageHash, _appRoot);
+        using var sourceClient = source.Kind == SourceKind.HomebrewPreIndexed
+            ? HomebrewPreIndexedSource.CreateTlsTrustedClient(_homebrewClient, source)
+            : null;
+        var client = sourceClient ?? (source.Kind == SourceKind.HomebrewPreIndexed ? _homebrewClient : _client);
+        var (entries, _) = PreIndexedSource.LoadV2VersionData(client, conn, source, packageRowid, packageHash, _appRoot);
         return entries.Select(e => new VersionKey { Version = e.Version, Channel = "" }).ToList();
     }
 
@@ -2575,6 +2711,18 @@ public class Repository : IDisposable
             RestLocator rest => ManifestFromRest(located.SourceIndex, rest.PackageId, rest.Versions, located.Display, query),
             _ => throw new InvalidOperationException("Unknown locator type")
         };
+    }
+
+    private HttpClient? CreateHomebrewSourceClient(InstallRequest request, Manifest manifest)
+    {
+        if (manifest.Homebrew is null || request.ManifestPath is not null)
+            return null;
+
+        var (located, _, _) = FindSingleMatch(request.Query);
+        var source = _store.Sources[located.SourceIndex];
+        return source.Kind == SourceKind.HomebrewPreIndexed
+            ? HomebrewPreIndexedSource.CreateTlsTrustedClient(_homebrewClient, source)
+            : null;
     }
 
     private (Manifest, object, List<string>) ManifestFromV1(
@@ -2618,7 +2766,11 @@ public class Repository : IDisposable
         var versions = PreIndexedSource.QueryV1Versions(conn, packageRowid);
         var selected = SelectV1Version(versions, query.Version, query.Channel, display.Id, source.Name);
         var relativePath = PreIndexedSource.ResolveV1RelativePath(conn, selected.PathPart);
-        var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V1_M", source, relativePath, selected.ManifestHash, _appRoot);
+        using var sourceClient = source.Kind == SourceKind.HomebrewPreIndexed
+            ? HomebrewPreIndexedSource.CreateTlsTrustedClient(_homebrewClient, source)
+            : null;
+        var client = sourceClient ?? (source.Kind == SourceKind.HomebrewPreIndexed ? _homebrewClient : _client);
+        var bytes = PreIndexedSource.GetCachedSourceFile(client, "V1_M", source, relativePath, selected.ManifestHash, _appRoot);
         var manifest = ParseYamlManifest(bytes);
         var structuredDocument = ParseYamlManifestDocuments(bytes);
         manifest = manifest with { Version = selected.Version, Channel = selected.Channel };
@@ -2665,9 +2817,13 @@ public class Repository : IDisposable
         PackageQuery query)
     {
         var source = _store.Sources[sourceIndex];
-        var (entries, vdFile) = PreIndexedSource.LoadV2VersionData(_client, conn, source, packageRowid, packageHash, _appRoot);
+        using var sourceClient = source.Kind == SourceKind.HomebrewPreIndexed
+            ? HomebrewPreIndexedSource.CreateTlsTrustedClient(_homebrewClient, source)
+            : null;
+        var client = sourceClient ?? (source.Kind == SourceKind.HomebrewPreIndexed ? _homebrewClient : _client);
+        var (entries, vdFile) = PreIndexedSource.LoadV2VersionData(client, conn, source, packageRowid, packageHash, _appRoot);
         var selected = SelectV2Version(entries, query.Version, query.Channel, display.Id, source.Name);
-        var bytes = PreIndexedSource.GetCachedSourceFile(_client, "V2_M", source, selected.ManifestRelativePath, selected.ManifestHash, _appRoot);
+        var bytes = PreIndexedSource.GetCachedSourceFile(client, "V2_M", source, selected.ManifestRelativePath, selected.ManifestHash, _appRoot);
         var manifest = ParseYamlManifest(bytes);
         var structuredDocument = ParseYamlManifestDocuments(bytes);
         manifest = manifest with { Version = selected.Version };
@@ -2848,6 +3004,7 @@ public class Repository : IDisposable
 
         Installer? best = null;
         foreach (var installer in installers
+            .Where(HomebrewKegStore.InstallerMatchesHost)
             .Where(installer => InstallerMatchesRequested(installer, requestedType, requestedScope, requestedPlatform, requestedOsVersion, systemPlatform, currentOsVersion))
             .Where(installer => InstallerMatchesArchitecture(installer, requestedArchitecture, systemArchitecture))
             .Where(installer => !InstallerUnsupportedOnArchitecture(installer, systemArchitecture))
@@ -3325,6 +3482,8 @@ public class Repository : IDisposable
 
         var topLevelRequireExplicit = ReadBool(dict, "RequireExplicitUpgrade");
         var anyInstallerRequireExplicit = installers.Any(i => i.RequireExplicitUpgrade);
+        var homebrew = ReadHomebrewMetadata(dict.GetValueOrDefault("Pinget"), GetStr("PackageIdentifier"), GetStr("PackageVersion"));
+        ValidateHomebrewInstallers(homebrew, installers);
 
         return new Manifest
         {
@@ -3349,12 +3508,215 @@ public class Repository : IDisposable
             ReleaseNotes = GetOptStr("ReleaseNotes"),
             ReleaseNotesUrl = GetOptStr("ReleaseNotesUrl"),
             Tags = tags,
+            Homebrew = homebrew,
             Agreements = agreements,
             Documentation = docs,
             Icons = icons,
             Installers = installers,
             PackageDependencies = dependencies,
             RequireExplicitUpgrade = topLevelRequireExplicit || anyInstallerRequireExplicit,
+        };
+    }
+
+    private static void ValidateHomebrewInstallers(HomebrewFormulaMetadata? metadata, IReadOnlyList<Installer> installers)
+    {
+        var homebrewInstallers = installers
+            .Where(installer => string.Equals(installer.InstallerType, "homebrew-bottle", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (metadata is null)
+        {
+            if (homebrewInstallers.Count > 0)
+                throw new InvalidDataException("InstallerType homebrew-bottle requires Pinget.Homebrew metadata.");
+            return;
+        }
+
+        if (homebrewInstallers.Count != installers.Count)
+            throw new InvalidDataException("All installers in a Pinget.Homebrew manifest must use InstallerType homebrew-bottle.");
+
+        foreach (var bottle in metadata.Bottles)
+        {
+            var matches = homebrewInstallers
+                .Where(installer => string.Equals(installer.Url, bottle.Url, StringComparison.Ordinal) &&
+                    string.Equals(installer.Sha256, bottle.Sha256, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (matches.Count != 1)
+                throw new InvalidDataException(
+                    $"Pinget.Homebrew bottle '{bottle.BottleTag}' must match exactly one homebrew-bottle installer by URL and SHA-256.");
+
+            var installer = matches[0];
+            if (!string.Equals(installer.Architecture, bottle.Architecture, StringComparison.Ordinal) ||
+                !installer.Platforms.Contains(bottle.TargetOS, StringComparer.Ordinal))
+            {
+                throw new InvalidDataException(
+                    $"Pinget.Homebrew bottle '{bottle.BottleTag}' target must match its installer Platform and Architecture.");
+            }
+        }
+
+        if (metadata.Bottles.Count != homebrewInstallers.Count)
+            throw new InvalidDataException("Each homebrew-bottle installer must have exactly one Pinget.Homebrew.Bottles entry.");
+    }
+
+    private static HomebrewFormulaMetadata? ReadHomebrewMetadata(object? pingetValue, string packageIdentifier, string packageVersion)
+    {
+        if (pingetValue is null)
+            return null;
+        if (pingetValue is not IDictionary<object, object> pinget)
+            throw new InvalidDataException("Pinget manifest extension must be a mapping.");
+        if (!pinget.TryGetValue("Homebrew", out var homebrewValue))
+            return null;
+        if (homebrewValue is not IDictionary<object, object> homebrew)
+            throw new InvalidDataException("Pinget.Homebrew manifest extension must be a mapping.");
+
+        static string RequiredString(IDictionary<object, object> mapping, string key, string prefix)
+        {
+            if (!mapping.TryGetValue(key, out var value) || string.IsNullOrWhiteSpace(value?.ToString()))
+                throw new InvalidDataException($"{prefix}.{key} is required.");
+            return value!.ToString()!;
+        }
+
+        static uint RequiredUInt32(IDictionary<object, object> mapping, string key, string prefix)
+        {
+            var value = RequiredString(mapping, key, prefix);
+            if (!uint.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var result))
+                throw new InvalidDataException($"{prefix}.{key} must be an unsigned integer.");
+            return result;
+        }
+
+        static string? OptionalString(IDictionary<object, object> mapping, string key) =>
+            mapping.TryGetValue(key, out var value) && value is not null ? value.ToString() : null;
+
+        static List<string> StringList(IDictionary<object, object> mapping, string key, string prefix)
+        {
+            if (!mapping.TryGetValue(key, out var value) || value is null)
+                return [];
+            if (value is not IList<object> items)
+                throw new InvalidDataException($"{prefix}.{key} must be a sequence of strings.");
+            return items.Select((item, index) =>
+            {
+                if (item is not string text || string.IsNullOrWhiteSpace(text))
+                    throw new InvalidDataException($"{prefix}.{key}[{index}] must be a non-empty string.");
+                return text;
+            }).ToList();
+        }
+
+        var prefix = "Pinget.Homebrew";
+        var schemaVersion = RequiredUInt32(homebrew, "SchemaVersion", prefix);
+        if (schemaVersion != 1)
+            throw new InvalidDataException($"Unsupported Pinget.Homebrew.SchemaVersion {schemaVersion}.");
+        var formula = RequiredString(homebrew, "Formula", prefix);
+        var tap = RequiredString(homebrew, "Tap", prefix);
+        var tapParts = tap.Split('/');
+        if (tapParts.Length != 2 || tapParts.Any(string.IsNullOrWhiteSpace))
+            throw new InvalidDataException("Pinget.Homebrew.Tap must be a fully qualified tap such as homebrew/core.");
+        string expectedPackageId;
+        try { expectedPackageId = HomebrewPackageIds.Create(tap, formula); }
+        catch (ArgumentException ex) { throw new InvalidDataException(ex.Message, ex); }
+        if (!string.Equals(packageIdentifier, expectedPackageId, StringComparison.Ordinal))
+            throw new InvalidDataException($"PackageIdentifier must equal Homebrew-derived identifier '{expectedPackageId}'.");
+
+        var upstreamVersion = RequiredString(homebrew, "UpstreamVersion", prefix);
+        var revision = RequiredUInt32(homebrew, "Revision", prefix);
+        var expectedPackageVersion = revision == 0 ? upstreamVersion : $"{upstreamVersion}_{revision}";
+
+        var versionScheme = RequiredUInt32(homebrew, "VersionScheme", prefix);
+        if (versionScheme > 5)
+            throw new InvalidDataException($"Unsupported Homebrew version scheme {versionScheme}.");
+        if (!homebrew.TryGetValue("KegOnly", out var kegOnlyValue) ||
+            !(kegOnlyValue is bool || bool.TryParse(kegOnlyValue?.ToString(), out _)))
+            throw new InvalidDataException("Pinget.Homebrew.KegOnly must be true or false.");
+
+        if (!homebrew.TryGetValue("Bottles", out var bottleValue) || bottleValue is not IList<object> rawBottles || rawBottles.Count == 0)
+            throw new InvalidDataException("Pinget.Homebrew.Bottles must contain at least one target.");
+        var bottles = new List<HomebrewBottleMetadata>(rawBottles.Count);
+        for (var index = 0; index < rawBottles.Count; index++)
+        {
+            if (rawBottles[index] is not IDictionary<object, object> bottle)
+                throw new InvalidDataException($"Pinget.Homebrew.Bottles[{index}] must be a mapping.");
+            var bottlePrefix = $"{prefix}.Bottles[{index}]";
+            var url = RequiredString(bottle, "Url", bottlePrefix);
+            var sha256 = RequiredString(bottle, "Sha256", bottlePrefix).ToLowerInvariant();
+            if (sha256.Length != 64 || sha256.Any(character => !Uri.IsHexDigit(character)))
+                throw new InvalidDataException($"{bottlePrefix}.Sha256 must be a 64-digit SHA-256.");
+            var targetOs = RequiredString(bottle, "TargetOS", bottlePrefix);
+            if (targetOs is not ("macOS" or "Linux"))
+                throw new InvalidDataException($"Unsupported Homebrew bottle target OS '{targetOs}'.");
+            var architecture = RequiredString(bottle, "Architecture", bottlePrefix);
+            if (architecture is not ("x64" or "arm64"))
+                throw new InvalidDataException($"Unsupported Homebrew bottle architecture '{architecture}'.");
+            var bottleTag = RequiredString(bottle, "BottleTag", bottlePrefix);
+            var tagTarget = MapHomebrewBottleTag(bottleTag);
+            if (tagTarget is null)
+                throw new InvalidDataException($"Unsupported Homebrew bottle tag '{bottleTag}'.");
+            if (tagTarget.Value.OperatingSystem != targetOs || tagTarget.Value.Architecture != architecture)
+                throw new InvalidDataException(
+                    $"Homebrew bottle tag '{bottleTag}' maps to {tagTarget.Value.OperatingSystem}/{tagTarget.Value.Architecture}, not {targetOs}/{architecture}.");
+            var rebuild = RequiredUInt32(bottle, "Rebuild", bottlePrefix);
+            var relocation = RequiredString(bottle, "Relocation", bottlePrefix);
+            var expectedFixedCellar = HomebrewBottleMetadata.FixedCellarForTag(bottleTag);
+            if (relocation is not ("any" or "any_skip_relocation") && relocation != expectedFixedCellar)
+                throw new InvalidDataException($"Unsupported Homebrew bottle relocation value '{relocation}'.");
+
+            var minimumOsVersion = OptionalString(bottle, "MinimumOSVersion");
+            var maximumOsVersion = OptionalString(bottle, "MaximumOSVersion");
+            var minimumGlibc = OptionalString(bottle, "MinimumGlibc");
+            var loader = OptionalString(bottle, "Loader");
+            if (targetOs == "macOS" && (minimumGlibc is not null || loader is not null))
+                throw new InvalidDataException("Linux ABI fields cannot be used for a macOS bottle target.");
+            if (targetOs == "Linux" && (minimumOsVersion is not null || maximumOsVersion is not null))
+                throw new InvalidDataException("macOS product-version fields cannot be used for a Linux bottle target.");
+
+            bottles.Add(new HomebrewBottleMetadata
+            {
+                Url = url,
+                Sha256 = sha256,
+                TargetOS = targetOs,
+                Architecture = architecture,
+                BottleTag = bottleTag,
+                Rebuild = rebuild,
+                Relocation = relocation,
+                MinimumOSVersion = minimumOsVersion,
+                MaximumOSVersion = maximumOsVersion,
+                MinimumGlibc = minimumGlibc,
+                Loader = loader,
+            });
+        }
+        var rebuiltVersion = $"{expectedPackageVersion}.bottle.{bottles[0].Rebuild}";
+        if (packageVersion != expectedPackageVersion &&
+            (packageVersion != rebuiltVersion || bottles.Any(bottle => bottle.Rebuild != bottles[0].Rebuild)))
+            throw new InvalidDataException($"PackageVersion must equal Homebrew stable pkg_version '{expectedPackageVersion}' or its matching .bottle.Rebuild version.");
+
+        return new HomebrewFormulaMetadata
+        {
+            SchemaVersion = checked((int)schemaVersion),
+            Formula = formula,
+            Tap = tap,
+            UpstreamVersion = upstreamVersion,
+            Revision = revision,
+            VersionScheme = versionScheme,
+            Aliases = StringList(homebrew, "Aliases", prefix),
+            OldNames = StringList(homebrew, "OldNames", prefix),
+            KegOnly = Convert.ToBoolean(kegOnlyValue, CultureInfo.InvariantCulture),
+            Bottles = bottles,
+        };
+    }
+
+    private static (string OperatingSystem, string Architecture)? MapHomebrewBottleTag(string tag)
+    {
+        string[] macOSReleases =
+        [
+            "tahoe", "sequoia", "sonoma", "ventura", "monterey", "big_sur",
+            "catalina", "mojave", "high_sierra", "sierra", "el_capitan", "yosemite",
+        ];
+
+        if (tag.StartsWith("arm64_", StringComparison.Ordinal) && macOSReleases.Contains(tag["arm64_".Length..], StringComparer.Ordinal))
+            return ("macOS", "arm64");
+        if (macOSReleases.Contains(tag, StringComparer.Ordinal))
+            return ("macOS", "x64");
+        return tag switch
+        {
+            "x86_64_linux" => ("Linux", "x64"),
+            "aarch64_linux" => ("Linux", "arm64"),
+            _ => null,
         };
     }
 
@@ -4132,7 +4494,7 @@ public class Repository : IDisposable
 
                 string? version = null;
                 string? moniker = null;
-                if (source.Kind == SourceKind.PreIndexed)
+                if (source.Kind is SourceKind.PreIndexed or SourceKind.HomebrewPreIndexed)
                 {
                     try
                     {
@@ -4321,7 +4683,7 @@ public class Repository : IDisposable
         for (int sourceIndex = 0; sourceIndex < _store.Sources.Count; sourceIndex++)
         {
             var source = _store.Sources[sourceIndex];
-            if (source.Kind != SourceKind.PreIndexed) continue;
+            if (source.Kind is not (SourceKind.PreIndexed or SourceKind.HomebrewPreIndexed)) continue;
             if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
                 continue;
 
@@ -4404,7 +4766,7 @@ public class Repository : IDisposable
         for (int sourceIndex = 0; sourceIndex < _store.Sources.Count; sourceIndex++)
         {
             var source = _store.Sources[sourceIndex];
-            if (source.Kind != SourceKind.PreIndexed) continue;
+            if (source.Kind is not (SourceKind.PreIndexed or SourceKind.HomebrewPreIndexed)) continue;
             if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
                 continue;
 
@@ -4634,7 +4996,7 @@ public class Repository : IDisposable
         for (int sourceIndex = 0; sourceIndex < _store.Sources.Count; sourceIndex++)
         {
             var source = _store.Sources[sourceIndex];
-            if (source.Kind != SourceKind.PreIndexed) continue;
+            if (source.Kind is not (SourceKind.PreIndexed or SourceKind.HomebrewPreIndexed)) continue;
             if (requestedSource is not null && !source.Name.Equals(requestedSource, StringComparison.OrdinalIgnoreCase))
                 continue;
 
@@ -5580,7 +5942,7 @@ public class Repository : IDisposable
             score = Math.Max(score, ScoreTextMatch(commandValue, query.Command, query.Exact, 155, 145, 135));
         }
 
-        if (match.SourceKind == SourceKind.PreIndexed)
+        if (match.SourceKind is SourceKind.PreIndexed or SourceKind.HomebrewPreIndexed)
             score += 5;
 
         if (SearchMatchHasUnknownVersion(match))

@@ -92,6 +92,8 @@ fn source(name: &str, kind: SourceKind, arg: String, explicit: bool) -> SourceRe
         source_version: None,
         etag: None,
         last_modified: None,
+        publisher: None,
+        trusted_ca: Vec::new(),
     }
 }
 

@@ -15,8 +15,14 @@ public sealed class AddSourceCmdlet : PSCmdlet
     public string Argument { get; set; } = string.Empty;
 
     [Parameter(ValueFromPipeline = true, ValueFromPipelineByPropertyName = true)]
-    [ValidateSet("Microsoft.Rest", "Microsoft.PreIndexed.Package")]
+    [ValidateSet("Microsoft.Rest", "Microsoft.PreIndexed.Package", "Pinget.PreIndexed.Homebrew")]
     public string? Type { get; set; }
+
+    [Parameter(ValueFromPipelineByPropertyName = true)]
+    public string? Publisher { get; set; }
+
+    [Parameter(ValueFromPipelineByPropertyName = true)]
+    public string[] TrustedCa { get; set; } = [];
 
     [Parameter(ValueFromPipelineByPropertyName = true)]
     public PSSourceTrustLevel TrustLevel { get; set; } = PSSourceTrustLevel.Default;
@@ -30,6 +36,6 @@ public sealed class AddSourceCmdlet : PSCmdlet
     protected override void ProcessRecord()
     {
         using var client = PingetClient.Open();
-        client.AddSource(Name, Argument, Type, TrustLevel, Explicit, Priority);
+        client.AddSource(Name, Argument, Type, TrustLevel, Explicit, Priority, Publisher, TrustedCa);
     }
 }

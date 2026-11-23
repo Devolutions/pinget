@@ -214,7 +214,7 @@ internal static class PreIndexedSource
         }
     }
 
-    private static void RemoveSqliteSidecars(string dbPath)
+    internal static void RemoveSqliteSidecars(string dbPath)
     {
         TryDelete(dbPath + "-wal");
         TryDelete(dbPath + "-shm");

@@ -10,6 +10,10 @@ public sealed class PSSourceResult
 
     public string TrustLevel { get; init; } = "None";
 
+    public string? Publisher { get; init; }
+
+    public string[] TrustedCa { get; init; } = [];
+
     public bool Explicit { get; init; }
 
     public int Priority { get; init; }

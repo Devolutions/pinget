@@ -139,14 +139,17 @@ fn leave_state_staging(state: &Path, build_id: &str) -> PathBuf {
 fn killed_before_package_swap_with_staged_package_left_is_rolled_back_then_republished() {
     let root = review_directory("before-swap");
     let (state, build_a, build_b) = two_builds(&root);
-    let (killed, _) = interrupted_copy(&root, &state, &build_a, &build_b, CommitStep::BeforePackageSwap);
+    let (killed, package_b) = interrupted_copy(&root, &state, &build_a, &build_b, CommitStep::BeforePackageSwap);
     assert!(marker_json(&killed).get("pendingCommit").is_some());
     let names = root_names(&killed);
-    assert!(
-        names
-            .iter()
-            .any(|name| name.starts_with(".source2.") && name.ends_with(".new")),
-        "the staged package is left behind: {names:?}"
+    let staged_name = names
+        .iter()
+        .find(|name| name.starts_with(&format!(".pinget-msix-source2.msix-{build_b}-")) && name.ends_with(".new"))
+        .unwrap_or_else(|| panic!("the staged package is left behind: {names:?}"));
+    assert_eq!(
+        fs::read(killed.join(staged_name)).expect("staged package"),
+        package_b,
+        "the staged package must match the new publication"
     );
     assert!(
         !names.iter().any(|name| name.starts_with(".publish-")),

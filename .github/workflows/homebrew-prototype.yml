@@ -1,0 +1,150 @@
+name: Homebrew prototype acceptance
+
+on:
+  push:
+    branches: [copilot/scaling-chainsaw]
+    paths:
+      - 'rust/**'
+      - 'dotnet/**'
+      - 'tests/homebrew/**'
+      - 'scripts/Import-HomebrewCatalog.ps1'
+      - 'tests/publisher/mszip-interop.ps1'
+      - 'tests/publisher/Test-MszipInterop.ps1'
+      - '.github/workflows/homebrew-prototype.yml'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      DOTNET_ROLL_FORWARD: Major
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Setup Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install missing Linux relocation tool
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if ! command -v patchelf; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq patchelf
+          fi
+      - name: Build and test Homebrew implementations
+        shell: bash
+        run: |
+          cargo test --manifest-path rust/Cargo.toml -p pinget-core homebrew
+          cargo test --manifest-path rust/Cargo.toml -p pinget-publisher --test homebrew
+          cargo build --manifest-path rust/Cargo.toml -p pinget-cli
+          dotnet build dotnet/src/Devolutions.Pinget.Cli/Devolutions.Pinget.Cli.csproj -c Release
+          dotnet test dotnet/src/Devolutions.Pinget.Core.Tests/Devolutions.Pinget.Core.Tests.csproj -c Release --filter 'FullyQualifiedName~Homebrew'
+          dotnet test dotnet/src/Devolutions.Pinget.Publisher.Tests/Devolutions.Pinget.Publisher.Tests.csproj -c Release --filter 'FullyQualifiedName~Homebrew'
+          dotnet tool install Devolutions.Psign.Tool --version 0.8.5 --tool-path "$RUNNER_TEMP/psign-homebrew"
+          psign="$RUNNER_TEMP/psign-homebrew/psign-tool"
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Windows gets a psign-tool.cmd shim; use the packaged native executable directly.
+            psign="$(find "$RUNNER_TEMP/psign-homebrew/.store" -type f -name psign-tool.exe | head -n 1)"
+          fi
+          test -n "$psign"
+          "$psign" --help > /dev/null
+          echo "PSIGN_TOOL=$psign" >> "$GITHUB_ENV"
+      - name: Test portable catalog importer
+        shell: pwsh
+        run: |
+          ./tests/homebrew/Test-CatalogImport.ps1
+      - name: Run real signed static source acceptance
+        shell: pwsh
+        run: |
+          $extension = if ($IsWindows) { '.exe' } else { '' }
+          ./tests/homebrew/Run-NativeAcceptance.ps1 `
+            -RustCli "rust/target/debug/pinget$extension" `
+            -DotnetAssembly dotnet/src/Devolutions.Pinget.Cli/bin/Release/net10.0/pinget.dll `
+            -PsignTool "$env:PSIGN_TOOL" `
+            -Report "$env:RUNNER_TEMP/homebrew-acceptance-report.json"
+      - name: Upload non-secret acceptance report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: homebrew-acceptance-${{ matrix.os }}
+          path: ${{ runner.temp }}/homebrew-acceptance-report.json
+          if-no-files-found: warn
+
+  portable-mszip-fixtures:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Setup Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Generate portable MSZIP fixtures with both publishers
+        shell: pwsh
+        run: |
+          ./tests/publisher/Test-MszipInterop.ps1
+          ./tests/publisher/mszip-interop.ps1 -Mode produce `
+            -Output "$env:RUNNER_TEMP/mszip-fixtures" `
+            -Reports "$env:RUNNER_TEMP/mszip-reports" `
+            -RunId "${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: portable-mszip-fixtures-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mszip-fixtures
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        with:
+          name: portable-mszip-test-report-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mszip-reports/mszip-portable.trx
+          if-no-files-found: error
+          retention-days: 7
+
+  native-mszip-decoder:
+    needs: portable-mszip-fixtures
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        producer: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with:
+          name: portable-mszip-fixtures-${{ matrix.producer }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mszip-fixtures
+      - name: Decode portable fixtures with the Windows Compression API
+        shell: pwsh
+        run: |
+          ./tests/publisher/mszip-interop.ps1 -Mode validate-windows `
+            -InputDirectory "$env:RUNNER_TEMP/mszip-fixtures" `
+            -RunId "${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.producer }}"

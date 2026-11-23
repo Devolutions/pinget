@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -40,7 +41,8 @@ internal sealed record IndexedPackage(
 internal sealed record ScanResult(
     IReadOnlyDictionary<string, string> Inventory,
     IReadOnlyList<IndexedPackage> Packages,
-    IReadOnlyList<MergedManifest> Manifests);
+    IReadOnlyList<MergedManifest> Manifests,
+    string Profile);
 
 internal static partial class ManifestScanner
 {
@@ -114,7 +116,95 @@ internal static partial class ManifestScanner
         RejectOutputCollisions(merged);
         foreach (var group in merged.GroupBy(m => m.PackageId, StringComparer.OrdinalIgnoreCase))
             _ = ValidateVersions(group);
-        return generateArtifacts ? BuildPackages(inventory, merged) : new ScanResult(inventory, [], merged);
+        var bottleAssets = CollectBottleAssets(root);
+        foreach (var asset in bottleAssets)
+            inventory.Add(asset.Key, asset.Value);
+        var hasHomebrew = merged.Any(IsHomebrewManifest);
+        var hasWindows = merged.Any(manifest => !IsHomebrewManifest(manifest));
+        if (hasHomebrew && hasWindows)
+            throw new PublisherException("A publisher snapshot cannot mix Homebrew and Windows package profiles.");
+        var profile = hasHomebrew ? "homebrew" : "windows";
+        if (profile == "homebrew")
+            ValidateHomebrewBottleAssets(merged, inventory);
+        else if (bottleAssets.Count > 0)
+            throw new PublisherException("bottles/ assets are only supported by the Homebrew publisher profile.");
+        var result = generateArtifacts ? BuildPackages(inventory, merged) : new ScanResult(inventory, [], merged, profile);
+        return result with { Profile = profile };
+    }
+
+    private static bool IsHomebrewManifest(MergedManifest manifest)
+    {
+        if (manifest.PackageId.StartsWith("Pinget.Homebrew.", StringComparison.Ordinal))
+            return true;
+        if (manifest.Model["Pinget"] is JsonObject pinget && pinget["Homebrew"] is not null)
+            return true;
+        if (manifest.Model["Installers"] is not JsonArray installers)
+            return false;
+        return installers.Any(installer =>
+            string.Equals(installer?["InstallerType"]?.GetValue<string>(), "homebrew-bottle", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static SortedDictionary<string, string> CollectBottleAssets(string root)
+    {
+        var directory = Path.Combine(root, "bottles");
+        var assets = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        if (!Directory.Exists(directory))
+            return assets;
+        RejectReparsePoint(directory);
+        foreach (var path in Directory.EnumerateFileSystemEntries(directory))
+        {
+            RejectReparsePoint(path);
+            if (!File.Exists(path) || Directory.Exists(path))
+                throw new PublisherException("bottles/ may contain only regular content-addressed bottle files.");
+            var name = Path.GetFileName(path);
+            if (!name.EndsWith(".tar.gz", StringComparison.Ordinal))
+                throw new PublisherException($"Invalid bottle mirror filename: {name}");
+            var expectedHash = name[..^7];
+            if (expectedHash.Length != 64 || !expectedHash.All(char.IsAsciiHexDigit)
+                || !string.Equals(expectedHash, expectedHash.ToLowerInvariant(), StringComparison.Ordinal))
+                throw new PublisherException($"Invalid bottle mirror filename: {name}");
+            using var stream = File.OpenRead(path);
+            var actualHash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+            if (!string.Equals(actualHash, expectedHash, StringComparison.Ordinal))
+                throw new PublisherException($"Bottle mirror hash does not match filename: {name}");
+            assets.Add($"bottles/{name}", expectedHash);
+        }
+        return assets;
+    }
+
+    private static void ValidateHomebrewBottleAssets(
+        IReadOnlyList<MergedManifest> manifests,
+        IReadOnlyDictionary<string, string> inventory)
+    {
+        foreach (var manifest in manifests)
+        {
+            if (manifest.Model["Installers"] is not JsonArray installers)
+                continue;
+            foreach (var installer in installers)
+            {
+                if (!string.Equals(installer?["InstallerType"]?.GetValue<string>(), "homebrew-bottle", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                var sha256 = installer?["InstallerSha256"]?.GetValue<string>()?.ToLowerInvariant()
+                    ?? throw new PublisherException("Homebrew installer is missing InstallerSha256.");
+                var url = installer["InstallerUrl"]?.GetValue<string>()
+                    ?? throw new PublisherException("Homebrew installer is missing InstallerUrl.");
+                if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
+                    || uri.Scheme != Uri.UriSchemeHttps
+                    || !string.IsNullOrEmpty(uri.UserInfo)
+                    || !string.IsNullOrEmpty(uri.Query)
+                    || !string.IsNullOrEmpty(uri.Fragment)
+                    || uri.AbsolutePath.Contains('%'))
+                    throw new PublisherException("Homebrew bottle URL must be an unsigned HTTPS static URL.");
+                var segments = uri.AbsolutePath.Trim('/').Split('/');
+                var filename = $"{sha256}.tar.gz";
+                if (sha256.Length != 64 || !sha256.All(char.IsAsciiHexDigit)
+                    || segments.Length < 2 || segments[^2] != "bottles" || segments[^1] != filename)
+                    throw new PublisherException("Homebrew bottle URL and InstallerSha256 must identify /bottles/<sha256>.tar.gz.");
+                if (!inventory.TryGetValue($"bottles/{filename}", out var mirroredHash)
+                    || !string.Equals(mirroredHash, sha256, StringComparison.Ordinal))
+                    throw new PublisherException($"Homebrew bottle is missing from the bottles/ mirror inventory: {filename}");
+            }
+        }
     }
 
     private static List<string> EnumerateYamlFiles(string root)
@@ -254,7 +344,7 @@ internal static partial class ManifestScanner
         {
             if (child is not YamlScalarNode item)
                 throw new PublisherException($"Manifest field '{key}' must be a sequence of strings.");
-            result.Add(JsonValue.Create(item.Value ?? string.Empty));
+            result.Add((JsonNode?)JsonValue.Create(item.Value ?? string.Empty));
         }
         return result;
     }
@@ -594,7 +684,7 @@ internal static partial class ManifestScanner
                 System.Security.Cryptography.SHA256.HashData(compressed)));
         }
 
-        return new ScanResult(inventory, packages, manifests);
+        return new ScanResult(inventory, packages, manifests, "windows");
     }
 
     private static string[] ValidateVersions(IEnumerable<MergedManifest> group)

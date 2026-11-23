@@ -1,5 +1,10 @@
 //! Wave 21 publisher regression tests.
 
+// Keep the private encoder test-only; do not expose it through the public API.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "mszip_interop_tests.rs"]
+mod mszip_interop_tests;
+
 use super::*;
 
 const HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -112,6 +117,174 @@ fn r21_6_explicit_psign_tool_path_is_absolute() {
     let found = psign::find_psign_tool(Some(Path::new("Cargo.toml"))).expect("existing file");
     assert!(found.is_absolute(), "{}", found.display());
     assert!(found.ends_with("Cargo.toml"));
+}
+
+#[test]
+fn build_rejects_reuse_of_legacy_portable_snapshot_without_mutation() {
+    let root = wave21_directory("legacy-mszip");
+    let input = root.join("input");
+    let state = root.join("state");
+    fs::create_dir(&input).expect("input");
+    fs::write(input.join("manifest.yaml"), manifest("", &installer(""))).expect("manifest");
+    let options = BuildOptions {
+        input,
+        state: state.clone(),
+    };
+    let report = build(&options).expect("initial build");
+    let snapshot = report.snapshot_directory;
+    let index_path = snapshot.join("Public").join("index.db");
+    let database = Connection::open(&index_path).expect("index");
+    let (id, hash): (String, Vec<u8>) = database
+        .query_row("SELECT id,hash FROM packages", [], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("package");
+    let old_hash = hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let old_relative = format!("packages/{id}/{}/versionData.mszyml", &old_hash[..8]);
+    let old_path = snapshot.join("feed").join(&old_relative);
+    let mut legacy = fs::read(&old_path).expect("sidecar");
+    legacy[4..8].fill(0);
+    let digest = Sha256::digest(&legacy);
+    let legacy_hash = sha256_hex(&legacy);
+    let legacy_relative = format!("packages/{id}/{}/versionData.mszyml", &legacy_hash[..8]);
+    assert_ne!(old_relative, legacy_relative);
+    let legacy_path = snapshot.join("feed").join(&legacy_relative);
+    fs::create_dir_all(legacy_path.parent().expect("sidecar parent")).expect("sidecar directory");
+    fs::write(&legacy_path, &legacy).expect("legacy sidecar");
+    fs::remove_file(&old_path).expect("old sidecar");
+    fs::remove_dir(old_path.parent().expect("old sidecar parent")).expect("old sidecar directory");
+    database
+        .execute(
+            "UPDATE packages SET hash=?1 WHERE id=?2",
+            params![digest.as_slice(), id],
+        )
+        .expect("legacy hash");
+    drop(database);
+
+    let metadata_path = snapshot.join("snapshot.json");
+    let mut metadata: SnapshotMetadata =
+        serde_json::from_slice(&fs::read(&metadata_path).expect("metadata")).expect("parse metadata");
+    metadata.artifacts.remove(&old_relative).expect("old artifact");
+    metadata.artifacts.insert(legacy_relative, legacy_hash);
+    metadata.index_hash = sha256_hex(&fs::read(index_path).expect("index bytes"));
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
+    )
+    .expect("metadata");
+    let snapshot_before = hash_tree(&snapshot).expect("snapshot inventory");
+    let state_before = fs::read(state.join("publisher.db")).expect("state bytes");
+
+    let error = build(&options).expect_err("legacy snapshot must not be reused");
+    assert!(error.to_string().contains("fresh --state"), "{error}");
+    assert_eq!(hash_tree(&snapshot).expect("preserved snapshot"), snapshot_before);
+    assert_eq!(
+        fs::read(state.join("publisher.db")).expect("preserved state"),
+        state_before
+    );
+    assert_eq!(fs::read(legacy_path).expect("preserved legacy sidecar"), legacy);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn publication_rejects_same_build_and_version_with_different_index() {
+    let root = wave21_directory("same-build-different-index");
+    let input = root.join("input");
+    let first_state = root.join("first-state");
+    let second_state = root.join("second-state");
+    let destination = root.join("destination");
+    fs::create_dir(&input).expect("input");
+    fs::write(input.join("manifest.yaml"), manifest("", &installer(""))).expect("manifest");
+    let first = build(&BuildOptions {
+        input: input.clone(),
+        state: first_state.clone(),
+    })
+    .expect("first build");
+    let second = build(&BuildOptions {
+        input,
+        state: second_state.clone(),
+    })
+    .expect("fresh-state build");
+    assert_eq!(first.build_id, second.build_id);
+
+    let index = second.snapshot_directory.join("Public").join("index.db");
+    let original_hash = sha256_hex(&fs::read(&index).expect("original index"));
+    let connection = Connection::open(&index).expect("open index");
+    connection
+        .execute_batch("PRAGMA user_version=31415")
+        .expect("change index bytes");
+    drop(connection);
+    let index_hash = sha256_hex(&fs::read(&index).expect("changed index"));
+    assert_ne!(original_hash, index_hash);
+    let metadata_path = second.snapshot_directory.join("snapshot.json");
+    let mut metadata: SnapshotMetadata =
+        serde_json::from_slice(&fs::read(&metadata_path).expect("metadata")).expect("parse metadata");
+    metadata.index_hash = index_hash.clone();
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
+    )
+    .expect("metadata");
+
+    let package_options = |state: &Path, version: &str, filename: &str, dest: Option<PathBuf>| PackageOptions {
+        state: state.to_path_buf(),
+        build_id: Some(first.build_id.clone()),
+        msix: root.join(filename),
+        name: "Pinget.Test.IndexRevision".to_owned(),
+        publisher: "CN=Pinget Index Revision".to_owned(),
+        version: version.to_owned(),
+        destination: dest,
+    };
+    let initial_package = package_options(&first_state, "1.0.0.0", "initial.msix", None);
+    package(&initial_package).expect("initial package");
+    let first_publish = PublishOptions {
+        state: first_state,
+        destination: destination.clone(),
+        build_id: Some(first.build_id.clone()),
+        msix: initial_package.msix,
+        unsigned_development: true,
+        psign_tool: None,
+        trusted_ca: Vec::new(),
+    };
+    assert!(!publish(&first_publish).expect("initial publication").reused);
+    assert!(publish(&first_publish).expect("same-index retry").reused);
+    let before = hash_tree(&destination).expect("published inventory");
+
+    let preflight = package_options(&second_state, "1.0.0.0", "preflight.msix", Some(destination.clone()));
+    let error = package(&preflight).expect_err("same version with different index must fail preflight");
+    assert!(
+        error.to_string().contains("different build content or index"),
+        "{error}"
+    );
+    assert!(!preflight.msix.exists());
+    assert_eq!(hash_tree(&destination).expect("preserved destination"), before);
+
+    let candidate = package_options(&second_state, "1.0.0.0", "candidate.msix", None);
+    package(&candidate).expect("package without destination preflight");
+    let mut next = PublishOptions {
+        state: second_state.clone(),
+        destination: destination.clone(),
+        build_id: Some(second.build_id),
+        msix: candidate.msix,
+        unsigned_development: true,
+        psign_tool: None,
+        trusted_ca: Vec::new(),
+    };
+    let error = publish(&next).expect_err("same version with different index must not be reused");
+    assert!(
+        error.to_string().contains("different build content or index"),
+        "{error}"
+    );
+    assert_eq!(hash_tree(&destination).expect("preserved destination"), before);
+
+    let upgraded = package_options(&second_state, "1.0.0.1", "upgraded.msix", Some(destination.clone()));
+    package(&upgraded).expect("higher-version preflight");
+    next.msix = upgraded.msix;
+    assert!(!publish(&next).expect("higher-version publication").reused);
+    let marker = read_owner_marker(&destination.join(".pinget-publisher.json"))
+        .expect("marker")
+        .expect("owned destination");
+    assert_eq!(marker.index_hash, index_hash);
+    assert_eq!(marker.package_version, "1.0.0.1");
+    fs::remove_dir_all(root).expect("cleanup");
 }
 
 #[test]
